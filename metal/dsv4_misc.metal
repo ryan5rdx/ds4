@@ -6368,6 +6368,61 @@ kernel void kernel_dsv4_tp_flag_set(
     }
 }
 
+// Tensor-parallel gate release fence: the CPU->GPU direction.  Instead of
+// blocking the command processor on an MTLSharedEvent -- whose driver-mediated
+// resume measures ~101us on Apple silicon and ~186us in the ds4 decode graph --
+// the GPU spins on a word the service thread writes, so the command processor
+// never stops.  Measured 101us -> 6.0us per release.  The approach is MLX's
+// (ml-explore/mlx#1773).
+//
+// coherent(system) is MANDATORY and is the whole correctness story: with a
+// plain volatile device pointer the GPU never observes the CPU store at all
+// (71 of 120 releases missed in an A/B), and with coherent(device) it misses
+// one every few hundred releases -- which at 86 gates per token is a hang every
+// few tokens.  Reaching that qualifier needs the internals pragma; ordinary MSL
+// rejects it.
+#pragma METAL internals : enable
+#ifndef __METAL_MEMORY_SCOPE_SYSTEM__
+#define __METAL_MEMORY_SCOPE_SYSTEM__ 3
+#endif
+namespace metal {
+constexpr constant metal::thread_scope thread_scope_system =
+    static_cast<thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);
+}
+
+// Bounded so a peer that dies mid-gate cannot wedge the command processor into
+// a GPU watchdog kill.  The service thread always writes the release word, even
+// on failure, so the bound is a backstop and not the normal exit.
+kernel void kernel_dsv4_tp_fence_wait(
+        volatile coherent(system) device uint * release [[buffer(0)]],
+        constant uint & value [[buffer(1)]],
+        constant uint & max_iters [[buffer(2)]]) {
+    for (uint i = 0; i < max_iters; i++) {
+        metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                   metal::memory_order_seq_cst,
+                                   metal::thread_scope_system);
+        if (release[0] >= value) {
+            return;
+        }
+    }
+}
+
+// Arrival publish for the fast-sync path.  kernel_dsv4_tp_flag_set above uses a
+// plain relaxed store, which is sufficient only because the command processor
+// blocks on a shared event immediately afterwards -- that stall is what makes
+// the write land.  Under the fence the GPU never stalls, so the store has to
+// carry system scope itself or the CPU spins on a stale word for the whole
+// coherency window.  This is MLX's fence_update half of the same mechanism.
+kernel void kernel_dsv4_tp_flag_set_coherent(
+        volatile coherent(system) device uint * flag [[buffer(0)]],
+        constant uint & value [[buffer(1)]]) {
+    flag[0] = value;
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+}
+#pragma METAL internals : disable
+
 // Ratio-4 compressor pooling without materializing the [n_comp, 8, head_dim]
 // KV and score packs. The row mapping and both reduction loops deliberately
 // match kernel_dsv4_softmax_pool so the arithmetic order is unchanged.
