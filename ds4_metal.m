@@ -8680,7 +8680,18 @@ int ds4_gpu_tp_init(uint32_t rank,
     }
     pthread_attr_destroy(&attr);
     g_tp_thread_running = 1;
-    if (getenv("DS4_TP_NO_KEEPALIVE") == NULL) {
+    /* The keep-alive exists to stop the GPU power-gating between gates, but
+     * powermetrics shows the decode GPU pinned at its top P-state (P8, 1398
+     * MHz) throughout, so there is no gating to prevent -- and the spin is a
+     * pure parasite.  Its quantum is one uninterruptible ~35 ms dispatch (iters
+     * 1.2M) against a ~44 ms token, the pause flag is only sampled between
+     * dispatches, and it is only paused around verify blocks, so during
+     * ordinary decode it contends for the whole token.  Measured on a 2x M2
+     * Ultra pair: 17.0 t/s with it, 22.8 t/s without (+34%), and a Metal System
+     * Trace attributes 6.4 s of GPU time to the spin against 2.4 s for the
+     * model itself.  Default it off; DS4_TP_KEEPALIVE=1 restores it. */
+    if (getenv("DS4_TP_KEEPALIVE") != NULL &&
+        getenv("DS4_TP_NO_KEEPALIVE") == NULL) {
         uint32_t ka_tgs = ds4_gpu_tp_keepalive_tgs_from_env();
         g_tp_keepalive_queue = [g_device newCommandQueue];
         g_tp_keepalive_buffer = [g_device newBufferWithLength:(NSUInteger)ka_tgs * 256u * sizeof(float)
