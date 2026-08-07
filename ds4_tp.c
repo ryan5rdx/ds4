@@ -41,7 +41,7 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 10u
+#define DS4_TP_PROTOCOL_VERSION 11u
 
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
@@ -560,7 +560,8 @@ uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
     return slots * vec * 2 +    /* out + in vectors */
            slots * 8 * 2 +      /* in flags + out flag staging */
            16 +                 /* token slot */
-           slots * 4 +          /* GPU-written gate-ready flags */
+           (uint64_t)DS4_GPU_TP_FLAG_BANK_SLOTS * 4u * 2u +
+                                /* row + verifier GPU-ready flag banks */
            (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
 }
 
@@ -573,7 +574,8 @@ static void tp_slab_layout(ds4_tp *tp) {
     tp->token_off = tp->in_flags_off + slots * 8;
     tp->out_flags_off = tp->token_off + 16;
     tp->gpu_flags_off = tp->out_flags_off + slots * 8;
-    tp->batch_out_off = tp->gpu_flags_off + slots * 4;
+    tp->batch_out_off = tp->gpu_flags_off +
+                        (uint64_t)DS4_GPU_TP_FLAG_BANK_SLOTS * 4u * 2u;
     tp->batch_in_off = tp->batch_out_off +
                        (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
     tp->slab_bytes = tp->batch_in_off +
@@ -1860,6 +1862,8 @@ int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen) {
     tp->slab = base;
     memset(tp->slab + tp->in_flags_off, 0, (uint64_t)tp->n_slots * 8);
     memset(tp->slab + tp->token_off, 0, 16);
+    memset(tp->slab + tp->gpu_flags_off, 0,
+           (uint64_t)DS4_GPU_TP_FLAG_BANK_SLOTS * 4u * 2u);
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) {
         for (;;) {

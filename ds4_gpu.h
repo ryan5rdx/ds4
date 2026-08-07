@@ -22,6 +22,10 @@ extern "C" {
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 #endif
 
+/* GPU-written TP arrival flags use fixed-size banks so row and verifier
+ * sequence spaces cannot satisfy one another with a stale value. */
+enum { DS4_GPU_TP_FLAG_BANK_SLOTS = 1024u };
+
 #ifndef DS4_GPU_ATTENTION_DECODE_ROW_DEFINED
 #define DS4_GPU_ATTENTION_DECODE_ROW_DEFINED
 #define DS4_GPU_ATTENTION_DECODE_BATCH_MAX 32u
@@ -401,8 +405,11 @@ void ds4_gpu_tp_set_attn_head_split(int enabled);
 void ds4_gpu_model_residency_skip(int skip);
 /* Submit one trivial command buffer (first-submission costs paid at load). */
 int ds4_gpu_warm_command_queue(void);
-/* Nonzero after any gate exchange failed; the eval must abort. */
+/* Nonzero after any gate exchange failed or a bounded release fence timed
+ * out; the eval must abort. */
 int ds4_gpu_tp_failed(void);
+int ds4_gpu_tp_fence_timed_out(void);
+void ds4_gpu_tp_clear_fence_timeout(void);
 
 /* Tensor-parallel sliced projections (Metal decode path only).
  *

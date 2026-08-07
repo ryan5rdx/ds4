@@ -6881,6 +6881,59 @@ kernel void kernel_dsv4_tp_flag_set(
     }
 }
 
+// Tensor-parallel gate release fence (CPU->GPU): the GPU spins on a word the
+// service thread writes instead of blocking the command processor on a shared
+// event. coherent(system) is required for visibility across the device/host
+// boundary and therefore deliberately uses the Metal internals qualifier. A
+// timeout is latched so the host rejects the graph instead of consuming stale
+// peer rows.
+#pragma METAL internals : enable
+#ifndef __METAL_MEMORY_SCOPE_SYSTEM__
+#define __METAL_MEMORY_SCOPE_SYSTEM__ 3
+#endif
+namespace metal {
+constexpr constant metal::thread_scope thread_scope_system =
+    static_cast<thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);
+}
+
+kernel void kernel_dsv4_tp_fence_wait(
+        volatile coherent(system) device uint * release [[buffer(0)]],
+        constant uint & value [[buffer(1)]],
+        constant uint & max_iters [[buffer(2)]],
+        volatile coherent(system) device uint * timeout [[buffer(3)]]) {
+    for (uint i = 0; i < max_iters; i++) {
+        metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                   metal::memory_order_seq_cst,
+                                   metal::thread_scope_system);
+        if (release[0] == value) {
+            metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                       metal::memory_order_seq_cst,
+                                       metal::thread_scope_system);
+            return;
+        }
+    }
+    timeout[0] = 1u;
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+}
+
+// Arrival publication for the fast-release path. The ordinary relaxed flag
+// store relies on the following event boundary for visibility; the fence path
+// has no such event and must publish coherently itself.
+kernel void kernel_dsv4_tp_flag_set_coherent(
+        volatile coherent(system) device uint * flag [[buffer(0)]],
+        constant uint & value [[buffer(1)]]) {
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+    flag[0] = value;
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+}
+#pragma METAL internals : disable
+
 // Poll-gate flag with a payload checksum: the CPU sees the flag word as soon
 // as its cache line is written back at command-buffer completion, which can
 // precede the rest of the partial's lines. Publishing an integer checksum of
