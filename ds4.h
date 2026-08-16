@@ -466,6 +466,7 @@ int ds4_session_eval_speculative_argmax_excluding(
  * ds4_tp_worker_run. */
 enum {
     DS4_TP_SPEC_F_ATTN_OUT_SPLIT = 1u << 0,
+    DS4_TP_SPEC_F_ATTN_HEAD_SPLIT = 1u << 1,
     /* Row and verifier arrivals use disjoint GPU-written flag banks. */
     DS4_TP_GPU_FLAG_BANK_SLOTS = 1024u,
 };

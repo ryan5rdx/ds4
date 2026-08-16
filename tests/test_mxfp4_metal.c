@@ -437,8 +437,12 @@ int main(void) {
         (uint64_t)TP_TEST_ROWS * ATTN_GROUPS * DIM;
     const uint64_t tp_low_count =
         (uint64_t)TP_TEST_ROWS * TP_GROUPS * ATTN_RANK;
+    const uint64_t tp_heads_compact_count =
+        (uint64_t)TP_TEST_ROWS * TP_GROUPS * DIM;
     const uint64_t tp_out_count = (uint64_t)TP_TEST_ROWS * DIM;
     float *tp_heads_host = calloc((size_t)heads_count, sizeof(float));
+    float *tp_heads_compact_host = calloc(
+        (size_t)tp_heads_compact_count, sizeof(float));
     float *tp_low_full_ref = calloc(
         (size_t)TP_TEST_ROWS * (size_t)q8_low_dim, sizeof(float));
     float *tp_low_expected = calloc((size_t)tp_low_count, sizeof(float));
@@ -449,13 +453,17 @@ int main(void) {
     float *tp_out_full_ref = calloc((size_t)tp_out_count, sizeof(float));
     ds4_gpu_tensor *tp_heads_tensor = ds4_gpu_tensor_alloc(
         heads_count * sizeof(float));
+    ds4_gpu_tensor *tp_heads_compact_tensor = ds4_gpu_tensor_alloc(
+        tp_heads_compact_count * sizeof(float));
     ds4_gpu_tensor *tp_low_tensor = ds4_gpu_tensor_alloc(
         tp_low_count * sizeof(float));
     ds4_gpu_tensor *tp_out_tensor = ds4_gpu_tensor_alloc(
         tp_out_count * sizeof(float));
-    ok = ok && tp_heads_host && tp_low_full_ref && tp_low_expected &&
+    ok = ok && tp_heads_host && tp_heads_compact_host &&
+         tp_low_full_ref && tp_low_expected &&
          tp_low_actual && tp_out_expected && tp_out_actual && tp_out_sum &&
-         tp_out_full_ref && tp_heads_tensor && tp_low_tensor && tp_out_tensor;
+         tp_out_full_ref && tp_heads_tensor && tp_heads_compact_tensor &&
+         tp_low_tensor && tp_out_tensor;
     for (uint64_t i = 0; i < heads_count; i++) {
         tp_heads_host[i] =
             (float)((int32_t)((i * 17u + i / DIM * 7u) % 53u) - 26) /
@@ -494,6 +502,11 @@ int main(void) {
         const uint32_t group0 = rank_id * TP_GROUPS;
         const uint64_t k0 = (uint64_t)group0 * ATTN_RANK;
         for (uint32_t t = 0; t < TP_TEST_ROWS; t++) {
+            memcpy(tp_heads_compact_host +
+                       (uint64_t)t * TP_GROUPS * DIM,
+                   tp_heads_host +
+                       ((uint64_t)t * ATTN_GROUPS + group0) * DIM,
+                   (size_t)TP_GROUPS * DIM * sizeof(float));
             memcpy(tp_low_expected +
                        (uint64_t)t * TP_GROUPS * ATTN_RANK,
                    tp_low_full_ref + (uint64_t)t * q8_low_dim + k0,
@@ -551,6 +564,57 @@ int main(void) {
         }
         for (uint64_t i = 0; i < tp_out_count; i++) {
             tp_out_sum[i] += tp_out_actual[i];
+        }
+        /* The end-to-end verifier head split packs this rank's groups at the
+         * start of every row. Point the weight range at the global group and
+         * present both the logical group count and heads stride as compact. */
+        const uint64_t attn_a_row_bytes =
+            attn_a_blocks_per_row * sizeof(block_q8_0);
+        const uint64_t compact_attn_a_offset = attn_a_offset +
+            (uint64_t)group0 * ATTN_RANK * attn_a_row_bytes;
+        ok = ok && ds4_gpu_tensor_write(
+            tp_heads_compact_tensor, 0, tp_heads_compact_host,
+            tp_heads_compact_count * sizeof(float));
+        ok = ok && ds4_gpu_tensor_fill_f32(
+            tp_low_tensor, -113.0f, tp_low_count);
+        ok = ok && ds4_gpu_tensor_fill_f32(
+            tp_out_tensor, -114.0f, tp_out_count);
+        ok = ok && ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+            tp_low_tensor,
+            model,
+            model_size,
+            compact_attn_a_offset,
+            DIM,
+            ATTN_RANK,
+            TP_GROUPS,
+            0,
+            TP_GROUPS,
+            tp_heads_compact_tensor,
+            TP_TEST_ROWS);
+        ok = ok && ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+            tp_out_tensor,
+            model,
+            model_size,
+            attn_b_offset,
+            q8_low_dim,
+            DIM,
+            k0,
+            (uint64_t)TP_GROUPS * ATTN_RANK,
+            tp_low_tensor,
+            TP_TEST_ROWS);
+        ok = ok && ds4_gpu_tensor_read(
+            tp_low_tensor, 0, tp_low_actual, tp_low_count * sizeof(float));
+        ok = ok && ds4_gpu_tensor_read(
+            tp_out_tensor, 0, tp_out_actual, tp_out_count * sizeof(float));
+        if (ok) {
+            char low_label[24];
+            char out_label[24];
+            snprintf(low_label, sizeof(low_label), "tp%u-compact-low", rank_id);
+            snprintf(out_label, sizeof(out_label), "tp%u-compact-out", rank_id);
+            ok = compare_values(low_label, tp_low_actual, tp_low_expected,
+                                tp_low_count, 3.0e-4f) &&
+                 compare_values(out_label, tp_out_actual, tp_out_expected,
+                                tp_out_count, 3.0e-3f);
         }
     }
     if (ok) {
@@ -641,6 +705,7 @@ int main(void) {
     ds4_gpu_tensor_free(markov_logits_tensor);
     ds4_gpu_tensor_free(tp_out_tensor);
     ds4_gpu_tensor_free(tp_low_tensor);
+    ds4_gpu_tensor_free(tp_heads_compact_tensor);
     ds4_gpu_tensor_free(tp_heads_tensor);
     free(tp_out_full_ref);
     free(tp_out_sum);
@@ -649,6 +714,7 @@ int main(void) {
     free(tp_low_actual);
     free(tp_low_expected);
     free(tp_low_full_ref);
+    free(tp_heads_compact_host);
     free(tp_heads_host);
 
     /* The production large-prefill path stores its fused SwiGLU result as

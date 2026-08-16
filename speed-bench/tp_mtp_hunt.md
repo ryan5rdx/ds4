@@ -1,8 +1,9 @@
 # TP DSpark performance hunt
 
 This note records the `tp-mtp-hunt` branch changes and the two-node test
-matrix.  It is a companion to `tp_decode_investigation.md`; all estimates are
-pre-measurement until the M2 Ultra pair has run the matrix below.
+matrix.  It is a companion to `tp_decode_investigation.md`.  Measurements
+explicitly listed below are from the M2 Ultra pair; remaining gains are
+estimates until their corresponding A/B runs complete.
 
 ## What changed
 
@@ -19,6 +20,11 @@ The default DSpark TP path now:
   full vocabulary-row readback and CPU Q8 matvec for every proposal step
   (including the confidence-zero diagnostic path), and skips unused confidence
   readback when that path also disables the adaptive scheduler;
+- keeps the verifier's Apple Q8 vocabulary head on one weight pass for draft
+  lengths two through five: lengths two through four use the existing exact
+  four-row tile and length five uses the bit-checked native five-row tile,
+  instead of padding every block to eight rows (`DS4_DSPARK_VERIFY_HEAD_PAD8=1`
+  restores the old path);
 - submits verifier command buffers every four layers on both ranks when the
   init-fixed batch-fence configuration makes cross-buffer gates safe;
 - declines a one-token proposal after its free first-token check, because a
@@ -31,6 +37,14 @@ The default DSpark TP path now:
 projection split.  It halves each rank's verifier attention-output weights but
 adds one TP batch gate per layer, so it must win an A/B before becoming a
 default.
+
+`DS4_DSPARK_TP_VERIFY_HEAD_SPLIT=1` is the end-to-end form of that experiment.
+It automatically enables the output split, slices `attn_q_b` to this rank's 32
+heads, keeps those heads compact through raw/indexed attention, and reconstructs
+the full 4K attention row with the same one batch gate per layer.  The option
+changes verifier gate participation and therefore must be set identically on
+both ranks.  Expected incremental saving over output-split alone is roughly
+6--9 ms per five-row verify block; measure rather than promoting it by default.
 
 Correctness guards added with the performance work:
 
@@ -81,6 +95,33 @@ Results produced before this correction used the wrong anchor, transformed the
 main KV through the support block, and exposed a much larger history than the
 checkpoint was trained for.  Do not use their acceptance rates to judge the
 support model; rerun both the forced-five and production arms.
+
+## Corrected two-node results
+
+The corrected proposer and compact-capture fix produced these 512-token
+Promessi sposi measurements with the published 5.99 GB support GGUF.  Throughput
+runs used `DS4_METAL_FAST_SYNC=1` on both ranks and no dispatch/GPU-busy
+profiling.
+
+| Arm | Steady decode | Key result |
+|---|---:|---|
+| Target-only control | 41.96 t/s | 23.83 ms/token baseline |
+| Production policy, clean | 38.08 t/s | Working proposals, but still a large low-yield tax |
+| Production policy, stats | 38.82 t/s | 13 proposed, 2 accepted; 490/502 cycles produced no draft |
+| Forced five, stats | 21.35 t/s | 1,596 proposed, 189 accepted; zero full `d5>a5` blocks |
+
+The forced arm had a 35.5% first-proposal hit rate and accepted 1.658 drafts per
+actual verifier call.  Proposal work cost 3,411.8 ms, while 114 five-row
+verifiers cost 12,332.9 ms, or 108.18 ms each.  A normal target cycle cost
+about 24.53 ms.  Even a perfect five-token block was therefore marginal before
+the new verifier cuts; the observed average acceptance was far below break-even.
+
+The production stats arm paid 873.0 ms of proposal work plus one 68.8 ms d2
+verifier to save only 48.1 ms of target work (`net_saved=-896.1 ms`).  That
+result motivated the default Apple TP policy below: make cold probing sparse,
+batch its support-KV catch-up, and reserve the verifier for d5.  The policy,
+one-pass Q8 verifier head, and optional attention-head split were implemented
+after these measurements and still require the A/B matrix below.
 
 ## Required setup
 
@@ -160,6 +201,16 @@ Then run the production-policy arm by removing `DS4_DSPARK_SCHEDULER=0` and
 replacing `--dspark-confidence 0` with `--dspark`.  Finally remove
 `DS4_DSPARK_STATS=1` for the clean throughput number.
 
+On Apple TP, that production arm now admits only full five-token proposals to
+the verifier.  A short proposal or any verifier result below `a5` backs the
+next proposal off by 64, then 128, then 256 target cycles; `d5>a5` immediately
+returns to hot probing.  Skipped cycles retain target-hidden rows in a 128-row
+GPU ring and batch-convert the missing support KVs at the next probe, avoiding
+the old per-token support-ring maintenance tax.  For an old-policy A/B, add
+`DS4_DSPARK_TP_LOW_YIELD_POLICY=0` on the coordinator only.  This is distinct
+from `DS4_DSPARK_SCHEDULER=0`, which remains the forced diagnostic mode and
+bypasses all adaptive policy.
+
 The target-only control is the same command without `--mtp`/`--dspark` and
 without DSpark environment variables.  Alternate control and treatment if
 multiple samples are taken so temperature and DVFS drift do not all favor one
@@ -197,12 +248,15 @@ on both ranks unless the table says coordinator-only.
 | Arm | Added environment | What it isolates | Expected direction |
 |---|---|---|---|
 | Optimized | none | All default branch changes | Reference |
+| Old production scheduler | `DS4_DSPARK_TP_LOW_YIELD_POLICY=0` (coordinator only) | d5-only admission, fixed backoff, and deferred support-KV catch-up | Slower on low-yield prompts; useful rollback/A-B |
 | Old batch release | `DS4_METAL_FAST_BATCH_SYNC=0` | Fast verifier fence only; ordinary fast fence stays on | 4.1--7.7 ms/block slower |
 | Row MoE | `DS4_DSPARK_TP_VERIFY_ROW_MOE=1` | Batched resident-MXFP4 verifier MoE | Slower; magnitude unmeasured |
 | Replay partials | `DS4_DSPARK_TP_REPLAY_PARTIAL=1` | Distributed prefix snapshots | ~23.8 ms per replayed token slower |
 | No verifier pipeline | `DS4_DSPARK_DISABLE_VERIFY_PIPELINE=1` | Host encode/GPU overlap | ~0.5--2 ms/block slower |
 | CPU Markov | `DS4_DSPARK_NO_GPU_MARKOV=1` (coordinator only) | Metal Markov argmax | Slower; inspect proposal timing |
+| Pad verifier head to eight | `DS4_DSPARK_VERIFY_HEAD_PAD8=1` | Native/four-row Apple Q8 verifier head | ~0.5--1.1 ms/block slower; no dispatch-count change |
 | Split attention output | `DS4_DSPARK_TP_VERIFY_ATTN_OUT_SPLIT=1` | Default-off projection split | Unknown; likely -1 to +2 ms/block |
+| Split verifier heads | `DS4_DSPARK_TP_VERIFY_HEAD_SPLIT=1` | q_b + attention core + output projection, 32 heads/rank | Expected 6--9 ms/block over output-only split |
 | Verify one-row drafts | `DS4_DSPARK_VERIFY_SINGLE=1` (coordinator only) | One-row economic guard | Always slower when exercised |
 
 For any arm, the high-value diagnostics are `gen_tps`, `gen_steady_tps`,
