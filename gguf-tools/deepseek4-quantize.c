@@ -36,6 +36,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #if defined(_WIN32)
 #error "deepseek4-quantize.c currently targets POSIX systems"
@@ -1579,6 +1581,7 @@ typedef struct {
 
 typedef struct {
     char *path;
+    char *architecture;
     uint32_t version;
     uint64_t n_kv;
     uint64_t n_tensors;
@@ -1587,6 +1590,14 @@ typedef struct {
     size_t alignment;
     int n_experts;
     uint32_t n_layers;
+    bool has_dflash_block_count;
+    bool has_dflash_block_size;
+    bool has_dflash_noise_token_id;
+    uint32_t dflash_block_count;
+    uint32_t dflash_block_size;
+    uint32_t dflash_noise_token_id;
+    int32_t dflash_target_layers[8];
+    uint32_t dflash_target_layer_count;
     size_t data_offset;
     tensor_meta *tensors;
     hmap tensor_map;
@@ -1742,11 +1753,35 @@ static gguf_file load_gguf_metadata_with_override(const char *path,
         char *key = read_gguf_string_fp(fp);
         uint32_t type = read_u32_le_fp(fp, "GGUF KV type");
         if (strcmp(key, DS4_KV_COMPRESS_RATIOS) == 0) found_compress_ratios = true;
-        if (strcmp(key, "general.alignment") == 0 && type == GGUF_TYPE_UINT32) {
+        if (strcmp(key, "general.architecture") == 0 && type == GGUF_TYPE_STRING) {
+            free(g.architecture);
+            g.architecture = read_gguf_string_fp(fp);
+        } else if (strcmp(key, "general.alignment") == 0 && type == GGUF_TYPE_UINT32) {
             uint32_t a = read_u32_le_fp(fp, "GGUF alignment");
             if (a) g.alignment = a;
         } else if (strcmp(key, "deepseek4.block_count") == 0 && type == GGUF_TYPE_UINT32) {
             g.n_layers = read_u32_le_fp(fp, "GGUF layer count");
+        } else if (strcmp(key, "dflash.block_count") == 0 && type == GGUF_TYPE_UINT32) {
+            g.dflash_block_count = read_u32_le_fp(fp, "dflash block count");
+            g.has_dflash_block_count = true;
+        } else if (strcmp(key, "dflash.block_size") == 0 && type == GGUF_TYPE_UINT32) {
+            g.dflash_block_size = read_u32_le_fp(fp, "dflash block size");
+            g.has_dflash_block_size = true;
+        } else if (strcmp(key, "tokenizer.ggml.mask_token_id") == 0 &&
+                   type == GGUF_TYPE_UINT32) {
+            g.dflash_noise_token_id = read_u32_le_fp(fp, "dflash mask token id");
+            g.has_dflash_noise_token_id = true;
+        } else if (strcmp(key, "dflash.target_layers") == 0 && type == GGUF_TYPE_ARRAY) {
+            uint32_t elem_type = read_u32_le_fp(fp, "dflash target layer array type");
+            uint64_t n = read_u64_le_fp(fp, "dflash target layer count");
+            if (elem_type != GGUF_TYPE_INT32 || n == 0 ||
+                n > sizeof(g.dflash_target_layers) / sizeof(g.dflash_target_layers[0])) {
+                die("dflash.target_layers must be a non-empty INT32 array of at most 8 entries");
+            }
+            g.dflash_target_layer_count = (uint32_t)n;
+            for (uint32_t j = 0; j < g.dflash_target_layer_count; j++) {
+                g.dflash_target_layers[j] = read_i32_fp(fp, "dflash target layer");
+            }
         } else if (strcmp(key, "deepseek4.expert_count") == 0 && type == GGUF_TYPE_UINT32) {
             uint32_t n = read_u32_le_fp(fp, "GGUF expert count");
             if (n <= (uint32_t)INT_MAX) g.n_experts = (int)n;
@@ -2008,6 +2043,7 @@ static void dspark_support_defaults(dspark_support_options *o) {
 
 typedef struct {
     char *hf_dir;
+    char *dflash_gguf;
     char *template_gguf;
     char *out_gguf;
     char *compare_gguf;
@@ -2385,10 +2421,16 @@ static void dspark_shape_reversed_from_info(tensor_meta *m, const st_info *info)
 }
 
 static void dspark_plan_set_size(dspark_tensor_plan *tp) {
-    if (tp->meta.type != DS4Q_TYPE_I32 && !is_quantizable_target(tp->meta.type)) {
+    const bool preserved_mxfp4 =
+        tp->kind == DSPARK_PLAN_EXPERT &&
+        tp->meta.type == DS4Q_TYPE_MXFP4 &&
+        parse_expert_tensor(tp->meta.name).is_expert;
+    if (tp->meta.type != DS4Q_TYPE_I32 &&
+        !is_quantizable_target(tp->meta.type) &&
+        !preserved_mxfp4) {
         die("unsupported DSpark planned tensor type");
     }
-    if (ds4q_can_quantize(tp->meta.type) &&
+    if ((ds4q_can_quantize(tp->meta.type) || preserved_mxfp4) &&
         tp->meta.ne[0] % ds4q_block_size(tp->meta.type) != 0) {
         fprintf(stderr,
                 "error: DSpark tensor %s ne[0]=%" PRId64
@@ -2712,11 +2754,566 @@ static void free_dspark_support_plan(dspark_support_plan *plan) {
     memset(plan, 0, sizeof(*plan));
 }
 
+/* =====
+ * llama.cpp dflash GGUF -> DS4 DSpark support GGUF importer
+ *
+ * The full-fat DSpark release is already a GGUF, but it uses llama.cpp's
+ * `dflash` architecture and tensor namespace.  DS4 intentionally consumes a
+ * small standalone `deepseek4-dspark` GGUF.  Most payloads are already in the
+ * ideal runtime format, so this importer validates the exact released schema,
+ * renames tensors, copies compatible bytes losslessly, expands quality-critical
+ * BF16 tensors to F32, and quantizes only the Markov matrices needed by DS4's
+ * GPU fast path.
+ */
+
+typedef enum {
+    DFLASH_COPY,
+    DFLASH_BF16_TO_Q8_0,
+    DFLASH_BF16_TO_F32,
+} dflash_conversion;
+
+typedef struct {
+    const char *source_suffix;
+    const char *target_suffix;
+    ds4q_type source_type;
+    ds4q_type target_type;
+    int n_dims;
+    int64_t ne[3];
+    dflash_conversion conversion;
+} dflash_block_schema;
+
+typedef struct {
+    const char *source_name;
+    const char *target_name;
+    ds4q_type source_type;
+    ds4q_type target_type;
+    int n_dims;
+    int64_t ne[3];
+    dflash_conversion conversion;
+} dflash_special_schema;
+
+static const dflash_block_schema dflash_block_tensors[] = {
+    {"attn_sinks.weight",       "attn_sinks.weight",       DS4Q_TYPE_F32,   DS4Q_TYPE_F32,   1, {64},              DFLASH_COPY},
+    {"attn_kv_a_norm.weight",   "attn_kv_a_norm.weight",   DS4Q_TYPE_F32,   DS4Q_TYPE_F32,   1, {512},             DFLASH_COPY},
+    {"attn_q_a_norm.weight",    "attn_q_a_norm.weight",    DS4Q_TYPE_F32,   DS4Q_TYPE_F32,   1, {1024},            DFLASH_COPY},
+    {"attn_kv.weight",          "attn_kv.weight",          DS4Q_TYPE_Q8_0,  DS4Q_TYPE_Q8_0,  2, {4096, 512},       DFLASH_COPY},
+    {"attn_output_a.weight",    "attn_output_a.weight",    DS4Q_TYPE_Q8_0,  DS4Q_TYPE_Q8_0,  2, {4096, 8192},      DFLASH_COPY},
+    {"attn_output_b.weight",    "attn_output_b.weight",    DS4Q_TYPE_Q8_0,  DS4Q_TYPE_Q8_0,  2, {8192, 4096},      DFLASH_COPY},
+    {"attn_q_a.weight",         "attn_q_a.weight",         DS4Q_TYPE_Q8_0,  DS4Q_TYPE_Q8_0,  2, {4096, 1024},      DFLASH_COPY},
+    {"attn_q_b.weight",         "attn_q_b.weight",         DS4Q_TYPE_Q8_0,  DS4Q_TYPE_Q8_0,  2, {1024, 32768},     DFLASH_COPY},
+    {"attn_norm.weight",        "attn_norm.weight",        DS4Q_TYPE_F32,   DS4Q_TYPE_F32,   1, {4096},            DFLASH_COPY},
+    {"exp_probs_b.bias",        "exp_probs_b.bias",        DS4Q_TYPE_F32,   DS4Q_TYPE_F32,   1, {256},             DFLASH_COPY},
+    {"ffn_gate_inp.weight",     "ffn_gate_inp.weight",     DS4Q_TYPE_BF16,  DS4Q_TYPE_F32,   2, {4096, 256},       DFLASH_BF16_TO_F32},
+    {"ffn_gate_shexp.weight",   "ffn_gate_shexp.weight",   DS4Q_TYPE_Q8_0,  DS4Q_TYPE_Q8_0,  2, {4096, 2048},      DFLASH_COPY},
+    {"ffn_up_shexp.weight",     "ffn_up_shexp.weight",     DS4Q_TYPE_Q8_0,  DS4Q_TYPE_Q8_0,  2, {4096, 2048},      DFLASH_COPY},
+    {"ffn_down_shexp.weight",   "ffn_down_shexp.weight",   DS4Q_TYPE_Q8_0,  DS4Q_TYPE_Q8_0,  2, {2048, 4096},      DFLASH_COPY},
+    {"ffn_norm.weight",         "ffn_norm.weight",         DS4Q_TYPE_F32,   DS4Q_TYPE_F32,   1, {4096},            DFLASH_COPY},
+    {"hc_attn_base.weight",     "hc_attn_base.weight",     DS4Q_TYPE_F32,   DS4Q_TYPE_F32,   1, {24},              DFLASH_COPY},
+    {"hc_attn_fn.weight",       "hc_attn_fn.weight",       DS4Q_TYPE_F32,   DS4Q_TYPE_F32,   2, {16384, 24},       DFLASH_COPY},
+    {"hc_attn_scale.weight",    "hc_attn_scale.weight",    DS4Q_TYPE_F32,   DS4Q_TYPE_F32,   1, {3},               DFLASH_COPY},
+    {"hc_ffn_base.weight",      "hc_ffn_base.weight",      DS4Q_TYPE_F32,   DS4Q_TYPE_F32,   1, {24},              DFLASH_COPY},
+    {"hc_ffn_fn.weight",        "hc_ffn_fn.weight",        DS4Q_TYPE_F32,   DS4Q_TYPE_F32,   2, {16384, 24},       DFLASH_COPY},
+    {"hc_ffn_scale.weight",     "hc_ffn_scale.weight",     DS4Q_TYPE_F32,   DS4Q_TYPE_F32,   1, {3},               DFLASH_COPY},
+    {"ffn_gate_exps.weight",    "ffn_gate_exps.weight",    DS4Q_TYPE_MXFP4, DS4Q_TYPE_MXFP4, 3, {4096, 2048, 256}, DFLASH_COPY},
+    {"ffn_up_exps.weight",      "ffn_up_exps.weight",      DS4Q_TYPE_MXFP4, DS4Q_TYPE_MXFP4, 3, {4096, 2048, 256}, DFLASH_COPY},
+    {"ffn_down_exps.weight",    "ffn_down_exps.weight",    DS4Q_TYPE_MXFP4, DS4Q_TYPE_MXFP4, 3, {2048, 4096, 256}, DFLASH_COPY},
+};
+
+static const dflash_special_schema dflash_special_tensors[] = {
+    {"fc.weight",                  "mtp.0.main_proj.weight",                    DS4Q_TYPE_Q8_0, DS4Q_TYPE_Q8_0, 2, {12288, 4096},  DFLASH_COPY},
+    {"enc.output_norm.weight",     "mtp.0.main_norm.weight",                    DS4Q_TYPE_F32,  DS4Q_TYPE_F32,  1, {4096},         DFLASH_COPY},
+    {"output_norm.weight",         "mtp.2.norm.weight",                         DS4Q_TYPE_F32,  DS4Q_TYPE_F32,  1, {4096},         DFLASH_COPY},
+    {"output_hc_base.weight",      "mtp.2.hc_head_base.weight",                 DS4Q_TYPE_F32,  DS4Q_TYPE_F32,  1, {4},            DFLASH_COPY},
+    {"output_hc_fn.weight",        "mtp.2.hc_head_fn.weight",                   DS4Q_TYPE_F32,  DS4Q_TYPE_F32,  2, {16384, 4},     DFLASH_COPY},
+    {"output_hc_scale.weight",     "mtp.2.hc_head_scale.weight",                DS4Q_TYPE_F32,  DS4Q_TYPE_F32,  1, {1},            DFLASH_COPY},
+    {"markov_w1.weight",           "mtp.2.markov_head.markov_w1.weight",        DS4Q_TYPE_BF16, DS4Q_TYPE_Q8_0, 2, {256, 129280}, DFLASH_BF16_TO_Q8_0},
+    {"markov_w2.weight",           "mtp.2.markov_head.markov_w2.weight",        DS4Q_TYPE_BF16, DS4Q_TYPE_Q8_0, 2, {256, 129280}, DFLASH_BF16_TO_Q8_0},
+    {"conf_proj.weight",           "mtp.2.confidence_head.proj.weight",         DS4Q_TYPE_BF16, DS4Q_TYPE_F32,  2, {4352, 1},     DFLASH_BF16_TO_F32},
+};
+
+typedef struct {
+    tensor_meta meta;
+    int source_index;
+    dflash_conversion conversion;
+} dflash_import_tensor;
+
+typedef struct {
+    dflash_import_tensor *tensors;
+    int len;
+    size_t alignment;
+    size_t kv_bytes;
+    size_t meta_size;
+    size_t data_offset;
+    size_t tensor_bytes;
+    dspark_support_options dspark;
+} dflash_import_plan;
+
+static char *fmt_mtp_name(int stage, const char *suffix) {
+    return fmt_stage_name(stage, suffix);
+}
+
+static const dflash_block_schema *dflash_find_block_schema(const char *suffix) {
+    for (size_t i = 0; i < sizeof(dflash_block_tensors) / sizeof(dflash_block_tensors[0]); i++) {
+        if (strcmp(suffix, dflash_block_tensors[i].source_suffix) == 0) {
+            return &dflash_block_tensors[i];
+        }
+    }
+    return NULL;
+}
+
+static const dflash_special_schema *dflash_find_special_schema(const char *name) {
+    for (size_t i = 0; i < sizeof(dflash_special_tensors) / sizeof(dflash_special_tensors[0]); i++) {
+        if (strcmp(name, dflash_special_tensors[i].source_name) == 0) {
+            return &dflash_special_tensors[i];
+        }
+    }
+    return NULL;
+}
+
+static void dflash_check_tensor_schema(const tensor_meta *src,
+                                       ds4q_type expected_type,
+                                       int expected_n_dims,
+                                       const int64_t expected_ne[3]) {
+    if (src->type != expected_type) {
+        fprintf(stderr,
+                "error: dflash tensor %s has type %s, expected %s\n",
+                src->name,
+                ds4q_type_name(src->type),
+                ds4q_type_name(expected_type));
+        exit(1);
+    }
+    if (src->n_dims != expected_n_dims) {
+        fprintf(stderr,
+                "error: dflash tensor %s has rank %d, expected %d\n",
+                src->name,
+                src->n_dims,
+                expected_n_dims);
+        exit(1);
+    }
+    for (int i = 0; i < expected_n_dims; i++) {
+        if (src->ne[i] != expected_ne[i]) {
+            fprintf(stderr,
+                    "error: dflash tensor %s dim %d is %" PRId64 ", expected %" PRId64 "\n",
+                    src->name,
+                    i,
+                    src->ne[i],
+                    expected_ne[i]);
+            exit(1);
+        }
+    }
+}
+
+static int dflash_import_plan_find(const dflash_import_plan *plan, const char *name) {
+    for (int i = 0; i < plan->len; i++) {
+        if (strcmp(plan->tensors[i].meta.name, name) == 0) return i;
+    }
+    return -1;
+}
+
+static int dflash_import_tensor_cmp(const void *a, const void *b) {
+    const dflash_import_tensor *ta = a;
+    const dflash_import_tensor *tb = b;
+    return strcmp(ta->meta.name, tb->meta.name);
+}
+
+static uint64_t file_size_fp(FILE *fp, const char *path) {
+    off_t current = ftello(fp);
+    if (current < 0 || fseeko(fp, 0, SEEK_END) != 0) die_errno("seek", path);
+    off_t end = ftello(fp);
+    if (end < 0 || fseeko(fp, current, SEEK_SET) != 0) die_errno("seek", path);
+    return (uint64_t)end;
+}
+
+static void dflash_validate_source_bounds(const gguf_file *src) {
+    FILE *fp = fopen(src->path, "rb");
+    if (!fp) die_errno("open GGUF", src->path);
+    const uint64_t file_size = file_size_fp(fp, src->path);
+    fclose(fp);
+    for (uint64_t i = 0; i < src->n_tensors; i++) {
+        const tensor_meta *t = &src->tensors[i];
+        if (t->old_offset > UINT64_MAX - (uint64_t)src->data_offset) {
+            fprintf(stderr, "error: dflash tensor %s offset overflows the source file\n", t->name);
+            exit(1);
+        }
+        if (t->old_offset % src->alignment != 0) {
+            fprintf(stderr, "error: dflash tensor %s offset is not aligned\n", t->name);
+            exit(1);
+        }
+        const uint64_t begin = (uint64_t)src->data_offset + t->old_offset;
+        if (begin > file_size || t->size > file_size - begin) {
+            fprintf(stderr, "error: dflash tensor %s payload is outside the source file\n", t->name);
+            exit(1);
+        }
+        const uint64_t end = begin + t->size;
+        for (uint64_t j = 0; j < i; j++) {
+            const tensor_meta *other = &src->tensors[j];
+            if (other->old_offset > UINT64_MAX - (uint64_t)src->data_offset) {
+                fprintf(stderr,
+                        "error: dflash tensor %s offset overflows the source file\n",
+                        other->name);
+                exit(1);
+            }
+            const uint64_t other_begin = (uint64_t)src->data_offset + other->old_offset;
+            const uint64_t other_end = other_begin + other->size;
+            if (begin < other_end && other_begin < end) {
+                fprintf(stderr,
+                        "error: dflash tensor payloads overlap: %s and %s\n",
+                        t->name,
+                        other->name);
+                exit(1);
+            }
+        }
+    }
+}
+
+static dflash_import_plan build_dflash_import_plan(const gguf_file *src) {
+    enum { DFLASH_EXPECTED_TENSORS = 81, DFLASH_EXPECTED_STAGES = 3 };
+    dflash_import_plan plan = {0};
+    dspark_support_defaults(&plan.dspark);
+
+    if (src->version != 3) die("dflash importer requires GGUF v3");
+    if (!src->architecture || strcmp(src->architecture, "dflash") != 0) {
+        die("dflash importer requires general.architecture=dflash");
+    }
+    if (src->n_tensors != DFLASH_EXPECTED_TENSORS) {
+        fprintf(stderr,
+                "error: dflash source has %" PRIu64 " tensors, expected %d\n",
+                src->n_tensors,
+                DFLASH_EXPECTED_TENSORS);
+        exit(1);
+    }
+    if (!src->has_dflash_block_count || src->dflash_block_count != DFLASH_EXPECTED_STAGES) {
+        die("dflash source must have dflash.block_count=3");
+    }
+    if (!src->has_dflash_block_size || src->dflash_block_size != DSPARK_DEFAULT_BLOCK_SIZE) {
+        die("dflash source must have dflash.block_size=5");
+    }
+    if (!src->has_dflash_noise_token_id ||
+        src->dflash_noise_token_id != DSPARK_DEFAULT_NOISE_TOKEN_ID) {
+        die("dflash source must have tokenizer.ggml.mask_token_id=128799");
+    }
+    if (src->dflash_target_layer_count != DFLASH_EXPECTED_STAGES) {
+        die("dflash source must have three one-based target layers");
+    }
+    for (uint32_t i = 0; i < src->dflash_target_layer_count; i++) {
+        const int32_t layer = src->dflash_target_layers[i];
+        if (layer != (int32_t)(41 + i)) {
+            die("dflash source must have one-based target layers 41,42,43");
+        }
+        plan.dspark.target_layers[i] = (uint32_t)(layer - 1);
+    }
+    plan.dspark.target_layer_count = src->dflash_target_layer_count;
+    plan.dspark.block_size = src->dflash_block_size;
+    plan.dspark.noise_token_id = src->dflash_noise_token_id;
+    plan.dspark.markov_rank = DSPARK_DEFAULT_MARKOV_RANK;
+
+    plan.tensors = xcalloc(DFLASH_EXPECTED_TENSORS, sizeof(plan.tensors[0]));
+    for (uint64_t i = 0; i < src->n_tensors; i++) {
+        const tensor_meta *source = &src->tensors[i];
+        char *target_name = NULL;
+        ds4q_type source_type = DS4Q_TYPE_COUNT;
+        ds4q_type target_type = DS4Q_TYPE_COUNT;
+        int n_dims = 0;
+        const int64_t *ne = NULL;
+        dflash_conversion conversion = DFLASH_COPY;
+
+        int stage = -1;
+        int prefix_len = 0;
+        if (sscanf(source->name, "blk.%d.%n", &stage, &prefix_len) == 1 &&
+            prefix_len > 0 && stage >= 0 && stage < DFLASH_EXPECTED_STAGES) {
+            const dflash_block_schema *schema =
+                dflash_find_block_schema(source->name + prefix_len);
+            if (!schema) {
+                fprintf(stderr, "error: unknown dflash block tensor: %s\n", source->name);
+                exit(1);
+            }
+            target_name = fmt_mtp_name(stage, schema->target_suffix);
+            source_type = schema->source_type;
+            target_type = schema->target_type;
+            n_dims = schema->n_dims;
+            ne = schema->ne;
+            conversion = schema->conversion;
+        } else {
+            const dflash_special_schema *schema = dflash_find_special_schema(source->name);
+            if (!schema) {
+                fprintf(stderr, "error: unknown dflash tensor: %s\n", source->name);
+                exit(1);
+            }
+            target_name = xstrdup(schema->target_name);
+            source_type = schema->source_type;
+            target_type = schema->target_type;
+            n_dims = schema->n_dims;
+            ne = schema->ne;
+            conversion = schema->conversion;
+        }
+
+        dflash_check_tensor_schema(source, source_type, n_dims, ne);
+        if (dflash_import_plan_find(&plan, target_name) >= 0) {
+            fprintf(stderr, "error: duplicate mapped dflash tensor: %s\n", target_name);
+            exit(1);
+        }
+        dflash_import_tensor *dst = &plan.tensors[plan.len++];
+        dst->meta = *source;
+        dst->meta.name = target_name;
+        dst->meta.type = target_type;
+        dst->meta.size = tensor_nbytes(target_type, dst->meta.ne, dst->meta.n_dims);
+        dst->source_index = (int)i;
+        dst->conversion = conversion;
+    }
+
+    if (plan.len != DFLASH_EXPECTED_TENSORS) die("incomplete dflash tensor mapping");
+    dflash_validate_source_bounds(src);
+    qsort(plan.tensors,
+          (size_t)plan.len,
+          sizeof(plan.tensors[0]),
+          dflash_import_tensor_cmp);
+
+    plan.alignment = DS4_GGUF_DEFAULT_ALIGNMENT;
+    plan.kv_bytes =
+        gguf_kv_size_string("general.architecture", "deepseek4-dspark") +
+        gguf_kv_size_string("general.name", "DeepSeek V4 Flash DSpark support") +
+        gguf_kv_size_u32("general.alignment") +
+        gguf_kv_size_u32("dspark.block_size") +
+        gguf_kv_size_u32("dspark.markov_rank") +
+        gguf_kv_size_u32("dspark.noise_token_id") +
+        gguf_kv_size_u32_array("dspark.target_layer_ids", plan.dspark.target_layer_count) +
+        gguf_kv_size_u32("dspark.stage_count") +
+        gguf_kv_size_u32("dspark.n_layers");
+
+    size_t tensor_info = 0;
+    size_t offset = 0;
+    for (int i = 0; i < plan.len; i++) {
+        tensor_meta *t = &plan.tensors[i].meta;
+        t->new_offset = offset;
+        offset += ds4q_pad(t->size, plan.alignment);
+        tensor_info += gguf_string_size(t->name) + 4 + (size_t)t->n_dims * 8 + 4 + 8;
+    }
+    plan.tensor_bytes = offset;
+    plan.meta_size = 4 + 4 + 8 + 8 + plan.kv_bytes + tensor_info;
+    plan.data_offset = ds4q_pad(plan.meta_size, plan.alignment);
+    return plan;
+}
+
+static void print_dflash_import_plan(const dflash_import_plan *plan) {
+    size_t copied = 0;
+    size_t q8 = 0;
+    size_t f32 = 0;
+    size_t type_counts[DS4Q_TYPE_COUNT] = {0};
+    for (int i = 0; i < plan->len; i++) {
+        const dflash_import_tensor *t = &plan->tensors[i];
+        if (t->conversion == DFLASH_COPY) copied++;
+        else if (t->conversion == DFLASH_BF16_TO_Q8_0) q8++;
+        else if (t->conversion == DFLASH_BF16_TO_F32) f32++;
+        if (t->meta.type >= 0 && t->meta.type < DS4Q_TYPE_COUNT) type_counts[t->meta.type]++;
+    }
+    printf("dflash_import: block=%u markov_rank=%u noise_token=%u target_layers=",
+           plan->dspark.block_size,
+           plan->dspark.markov_rank,
+           plan->dspark.noise_token_id);
+    for (uint32_t i = 0; i < plan->dspark.target_layer_count; i++) {
+        printf("%s%u", i ? "," : "", plan->dspark.target_layers[i]);
+    }
+    printf("\n");
+    printf("n_tensors: %d\n", plan->len);
+    printf("payload_actions: copy=%zu bf16_to_q8_0=%zu bf16_to_f32=%zu\n", copied, q8, f32);
+    printf("meta_bytes: %zu\n", plan->data_offset);
+    printf("tensor_bytes_padded: %zu\n", plan->tensor_bytes);
+    printf("approx_file_bytes: %zu\n", plan->data_offset + plan->tensor_bytes);
+    printf("tensor_types:");
+    for (int i = 0; i < DS4Q_TYPE_COUNT; i++) {
+        if (type_counts[i]) printf(" %s=%zu", ds4q_type_name((ds4q_type)i), type_counts[i]);
+    }
+    printf("\n");
+}
+
+static void copy_file_bytes(FILE *src, FILE *dst, uint64_t offset, size_t n, const char *path) {
+    uint8_t *buffer = xmalloc(8u * 1024u * 1024u);
+    if (fseeko(src, (off_t)offset, SEEK_SET) != 0) die_errno("seek GGUF", path);
+    size_t left = n;
+    while (left) {
+        const size_t chunk = left < 8u * 1024u * 1024u ? left : 8u * 1024u * 1024u;
+        if (fread(buffer, 1, chunk, src) != chunk) die_errno("read GGUF tensor", path);
+        if (fwrite(buffer, 1, chunk, dst) != chunk) die("write imported tensor failed");
+        left -= chunk;
+    }
+    free(buffer);
+}
+
+static char *active_temp_output;
+static bool active_temp_cleanup_registered;
+
+static void cleanup_active_temp_output(void) {
+    if (!active_temp_output) return;
+    (void)unlink(active_temp_output);
+    free(active_temp_output);
+    active_temp_output = NULL;
+}
+
+static FILE *open_atomic_output(const char *out_path) {
+    if (active_temp_output) die("an atomic output is already active");
+    const size_t n = strlen(out_path);
+    static const char suffix[] = ".tmp.XXXXXX";
+    char *temp_path = xmalloc(n + sizeof(suffix));
+    memcpy(temp_path, out_path, n);
+    memcpy(temp_path + n, suffix, sizeof(suffix));
+    int fd = mkstemp(temp_path);
+    if (fd < 0) die_errno("create temporary output", temp_path);
+    FILE *fp = fdopen(fd, "wb");
+    if (!fp) {
+        const int saved_errno = errno;
+        close(fd);
+        unlink(temp_path);
+        errno = saved_errno;
+        die_errno("open temporary output", temp_path);
+    }
+    active_temp_output = temp_path;
+    if (!active_temp_cleanup_registered) {
+        if (atexit(cleanup_active_temp_output) != 0) {
+            fclose(fp);
+            cleanup_active_temp_output();
+            die("atexit registration failed");
+        }
+        active_temp_cleanup_registered = true;
+    }
+    return fp;
+}
+
+static void commit_atomic_output(FILE *fp, const char *out_path) {
+    if (!active_temp_output) die("no atomic output is active");
+    if (fflush(fp) != 0) die_errno("flush temporary output", active_temp_output);
+    const int fd = fileno(fp);
+    if (fd < 0 || fsync(fd) != 0) die_errno("sync temporary output", active_temp_output);
+    if (fclose(fp) != 0) die_errno("close temporary output", active_temp_output);
+    if (rename(active_temp_output, out_path) != 0) {
+        die_errno("rename temporary output", out_path);
+    }
+    free(active_temp_output);
+    active_temp_output = NULL;
+}
+
+static byte_buf convert_dflash_bf16_tensor(const byte_buf *source,
+                                           const tensor_meta *source_meta,
+                                           const tensor_meta *target_meta,
+                                           dflash_conversion conversion) {
+    int64_t n = 1;
+    for (int i = 0; i < source_meta->n_dims; i++) {
+        if (source_meta->ne[i] <= 0 || n > INT64_MAX / source_meta->ne[i]) {
+            die("dflash BF16 tensor shape overflow");
+        }
+        n *= source_meta->ne[i];
+    }
+    if (source_meta->type != DS4Q_TYPE_BF16 || source->size != (size_t)n * 2) {
+        die("dflash conversion source is not a valid BF16 tensor");
+    }
+    float *values = xmalloc((size_t)n * sizeof(values[0]));
+    for (int64_t i = 0; i < n; i++) {
+        values[i] = ds4q_bf16_to_f32(load_u16_le(source->data + (size_t)i * 2));
+    }
+    ds4q_type target_type = conversion == DFLASH_BF16_TO_Q8_0
+        ? DS4Q_TYPE_Q8_0
+        : DS4Q_TYPE_F32;
+    if (target_meta->type != target_type) die("dflash conversion target type mismatch");
+    ds4q_quantize_init(target_type);
+    byte_buf out = f32_to_type(values, n, target_type, target_meta->ne[0], NULL);
+    free(values);
+    if (out.size != target_meta->size) die("dflash converted tensor size mismatch");
+    return out;
+}
+
+static void write_dflash_import_header(FILE *out,
+                                       const dflash_import_plan *plan) {
+    if (fwrite("GGUF", 1, 4, out) != 4) die("write GGUF magic failed");
+    write_u32(out, 3);
+    write_u64(out, (uint64_t)plan->len);
+    write_u64(out, 9);
+    write_gguf_kv_string(out, "general.architecture", "deepseek4-dspark");
+    write_gguf_kv_string(out, "general.name", "DeepSeek V4 Flash DSpark support");
+    write_gguf_kv_u32(out, "general.alignment", (uint32_t)plan->alignment);
+    write_gguf_kv_u32(out, "dspark.block_size", plan->dspark.block_size);
+    write_gguf_kv_u32(out, "dspark.markov_rank", plan->dspark.markov_rank);
+    write_gguf_kv_u32(out, "dspark.noise_token_id", plan->dspark.noise_token_id);
+    write_gguf_kv_u32_array(out,
+                            "dspark.target_layer_ids",
+                            plan->dspark.target_layers,
+                            plan->dspark.target_layer_count);
+    write_gguf_kv_u32(out, "dspark.stage_count", 3);
+    write_gguf_kv_u32(out, "dspark.n_layers", 3);
+
+    for (int i = 0; i < plan->len; i++) {
+        const tensor_meta *t = &plan->tensors[i].meta;
+        write_gguf_string(out, t->name);
+        write_u32(out, (uint32_t)t->n_dims);
+        for (int j = 0; j < t->n_dims; j++) write_u64(out, (uint64_t)t->ne[j]);
+        write_u32(out, (uint32_t)t->type);
+        write_u64(out, t->new_offset);
+    }
+    off_t pos = ftello(out);
+    if (pos < 0 || (size_t)pos > plan->data_offset) die("dflash output metadata larger than planned");
+    write_padding(out, plan->data_offset - (size_t)pos);
+}
+
+static void write_dflash_import_gguf(const gguf_file *src,
+                                     const dflash_import_plan *plan,
+                                     const char *out_path) {
+    FILE *in = fopen(src->path, "rb");
+    if (!in) die_errno("open GGUF", src->path);
+    FILE *out = open_atomic_output(out_path);
+
+    write_dflash_import_header(out, plan);
+
+    for (int i = 0; i < plan->len; i++) {
+        const dflash_import_tensor *entry = &plan->tensors[i];
+        const tensor_meta *source_meta = &src->tensors[entry->source_index];
+        const uint64_t source_offset = (uint64_t)src->data_offset + source_meta->old_offset;
+        fprintf(stderr,
+                "[%2d/%2d] %s -> %s (%s)\n",
+                i + 1,
+                plan->len,
+                source_meta->name,
+                entry->meta.name,
+                entry->conversion == DFLASH_COPY ? "copy" :
+                entry->conversion == DFLASH_BF16_TO_Q8_0 ? "bf16->q8_0" : "bf16->f32");
+        if (entry->conversion == DFLASH_COPY) {
+            if (source_meta->size != entry->meta.size) die("dflash copy size mismatch");
+            copy_file_bytes(in, out, source_offset, source_meta->size, src->path);
+        } else {
+            byte_buf source_data = {
+                .size = source_meta->size,
+                .data = xmalloc(source_meta->size),
+            };
+            if (fseeko(in, (off_t)source_offset, SEEK_SET) != 0) die_errno("seek GGUF", src->path);
+            if (fread(source_data.data, 1, source_data.size, in) != source_data.size) {
+                die_errno("read GGUF tensor", src->path);
+            }
+            byte_buf converted = convert_dflash_bf16_tensor(&source_data,
+                                                            source_meta,
+                                                            &entry->meta,
+                                                            entry->conversion);
+            if (fwrite(converted.data, 1, converted.size, out) != converted.size) {
+                die("write converted dflash tensor failed");
+            }
+            free(source_data.data);
+            free(converted.data);
+        }
+        write_padding(out, ds4q_pad(entry->meta.size, plan->alignment) - entry->meta.size);
+    }
+    fclose(in);
+    commit_atomic_output(out, out_path);
+}
+
+static void free_dflash_import_plan(dflash_import_plan *plan) {
+    for (int i = 0; i < plan->len; i++) free(plan->tensors[i].meta.name);
+    free(plan->tensors);
+    memset(plan, 0, sizeof(*plan));
+}
+
 static void usage(const char *argv0) {
     printf("usage: %s --hf DIR --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
+    printf("       %s --import-dflash-gguf INPUT.gguf --out OUT.gguf [--dry-run]\n", argv0);
     printf("\nDeepSeek V4 Flash/Pro safetensors -> GGUF quantizer in plain C.\n\n");
     printf("options:\n");
     printf("  --hf DIR               Hugging Face model directory with model.safetensors.index.json\n");
+    printf("  --import-dflash-gguf FILE  import the full-fat llama.cpp dflash GGUF as DS4 support\n");
     printf("  --template FILE        existing DS4 GGUF used for metadata, tensor order, shapes\n");
     printf("  --out FILE             output GGUF path\n");
     printf("  --compare-gguf FILE    reference GGUF for --compare-tensor; normal mode defaults to template\n");
@@ -2799,6 +3396,13 @@ static bool file_exists(const char *path) {
     return true;
 }
 
+static bool paths_same_file(const char *a, const char *b) {
+    struct stat sa;
+    struct stat sb;
+    if (stat(a, &sa) != 0 || stat(b, &sb) != 0) return false;
+    return sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino;
+}
+
 static params parse_args(int argc, char **argv) {
     params p = {0};
     p.policy.routed_w1 = p.policy.routed_w2 = p.policy.routed_w3 = DS4Q_TYPE_COUNT;
@@ -2815,6 +3419,9 @@ static params parse_args(int argc, char **argv) {
             exit(0);
         } else if (strcmp(arg, "--hf") == 0) {
             p.hf_dir = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--import-dflash-gguf") == 0 ||
+                   strcmp(arg, "--dflash-gguf") == 0) {
+            p.dflash_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--template") == 0) {
             p.template_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--out") == 0) {
@@ -2880,6 +3487,40 @@ static params parse_args(int argc, char **argv) {
             exit(1);
         }
     }
+    if (p.dflash_gguf) {
+        if (p.hf_dir || p.template_gguf || p.dspark_manifest || p.dspark_support ||
+            p.compare_gguf || p.compare_tensor || p.imatrix_file || p.policy.n_overrides ||
+            p.policy.routed_w1 != DS4Q_TYPE_COUNT ||
+            p.policy.routed_w2 != DS4Q_TYPE_COUNT ||
+            p.policy.routed_w3 != DS4Q_TYPE_COUNT ||
+            p.policy.attention_proj != DS4Q_TYPE_COUNT ||
+            p.policy.attention != DS4Q_TYPE_COUNT ||
+            p.policy.shared != DS4Q_TYPE_COUNT ||
+            p.policy.embedding != DS4Q_TYPE_COUNT ||
+            p.policy.output != DS4Q_TYPE_COUNT ||
+            p.policy.dense != DS4Q_TYPE_COUNT ||
+            p.n_experts != 0 ||
+            p.n_threads != 8 ||
+            p.dspark.block_size != DSPARK_DEFAULT_BLOCK_SIZE ||
+            p.dspark.markov_rank != DSPARK_DEFAULT_MARKOV_RANK ||
+            p.dspark.noise_token_id != DSPARK_DEFAULT_NOISE_TOKEN_ID ||
+            p.dspark.target_layer_count != 3 ||
+            p.dspark.target_layers[0] != 40 ||
+            p.dspark.target_layers[1] != 41 ||
+            p.dspark.target_layers[2] != 42) {
+            die("--import-dflash-gguf cannot be combined with HF/template/quantization modes");
+        }
+        if (!p.out_gguf && !p.dry_run) die("--out is required unless --dry-run is used");
+        if (p.out_gguf &&
+            (strcmp(p.dflash_gguf, p.out_gguf) == 0 ||
+             paths_same_file(p.dflash_gguf, p.out_gguf))) {
+            die("dflash input and output paths must differ");
+        }
+        if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) {
+            die("output exists; use --overwrite");
+        }
+        return p;
+    }
     if (!p.hf_dir) die("--hf is required");
     if (p.dspark_manifest && p.dspark_support) die("--dspark-manifest and --dspark-support are mutually exclusive");
     if (p.dspark_manifest) return p;
@@ -2901,6 +3542,7 @@ static params parse_args(int argc, char **argv) {
 
 static void free_gguf_file(gguf_file *g) {
     free(g->path);
+    free(g->architecture);
     free(g->kv_raw);
     for (uint64_t i = 0; i < g->n_tensors; i++) free(g->tensors[i].name);
     free(g->tensors);
@@ -3002,6 +3644,18 @@ static void compare_dspark_support_tensor(st_db *db, const dspark_support_plan *
 
 int main(int argc, char **argv) {
     params p = parse_args(argc, argv);
+    if (p.dflash_gguf) {
+        gguf_file source = load_gguf_metadata(p.dflash_gguf);
+        dflash_import_plan plan = build_dflash_import_plan(&source);
+        print_dflash_import_plan(&plan);
+        if (!p.dry_run) {
+            write_dflash_import_gguf(&source, &plan, p.out_gguf);
+            fprintf(stderr, "wrote %s\n", p.out_gguf);
+        }
+        free_dflash_import_plan(&plan);
+        free_gguf_file(&source);
+        return 0;
+    }
     if (p.dspark_manifest) {
         print_dspark_manifest(p.hf_dir);
         for (int i = 0; i < p.policy.n_overrides; i++) free(p.policy.overrides[i].prefix);

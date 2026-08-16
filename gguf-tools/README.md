@@ -147,6 +147,53 @@ gguf-tools/deepseek4-quantize \
   --out DeepSeek-V4-Flash-DSpark-support-0731.gguf
 ```
 
+To preserve the official packed FP4 routed experts losslessly as GGUF MXFP4,
+set the routed-expert type explicitly:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --hf ../deepseek-v4-quants/hf/DeepSeek-V4-Flash-0731 \
+  --dspark-support \
+  --experts mxfp4 \
+  --out DeepSeek-V4-Flash-DSpark-support-MXFP4.gguf
+```
+
+MXFP4 is accepted only for routed expert tensors backed by the checkpoint's
+packed `I8` weights and `F8_E8M0` scales.  Dense DSpark tensors continue to use
+their normal defaults or explicit `--tensor-type` overrides.
+
+### Import the full-fat llama.cpp DSpark GGUF
+
+The published `DeepseekV4-Flash-20260731-DSpark.gguf` uses llama.cpp's
+`dflash` architecture and cannot be passed directly to DS4's `--mtp` option.
+The pinned public artifact is 10,896,057,568 bytes.
+Import it without downloading the Hugging Face safetensor shards:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --import-dflash-gguf ~/Downloads/DeepseekV4-Flash-20260731-DSpark.gguf \
+  --out ~/Downloads/DeepSeek-V4-Flash-DSpark-support-full.gguf
+```
+
+Use `--dry-run` first to validate the source and print the output inventory
+without writing the roughly 10.8 GB result.  The importer fails closed unless
+the input is the expected 81-tensor, three-stage Flash DSpark schema.  It maps
+the source's one-based target layers `41,42,43` to DS4's zero-based
+`40,41,42`, stream-copies all 75 compatible payloads (including MXFP4 experts)
+without re-encoding, expands the three BF16 router gates and the confidence
+projection to F32, and converts the two BF16 Markov matrices to Q8_0 for the
+Metal Markov fast path.  Keeping the routers in F32 costs only about 9 MB more
+than Q8_0 and avoids perturbing the top-6 expert selection in the
+quality-focused sidecar.
+
+For the pinned public artifact, the expected output inventory is 45 F32, 27
+Q8_0, and 9 MXFP4 tensors, with an exact file size of 10,835,055,488 bytes.
+
+The input and output must be different files.  Existing outputs require
+`--overwrite`.  Conversion is written to a same-directory temporary file and
+published with an atomic rename, so a failed conversion does not damage an
+existing output.
+
 `--dspark-support --dry-run` reads safetensors shard headers to derive exact
 GGUF shapes and types, but it does not read tensor payloads.  The DSpark metadata
 defaults match the published Flash DSpark config: block size 5, target layers

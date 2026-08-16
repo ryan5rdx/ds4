@@ -220,10 +220,23 @@ arm.
 
 The published 5.99 GB support GGUF is not numerically equivalent to the
 official checkpoint: its routed experts are IQ2_XXS/Q2_K and its Markov and
-confidence heads are Q8_0, whereas the source uses FP4 experts, BF16 Markov W1,
-and F32 Markov W2/confidence.  First establish corrected-runtime acceptance
-with the published file.  If production confidence still prunes too heavily,
-build a confidence-preserving sidecar from the original HF shards:
+confidence heads are Q8_0, whereas the checkpoint uses FP4 experts and BF16
+Markov/confidence weights (the official confidence path computes in F32).
+First establish corrected-runtime acceptance with the published file.
+
+If the full-fat llama.cpp `DeepseekV4-Flash-20260731-DSpark.gguf` is already
+available, adapt it directly without downloading the HF shards:
+
+```sh
+gguf-tools/deepseek4-quantize \
+  --import-dflash-gguf /path/DeepseekV4-Flash-20260731-DSpark.gguf \
+  --out DSpark-support-full.gguf
+```
+
+This preserves the MXFP4 experts, expands the BF16 router gates and confidence
+projection to F32, and converts only the two Markov matrices to Q8_0 for the
+Metal GPU fast path.  Otherwise, build a support sidecar from the original HF
+shards:
 
 ```sh
 gguf-tools/deepseek4-quantize \
