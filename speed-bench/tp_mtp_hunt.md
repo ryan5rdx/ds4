@@ -108,8 +108,8 @@ First run a short semantic smoke with the command below changed to
 bootstrap: it creates a pending proposal but does not charge a no-draft
 scheduler result or launch a verifier.  Starting with the next matching anchor,
 proposal zero is checked against post-anchor target logits.  The smoke must
-finish with `errors=0`, `replay_fallbacks=0`, and `replayed=0` before timing a
-full run.
+finish with `proposed>0`, `errors=0`, `replay_fallbacks=0`, and `replayed=0`
+before timing a full run.
 
 Also run one reused-session smoke before the 512-token timing arm.  Keep the
 same forced-five environment and add `DS4_DSPARK_SPEC_LOG=1`, but use:
@@ -121,8 +121,13 @@ same forced-five environment and add `DS4_DSPARK_SPEC_LOG=1`, but use:
 Under TP, `ds4-bench` restores the first frontier by replaying its prefix, then
 extends the same session to 512.  This covers pending invalidation, cold
 support-ring reconstruction, and batched suffix maintenance.  Require two CSV
-rows, no hang, proposer stages reported as `ok`, and zero `invalid`,
-`verifier_unavailable`, `errors`, `replay_fallbacks`, and `replayed` counters.
+rows, no hang, `proposed>0`, and zero `invalid`, `verifier_unavailable`,
+`errors`, `replay_fallbacks`, and `replayed` counters.
+
+If a smoke reports `proposed=0`, shorten it to four generated tokens and add
+`DS4_DSPARK_PROBE=1`.  That diagnostic changes the proposer execution path, so
+use it only to capture the `DSpark proposer pending` stage-status line; remove
+it again for acceptance and throughput measurements.
 
 Use the existing worker command, rebuilt from this branch.  On the coordinator,
 append the DSpark options to the same command used for the 41.96 t/s baseline:

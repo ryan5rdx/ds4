@@ -625,6 +625,38 @@ static void test_metal_pack_slot_rows_f32(void) {
         }
     }
 
+    /* A DSpark prefill capture is a row-offset view over fixed-stride layer
+     * slots.  Only n_rows in the final slot need to remain addressable. */
+    const uint32_t row0 = 2;
+    const uint64_t view_rows =
+        (uint64_t)(n_slots - 1u) * slot_cap + n_rows;
+    ds4_gpu_tensor *slot_view = ds4_gpu_tensor_view(
+        slots,
+        (uint64_t)row0 * width * sizeof(float),
+        view_rows * width * sizeof(float));
+    TEST_ASSERT(slot_view != NULL);
+    if (slot_view) {
+        TEST_ASSERT(ds4_gpu_pack_slot_rows_f32_tensor(out,
+                                                      slot_view,
+                                                      n_rows,
+                                                      width,
+                                                      n_slots,
+                                                      slot_cap) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(out, 0, out_host, out_bytes) != 0);
+        for (uint32_t row = 0; row < n_rows; row++) {
+            for (uint32_t slot = 0; slot < n_slots; slot++) {
+                for (uint32_t col = 0; col < width; col++) {
+                    const float ref = slot_host[
+                        ((uint64_t)slot * slot_cap + row0 + row) * width + col];
+                    const float got = out_host[
+                        ((uint64_t)row * n_slots + slot) * width + col];
+                    TEST_ASSERT(got == ref);
+                }
+            }
+        }
+    }
+    ds4_gpu_tensor_free(slot_view);
+
     free(slot_host);
     free(out_host);
     ds4_gpu_tensor_free(slots);

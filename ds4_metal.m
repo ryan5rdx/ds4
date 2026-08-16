@@ -9244,6 +9244,7 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
         uint64_t row_bytes = 0;
         uint64_t slot_plane_bytes = 0;
+        uint64_t slots_rows = 0;
         uint64_t slots_bytes = 0;
         uint64_t out_rows = 0;
         uint64_t out_bytes = 0;
@@ -9251,8 +9252,12 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
         row_bytes = (uint64_t)width * sizeof(float);
         if ((uint64_t)slot_cap > UINT64_MAX / row_bytes) return 0;
         slot_plane_bytes = (uint64_t)slot_cap * row_bytes;
-        if ((uint64_t)n_slots > UINT64_MAX / slot_plane_bytes) return 0;
-        slots_bytes = (uint64_t)n_slots * slot_plane_bytes;
+        /* slot_cap is the stride between slots, not a promise that the final
+         * slot has slot_cap live rows.  Callers may pass a row-offset view;
+         * the kernel only reads n_rows from the final slot. */
+        slots_rows = (uint64_t)(n_slots - 1u) * slot_cap + n_rows;
+        if (slots_rows > UINT64_MAX / row_bytes) return 0;
+        slots_bytes = slots_rows * row_bytes;
         if ((uint64_t)n_rows > UINT64_MAX / n_slots) return 0;
         out_rows = (uint64_t)n_rows * n_slots;
         if (out_rows > UINT64_MAX / row_bytes) return 0;

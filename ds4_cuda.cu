@@ -3658,8 +3658,8 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
     uint64_t out_elems = 0;
     if (!out || !slots || n_rows == 0 || width == 0 || n_slots == 0 ||
         slot_cap == 0 || n_rows > slot_cap ||
-        (uint64_t)n_slots > UINT64_MAX / slot_cap ||
-        (slot_rows = (uint64_t)n_slots * slot_cap) > UINT64_MAX / width ||
+        (slot_rows = (uint64_t)(n_slots - 1u) * slot_cap + n_rows) >
+            UINT64_MAX / width ||
         (slot_elems = slot_rows * width) > UINT64_MAX / sizeof(float) ||
         (uint64_t)n_rows > UINT64_MAX / n_slots ||
         (out_rows = (uint64_t)n_rows * n_slots) > UINT64_MAX / width ||
