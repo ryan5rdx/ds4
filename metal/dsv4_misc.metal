@@ -6648,28 +6648,30 @@ constexpr constant metal::thread_scope thread_scope_system =
 }
 
 // Bounded so a dead peer cannot wedge the command processor into a watchdog
-// kill; the service thread writes the release even on failure.
+// kill; the service thread writes the release even on failure. A timeout is
+// latched in shared memory so the host rejects the graph instead of consuming
+// stale peer rows.
 kernel void kernel_dsv4_tp_fence_wait(
         volatile coherent(system) device uint * release [[buffer(0)]],
         constant uint & value [[buffer(1)]],
-        constant uint & max_iters [[buffer(2)]]) {
+        constant uint & max_iters [[buffer(2)]],
+        volatile coherent(system) device uint * timeout [[buffer(3)]]) {
     for (uint i = 0; i < max_iters; i++) {
         metal::atomic_thread_fence(metal::mem_flags::mem_device,
                                    metal::memory_order_seq_cst,
                                    metal::thread_scope_system);
-        if (release[0] >= value) {
-            // Pair the CPU release-store with a final system-scope fence before
-            // any following command reads the activation payload.
+        if (release[0] == value) {
             metal::atomic_thread_fence(metal::mem_flags::mem_device,
                                        metal::memory_order_seq_cst,
                                        metal::thread_scope_system);
             return;
         }
     }
+    timeout[0] = 1u;
 }
 
-// Pipeline-parallel activation handoff.  One SIMD group waits on a CPU-published
-// ready state, then copies the shared activation into graph-owned storage.  A
+// Pipeline-parallel activation handoff. One SIMD group waits on a CPU-published
+// ready state, then copies the shared activation into graph-owned storage. A
 // separate timeout word makes bounded-wait failure observable to the host; the
 // copy is zeroed on failure so following kernels never consume stale state.
 kernel void kernel_dsv4_pp_fence_wait_copy(
@@ -6722,6 +6724,9 @@ kernel void kernel_dsv4_pp_fence_wait_copy(
 kernel void kernel_dsv4_tp_flag_set_coherent(
         volatile coherent(system) device uint * flag [[buffer(0)]],
         constant uint & value [[buffer(1)]]) {
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
     flag[0] = value;
     metal::atomic_thread_fence(metal::mem_flags::mem_device,
                                metal::memory_order_seq_cst,
@@ -6810,4 +6815,138 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
     }
 
     dst[ic * args.head_dim + id] = acc/sum;
+}
+
+// DSpark's Markov correction is a small Q8_0 matrix-vector product followed
+// by an argmax over the vocabulary:
+//
+//     argmax_i(logits[i] + W2[i] * W1[previous_token])
+//
+// Keep the vocabulary logits on the GPU.  The first kernel mirrors the
+// CUDA/ROCm row arithmetic and reduction shape, but writes one (value,index)
+// result per threadgroup instead of depending on 64-bit device atomics.  A
+// second tiny kernel performs the cross-threadgroup reduction and emits the
+// packed uint64 key consumed by the common DSpark code.
+struct ds4_metal_args_dspark_markov_argmax {
+    uint vocab;
+    uint rank_blocks;
+    uint groups;
+    uint pad;
+};
+
+struct ds4_metal_dspark_markov_candidate {
+    float value;
+    uint  index;
+};
+
+static inline bool dspark_markov_score_better(
+        float candidate_value,
+        uint candidate_index,
+        float current_value,
+        uint current_index) {
+    return candidate_value > current_value ||
+           (candidate_value == current_value &&
+            candidate_index < current_index);
+}
+
+kernel void kernel_dspark_markov_argmax_q8_0(
+        constant ds4_metal_args_dspark_markov_argmax & args [[buffer(0)]],
+        device const float                            * logits [[buffer(1)]],
+        device const block_q8_0                       * w1_row [[buffer(2)]],
+        device const uchar                            * w2 [[buffer(3)]],
+        device ds4_metal_dspark_markov_candidate      * candidates [[buffer(4)]],
+        uint tgid [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float state[256];
+    const uint rank = args.rank_blocks * 32u;
+    if (tid < rank) {
+        const uint block = tid >> 5u;
+        const uint lane = tid & 31u;
+        state[tid] = float(w1_row[block].d) *
+                     float(w1_row[block].qs[lane]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float best_value = -INFINITY;
+    uint best_index = 0u;
+    const uint stride = args.groups * 256u;
+    for (uint row_index = tgid * 256u + tid;
+         row_index < args.vocab;
+         row_index += stride) {
+        device const block_q8_0 * row =
+            (device const block_q8_0 *)(
+                w2 + (ulong)row_index * args.rank_blocks * 34ul);
+        float acc = 0.0f;
+        for (uint block = 0u; block < args.rank_blocks; ++block) {
+            float sum = 0.0f;
+#pragma clang loop unroll(full)
+            for (uint lane = 0u; lane < 32u; ++lane) {
+                sum += float(row[block].qs[lane]) *
+                       state[block * 32u + lane];
+            }
+            acc += float(row[block].d) * sum;
+        }
+        const float value = logits[row_index] + acc;
+        if (dspark_markov_score_better(value, row_index,
+                                       best_value, best_index)) {
+            best_value = value;
+            best_index = row_index;
+        }
+    }
+
+    threadgroup float values[256];
+    threadgroup uint indices[256];
+    values[tid] = best_value;
+    indices[tid] = best_index;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride2 = 128u; stride2 != 0u; stride2 >>= 1u) {
+        if (tid < stride2 &&
+            dspark_markov_score_better(values[tid + stride2],
+                                       indices[tid + stride2],
+                                       values[tid], indices[tid])) {
+            values[tid] = values[tid + stride2];
+            indices[tid] = indices[tid + stride2];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        candidates[tgid].value = values[0];
+        candidates[tgid].index = indices[0];
+    }
+}
+
+kernel void kernel_dspark_markov_argmax_reduce(
+        constant ds4_metal_args_dspark_markov_argmax & args [[buffer(0)]],
+        device const ds4_metal_dspark_markov_candidate * candidates [[buffer(1)]],
+        device ulong                                    * out_key [[buffer(2)]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float values[128];
+    threadgroup uint indices[128];
+    if (tid < args.groups) {
+        values[tid] = candidates[tid].value;
+        indices[tid] = candidates[tid].index;
+    } else {
+        values[tid] = -INFINITY;
+        indices[tid] = 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 64u; stride != 0u; stride >>= 1u) {
+        if (tid < stride &&
+            dspark_markov_score_better(values[tid + stride],
+                                       indices[tid + stride],
+                                       values[tid], indices[tid])) {
+            values[tid] = values[tid + stride];
+            indices[tid] = indices[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        // The high word is the monotonically ordered IEEE-754 score.  The
+        // complemented token in the low word makes smaller tokens win exact
+        // score ties and is decoded by ds4.c as ~(uint32_t)key.
+        const uint bits = as_type<uint>(values[0]);
+        const uint value_key =
+            (bits & 0x80000000u) != 0u ? ~bits : (bits | 0x80000000u);
+        out_key[0] = (ulong(value_key) << 32u) | ulong(~indices[0]);
+    }
 }

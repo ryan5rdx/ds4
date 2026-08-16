@@ -455,10 +455,22 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  float top_p, float min_p, uint64_t *rng,
                                  int *accepted, int accepted_cap,
                                  char *err, size_t errlen);
+/* Fixed-length benchmark form: the excluded token is never accepted as the
+ * target top and does not terminate a speculative block. */
+int ds4_session_eval_speculative_argmax_excluding(
+        ds4_session *s, int first_token, int max_tokens, int excluded_token,
+        int *accepted, int accepted_cap, char *err, size_t errlen);
 /* TP worker side of a mirrored speculative-verify block: run its half of the
  * batch verify for KV side effects, then obey the leader's commit frame
- * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */
+ * (keep a captured prefix, or roll back and replay). Only called from
+ * ds4_tp_worker_run. */
+enum {
+    DS4_TP_SPEC_F_ATTN_OUT_SPLIT = 1u << 0,
+    /* Row and verifier arrivals use disjoint GPU-written flag banks. */
+    DS4_TP_GPU_FLAG_BANK_SLOTS = 1024u,
+};
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
+                              uint32_t flags, int *replay_n_out,
                               char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);

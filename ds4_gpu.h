@@ -203,6 +203,9 @@ enum {
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
+/* Model-free Metal oracle: select a synthetic expert shard without starting
+ * the TP gate service. Passing world=1 restores ordinary unsharded behavior. */
+void ds4_gpu_test_set_tp_expert_shard(uint32_t rank, uint32_t world);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
@@ -492,6 +495,7 @@ int ds4_gpu_embed_tokens_quant_tensor(
  * monotonic shared event. gate_slots is the total slot count the token will
  * use. Fails closed. */
 int ds4_gpu_tp_split_safe(uint32_t gate_slots);
+int ds4_gpu_tp_batch_split_safe(uint32_t gate_slots);
 
 void ds4_gpu_trace_tag(const char *tag);
 void ds4_gpu_trace_tag_layer(uint32_t layer, const char *stage);

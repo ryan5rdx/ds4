@@ -195,6 +195,7 @@ typedef struct {
     uint64_t session_id;
     uint64_t seq;
     int value;
+    uint32_t flags;
     int *tokens;
     uint32_t n_tokens;
     ds4_tp_batch_item *items;
@@ -219,13 +220,14 @@ int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count);
 
 /* Speculative verify mirroring.  The leader announces a draft block right
  * before both ranks run the expert-split batch verify; the worker then blocks
- * on the commit frame, which carries the leader's decision: full_accept keeps
- * the pushed rows, otherwise both sides roll back and replay replay_n tokens
- * through the gated single-token decode in lockstep. */
+ * on the commit frame.  commit_n keeps exactly that many verifier rows
+ * (draft_n is the full-accept fast path, a shorter nonzero prefix restores a
+ * captured compressor frontier).  commit_n == 0 rolls the verifier back and
+ * optionally replays replay_n tokens through gated single-token decode. */
 int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
-                       const int *drafts, uint32_t n);
-int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t full_accept, int32_t replay_n);
-int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *full_accept, int32_t *replay_n);
+                       const int *drafts, uint32_t n, uint32_t flags);
+int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t commit_n, int32_t replay_n);
+int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *commit_n, int32_t *replay_n);
 
 /* Leader bring-up for frontends: derives the identity from the loaded engine,
  * connects to the worker, and binds the engine to the transport. Call after

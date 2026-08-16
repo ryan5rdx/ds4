@@ -39,7 +39,7 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 7u
+#define DS4_TP_PROTOCOL_VERSION 8u
 
 /* Default gate timeout is generous: the first gate after a sync waits for
  * the peer's whole (possibly cold page cache) prefill. */
@@ -527,7 +527,8 @@ uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
     return slots * vec * 2 +    /* out + in vectors */
            slots * 8 * 2 +      /* in flags + out flag staging */
            16 +                 /* token slot */
-           slots * 4 +          /* GPU-written gate-ready flags */
+           (uint64_t)DS4_TP_GPU_FLAG_BANK_SLOTS * 4u * 2u +
+                                /* row + verifier GPU-ready flag banks */
            (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
 }
 
@@ -540,7 +541,8 @@ static void tp_slab_layout(ds4_tp *tp) {
     tp->token_off = tp->in_flags_off + slots * 8;
     tp->out_flags_off = tp->token_off + 16;
     tp->gpu_flags_off = tp->out_flags_off + slots * 8;
-    tp->batch_out_off = tp->gpu_flags_off + slots * 4;
+    tp->batch_out_off = tp->gpu_flags_off +
+                        (uint64_t)DS4_TP_GPU_FLAG_BANK_SLOTS * 4u * 2u;
     tp->batch_in_off = tp->batch_out_off +
                        (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
     tp->slab_bytes = tp->batch_in_off +
@@ -1623,14 +1625,14 @@ typedef struct {
 
 static int tp_send_token_command(ds4_tp *tp, uint32_t type,
                                  uint64_t session_id, const int *tokens,
-                                 uint32_t count) {
+                                 uint32_t count, uint32_t flags) {
     const uint64_t bytes64 = sizeof(ds4_tp_token_command_header) +
                              (uint64_t)count * sizeof(int32_t);
     if (!tp || (!tokens && count != 0) || bytes64 > UINT32_MAX) return 0;
     const uint32_t bytes = (uint32_t)bytes64;
     uint8_t *payload = malloc(bytes ? bytes : 1u);
     if (!payload) return 0;
-    ds4_tp_token_command_header h = { session_id, count, 0 };
+    ds4_tp_token_command_header h = { session_id, count, flags };
     memcpy(payload, &h, sizeof(h));
     int32_t *wire_tokens = (int32_t *)(payload + sizeof(h));
     for (uint32_t i = 0; i < count; i++) wire_tokens[i] = (int32_t)tokens[i];
@@ -1653,7 +1655,7 @@ int ds4_tp_send_session_destroy(ds4_tp *tp, uint64_t session_id) {
 int ds4_tp_send_sync(ds4_tp *tp, uint64_t session_id,
                      const int *tokens, uint32_t n_tokens) {
     return tp_send_token_command(tp, DS4_TP_FRAME_SYNC, session_id,
-                                 tokens, n_tokens);
+                                 tokens, n_tokens, 0);
 }
 
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
@@ -1775,6 +1777,7 @@ static int tp_command_decode_tokens(ds4_tp_command *command,
     const int32_t *wire_tokens = (const int32_t *)(payload + sizeof(h));
     for (uint32_t i = 0; i < h.count; i++) tokens[i] = wire_tokens[i];
     command->session_id = h.session_id;
+    command->flags = h.reserved;
     command->tokens = tokens;
     command->n_tokens = h.count;
     return 1;
@@ -1909,28 +1912,42 @@ int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count) {
 }
 
 int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
-                       const int *drafts, uint32_t n) {
+                       const int *drafts, uint32_t n, uint32_t flags) {
     return tp_send_token_command(tp, DS4_TP_FRAME_VERIFY, session_id,
-                                 drafts, n);
+                                 drafts, n, flags);
 }
 
-int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t full_accept, int32_t replay_n) {
-    struct { int32_t full; int32_t replay; } msg = { full_accept, replay_n };
+enum { DS4_TP_VERIFY_COMMIT_VERSION = 1 };
+
+int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t commit_n, int32_t replay_n) {
+    /* Version this payload because the original two-word frame encoded the
+     * first word as a boolean full_accept.  Silently mixing old and new ranks
+     * would otherwise turn a partial-prefix decision into a full commit. */
+    struct {
+        uint32_t version;
+        int32_t commit;
+        int32_t replay;
+    } msg = { DS4_TP_VERIFY_COMMIT_VERSION, commit_n, replay_n };
     return tp_send_frame(tp->control_fd, DS4_TP_FRAME_VERIFY_COMMIT,
                          &msg, sizeof(msg));
 }
 
-int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *full_accept, int32_t *replay_n) {
+int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *commit_n, int32_t *replay_n) {
     uint32_t type = 0, bytes = 0;
-    struct { int32_t full; int32_t replay; } msg;
+    struct {
+        uint32_t version;
+        int32_t commit;
+        int32_t replay;
+    } msg;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_VERIFY_COMMIT || bytes != sizeof(msg) ||
-        !tp_read_full(tp->control_fd, &msg, sizeof(msg))) {
+        !tp_read_full(tp->control_fd, &msg, sizeof(msg)) ||
+        msg.version != DS4_TP_VERIFY_COMMIT_VERSION) {
         fprintf(stderr, "ds4-tp: bad verify-commit frame (type %u bytes %u)\n",
                 type, bytes);
         return 0;
     }
-    *full_accept = msg.full;
+    *commit_n = msg.commit;
     *replay_n = msg.replay;
     return 1;
 }
@@ -2173,11 +2190,19 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
                 rc = 1;
             }
         } else if (command.type == DS4_TP_FRAME_VERIFY) {
+            int replay_n = 0;
             int spec_rc = ds4_session_tp_spec_cycle(session, command.tokens,
                                                     (int)command.n_tokens,
+                                                    command.flags, &replay_n,
                                                     err, sizeof(err));
-            if (spec_rc != 0) {
+            if (!ds4_tp_send_command_ack(tp, command.session_id, spec_rc)) {
+                rc = 1;
+            } else if (spec_rc != 0) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker verify: %s", err);
+                rc = 1;
+            } else if (replay_n > 0 &&
+                       ds4_engine_tp_vocab_split(engine) &&
+                       !tp_worker_send_logits(tp, session, logits, vocab)) {
                 rc = 1;
             }
         } else if (command.type == DS4_TP_FRAME_REWIND) {
