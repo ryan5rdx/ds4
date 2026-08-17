@@ -136,6 +136,7 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1;
+static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_r4;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1_tg_multiple;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_tg_multiple;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_pipeline_nsg1;
@@ -960,6 +961,56 @@ static id<MTLCommandBuffer> ds4_gpu_command_buffer(int *owned) {
     return cb;
 }
 
+/* Trace annotation. Everything here is a no-op unless DS4_METAL_TRACE_LABELS
+ * is set, so a normal run does no NSString work on the hot path. With it set,
+ * Metal System Trace's metal-gpu-intervals table carries the encoder labels
+ * and nested debug groups, which is enough to attribute a token per stage
+ * without the Shader Timeline instrument (which perturbs what it measures). */
+static int ds4_gpu_trace_labels(void) {
+    static int value = -1;
+    if (value < 0) value = getenv("DS4_METAL_TRACE_LABELS") != NULL;
+    return value;
+}
+
+static char g_trace_tag[64];
+
+void ds4_gpu_trace_tag(const char *tag) {
+    if (!ds4_gpu_trace_labels()) return;
+    if (!tag) { g_trace_tag[0] = 0; return; }
+    snprintf(g_trace_tag, sizeof(g_trace_tag), "%s", tag);
+}
+
+void ds4_gpu_trace_tag_layer(uint32_t layer, const char *stage) {
+    if (!ds4_gpu_trace_labels()) return;
+    snprintf(g_trace_tag, sizeof(g_trace_tag), "L%u/%s", layer, stage ? stage : "");
+}
+
+static void ds4_gpu_trace_label_encoder(id<MTLComputeCommandEncoder> enc) {
+    if (!ds4_gpu_trace_labels() || !enc || !g_trace_tag[0]) return;
+    enc.label = [NSString stringWithUTF8String:g_trace_tag];
+}
+
+static void ds4_gpu_trace_push(id<MTLComputeCommandEncoder> enc, const char *name) {
+    if (!ds4_gpu_trace_labels() || !enc || !name) return;
+    [enc pushDebugGroup:[NSString stringWithUTF8String:name]];
+}
+
+static void ds4_gpu_trace_pop(id<MTLComputeCommandEncoder> enc) {
+    if (!ds4_gpu_trace_labels() || !enc) return;
+    [enc popDebugGroup];
+}
+
+/* Dispatch accounting. Nothing in the tree knew how many dispatches a decoded
+ * token issues, so the per-dispatch cost that a fusion campaign would target
+ * has only ever been derived, never counted. Removing dispatches has now
+ * underdelivered four times against models built on that derived number, so
+ * count them. One non-atomic increment on a single-threaded encode path.
+ * Report with DS4_METAL_DISPATCH_PROFILE=1. */
+static uint64_t g_dispatch_count;
+static uint64_t g_dispatch_cbs;
+
+#define DS4_DISP(enc) (g_dispatch_count++, (enc))
+
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
@@ -967,10 +1018,13 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
             g_batch_enc = g_batch_encoder_concurrent
                 ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
                 : [cb computeCommandEncoder];
+            ds4_gpu_trace_label_encoder(g_batch_enc);
         }
         return g_batch_enc;
     }
-    return [cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    ds4_gpu_trace_label_encoder(enc);
+    return enc;
 }
 
 static void ds4_gpu_end_compute_encoder(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc) {
@@ -1001,6 +1055,14 @@ static void ds4_gpu_invalidate_completion_counters(void) {
 
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
     [cb waitUntilCompleted];
+    if (getenv("DS4_METAL_DISPATCH_PROFILE")) {
+        if ((++g_dispatch_cbs % 64u) == 0u) {
+            fprintf(stderr, "ds4: dispatches %llu over %llu cbs (%.1f per cb)\n",
+                    (unsigned long long)g_dispatch_count,
+                    (unsigned long long)g_dispatch_cbs,
+                    (double)g_dispatch_count / (double)g_dispatch_cbs);
+        }
+    }
     if (getenv("DS4_METAL_GPU_BUSY_PROFILE")) {
         const double busy = cb.GPUEndTime - cb.GPUStartTime;
         if (busy > 0) g_gpu_busy_accum += busy;
@@ -1224,6 +1286,60 @@ static int ds4_gpu_use_m5_private_scratch(void) {
         initialized = 1;
     }
     return enabled;
+}
+
+/* Calibration ballast, DS4_METAL_DISPATCH_BALLAST=N.
+ *
+ * Every fusion estimate in this tree is priced as (dispatches removed) x (a
+ * marginal per-dispatch cost), and that cost has only ever been back-derived
+ * from landed changes. ba132ba put it between 4.4 us for a one-threadgroup
+ * launch and 10.6 us where an intermediate buffer round trip also disappeared,
+ * a 2.4x band -- wide enough that a candidate list can land anywhere from
+ * "worth a campaign" to "inside the noise floor". 7331e3d records that budgets
+ * built on the derived number "mispredicted four times, always optimistically".
+ *
+ * Measure it instead. This emits N extra one-thread dispatches per decode
+ * layer, which do nothing at all, so d(ms per token)/d(43N) is the marginal
+ * launch cost in situ, at the decode shape regime, on the machine under test.
+ * Sweep N over 0, 1, 2, 4 and fit the slope.
+ *
+ * Zero cost when unset: one memoized getenv and an integer test. */
+static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name);
+
+void ds4_gpu_decode_dispatch_ballast(void) {
+    static int ballast_n = -1;
+    if (ballast_n < 0) {
+        const char *env = getenv("DS4_METAL_DISPATCH_BALLAST");
+        const long v = env && env[0] ? strtol(env, NULL, 10) : 0;
+        ballast_n = (v > 0 && v <= 64) ? (int)v : 0;
+    }
+    if (ballast_n == 0) return;
+    if (!g_initialized && !ds4_gpu_init()) return;
+
+    static id<MTLComputePipelineState> ballast_pipeline;
+    static id<MTLBuffer> ballast_sink;
+    if (!ballast_pipeline) {
+        ballast_pipeline = ds4_gpu_get_pipeline("kernel_ds4_dispatch_ballast");
+        if (!ballast_pipeline) { ballast_n = 0; return; }
+    }
+    if (!ballast_sink) {
+        ballast_sink = [g_device newBufferWithLength:sizeof(uint32_t)
+                                             options:MTLResourceStorageModeShared];
+        if (!ballast_sink) { ballast_n = 0; return; }
+    }
+
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:ballast_pipeline];
+    [enc setBuffer:ballast_sink offset:0 atIndex:0];
+    for (int i = 0; i < ballast_n; i++) {
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    }
+    ds4_gpu_end_compute_encoder(cb, enc);
+    (void)ds4_gpu_finish_command_buffer(cb, owned, "dispatch ballast");
 }
 
 static int ds4_gpu_scratch_needs_cpu_access(const char *label) {
@@ -2321,6 +2437,21 @@ static int ds4_gpu_env_value_eq(const char *v, size_t n, const char *literal) {
     return 1;
 }
 
+/* Metal-side counterpart of metal_graph_tp_ablate() in ds4.c, for chains whose
+ * only reliable gate is the Metal entry point rather than a call site. Same
+ * DS4_TP_ABLATE=chain[,chain] vocabulary, same contract: output is
+ * semantically wrong while enabled and both ranks must agree. Memoized because
+ * getenv is a locked linear scan and this sits on the per-layer path. */
+static int ds4_gpu_ablate_chain(const char *chain) {
+    static const char *spec;
+    static int initialized;
+    if (!initialized) {
+        spec = getenv("DS4_TP_ABLATE");
+        initialized = 1;
+    }
+    return spec && chain && strstr(spec, chain) != NULL;
+}
+
 static int ds4_gpu_env_bool(const char *name) {
     const char *v = getenv(name);
     if (!v) return -1;
@@ -2640,7 +2771,7 @@ static int ds4_gpu_warm_model_views(void) {
         [enc setBytes:&stride length:sizeof(stride) atIndex:2];
         [enc setBytes:&bytes length:sizeof(bytes) atIndex:3];
         [enc setBytes:&dst_offset length:sizeof(dst_offset) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)((n + 255) / 256), 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)((n + 255) / 256), 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         dst_offset += n;
     }
@@ -3529,6 +3660,42 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_pipeline(
     [g_pipeline_cache setObject:pipeline forKey:key];
     memo_dv = dv; memo_nwg = nwg; memo_pipeline = pipeline;
     return pipeline;
+}
+
+static int ds4_gpu_tp_world_is_two(void);
+
+/*
+ * The split-K vec kernel consumes one 32-key chunk per simdgroup.  Decode used
+ * to launch 32 workgroups per head unconditionally, which leaves most of the
+ * grid idle at DS4's short effective KV lengths and makes the following reduce
+ * move a 32-way partial for every output element.  Keep enough workgroups to
+ * expose parallelism across TP's 32 local heads while removing almost all
+ * empty partials.  World-1 retains the established geometry (and its packed
+ * 64-head specialization); the override is useful for target-machine sweeps.
+ */
+static uint32_t ds4_gpu_flash_attn_decode_nwg(uint32_t n_keys,
+                                              uint32_t baseline_nsg) {
+    uint32_t default_nwg = 32u;
+    if (ds4_gpu_tp_world_is_two()) {
+        const uint32_t chunks = (n_keys + 31u) / 32u;
+        const uint32_t needed =
+            (chunks + baseline_nsg - 1u) / baseline_nsg;
+
+        /* Preserve the old NWG=32 chunk-to-workgroup assignment exactly:
+         * choose a bucket large enough that no workgroup wraps around the
+         * split stride.  The coarse buckets bound runtime PSO compilation
+         * while still removing most empty work at short context. */
+        if      (needed <= 4u)  default_nwg = 4u;
+        else if (needed <= 5u)  default_nwg = 5u;
+        else if (needed <= 12u) default_nwg = 12u;
+        else if (needed <= 16u) default_nwg = 16u;
+        else if (needed <= 24u) default_nwg = 24u;
+        else                    default_nwg = 32u;
+    }
+    /* NWG=1 is a vec-kernel direct-output mode and has no partial stats for
+     * the reducer used by these entry points. */
+    return (uint32_t)ds4_gpu_env_u64("DS4_METAL_DECODE_NWG",
+                                      default_nwg, 2u, 32u);
 }
 
 static uint32_t ds4_gpu_flash_attn_vec_nsg(uint32_t n_keys, uint32_t nwg, uint32_t ncpsg) {
@@ -5030,8 +5197,6 @@ typedef struct {
     NSUInteger  smem;
 } ds4_gpu_mv_dispatch;
 
-static int ds4_gpu_tp_world_is_two(void);
-
 static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     const uint64_t default_nsg = ds4_gpu_tp_world_is_two() ? 2u : 4u;
     const int16_t nsg =
@@ -5895,7 +6060,7 @@ static int ds4_gpu_encode_rope_tail_inplace(
         [enc setBuffer:xbuf offset:xoff atIndex:3];
     }
     [enc setBuffer:xbuf offset:xoff atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(head_groups, n_tok, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(head_groups, n_tok, 1)
          threadsPerThreadgroup:MTLSizeMake(nth ? nth : 1u, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -7827,6 +7992,9 @@ int ds4_gpu_init(void) {
         g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_tg_multiple =
             ds4_gpu_new_mul_mv_tg_multiple_pipeline(
                 "kernel_mul_mv_id_mxfp4_sum6_f32", 1);
+        g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_r4 =
+            ds4_gpu_new_mul_mv_tg_multiple_pipeline(
+                "kernel_mul_mv_id_mxfp4_sum6_r4_f32", 1);
         g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_pipeline_nsg1 =
             ds4_gpu_new_mul_mv_tg_multiple_pipeline(
                 "kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_f32", 1);
@@ -7844,6 +8012,7 @@ int ds4_gpu_init(void) {
                 "kernel_mul_mv_id_mxfp4_sum6_fixed_route_full_rows_static_f32", 1);
         if (!g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1 ||
             !g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1 ||
+            !g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_r4 ||
             !g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1_tg_multiple ||
             !g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_tg_multiple ||
             !g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_pipeline_nsg1 ||
@@ -8755,7 +8924,7 @@ int ds4_gpu_test_mxfp4_down_half_lut(uint16_t *legacy_bits,
         [enc setComputePipelineState:pipeline];
         [enc setBuffer:legacy offset:0 atIndex:0];
         [enc setBuffer:lut offset:0 atIndex:1];
-        [enc dispatchThreadgroups:MTLSizeMake((count + 255u) / 256u, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((count + 255u) / 256u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
         [enc endEncoding];
         [cb commit];
@@ -8984,8 +9153,8 @@ int ds4_gpu_pp_fence_wait_copy(ds4_gpu_tensor       *dst,
     [enc setBytes:&words length:sizeof(words) atIndex:4];
     [enc setBytes:&ready_value length:sizeof(ready_value) atIndex:5];
     [enc setBytes:&max_iters length:sizeof(max_iters) atIndex:6];
-    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     ds4_gpu_end_compute_encoder(g_batch_cb, enc);
     ds4_gpu_close_batch_encoder();
     return 1;
@@ -9383,7 +9552,7 @@ static void ds4_gpu_encode_parallel_q8_down(
     [enc setBuffer:g_parallel_q8_x offset:g_parallel_q8_x_offset atIndex:2];
     [enc setBuffer:g_parallel_q8_out offset:g_parallel_q8_out_offset atIndex:3];
     [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(
              ((NSUInteger)g_parallel_q8_args.ne0 + 1u) / 2u, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
 }
@@ -9425,7 +9594,7 @@ static int ds4_gpu_parallel_q8_matvec_encode_pending(
                length:sizeof(g_parallel_gate_up_clamp)
               atIndex:7];
         [enc setThreadgroupMemoryLength:2u * g_parallel_gate_up_smem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(
                  ((NSUInteger)g_parallel_gate_up_args.ne0 +
                   g_parallel_gate_up_nr0 - 1u) / g_parallel_gate_up_nr0,
                  1, 1)
@@ -9760,7 +9929,7 @@ static void *ds4_gpu_tp_keepalive_thread(void *arg) {
             [enc setComputePipelineState:pipeline];
             [enc setBuffer:g_tp_keepalive_buffer offset:0 atIndex:0];
             [enc setBytes:&iters length:sizeof(iters) atIndex:1];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)ka_tgs, 1, 1)
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)ka_tgs, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc endEncoding];
             [cb commit];
@@ -9941,7 +10110,18 @@ int ds4_gpu_tp_init(uint32_t rank,
     }
     pthread_attr_destroy(&attr);
     g_tp_thread_running = 1;
-    if (getenv("DS4_TP_NO_KEEPALIVE") == NULL) {
+    /* The keep-alive exists to stop the GPU power-gating between gates, but
+     * powermetrics shows the decode GPU pinned at its top P-state (P8, 1398
+     * MHz) throughout, so there is no gating to prevent -- and the spin is a
+     * pure parasite.  Its quantum is one uninterruptible ~35 ms dispatch (iters
+     * 1.2M) against a ~44 ms token, the pause flag is only sampled between
+     * dispatches, and it is only paused around verify blocks, so during
+     * ordinary decode it contends for the whole token.  Measured on a 2x M2
+     * Ultra pair: 17.0 t/s with it, 22.8 t/s without (+34%), and a Metal System
+     * Trace attributes 6.4 s of GPU time to the spin against 2.4 s for the
+     * model itself.  Default it off; DS4_TP_KEEPALIVE=1 restores it. */
+    if (getenv("DS4_TP_KEEPALIVE") != NULL &&
+        getenv("DS4_TP_NO_KEEPALIVE") == NULL) {
         uint32_t ka_tgs = ds4_gpu_tp_keepalive_tgs_from_env();
         g_tp_keepalive_queue = [g_device newCommandQueue];
         g_tp_keepalive_buffer = [g_device newBufferWithLength:(NSUInteger)ka_tgs * 256u * sizeof(float)
@@ -9954,6 +10134,21 @@ int ds4_gpu_tp_init(uint32_t rank,
             fprintf(stderr, "ds4: TP keep-alive setup failed (continuing without)\n");
         }
     }
+    return 1;
+}
+
+/* Whether a decode token may be split across command buffers under tensor
+ * parallelism. The original prohibition assumed one monotonic shared event per
+ * token, where a command buffer running ahead could signal a sequence the
+ * prefix had not reached. Per-slot arrival flags and per-slot release words
+ * carry no such ambiguity: each gate publishes its own slot with its own value
+ * and a mismatch stalls rather than mis-fires. Fails closed - any configuration
+ * that still routes either direction through the shared event says no. */
+int ds4_gpu_tp_split_safe(uint32_t gate_slots) {
+    if (!g_initialized || !g_tp_thread_running) return 0;
+    if (g_tp_session_batch_mode || !g_tp_flag_gates) return 0;
+    if (!g_tp_fast_sync || g_tp_release_words == NULL) return 0;
+    if (gate_slots == 0 || gate_slots > DS4_TP_FENCE_SLOTS) return 0;
     return 1;
 }
 
@@ -10024,7 +10219,7 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
                 offset:(NSUInteger)(g_tp_slab_buffer_off + g_tp_gpu_flags_off + (uint64_t)slot * 4u)
                atIndex:0];
         [enc setBytes:&value length:sizeof(value) atIndex:1];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         ds4_gpu_close_batch_encoder();
@@ -10049,7 +10244,7 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
                atIndex:0];
         [enc setBytes:&want length:sizeof(want) atIndex:1];
         [enc setBytes:&g_tp_fence_max_iters length:sizeof(g_tp_fence_max_iters) atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         ds4_gpu_close_batch_encoder();
@@ -10105,7 +10300,7 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
                 offset:(NSUInteger)(g_tp_slab_buffer_off + g_tp_gpu_flags_off + (uint64_t)slot * 4u)
                atIndex:0];
         [enc setBytes:&value length:sizeof(value) atIndex:1];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         ds4_gpu_close_batch_encoder();
@@ -10481,6 +10676,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_id_mxfp4_sum6_pipeline = nil;
         g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1 = nil;
         g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1 = nil;
+        g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_r4 = nil;
         g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1_tg_multiple = nil;
         g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_tg_multiple = nil;
         g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_pipeline_nsg1 = nil;
@@ -10750,7 +10946,7 @@ static int ds4_gpu_encode_get_rows_f16(
     [enc setBuffer:weight offset:weight_offset atIndex:1];
     [enc setBuffer:tokens offset:tokens_offset atIndex:2];
     [enc setBuffer:out offset:out_offset atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake(nw0 * n_tokens, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nw0 * n_tokens, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -10849,7 +11045,7 @@ static int ds4_gpu_encode_get_rows_q8_0(
         [enc setBytes:single_token length:sizeof(*single_token) atIndex:2];
     }
     [enc setBuffer:out offset:out_offset atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake(nblocks, n_tokens, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nblocks, n_tokens, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -10926,7 +11122,7 @@ static int ds4_gpu_encode_get_rows_quant(
         [enc setBytes:single_token length:sizeof(*single_token) atIndex:2];
     }
     [enc setBuffer:out offset:out_offset atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake(nblocks, n_tokens, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nblocks, n_tokens, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -10973,7 +11169,7 @@ static int ds4_gpu_encode_repeat_hc_embedding(
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:rows offset:rows_offset atIndex:1];
     [enc setBuffer:out offset:out_offset atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(n_hc, n_tokens, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_hc, n_tokens, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -11365,7 +11561,7 @@ int ds4_gpu_embed_token_hc_tensor(
         [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
         [enc setBytes:&token_i32 length:sizeof(token_i32) atIndex:2];
         [enc setBuffer:g_embed_rows_buffer offset:0 atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(nw0, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nw0, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -13827,7 +14023,7 @@ static int ds4_gpu_encode_stream_expert_cache_validate(
     [enc setBuffer:up_addrs offset:0 atIndex:3];
     [enc setBuffer:down_addrs offset:0 atIndex:4];
     [enc setBuffer:status offset:0 atIndex:5];
-    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -17668,8 +17864,10 @@ int ds4_gpu_indexer_score_one_tensor(
             [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(index_comp) atIndex:3];
             [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
             [enc setThreadgroupMemoryLength:(128u + 64u) * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(n_comp, 1, 1)
+            ds4_gpu_trace_push(enc, "indexer_score");
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_comp, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            ds4_gpu_trace_pop(enc);
             ds4_gpu_end_compute_encoder(cb, enc);
 
             if (!ds4_gpu_finish_command_buffer(cb, owned, "indexer direct score")) return 0;
@@ -17723,7 +17921,7 @@ int ds4_gpu_indexer_score_one_tensor(
         if (dot_dispatch.smem) {
             [enc setThreadgroupMemoryLength:dot_dispatch.smem atIndex:0];
         }
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + (NSUInteger)dot_dispatch.nr0 - 1u) / (NSUInteger)dot_dispatch.nr0,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + (NSUInteger)dot_dispatch.nr0 - 1u) / (NSUInteger)dot_dispatch.nr0,
                                               n_head,
                                               1)
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)dot_dispatch.nsg, 1)];
@@ -17735,7 +17933,7 @@ int ds4_gpu_indexer_score_one_tensor(
         [enc setBuffer:g_indexer_head_scores_buffer offset:0 atIndex:1];
         [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
         [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 255u) / 256u, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 255u) / 256u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -17828,7 +18026,7 @@ static int ds4_gpu_indexer_scores_batch_tensor(
             const NSUInteger dot_shared = 32u * 32u;
             [enc setThreadgroupMemoryLength:(q_shared + k_shared) * sizeof(uint16_t) +
                                             dot_shared * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u,
                                                   ((NSUInteger)n_tokens + 15u) / 16u,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -17837,7 +18035,7 @@ static int ds4_gpu_indexer_scores_batch_tensor(
             const NSUInteger k_shared = 32u * 128u;
             const NSUInteger dot_shared = 8u * 32u;
             [enc setThreadgroupMemoryLength:(q_shared + k_shared + dot_shared) * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u,
                                                   ((NSUInteger)n_tokens + 7u) / 8u,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
@@ -17847,7 +18045,7 @@ static int ds4_gpu_indexer_scores_batch_tensor(
             const NSUInteger dot_shared = 8u * 32u;
             [enc setThreadgroupMemoryLength:(q_shared + k_shared) * sizeof(uint16_t) +
                                             dot_shared * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u,
                                                   ((NSUInteger)n_tokens + 7u) / 8u,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
@@ -17986,7 +18184,7 @@ int ds4_gpu_indexer_topk_tensor(
               offset:one_pass ? ds4_gpu_tensor_offset(selected) : cur_off
              atIndex:2];
         [enc setThreadgroupMemoryLength:smem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)npr * n_tokens, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)npr * n_tokens, 1, 1)
              threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -18024,7 +18222,7 @@ int ds4_gpu_indexer_topk_tensor(
             [enc setBuffer:final_merge ? selbuf : g_indexer_topk_buffer
                   offset:final_merge ? ds4_gpu_tensor_offset(selected) : next_off
                  atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nm * n_tokens, 1, 1)
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)nm * n_tokens, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(merge_threads, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -18095,7 +18293,7 @@ int ds4_gpu_dsv4_topk_mask_tensor(
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:topkbuf offset:ds4_gpu_tensor_offset(topk) atIndex:1];
         [enc setBuffer:maskbuf offset:ds4_gpu_tensor_offset(mask) atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake((((NSUInteger)n_comp * n_tokens) + 255u) / 256u, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((((NSUInteger)n_comp * n_tokens) + 255u) / 256u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -18104,7 +18302,7 @@ int ds4_gpu_dsv4_topk_mask_tensor(
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:topkbuf offset:ds4_gpu_tensor_offset(topk) atIndex:1];
         [enc setBuffer:maskbuf offset:ds4_gpu_tensor_offset(mask) atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake((((NSUInteger)top_k * n_tokens) + 255u) / 256u, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((((NSUInteger)top_k * n_tokens) + 255u) / 256u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -18182,7 +18380,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                     [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                     [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
                     [enc setThreadgroupMemoryLength:64u * 32u * sizeof(uint16_t) atIndex:0];
-                    [enc dispatchThreadgroups:MTLSizeMake(1u,
+                    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1u,
                                                           ((NSUInteger)out_dim + 63u) / 64u,
                                                           1u)
                          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -18211,7 +18409,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
             [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
                                                   1,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
@@ -18245,7 +18443,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg,
                                                   ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
@@ -18307,7 +18505,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
                 [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t) atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(nax_rows / nax_tile_n),
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)(nax_rows / nax_tile_n),
                                                       (NSUInteger)out_dim / 64u,
                                                       1)
                      threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -18348,7 +18546,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                        (NSUInteger)(generic_row0 * out_dim * sizeof(float))
                atIndex:3];
         [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)generic_rows + 31u) / 32u,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)generic_rows + 31u) / 32u,
                                               ((NSUInteger)out_dim + 63u) / 64u,
                                               1)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -18499,7 +18697,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
         [enc setThreadgroupMemoryLength:dispatch.smem atIndex:0];
-        [enc dispatchThreadgroups:
+        [DS4_DISP(enc) dispatchThreadgroups:
                 MTLSizeMake(((NSUInteger)out_dim +
                              (NSUInteger)dispatch.nr0 - 1u) /
                                 (NSUInteger)dispatch.nr0,
@@ -18702,7 +18900,7 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
                 [enc setThreadgroupMemoryLength:32 atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg,
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg,
                                                       (NSUInteger)n_tok,
                                                       1)
                      threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
@@ -18732,7 +18930,7 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg,
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg,
                                                       ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg,
                                                       1)
                      threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
@@ -18767,7 +18965,7 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
                 [enc setThreadgroupMemoryLength:64u * 32u * sizeof(uint16_t) atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / nax_tile_n),
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / nax_tile_n),
                                                       (NSUInteger)out_dim / 64u,
                                                       1)
                      threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -18795,7 +18993,7 @@ static int ds4_gpu_matmul_quant_impl_tensor(
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
         [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
                                               ((NSUInteger)out_dim + 63u) / 64u,
                                               1)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -18959,7 +19157,7 @@ int ds4_gpu_matmul_q8_0_rows_scalar_tensor(
         for (uint64_t t = 0; t < n_tok; t++) {
             [enc setBuffer:xbuf offset:x_base + (NSUInteger)(t * x_row_bytes) atIndex:2];
             [enc setBuffer:outbuf offset:out_base + (NSUInteger)(t * out_row_bytes) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
                                                       (NSUInteger)mv_dispatch.nr0,
                                                   1,
                                                   1)
@@ -19061,7 +19259,7 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         [enc setBuffer:out1buf offset:ds4_gpu_tensor_offset(out1) atIndex:6];
         [enc setThreadgroupMemoryLength:2u * dispatch0.smem atIndex:0];
         const uint64_t max_out_dim = out0_dim > out1_dim ? out0_dim : out1_dim;
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)max_out_dim +
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)max_out_dim +
                                                (NSUInteger)dispatch0.nr0 - 1u) /
                                               (NSUInteger)dispatch0.nr0,
                                               1,
@@ -19181,7 +19379,7 @@ static int ds4_gpu_shared_gate_up_swiglu_q8_0_impl(
         [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:6];
         [enc setBytes:&clamp length:sizeof(clamp) atIndex:7];
         [enc setThreadgroupMemoryLength:2u * mv_dispatch.smem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
                                                   (NSUInteger)mv_dispatch.nr0,
                                               1,
                                               1)
@@ -19290,7 +19488,7 @@ int ds4_gpu_router_shared_gate_up_q8_0_tensor(
         [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
         const NSUInteger router_tgs = ((NSUInteger)router_out_dim + 1u) / 2u;
         const NSUInteger shared_tgs = ((NSUInteger)out_dim / 2u + 1u) / 2u;
-        [enc dispatchThreadgroups:MTLSizeMake(router_tgs +
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(router_tgs +
                                               (router_only ? 0u : shared_tgs),
                                               1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
@@ -19402,7 +19600,7 @@ int ds4_gpu_router_project_select_fused_tensor(
         [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:8];
         [enc setBuffer:completion offset:0 atIndex:9];
         [enc setThreadgroupMemoryLength:1024u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(128, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(128, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (!ds4_gpu_finish_command_buffer(
@@ -19586,7 +19784,7 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
         [enc setBuffer:upbuf offset:ds4_gpu_tensor_offset(up) atIndex:5];
         [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:6];
         [enc setBytes:&clamp length:sizeof(clamp) atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) /
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) /
                                                   (NSUInteger)r0ptg,
                                               ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) /
                                                   (NSUInteger)r1ptg,
@@ -19708,7 +19906,7 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
         [enc setBuffer:midbuf offset:ds4_gpu_tensor_offset(mid) atIndex:6];
         [enc setBytes:&clamp length:sizeof(clamp) atIndex:7];
         [enc setThreadgroupMemoryLength:2u * mv_dispatch.smem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(
                 ((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
                     (NSUInteger)mv_dispatch.nr0,
                 (NSUInteger)n_tok,
@@ -19791,7 +19989,7 @@ int ds4_gpu_matmul_f16_tensor(
             if (mv_dispatch.smem) {
                 [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
             }
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
                                                   1,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
@@ -19821,7 +20019,7 @@ int ds4_gpu_matmul_f16_tensor(
             [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg,
                                                   ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
@@ -19864,7 +20062,7 @@ int ds4_gpu_matmul_f16_tensor(
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
                 [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t) atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / nax_tile_n),
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / nax_tile_n),
                                                       (NSUInteger)out_dim / 64u,
                                                       1)
                      threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -19893,7 +20091,7 @@ int ds4_gpu_matmul_f16_tensor(
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
         [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
                                               ((NSUInteger)out_dim + 63u) / 64u,
                                               1)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -19978,7 +20176,7 @@ int ds4_gpu_matmul_f16_pair_tensor(
         if (mv_dispatch.smem) {
             [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
         }
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
                                               1,
                                               1)
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
@@ -20116,7 +20314,7 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         if (mv_dispatch.smem) {
             [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
         }
-        [enc dispatchThreadgroups:MTLSizeMake(
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(
                 ((NSUInteger)width + (NSUInteger)mv_dispatch.nr0 - 1u) /
                     (NSUInteger)mv_dispatch.nr0,
                 1,
@@ -20271,7 +20469,7 @@ int ds4_gpu_matmul_f16_quad_compressor_store_tensor(
         [enc setBuffer:state1kvbuf offset:ds4_gpu_tensor_offset(state1_kv) atIndex:16];
         [enc setBuffer:state1scbuf offset:ds4_gpu_tensor_offset(state1_score) atIndex:17];
         [enc setThreadgroupMemoryLength:32u * 2u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(
                 ((NSUInteger)width0 + (NSUInteger)width1 + 1u) / 2u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -20398,7 +20596,7 @@ int ds4_gpu_dsv4_comp_row_finalize_tensor(
         [enc setBuffer:ds4_gpu_tensor_buffer(index_state_score)
                 offset:ds4_gpu_tensor_offset(index_state_score) atIndex:9];
         [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(2u + (4u * 1024u + 4u * 256u + 255u) / 256u, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(2u + (4u * 1024u + 4u * 256u + 255u) / 256u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -20577,7 +20775,7 @@ int ds4_gpu_qkv_pair_quad_compressor_store_tensor(
         [enc setBuffer:ds4_gpu_tensor_buffer(state1_kv) offset:ds4_gpu_tensor_offset(state1_kv) atIndex:23];
         [enc setBuffer:ds4_gpu_tensor_buffer(state1_score) offset:ds4_gpu_tensor_offset(state1_score) atIndex:24];
         [enc setThreadgroupMemoryLength:2u * 2u * 2u * 32u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(
                 (NSUInteger)(pair_vtgs + 1u) / 2u +
                 ((NSUInteger)width0 + (NSUInteger)width1 + 1u) / 2u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
@@ -20657,7 +20855,7 @@ int ds4_gpu_matmul_f32_tensor(
             if (mv_dispatch.smem) {
                 [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
             }
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
                                                   1,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
@@ -20687,7 +20885,7 @@ int ds4_gpu_matmul_f32_tensor(
             [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg,
                                                   ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
@@ -20716,7 +20914,7 @@ int ds4_gpu_matmul_f32_tensor(
             if (mv_dispatch.smem) {
                 [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
             }
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
                                                   (NSUInteger)n_tok,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
@@ -20850,7 +21048,7 @@ int ds4_gpu_rms_norm_plain_rows_tensor(
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
         [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(ds4_gpu_rms_norm_threads(n), 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -20976,7 +21174,7 @@ int ds4_gpu_hc_rms_scale_project_f16_tensor(
                 offset:ds4_gpu_tensor_offset(scale_scratch)
                atIndex:2];
         [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(
                  ds4_gpu_rms_norm_threads(in_dim), 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -20993,7 +21191,7 @@ int ds4_gpu_hc_rms_scale_project_f16_tensor(
                 offset:ds4_gpu_tensor_offset(scale_scratch)
                atIndex:4];
         [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(
                                           ((NSUInteger)n_rows + 31u) / 32u,
                                           ((NSUInteger)out_dim + 63u) / 64u,
                                           1)
@@ -21069,7 +21267,7 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
         [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(ds4_gpu_rms_norm_threads(n), 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -21133,7 +21331,7 @@ int ds4_gpu_add_rms_norm_weight_tensor(
         [enc setBuffer:sumbuf offset:ds4_gpu_tensor_offset(sum_out) atIndex:4];
         [enc setBuffer:normbuf offset:ds4_gpu_tensor_offset(norm_out) atIndex:5];
         [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(ds4_gpu_rms_norm_threads(n), 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -21219,7 +21417,7 @@ int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         [enc setBuffer:kv_wbuf offset:(NSUInteger)kv_inner_offset atIndex:5];
         [enc setBuffer:kvoutbuf offset:ds4_gpu_tensor_offset(kv_out) atIndex:6];
         [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(rows, 2, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(rows, 2, 1)
              threadsPerThreadgroup:MTLSizeMake(ds4_gpu_rms_norm_threads(q_n), 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -21353,7 +21551,7 @@ int ds4_gpu_dsv4_qkv_rms_norm_kv_rope_fp8_store_tensor(
         [enc setBuffer:kvoutbuf offset:ds4_gpu_tensor_offset(kv_out) atIndex:8];
         [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_cache) atIndex:9];
         [enc setThreadgroupMemoryLength:(32u + 64u) * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 2, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 2, 1)
              threadsPerThreadgroup:MTLSizeMake(ds4_gpu_rms_norm_threads(q_n), 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -21394,7 +21592,7 @@ int ds4_gpu_head_rms_norm_tensor(
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:3];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:4];
         [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(n_head, n_tok, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_head, n_tok, 1)
              threadsPerThreadgroup:MTLSizeMake(ds4_gpu_rms_norm_pipeline_threads(head_dim, g_rms_norm_plain_pipeline), 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -21540,7 +21738,7 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
         [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(n_head, n_tok, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_head, n_tok, 1)
              threadsPerThreadgroup:MTLSizeMake(
                  ds4_gpu_rms_norm_pipeline_threads(head_dim, pipeline),
                  1,
@@ -21631,7 +21829,7 @@ int ds4_gpu_dsv4_fp8_kv_quantize_tensor(
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
         [enc setThreadgroupMemoryLength:64u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(n_tok, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_tok, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -21671,7 +21869,7 @@ int ds4_gpu_dsv4_indexer_qat_tensor(
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
         [enc setThreadgroupMemoryLength:256u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -21808,7 +22006,7 @@ static int ds4_gpu_encode_set_rows_f32_i32(
         [enc setBytes:rows length:(NSUInteger)rows_bytes atIndex:2];
     }
     [enc setBuffer:dstbuf offset:ds4_gpu_tensor_offset(dst) atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_rows + nrptg - 1u) / nrptg, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_rows + nrptg - 1u) / nrptg, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, nrptg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -21839,7 +22037,7 @@ static int ds4_gpu_encode_add_f32_1d(
     [enc setBuffer:a offset:a_off atIndex:1];
     [enc setBuffer:b offset:b_off atIndex:2];
     [enc setBuffer:out offset:out_off atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -21972,7 +22170,7 @@ int ds4_gpu_kv_rope_fp8_store_raw_tensor(
         [enc setBuffer:kvbuf offset:ds4_gpu_tensor_offset(kv) atIndex:2];
         [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_cache) atIndex:3];
         [enc setThreadgroupMemoryLength:64u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -22023,7 +22221,7 @@ int ds4_gpu_kv_fp8_store_raw_tensor(
         [enc setBuffer:kvbuf offset:ds4_gpu_tensor_offset(kv) atIndex:1];
         [enc setBuffer:rawbuf offset:ds4_gpu_tensor_offset(raw_cache) atIndex:2];
         [enc setThreadgroupMemoryLength:64u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -22139,7 +22337,7 @@ static int ds4_gpu_encode_compressor_score_with_ape(
             [enc setBuffer:score_src offset:score_src_offset atIndex:1];
             [enc setBuffer:apebuf offset:ape_offset atIndex:2];
             [enc setBuffer:score_dst offset:score_dst_offset atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake(
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(
                     ((NSUInteger)total_elems + nth - 1u) / nth, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
@@ -22320,7 +22518,7 @@ static int ds4_gpu_compressor_store_one_tensor(
     [enc setBuffer:apebuf offset:(NSUInteger)ape_inner atIndex:3];
     [enc setBuffer:statekvbuf offset:ds4_gpu_tensor_offset(state_kv) atIndex:4];
     [enc setBuffer:statescbuf offset:ds4_gpu_tensor_offset(state_score) atIndex:5];
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)width + nth - 1u) / nth, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)width + nth - 1u) / nth, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -22583,7 +22781,7 @@ static int ds4_gpu_encode_softmax_f32_contiguous(
     [enc setBuffer:src offset:src_off atIndex:3];
     [enc setBuffer:dst offset:dst_off atIndex:4];
     [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(rows, planes, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(rows, planes, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -22677,7 +22875,7 @@ static int ds4_gpu_encode_dsv4_softmax_pool_one_comp_ggml_reduce(
         [enc setBuffer:g_compressor_pool_softmax_buffer offset:0 atIndex:3];
         [enc setBuffer:g_compressor_pool_product_buffer offset:0 atIndex:4];
         [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(head_dim, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(head_dim, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_encode_sum_rows_f32(cb,
@@ -22848,7 +23046,7 @@ static int ds4_gpu_encode_dsv4_softmax_pool(
     [enc setBuffer:kvbuf offset:kv_offset atIndex:1];
     [enc setBuffer:scorebuf offset:score_offset atIndex:2];
     [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + 255u) / 256u, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + 255u) / 256u, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -22915,7 +23113,7 @@ static int ds4_gpu_encode_concat_f32_dim1(
     [enc setBuffer:src0 offset:src0_offset atIndex:1];
     [enc setBuffer:src1 offset:src1_offset atIndex:2];
     [enc setBuffer:dst offset:dst_offset atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -23028,7 +23226,7 @@ static int ds4_gpu_encode_compressor_ratio4_direct_pool(
     [enc setBuffer:statekvbuf offset:state_kv_offset atIndex:3];
     [enc setBuffer:statescbuf offset:state_score_offset atIndex:4];
     [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:5];
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + nth - 1u) / nth, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + nth - 1u) / nth, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -23083,7 +23281,7 @@ static int ds4_gpu_encode_compressor_pack_ratio4(
     [enc setBuffer:statescbuf offset:state_score_offset atIndex:4];
     [enc setBuffer:g_compressor_pool_kv_buffer offset:0 atIndex:5];
     [enc setBuffer:g_compressor_pool_score_buffer offset:0 atIndex:6];
-    [enc dispatchThreadgroups:MTLSizeMake(n_comp, 8u, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_comp, 8u, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -23153,7 +23351,7 @@ static int ds4_gpu_encode_compressor_ratio4_decode_pack_ggml(
             [enc setBuffer:g_compressor_pool_product_buffer offset:0 atIndex:4];
             [enc setBuffer:outbuf offset:out_offset atIndex:5];
             [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(head_dim, 1, 1)
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(head_dim, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
             return 1;
@@ -23186,7 +23384,7 @@ static int ds4_gpu_encode_compressor_ratio4_decode_pack_ggml(
     [enc setBuffer:statescbuf offset:state_score_offset atIndex:2];
     [enc setBuffer:g_compressor_pool_product_buffer offset:0 atIndex:3];
     [enc setBuffer:g_compressor_pool_score_cont_buffer offset:0 atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(8u, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(8u, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -23331,7 +23529,7 @@ static int ds4_gpu_encode_compressor_shift_ratio4(
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:statekvbuf offset:ds4_gpu_tensor_offset(state_kv) atIndex:1];
     [enc setBuffer:statescbuf offset:ds4_gpu_tensor_offset(state_score) atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + 255u) / 256u, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n + 255u) / 256u, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -24414,7 +24612,7 @@ static int ds4_gpu_encode_fill_f32_rows(
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:buf offset:offset atIndex:1];
     [enc setBuffer:buf offset:offset atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(nk0 * (NSUInteger)args.ne01,
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nk0 * (NSUInteger)args.ne01,
                                           (NSUInteger)args.ne02,
                                           (NSUInteger)args.ne03)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
@@ -25042,7 +25240,7 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
                atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
         [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
                                               1,
                                               1)
              threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
@@ -25172,7 +25370,7 @@ int ds4_gpu_matmul_quant_kslice_tensor(
                        atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
                 [enc setThreadgroupMemoryLength:32 atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg,
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + rows_ptg - 1u) / rows_ptg,
                                                       1,
                                                       1)
                      threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
@@ -25532,7 +25730,7 @@ static int ds4_gpu_encode_cpy_f32_f32_1d(
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:src offset:src_off atIndex:1];
     [enc setBuffer:dst offset:dst_off atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -25581,7 +25779,7 @@ static int ds4_gpu_encode_cpy_f32_f32_3d(
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:src offset:src_off atIndex:1];
     [enc setBuffer:dst offset:dst_off atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(col_groups * rows, planes, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(col_groups * rows, planes, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -25631,7 +25829,7 @@ static int ds4_gpu_encode_cpy_f32_f32_3d_src_strided(
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:src offset:src_off atIndex:1];
     [enc setBuffer:dst offset:dst_off atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(col_groups * rows, planes, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(col_groups * rows, planes, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -25669,7 +25867,7 @@ static int ds4_gpu_encode_cpy_f32_f16_1d(
     }
     [enc setBuffer:src offset:src_off atIndex:1];
     [enc setBuffer:dst offset:dst_off atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -25715,7 +25913,7 @@ static int ds4_gpu_encode_cpy_f32_f16_2d(
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:src offset:src_off atIndex:1];
     [enc setBuffer:dst offset:dst_off atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(col_groups * rows, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(col_groups * rows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -25764,7 +25962,7 @@ static int ds4_gpu_encode_cpy_f32_f16_3d(
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:src offset:src_off atIndex:1];
     [enc setBuffer:dst offset:dst_off atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(col_groups * rows, planes, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(col_groups * rows, planes, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -25813,7 +26011,7 @@ static int ds4_gpu_encode_cpy_f16_f16_3d(
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:src offset:src_off atIndex:1];
     [enc setBuffer:dst offset:dst_off atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(col_groups * rows, planes, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(col_groups * rows, planes, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -25851,7 +26049,7 @@ static int ds4_gpu_encode_cpy_f16_f32_1d(
     }
     [enc setBuffer:src offset:src_off atIndex:1];
     [enc setBuffer:dst offset:dst_off atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -25884,7 +26082,7 @@ static int ds4_gpu_encode_copy_to_f16_1d(
         [enc setBytes:&n length:sizeof(n) atIndex:0];
         [enc setBuffer:src offset:src_off atIndex:1];
         [enc setBuffer:dst offset:dst_off atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return 1;
@@ -26051,7 +26249,7 @@ static int ds4_gpu_encode_flash_kv_stage_f16(
         [enc setBuffer:(use_pad_fusion ? pad : dst)
                  offset:(use_pad_fusion ? pad_offset : dst_offset)
                 atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (did_fuse_pad) *did_fuse_pad = use_pad_fusion;
@@ -26173,7 +26371,7 @@ static int ds4_gpu_encode_fill_f16_1d(
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:buf offset:offset atIndex:1];
     [enc setBuffer:buf offset:offset atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -26211,8 +26409,8 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
     }
 
     const uint32_t ncpsg = 32;
-    const uint32_t nwg = 32;
-    const uint32_t nsg = ds4_gpu_flash_attn_vec_nsg(n_raw, nwg, ncpsg);
+    const uint32_t nsg = ds4_gpu_flash_attn_vec_nsg(n_raw, 32u, ncpsg);
+    const uint32_t nwg = ds4_gpu_flash_attn_decode_nwg(n_raw, nsg);
     const NSUInteger row_bytes = (NSUInteger)head_dim * sizeof(float);
     const NSUInteger row_bytes_f16 = (NSUInteger)head_dim * sizeof(uint16_t);
     const NSUInteger mask_bytes = (NSUInteger)n_raw * sizeof(uint16_t);
@@ -26308,7 +26506,7 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
         [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
         [enc setBuffer:mask_buffer offset:0 atIndex:3];
         [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
     }
@@ -26364,7 +26562,7 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
     [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:6];
     [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:7];
     [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(1, n_head, nwg)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, n_head, nwg)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -26376,7 +26574,7 @@ static int ds4_gpu_encode_flash_attention_raw_heads(
     [enc setBytes:&reduce_args length:sizeof(reduce_args) atIndex:0];
     [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:1];
     [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32u * nwg, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -26774,7 +26972,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
         [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
         [enc setBuffer:mask_buffer offset:0 atIndex:3];
         [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         DS4_METAL_PROFILE_FLASH_ATTN_STAGE("pad");
@@ -26798,7 +26996,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
         [enc setBytes:&blk_args length:sizeof(blk_args) atIndex:0];
         [enc setBuffer:mask_buffer offset:0 atIndex:1];
         [enc setBuffer:blk_buffer offset:0 atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (mask_cache) mask_cache->blk_ready = true;
@@ -26857,7 +27055,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
     [enc setBuffer:blk_buffer offset:0 atIndex:7];
     [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:8];
     [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     DS4_METAL_PROFILE_FLASH_ATTN_STAGE("attention");
@@ -27056,7 +27254,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
         [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
         [enc setBuffer:mask_buffer offset:0 atIndex:3];
         [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         DS4_METAL_PROFILE_FLASH_ATTN_STAGE("pad");
@@ -27113,7 +27311,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
     [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:6];
     [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:7];
     [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(n_tokens, n_head, nwg)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_tokens, n_head, nwg)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     DS4_METAL_PROFILE_FLASH_ATTN_STAGE("attention_vec");
@@ -27126,7 +27324,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_vec(
     [enc setBytes:&reduce_args length:sizeof(reduce_args) atIndex:0];
     [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:1];
     [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32u * nwg, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     DS4_METAL_PROFILE_FLASH_ATTN_STAGE("attention_reduce");
@@ -27373,7 +27571,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
         [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
         [enc setBuffer:mask_buffer offset:0 atIndex:3];
         [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         DS4_METAL_PROFILE_FLASH_ATTN_STAGE("pad");
@@ -27397,7 +27595,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
         [enc setBytes:&blk_args length:sizeof(blk_args) atIndex:0];
         [enc setBuffer:mask_buffer offset:0 atIndex:1];
         [enc setBuffer:blk_buffer offset:0 atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         if (mask_cache) mask_cache->blk_ready = true;
@@ -27456,7 +27654,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
     [enc setBuffer:blk_buffer offset:0 atIndex:7];
     [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:8];
     [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     DS4_METAL_PROFILE_FLASH_ATTN_STAGE("attention");
@@ -27626,7 +27824,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads(
         [enc setBuffer:g_flash_attn_kv_buffer offset:kv_f16_offset atIndex:2];
         [enc setBuffer:mask_buffer offset:0 atIndex:3];
         [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         DS4_METAL_PROFILE_FLASH_ATTN_STAGE("pad");
@@ -27683,7 +27881,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads(
     [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:6];
     [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:7];
     [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(n_tokens, n_head, nwg)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_tokens, n_head, nwg)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     DS4_METAL_PROFILE_FLASH_ATTN_STAGE("attention_vec");
@@ -27696,7 +27894,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads(
     [enc setBytes:&reduce_args length:sizeof(reduce_args) atIndex:0];
     [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:1];
     [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32u * nwg, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     DS4_METAL_PROFILE_FLASH_ATTN_STAGE("attention_reduce");
@@ -27751,8 +27949,8 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     }
 
     const uint32_t ncpsg = 32;
-    const uint32_t nwg = 32;
-    const uint32_t nsg = ds4_gpu_flash_attn_vec_nsg(n_keys, nwg, ncpsg);
+    const uint32_t nsg = ds4_gpu_flash_attn_vec_nsg(n_keys, 32u, ncpsg);
+    const uint32_t nwg = ds4_gpu_flash_attn_decode_nwg(n_keys, nsg);
     const NSUInteger row_bytes = (NSUInteger)head_dim * sizeof(float);
     const NSUInteger row_bytes_f16 = (NSUInteger)head_dim * sizeof(uint16_t);
     const NSUInteger mask_bytes = (NSUInteger)n_keys * sizeof(uint16_t);
@@ -27942,7 +28140,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
         [enc setBuffer:flash_mask_buffer offset:0 atIndex:3];
         [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
     }
@@ -28002,7 +28200,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         [packed_enc setBytes:&g_decode_attn_rope_args
                        length:sizeof(g_decode_attn_rope_args) atIndex:8];
         [packed_enc setThreadgroupMemoryLength:packed_shared_bytes atIndex:0];
-        [packed_enc dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
+        [DS4_DISP(packed_enc) dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
                       threadsPerThreadgroup:MTLSizeMake(packed_threads, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, packed_enc);
         g_decode_attn_rope_fuse = 0;
@@ -28021,7 +28219,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:6];
     [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:7];
     [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(1, n_head, nwg)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, n_head, nwg)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -28048,7 +28246,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         [enc setBytes:&g_decode_attn_rope_args
                length:sizeof(g_decode_attn_rope_args) atIndex:3];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32u * nwg, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -28186,7 +28384,7 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
         [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
         [enc setBuffer:mask_buffer offset:0 atIndex:3];
         [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
     }
@@ -28207,7 +28405,7 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
     [enc setBytes:&blk_args length:sizeof(blk_args) atIndex:0];
     [enc setBuffer:mask_buffer offset:0 atIndex:1];
     [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -28263,7 +28461,7 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
     [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:7];
     [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:8];
     [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -28450,7 +28648,7 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
         [enc setBuffer:g_flash_attn_kv_buffer offset:0 atIndex:2];
         [enc setBuffer:mask_buffer offset:0 atIndex:3];
         [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
     }
@@ -28471,7 +28669,7 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
     [enc setBytes:&blk_args length:sizeof(blk_args) atIndex:0];
     [enc setBuffer:mask_buffer offset:0 atIndex:1];
     [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -28527,7 +28725,7 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
     [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:7];
     [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:8];
     [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -28883,8 +29081,27 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             !decode_one_token && !g_quality_mode && ds4_gpu_mpp_available() &&
             n_head == 64u &&
             top_k == 512u && window == 128u && head_dim == 512u;
-        const uint32_t decode_splits =
-            decode_one_token && !g_quality_mode ? 12u : 1u;
+        /* Split-K count for the one-token indexed attention reduce. 12 was
+         * chosen on unsplit hardware, where 64 heads in groups of 8 give
+         * 8 x 12 = 96 threadgroups. Under tensor parallelism each rank holds
+         * 32 heads, so the grid halves to 4 x 12 = 48 -- under one per core on
+         * a 60-core M2 Ultra, in a stage measured at 2.681 ms/token by
+         * DS4_TP_ABLATE=attncore against a byte volume of only ~45 MB, i.e.
+         * occupancy-bound rather than bandwidth-bound.
+         *
+         * DS4_METAL_DECODE_SPLITS sweeps it. The kernel takes nwg as a
+         * function constant and the reduce walks n_splits, so any value in
+         * range is valid, but this is NOT bit-exact: changing the split count
+         * repartitions the online-softmax reduction, so the FP association
+         * order changes. Default stays 12. */
+        uint32_t decode_splits = decode_one_token && !g_quality_mode ? 12u : 1u;
+        if (decode_splits > 1u) {
+            const char *splits_env = getenv("DS4_METAL_DECODE_SPLITS");
+            if (splits_env && splits_env[0]) {
+                const long v = strtol(splits_env, NULL, 10);
+                if (v >= 2 && v <= 31) decode_splits = (uint32_t)v;
+            }
+        }
         const bool split_decode = decode_splits > 1u;
         id<MTLComputePipelineState> attn_pipeline =
             split_decode ?
@@ -28971,7 +29188,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             [enc setBuffer:topkbuf offset:ds4_gpu_tensor_offset(topk) atIndex:1];
             [enc setBuffer:g_indexed_topk_buffer offset:0 atIndex:2];
             [enc setThreadgroupMemoryLength:(NSUInteger)top_k * sizeof(int32_t) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(top_k, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
         }
@@ -29003,7 +29220,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:5];
             [enc setThreadgroupMemoryLength:16u * 128u * sizeof(uint16_t) * 4u
                                     atIndex:0];
-            [enc dispatchThreadgroups:
+            [DS4_DISP(enc) dispatchThreadgroups:
                     MTLSizeMake((NSUInteger)n_tokens,
                                 ((NSUInteger)n_head + 7u) / 8u,
                                 decode_splits)
@@ -29016,7 +29233,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             [enc setBuffer:g_flash_attn_tmp_buffer offset:0 atIndex:1];
             [enc setBuffer:sinks_buf offset:(NSUInteger)sinks_inner atIndex:2];
             [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)nrows, 1, 1)
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)nrows, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
         } else {
@@ -29034,7 +29251,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             [enc setThreadgroupMemoryLength:(decode_one_token ? 16u : 1u) *
                                             128u * 4u * sizeof(uint16_t)
                                     atIndex:0];
-            [enc dispatchThreadgroups:
+            [DS4_DISP(enc) dispatchThreadgroups:
                     MTLSizeMake((NSUInteger)n_tokens,
                                 ((NSUInteger)n_head + (prefill_dual_heads ? 15u : 7u)) /
                                     (prefill_dual_heads ? 16u : 8u),
@@ -29233,6 +29450,11 @@ int ds4_gpu_attention_decode_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* DS4_TP_ABLATE=attncore. Gated at the entry point because ds4.c calls
+     * this from three places (23196, 23251, 23328) for the gathered, raw and
+     * indexed paths and which one fires depends on the layer's compressor
+     * ratio and the position. */
+    if (ds4_gpu_ablate_chain("attncore")) return 1;
     if (!heads || !model_map || !q || !raw_kv ||
         n_raw == 0 || n_head == 0 || head_dim == 0 ||
         raw_cap < n_raw || raw_start >= raw_cap ||
@@ -29377,7 +29599,7 @@ int ds4_gpu_swiglu_tensor(
         [enc setBuffer:gatebuf offset:ds4_gpu_tensor_offset(gate) atIndex:1];
         [enc setBuffer:upbuf offset:ds4_gpu_tensor_offset(up) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -29425,7 +29647,7 @@ int ds4_gpu_add_tensor(
         [enc setBuffer:abuf offset:ds4_gpu_tensor_offset(a) atIndex:1];
         [enc setBuffer:bbuf offset:ds4_gpu_tensor_offset(b) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -29477,7 +29699,7 @@ int ds4_gpu_add3_tensor(
         [enc setBuffer:bbuf offset:ds4_gpu_tensor_offset(b) atIndex:2];
         [enc setBuffer:cbuf offset:ds4_gpu_tensor_offset(c) atIndex:3];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -29544,7 +29766,7 @@ int ds4_gpu_directional_steering_project_tensor(
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
         [enc setBuffer:dbuf offset:ds4_gpu_tensor_offset(directions) atIndex:2];
         [enc setThreadgroupMemoryLength:nth * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -29593,7 +29815,7 @@ static int ds4_gpu_encode_unary_f32_rows(
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:src offset:src_off atIndex:1];
     [enc setBuffer:dst offset:dst_off atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake(nk0 * (NSUInteger)args.ne01,
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nk0 * (NSUInteger)args.ne01,
                                           (NSUInteger)args.ne02,
                                           (NSUInteger)args.ne03)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
@@ -29622,7 +29844,7 @@ static int ds4_gpu_encode_bin_f32_rows(
     [enc setBuffer:a offset:a_off atIndex:1];
     [enc setBuffer:b offset:b_off atIndex:2];
     [enc setBuffer:out offset:out_off atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)args->ne1,
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)args->ne1,
                                           (NSUInteger)args->ne2,
                                           (NSUInteger)args->ne3)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
@@ -30017,7 +30239,7 @@ static int ds4_gpu_encode_mul_mv_id(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30060,7 +30282,7 @@ static int ds4_gpu_encode_attn_out_low_q8_direct(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30107,7 +30329,7 @@ static int ds4_gpu_encode_mul_mv_id_pair(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30163,7 +30385,7 @@ static int ds4_gpu_encode_mul_mv_id_pair_swiglu(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30227,7 +30449,7 @@ static int ds4_gpu_encode_mul_mv_table_q4_pair_swiglu(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30292,7 +30514,7 @@ static int ds4_gpu_encode_mul_mv_addr_q4_pair_swiglu(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30337,7 +30559,7 @@ static int ds4_gpu_encode_mul_mv_table_q4_sum6(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30383,7 +30605,7 @@ static int ds4_gpu_encode_mul_mv_addr_q4_sum6(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30457,7 +30679,7 @@ static int ds4_gpu_encode_mul_mv_group_q4_pair_swiglu(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30498,7 +30720,7 @@ static int ds4_gpu_encode_mul_mv_group_q4_sum6(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30540,7 +30762,7 @@ static int ds4_gpu_encode_mul_mv_id_sum6(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30577,7 +30799,7 @@ static int ds4_gpu_encode_q4_gather_slots6(
     [enc setBuffer:ids offset:ids_off atIndex:7];
     [enc setBuffer:dst offset:dst_off atIndex:8];
     const NSUInteger threads = 256u;
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)chunks + threads - 1u) / threads,
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)chunks + threads - 1u) / threads,
                                           (NSUInteger)args->n_slots,
                                           1)
          threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
@@ -30639,7 +30861,7 @@ static int ds4_gpu_encode_mul_mv_slots6_pair_swiglu(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30679,7 +30901,7 @@ static int ds4_gpu_encode_mul_mv_slots6_sum6(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30743,7 +30965,7 @@ static int ds4_gpu_encode_mul_mv_group6_pair_swiglu(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30787,7 +31009,7 @@ static int ds4_gpu_encode_mul_mv_group6_sum6(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30866,7 +31088,7 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30924,7 +31146,7 @@ static int ds4_gpu_encode_mul_mv_addr_iq2(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -30979,7 +31201,7 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -31052,7 +31274,7 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -31107,7 +31329,7 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -31171,7 +31393,7 @@ static int ds4_gpu_encode_mul_mv_group8_pair_swiglu(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -31215,7 +31437,7 @@ static int ds4_gpu_encode_mul_mv_group8_sum6(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -31262,7 +31484,7 @@ static int ds4_gpu_encode_mul_mv_group24_id(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -31306,7 +31528,7 @@ static int ds4_gpu_encode_mul_mv_group24_sum6(
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(row_groups, (NSUInteger)args->nei1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -31394,7 +31616,7 @@ static int ds4_gpu_encode_mul_mm_id_map(
     [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:3];
     [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:4];
     [enc setThreadgroupMemoryLength:(NSUInteger)mm_args->ne02 * (NSUInteger)mm_args->ne20 * sizeof(uint16_t) atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
          threadsPerThreadgroup:MTLSizeMake((NSUInteger)mm_args->ne02, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -31459,7 +31681,7 @@ static int ds4_gpu_encode_mul_mm_id_mapped_tile(
         [enc useResource:src0 usage:MTLResourceUsageRead];
     }
     [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)work_cap,
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)work_cap,
                                           ((NSUInteger)mm_args->ne0 + 63u) / 64u,
                                           1)
          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -31519,7 +31741,7 @@ static int ds4_gpu_encode_mul_mm_id_addr_mapped_tile(
         [enc useResource:overflow_resource usage:MTLResourceUsageRead];
     }
     [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)mm_args->ne21 + tile_n - 1u) / tile_n,
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)mm_args->ne21 + tile_n - 1u) / tile_n,
                                           ((NSUInteger)mm_args->ne0 + 63u) / 64u,
                                           (NSUInteger)mm_args->ne02)
          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -31585,7 +31807,7 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
     [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:9];
     const NSUInteger tile_m = compact_tile ? 32u : 64u;
     [enc setThreadgroupMemoryLength:compact_tile ? 8192u : 16384u atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)work_cap,
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)work_cap,
                                           ((NSUInteger)mm_args->ne0 + tile_m - 1u) / tile_m,
                                           1)
          threadsPerThreadgroup:MTLSizeMake(compact_tile ? 64u : 128u, 1, 1)];
@@ -31640,7 +31862,7 @@ static int ds4_gpu_encode_attn_out_low_mpp(
     [enc setBuffer:src1 offset:src1_off atIndex:2];
     [enc setBuffer:dst offset:dst_off atIndex:3];
     [enc setThreadgroupMemoryLength:8192u atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)mm_args->ne21 + (NSUInteger)tile_n - 1u) / (NSUInteger)tile_n,
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)mm_args->ne21 + (NSUInteger)tile_n - 1u) / (NSUInteger)tile_n,
                                           ((NSUInteger)mm_args->ne0 + 63u) / 64u,
                                           (NSUInteger)mm_args->ne02)
          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -31683,7 +31905,7 @@ static int ds4_gpu_encode_swiglu_flat(
     [enc setBuffer:gate offset:gate_off atIndex:1];
     [enc setBuffer:up   offset:up_off   atIndex:2];
     [enc setBuffer:out  offset:out_off  atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -31733,7 +31955,7 @@ static int ds4_gpu_encode_moe_swiglu_weight(
     [enc setBuffer:up      offset:up_off      atIndex:2];
     [enc setBuffer:mid     offset:mid_off     atIndex:3];
     [enc setBuffer:weights offset:weights_off atIndex:4];
-    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -31769,7 +31991,7 @@ static int ds4_gpu_encode_moe_sum6(
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:experts offset:experts_off atIndex:1];
     [enc setBuffer:out     offset:out_off     atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -31805,7 +32027,7 @@ static int ds4_gpu_encode_moe_sum8(
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:experts offset:experts_off atIndex:1];
     [enc setBuffer:out     offset:out_off     atIndex:2];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -31963,7 +32185,7 @@ static int ds4_gpu_encode_get_rows_i32_token_rows(
         [enc setBytes:token_inline length:sizeof(*token_inline) atIndex:2];
     }
     [enc setBuffer:selected offset:selected_off atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake(nw0 * n_tokens, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nw0 * n_tokens, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -32006,7 +32228,7 @@ static int ds4_gpu_encode_get_rows_f32_router_weights(
     [enc setBuffer:probs offset:probs_off atIndex:1];
     [enc setBuffer:selected offset:selected_off atIndex:2];
     [enc setBuffer:weights offset:weights_off atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_expert_used, n_tokens, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_expert_used, n_tokens, 1)
          threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -32055,7 +32277,7 @@ static int ds4_gpu_encode_sum_rows_f32(
     [enc setBuffer:src offset:src_off atIndex:1];
     [enc setBuffer:dst offset:dst_off atIndex:2];
     [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;
@@ -32241,7 +32463,7 @@ static int ds4_gpu_encode_router_select(
             ? 2u * (256u * sizeof(float) + 256u * sizeof(int32_t))
             : 256u * sizeof(float) + 256u * sizeof(int32_t);
         [enc setThreadgroupMemoryLength:router_finalize_scratch_bytes atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -32252,7 +32474,7 @@ static int ds4_gpu_encode_router_select(
         [enc setBuffer:probsbuf offset:probs_off atIndex:0];
         [enc setBuffer:selectedbuf offset:selected_off atIndex:1];
         [enc setBuffer:weightsbuf offset:weights_off atIndex:2];
-        [enc dispatchThreads:MTLSizeMake(6, 1, 1)
+        [DS4_DISP(enc) dispatchThreads:MTLSizeMake(6, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return 1;
@@ -32364,7 +32586,7 @@ static int ds4_gpu_encode_router_select(
         [enc setBuffer:selectedbuf offset:selected_off atIndex:2];
         [enc setBuffer:weightsbuf offset:weights_off atIndex:3];
         [enc setThreadgroupMemoryLength:40u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return 1;
@@ -32380,7 +32602,7 @@ static int ds4_gpu_encode_router_select(
         [enc setBuffer:probsbuf offset:probs_off atIndex:0];
         [enc setBuffer:selectedbuf offset:selected_off atIndex:1];
         [enc setBuffer:weightsbuf offset:weights_off atIndex:2];
-        [enc dispatchThreads:MTLSizeMake(6, 1, 1)
+        [DS4_DISP(enc) dispatchThreads:MTLSizeMake(6, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(6, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return 1;
@@ -32445,7 +32667,7 @@ static int ds4_gpu_encode_router_select(
     [enc setBuffer:weightsbuf offset:weights_off atIndex:1];
     [enc setBytes:&scale length:sizeof(scale) atIndex:2];
     [enc setBuffer:weightsbuf offset:weights_off atIndex:3];
-    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)scale_args.ne1,
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)scale_args.ne1,
                                           (NSUInteger)scale_args.ne2,
                                           (NSUInteger)scale_args.ne3)
          threadsPerThreadgroup:MTLSizeMake(ds4_gpu_bin_threads(n_expert_used, g_bin_mul_scalar_pipeline), 1, 1)];
@@ -32531,7 +32753,7 @@ int ds4_gpu_glm_kv_lora_rms_norm_tensor(
         [enc setBuffer:weightbuf offset:(NSUInteger)weight_inner atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
         [enc setThreadgroupMemoryLength:nth * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -32623,7 +32845,7 @@ int ds4_gpu_glm_k_b_project_typed_tensor(
         [enc setBuffer:kvbuf offset:ds4_gpu_tensor_offset(kv_norm) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
         [enc setThreadgroupMemoryLength:(NSUInteger)kv_lora_dim * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, (NSUInteger)n_head, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, (NSUInteger)n_head, 1)
              threadsPerThreadgroup:MTLSizeMake(32, q_blocks, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -32727,7 +32949,7 @@ int ds4_gpu_glm_store_compact_kv_tensor(
         [enc setBuffer:kvrawbuf offset:ds4_gpu_tensor_offset(kv_raw) atIndex:2];
         [enc setBuffer:kvcachebuf offset:ds4_gpu_tensor_offset(kv_lora_cache) atIndex:3];
         [enc setBuffer:ropecachebuf offset:ds4_gpu_tensor_offset(k_rope_cache) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 2, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 2, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -32843,7 +33065,7 @@ int ds4_gpu_glm_qkv_norm_store_compact_kv_tensor(
         [enc setBuffer:kvcachebuf offset:ds4_gpu_tensor_offset(kv_lora_cache) atIndex:6];
         [enc setBuffer:ropecachebuf offset:ds4_gpu_tensor_offset(k_rope_cache) atIndex:7];
         [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 3, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 3, 1)
              threadsPerThreadgroup:MTLSizeMake(ds4_gpu_rms_norm_threads(q_n), 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -32953,7 +33175,7 @@ int ds4_gpu_glm_store_indexer_k_tensor(
         [enc setBuffer:biasbuf offset:(NSUInteger)bias_inner atIndex:3];
         [enc setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:4];
         [enc setThreadgroupMemoryLength:nth * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -33072,7 +33294,7 @@ int ds4_gpu_glm_build_kv_cache_tensor(
         const NSUInteger group_y = decode_group4 ?
             ((NSUInteger)n_head + 3u) / 4u :
             (NSUInteger)n_head;
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, group_y, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, group_y, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -33199,7 +33421,7 @@ int ds4_gpu_glm_build_kv_cache_flash_tensor(
         [enc setBuffer:valbuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:5];
         [enc setBuffer:g_flash_attn_kv_buffer offset:key_f16_offset atIndex:6];
         [enc setBuffer:g_flash_attn_kv_buffer offset:value_f16_offset atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, (NSUInteger)n_head, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, (NSUInteger)n_head, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -33407,7 +33629,7 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
             [enc setBuffer:g_flash_attn_kv_buffer offset:value_f16_offset atIndex:2];
             [enc setBuffer:mask_buffer offset:0 atIndex:3];
             [enc setBuffer:g_flash_attn_pad_buffer offset:0 atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(ncpsg, n_head, 1)
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(ncpsg, n_head, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
         }
@@ -33428,7 +33650,7 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
         [enc setBytes:&blk_args length:sizeof(blk_args) atIndex:0];
         [enc setBuffer:mask_buffer offset:0 atIndex:1];
         [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nblk0, nblk1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -33484,7 +33706,7 @@ static int ds4_gpu_glm_attention_flash_tensor_impl(
         [enc setBuffer:g_flash_attn_blk_buffer offset:0 atIndex:7];
         [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:8];
         [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nblk1, n_head, 1)
              threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -33627,7 +33849,7 @@ int ds4_gpu_glm_attention_full_tensor(
         [enc setBuffer:valbuf offset:ds4_gpu_tensor_offset(value_cache) atIndex:3];
         [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:4];
         [enc setThreadgroupMemoryLength:(256u + (NSUInteger)cache_len) * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, (NSUInteger)n_head, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, (NSUInteger)n_head, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -33670,7 +33892,7 @@ int ds4_gpu_glm_fill_selected_range_tensor(
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:1];
-        [enc dispatchThreadgroups:MTLSizeMake(n_groups, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_groups, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -33722,7 +33944,7 @@ int ds4_gpu_glm_fill_selected_range_batch_tensor(
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:1];
-        [enc dispatchThreadgroups:MTLSizeMake(n_groups, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_groups, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -33799,7 +34021,7 @@ static int ds4_gpu_glm_rope_tail_offset_tensor(
         [enc setComputePipelineState:pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head, (NSUInteger)n_tokens, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head, (NSUInteger)n_tokens, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -33934,7 +34156,7 @@ int ds4_gpu_glm_indexer_score_one_tensor(
             [enc setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
             [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
             [enc setThreadgroupMemoryLength:(128u + 4u) * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1, 1)
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -33961,7 +34183,7 @@ int ds4_gpu_glm_indexer_score_one_tensor(
         [enc setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
         [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
         [enc setThreadgroupMemoryLength:nth * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -34061,13 +34283,13 @@ int ds4_gpu_glm_indexer_scores_batch_tensor(
                 [enc setThreadgroupMemoryLength:(q_shared + k_shared) * sizeof(uint16_t) +
                                                 dot_shared * sizeof(float) atIndex:0];
             }
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_rows + 31u) / 32u,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_rows + 31u) / 32u,
                                                   ((NSUInteger)n_tokens + 7u) / 8u,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
         } else {
             [enc setThreadgroupMemoryLength:nth * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows,
                                                   (NSUInteger)n_tokens,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
@@ -34196,7 +34418,7 @@ int ds4_gpu_glm_qk_lowrank_typed_tensor(
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(qk_low) atIndex:3];
         if (use_glm52_sg) {
             /* 8 simdgroups x 2 rows per threadgroup: (64, 512/16) grid. */
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head,
                                                   (NSUInteger)(kv_lora_dim / 16u),
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
@@ -34204,7 +34426,7 @@ int ds4_gpu_glm_qk_lowrank_typed_tensor(
             if (use_glm52) {
                 [enc setThreadgroupMemoryLength:192u * sizeof(float) atIndex:0];
             }
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head, 1, 1)
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -34332,12 +34554,12 @@ int ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(qk_low) atIndex:3];
         if (use_glm52_t4) {
             [enc setThreadgroupMemoryLength:4u * 192u * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)head_count,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)head_count,
                                                   ((NSUInteger)n_tokens + 3u) / 4u,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         } else {
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)head_count,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)head_count,
                                                   (NSUInteger)n_tokens,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -34467,14 +34689,14 @@ int ds4_gpu_glm_value_project_typed_batch_heads_tensor(
         [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:3];
         if (use_mma) {
             [enc setThreadgroupMemoryLength:16u * 1024u atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tokens + 31u) / 32u,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tokens + 31u) / 32u,
                                                   ((NSUInteger)value_dim + 63u) / 64u,
                                                   (NSUInteger)head_count)
                  threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         } else {
             [enc setThreadgroupMemoryLength:(NSUInteger)kv_lora_dim * sizeof(float)
                                     atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)head_count,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)head_count,
                                                   (NSUInteger)n_tokens,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
@@ -34638,7 +34860,7 @@ int ds4_gpu_glm_attention_indexed_decode_typed_tensor(
         const NSUInteger scratch_floats =
             256u + (NSUInteger)n_selected + (NSUInteger)kv_lora_dim;
         [enc setThreadgroupMemoryLength:scratch_floats * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -34872,7 +35094,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         [enc setBuffer:partial_lorabuf offset:ds4_gpu_tensor_offset(partial_lora) atIndex:6];
         [enc setBuffer:partial_msbuf offset:ds4_gpu_tensor_offset(partial_ms) atIndex:7];
         [enc setThreadgroupMemoryLength:partial_scratch_bytes atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head / 8u, (NSUInteger)n_blocks, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head / 8u, (NSUInteger)n_blocks, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -34885,7 +35107,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         [enc setBuffer:valuebuf offset:(NSUInteger)value_inner atIndex:3];
         [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:4];
         [enc setThreadgroupMemoryLength:reduce_scratch_floats * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -35121,22 +35343,22 @@ int ds4_gpu_glm_attention_indexed_batch_typed_tensor(
         [enc setBuffer:headsbuf offset:ds4_gpu_tensor_offset(heads) atIndex:7];
         [enc setThreadgroupMemoryLength:scratch_bytes atIndex:0];
         if (use_q2_group4) {
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_head + 3u) / 4u,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_head + 3u) / 4u,
                                                   ((NSUInteger)n_tokens + 1u) / 2u,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
         } else if (use_group8) {
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_head + 7u) / 8u,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_head + 7u) / 8u,
                                                   (NSUInteger)n_tokens,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
         } else if (use_group2) {
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_head + 1u) / 2u,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_head + 1u) / 2u,
                                                   (NSUInteger)n_tokens,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         } else {
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head, (NSUInteger)n_tokens, 1)
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head, (NSUInteger)n_tokens, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -35261,7 +35483,7 @@ int ds4_gpu_sort_i32_rows_asc_tensor(
         [enc setBuffer:srcbuf offset:ds4_gpu_tensor_offset(src) atIndex:1];
         [enc setBuffer:dstbuf offset:ds4_gpu_tensor_offset(dst) atIndex:2];
         [enc setThreadgroupMemoryLength:scratch_bytes atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -35411,7 +35633,7 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
             [enc setBuffer:lorabuf offset:ds4_gpu_tensor_offset(lora_out) atIndex:7];
         }
         [enc setThreadgroupMemoryLength:scratch_bytes atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)head_count + 7u) / 8u,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)head_count + 7u) / 8u,
                                               (NSUInteger)n_tokens,
                                               1)
              threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
@@ -35539,7 +35761,7 @@ int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
         [enc setBuffer:ropecachebuf offset:ds4_gpu_tensor_offset(k_rope_cache) atIndex:4];
         [enc setBuffer:lorabuf offset:ds4_gpu_tensor_offset(lora_out) atIndex:5];
         [enc setThreadgroupMemoryLength:scratch_bytes atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)head_count + 7u) / 8u,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)head_count + 7u) / 8u,
                                               (NSUInteger)n_tokens,
                                               1)
              threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
@@ -35722,7 +35944,7 @@ int ds4_gpu_glm_router_select_tensor(
         [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:4];
         [enc setBuffer:probsbuf offset:ds4_gpu_tensor_offset(probs) atIndex:5];
         [enc setThreadgroupMemoryLength:256u * sizeof(float) + 256u * sizeof(int32_t) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -35806,7 +36028,7 @@ int ds4_gpu_glm_router_select_batch_tensor(
         [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:4];
         [enc setBuffer:probsbuf offset:ds4_gpu_tensor_offset(probs) atIndex:5];
         [enc setThreadgroupMemoryLength:256u * sizeof(float) + 256u * sizeof(int32_t) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -36399,7 +36621,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         if (pair_threadgroup_bytes != 0u) {
             [enc setThreadgroupMemoryLength:pair_threadgroup_bytes atIndex:0];
         }
-        [enc dispatchThreadgroups:MTLSizeMake(pair_x_groups,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(pair_x_groups,
                                               (NSUInteger)n_expert,
                                               1)
              threadsPerThreadgroup:MTLSizeMake(pair_threads, 1, 1)];
@@ -36500,7 +36722,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                 if (pair_threadgroup_bytes != 0u) {
                     [enc setThreadgroupMemoryLength:pair_threadgroup_bytes atIndex:0];
                 }
-                [enc dispatchThreadgroups:MTLSizeMake(pair_x_groups,
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(pair_x_groups,
                                                       (NSUInteger)n_expert,
                                                       1)
                      threadsPerThreadgroup:MTLSizeMake(pair_threads, 1, 1)];
@@ -36529,7 +36751,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         if (down_threadgroup_bytes != 0u) {
             [enc setThreadgroupMemoryLength:down_threadgroup_bytes atIndex:0];
         }
-        [enc dispatchThreadgroups:MTLSizeMake(down_x_groups, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(down_x_groups, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(down_threads, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         DS4_METAL_PROFILE_GLM_MOE_ONE_STAGE("down");
@@ -37635,7 +37857,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
         if (pair_threadgroup_bytes != 0u) {
             [enc setThreadgroupMemoryLength:pair_threadgroup_bytes atIndex:0];
         }
-        [enc dispatchThreadgroups:MTLSizeMake(pair_x_groups,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(pair_x_groups,
                                               (NSUInteger)n_expert,
                                               (NSUInteger)n_tokens)
              threadsPerThreadgroup:MTLSizeMake(pair_threads, 1, 1)];
@@ -37660,7 +37882,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
         if (down_threadgroup_bytes != 0u) {
             [enc setThreadgroupMemoryLength:down_threadgroup_bytes atIndex:0];
         }
-        [enc dispatchThreadgroups:MTLSizeMake(down_x_groups,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(down_x_groups,
                                               (NSUInteger)n_tokens,
                                               1)
              threadsPerThreadgroup:MTLSizeMake(down_threads, 1, 1)];
@@ -38006,6 +38228,25 @@ static bool ds4_gpu_mxfp4_moe_decode_nsg1_enabled(uint32_t n_tokens) {
            getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_NSG1") == NULL;
 }
 
+/* Four rows per thread for the routed down projection only; gate/up stays at
+ * two, where a12e73d measured widening as a regression (35.13 t/s) because the
+ * fused pair starts from half the rows and gives up occupancy headroom the
+ * down kernel does not need.
+ *
+ * The caller MUST set down_args.nr0 = 4 in the same branch that selects the r4
+ * pipeline. ds4_gpu_encode_mul_mv_id_sum6() derives row_groups from args->nr0
+ * while the kernel carries its own width, so a mismatch silently halves the
+ * grid and leaves the upper half of the projection unwritten -- the defect
+ * that forced d9eba30 to revert this work when main rewrote the kernel bodies.
+ *
+ * Bit-identical by construction: nr0 changes only which rows a thread owns,
+ * never the per-row block stride, the accumulation order, or the simd_sum
+ * tree. */
+static bool ds4_gpu_mxfp4_moe_decode_down_r4_enabled(void) {
+    return g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_r4 != nil &&
+           getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_DOWN_R4") == NULL;
+}
+
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -38039,6 +38280,13 @@ int ds4_gpu_routed_moe_one_tensor(
         __attribute__((cleanup(ds4_gpu_parallel_ffn_scope_cleanup))) =
             g_parallel_q8_pending;
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* Skip-ablation for attributing decode cost, DS4_TP_ABLATE=moe. Gated here
+     * rather than at a call site because the routed MoE has six of them and
+     * which one fires depends on tp_fold_ffn; the entry point covers all of
+     * them. Returns success without writing, so the consumer reads the
+     * previous token's routed output and the tokens are garbage - the point is
+     * the timing. Both ranks must set the same value. */
+    if (ds4_gpu_ablate_chain("moe")) return 1;
     /* TP sharding: only the owned contiguous expert range is mapped,
      * so bind from the owned base, validate only its bytes, and tell the
      * kernels the first expert id present at that base. */
@@ -38200,6 +38448,7 @@ int ds4_gpu_routed_moe_one_tensor(
         const bool down_rows_per_group_is_nr0 = ds4_gpu_routed_mv_rows_per_group_is_nr0(down_type);
         int pair_swiglu_nsg = 2;
         int down_sum6_nsg = 2;
+        bool down_sum6_r4 = false;
         int ok = 1;
         const bool write_clamped_moe =
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL;
@@ -38211,7 +38460,12 @@ int ds4_gpu_routed_moe_one_tensor(
             down_type == DS4_METAL_TENSOR_MXFP4 &&
             n_tokens == 1 &&
             n_expert == 6 &&
-            g_tp_split_world == 1 &&
+            /* No tp_world gate: this selects only the tg-multiple descriptor
+             * twins of the same functions, which carry no expert-range
+             * assumption. Every form layered on top of it -- fixed_route_pair,
+             * fixed_route_sum6, full_rows, static_trip -- keeps its own
+             * independent gate_args/down_args tp_world == 1 check, because
+             * those do bake in the full 0..255 expert range. */
             add_in == NULL &&
             !g_quality_mode &&
             !write_clamped_moe &&
@@ -38322,6 +38576,24 @@ int ds4_gpu_routed_moe_one_tensor(
                                 g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_tg_multiple :
                                 g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1));
                 down_sum6_nsg = 1;
+                /* Only the plain nsg1 pipeline has an r4 twin. Under tensor
+                 * parallelism that is the one selected anyway: tg_multiple and
+                 * every fixed_route form require g_tp_split_world == 1.
+                 *
+                 * Arm a flag rather than widening down_args here. down_args is
+                 * shared with the non-sum6 fallback below, which dispatches
+                 * down_mv_pipeline at the compile-time N_R0_MXFP4 of 2; a stray
+                 * nr0 = 4 reaching that call halves its grid and leaves the
+                 * upper half of the projection unwritten. */
+                if ((down_sum6_pipeline ==
+                         g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1 ||
+                     down_sum6_pipeline ==
+                         g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_tg_multiple) &&
+                    ds4_gpu_mxfp4_moe_decode_down_r4_enabled()) {
+                    down_sum6_pipeline =
+                        g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_r4;
+                    down_sum6_r4 = true;
+                }
             }
         } else if (down_type == DS4_METAL_TENSOR_IQ2_XXS &&
                    g_tp_split_world == 2) {
@@ -40523,6 +40795,9 @@ int ds4_gpu_routed_moe_one_tensor(
                                                        2);
             }
         } else if (ok && direct_down_sum) {
+            /* Widen only here, where the r4 pipeline is the one being encoded,
+             * so the grid and the kernel's row width can never disagree. */
+            if (down_sum6_r4) down_args.nr0 = 4;
             ok = ds4_gpu_encode_mul_mv_id_sum6(cb,
                                                  down_sum6_pipeline,
                                                  &down_args,
@@ -41963,7 +42238,7 @@ int ds4_gpu_hc_split_sinkhorn_tensor(
         [enc setBuffer:scalebuf offset:(NSUInteger)scale_inner atIndex:2];
         [enc setBuffer:basebuf offset:(NSUInteger)base_inner atIndex:3];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
-        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -42050,7 +42325,7 @@ static int ds4_gpu_hc_weighted_sum_strided(
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:1];
         [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) + (NSUInteger)weight_offset atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -42201,7 +42476,7 @@ int ds4_gpu_hc_split_weighted_sum_tensor(
         [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) atIndex:5];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:6];
         [enc setThreadgroupMemoryLength:(NSUInteger)n_hc * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows64, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows64, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -42346,7 +42621,7 @@ int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         [enc setBuffer:normwbuf offset:(NSUInteger)norm_inner atIndex:7];
         [enc setBuffer:normbuf offset:ds4_gpu_tensor_offset(norm_out) atIndex:8];
         [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows64, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows64, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -42440,7 +42715,7 @@ int ds4_gpu_hc_rms_norm_mix_f16_tensor(
         [enc setBuffer:wbuf offset:(NSUInteger)weight_inner atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
         [enc setThreadgroupMemoryLength:shared_floats * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:
+        [DS4_DISP(enc) dispatchThreadgroups:
              MTLSizeMake(use_cluster2 ? (out_dim + 3u) / 4u :
                                         (out_dim + 1u) / 2u,
                          1, 1)
@@ -42611,7 +42886,7 @@ int ds4_gpu_hc_rms_norm_mix_split_norm_f16_tensor(
         [enc setBuffer:normbuf offset:ds4_gpu_tensor_offset(norm_out) atIndex:10];
         [enc setBuffer:completion offset:0 atIndex:11];
         [enc setThreadgroupMemoryLength:shared_bytes atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(6, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(6, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 16, 1)];
 
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -42712,7 +42987,7 @@ int ds4_gpu_output_hc_weights_tensor(
             [enc setBuffer:scalebuf offset:(NSUInteger)scale_inner atIndex:2];
             [enc setBuffer:basebuf offset:(NSUInteger)base_inner atIndex:3];
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:4];
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(2, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -42762,7 +43037,7 @@ int ds4_gpu_output_hc_weights_tensor(
         [enc setBuffer:prebuf offset:ds4_gpu_tensor_offset(pre) atIndex:1];
         [enc setBuffer:scalebuf offset:(NSUInteger)scale_inner atIndex:2];
         [enc setBuffer:outbuf offset:out_offset atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)mul_args.ne01,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)mul_args.ne01,
                                               (NSUInteger)mul_args.ne02,
                                               (NSUInteger)mul_args.ne03)
              threadsPerThreadgroup:MTLSizeMake(mul_nth, 1, 1)];
@@ -42772,7 +43047,7 @@ int ds4_gpu_output_hc_weights_tensor(
         [enc setBuffer:outbuf offset:out_offset atIndex:1];
         [enc setBuffer:basebuf offset:(NSUInteger)base_inner atIndex:2];
         [enc setBuffer:outbuf offset:out_offset atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)add_args.ne01,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)add_args.ne01,
                                               (NSUInteger)add_args.ne02,
                                               (NSUInteger)add_args.ne03)
              threadsPerThreadgroup:MTLSizeMake(add_nth, 1, 1)];
@@ -42781,7 +43056,7 @@ int ds4_gpu_output_hc_weights_tensor(
         [enc setBytes:&sigmoid_args length:sizeof(sigmoid_args) atIndex:0];
         [enc setBuffer:outbuf offset:out_offset atIndex:1];
         [enc setBuffer:outbuf offset:out_offset atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(unary_nk0 * (NSUInteger)sigmoid_args.ne01,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(unary_nk0 * (NSUInteger)sigmoid_args.ne01,
                                               (NSUInteger)sigmoid_args.ne02,
                                               (NSUInteger)sigmoid_args.ne03)
              threadsPerThreadgroup:MTLSizeMake(unary_nth, 1, 1)];
@@ -42790,7 +43065,7 @@ int ds4_gpu_output_hc_weights_tensor(
         [enc setBytes:&scale_args length:sizeof(scale_args) atIndex:0];
         [enc setBuffer:outbuf offset:out_offset atIndex:1];
         [enc setBuffer:outbuf offset:out_offset atIndex:2];
-        [enc dispatchThreadgroups:MTLSizeMake(unary_nk0 * (NSUInteger)scale_args.ne01,
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(unary_nk0 * (NSUInteger)scale_args.ne01,
                                               (NSUInteger)scale_args.ne02,
                                               (NSUInteger)scale_args.ne03)
              threadsPerThreadgroup:MTLSizeMake(unary_nth, 1, 1)];
@@ -42902,7 +43177,7 @@ int ds4_gpu_hc_expand_tensor(
         [enc setBuffer:combbuf offset:ds4_gpu_tensor_offset(comb) atIndex:4];
         [enc setBuffer:blockbuf offset:ds4_gpu_tensor_offset(block_out) atIndex:5];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_hc) atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -43019,7 +43294,7 @@ int ds4_gpu_hc_expand_add_tensor(
         [enc setBuffer:combbuf offset:ds4_gpu_tensor_offset(comb) atIndex:4];
         [enc setBuffer:addbuf offset:ds4_gpu_tensor_offset(block_add) atIndex:5];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_hc) atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -43125,7 +43400,7 @@ int ds4_gpu_hc_expand_split_tensor(
         [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float) atIndex:4];
         [enc setBuffer:blockbuf offset:ds4_gpu_tensor_offset(block_out) atIndex:5];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_hc) atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -43246,7 +43521,7 @@ int ds4_gpu_hc_expand_add_split_tensor(
         [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float) atIndex:4];
         [enc setBuffer:addbuf offset:ds4_gpu_tensor_offset(block_add) atIndex:5];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_hc) atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_tg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
@@ -43377,7 +43652,7 @@ int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         [enc setBuffer:splitbuf offset:ds4_gpu_tensor_offset(split) + (NSUInteger)(2u * n_hc) * sizeof(float) atIndex:8];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_hc) atIndex:9];
         [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
                                               (NSUInteger)mv_dispatch.nr0,
                                               1,
                                               1)
@@ -43504,7 +43779,7 @@ int ds4_gpu_matmul_q8_0_hc_expand_tensor(
         [enc setBuffer:splitbuf offset:split_offset + (NSUInteger)(2u * n_hc) * sizeof(float) atIndex:7];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out_hc) atIndex:8];
         [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
                                               (NSUInteger)mv_dispatch.nr0,
                                               1,
                                               1)

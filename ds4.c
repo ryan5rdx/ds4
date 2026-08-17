@@ -432,6 +432,28 @@ static bool ds4_backend_supports_glm_streaming_full_layers(ds4_backend backend) 
  * per-layer graph path, so it showed up as 0.15 ms/token in __findenv_locked in
  * a symbolicated profile. The environment does not change under us, so memoize
  * on the name pointer - callers pass literals. */
+/* Ablation switches for attributing decode cost. Skipping a dispatch leaves
+ * the previous layer's data in place, so the output is garbage - the point is
+ * the timing, which is exact and needs no numerics argument. The stage
+ * profiler cannot do this job: its reported per-layer score time rose only
+ * 1.5% when the row count rose 22%, so it is measuring its own drain, not the
+ * kernel. Set DS4_METAL_ABLATE_INDEXER_SCORE / _TOPK and compare tokens/s. */
+static bool metal_graph_ablate_indexer(int which) {
+    static int initialized;
+    static int score_off, topk_off;
+    if (!initialized) {
+        score_off = getenv("DS4_METAL_ABLATE_INDEXER_SCORE") != NULL;
+        topk_off = getenv("DS4_METAL_ABLATE_INDEXER_TOPK") != NULL;
+        initialized = 1;
+        if (score_off || topk_off) {
+            fprintf(stderr,
+                    "ds4: indexer ablation active (score=%s topk=%s) - output is "
+                    "meaningless, timing only\n",
+                    score_off ? "SKIPPED" : "on", topk_off ? "SKIPPED" : "on");
+        }
+    }
+    return which == 0 ? score_off != 0 : topk_off != 0;
+}
 static bool glm_graph_env_present(const char *rocm_name, const char *metal_name) {
     enum { GLM_ENV_MEMO = 64 };
     static struct { const char *r, *m; bool present; } memo[GLM_ENV_MEMO];
@@ -21763,7 +21785,20 @@ static bool metal_graph_profile_router_selection(
 /* Diagnostic skip-ablation for TP profiling (DS4_TP_ABLATE=chain[,chain]):
  * drops whole encode chains so their true in-situ cost shows up as a t/s
  * delta.  Output is semantically wrong while enabled; both ranks must set
- * the same value.  Chains: hcpre, router, kv, compidx. */
+ * the same value.
+ *
+ * Chains here: hcpre, router, kv, qb, attnout, shared.  In ds4_metal.m via
+ * ds4_gpu_ablate_chain(), for stages whose call sites are too many or too
+ * conditional to gate individually: moe, attncore.
+ *
+ * compidx has no call site and never had one; it reports 0 ms because it is
+ * unimplemented, not because the chain is free.
+ *
+ * Caveat measured on this tree: any chain upstream of expert selection
+ * perturbs the routed MoE cost, because a stale top-6 unbalances the
+ * contiguous 128/128 shard.  The router arm removed 92 dispatches and still
+ * ran 0.574 ms slower, i.e. about 0.77 ms of added straggler.  Read deltas
+ * from small stages with that in mind. */
 static bool metal_graph_tp_ablate(const char *chain) {
     static const char *env = NULL;
     static int init = 0;
@@ -21931,6 +21966,13 @@ static bool metal_graph_encode_decode_layer_phase(
     const uint32_t tp_head0 = tp_split_attn ? g->tp_rank * tp_heads : 0;
 
     bool ok = true;
+#if defined(__APPLE__)
+    /* Calibration only, no-op unless DS4_METAL_DISPATCH_BALLAST is set. Placed
+     * at the head of the layer so the extra launches sit in the same command
+     * buffer and the same dependency position as the dispatches a fusion would
+     * remove. See ds4_gpu_decode_dispatch_ballast(). */
+    ds4_gpu_decode_dispatch_ballast();
+#endif
     const bool decode_stage_profile = metal_graph_decode_stage_profile_enabled(il);
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
     const bool fuse_shared_gate_up =
@@ -22505,7 +22547,10 @@ static bool metal_graph_encode_decode_layer_phase(
                                                    &tp_q_row_bytes);
     const uint64_t tp_q_rows_off =
         (uint64_t)tp_head0 * DS4_N_HEAD_DIM * tp_q_row_bytes;
-    if (ok) ok = metal_graph_matmul_dense_quant_abs(metal_graph_q(g),
+    /* DS4_TP_ABLATE=qb: the q_b projection, the single largest attention
+     * matvec at 8192 threadgroups. */
+    if (ok && !metal_graph_tp_ablate("qb"))
+        ok = metal_graph_matmul_dense_quant_abs(metal_graph_q(g),
                                                     model,
                                                     layer->attn_q_b,
                                                     layer->attn_q_b->abs_offset + tp_q_rows_off,
@@ -23011,7 +23056,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                     g->layer_n_index_comp[il],
                                                                     &decode_index_stage_t0);
                 }
-                if (ok) ok = ds4_gpu_indexer_score_one_tensor(metal_graph_indexer_scores(g),
+                if (ok && !metal_graph_ablate_indexer(0))
+                    ok = ds4_gpu_indexer_score_one_tensor(metal_graph_indexer_scores(g),
                                                                 metal_graph_indexer_q(g),
                                                                 metal_graph_indexer_weights(g),
                                                                 g->layer_index_comp_cache[il],
@@ -23027,7 +23073,8 @@ static bool metal_graph_encode_decode_layer_phase(
                                                                     g->layer_n_index_comp[il],
                                                                     &decode_index_stage_t0);
                 }
-                if (ok) ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
+                if (ok && !metal_graph_ablate_indexer(1))
+                    ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
                                                            metal_graph_indexer_scores(g),
                                                            g->layer_n_index_comp[il],
                                                            1,
@@ -23556,6 +23603,9 @@ static bool metal_graph_encode_decode_layer_phase(
          * output groups and the matching k-window of the expand projection,
          * leaving a partial block output in the gate slot. */
         const uint32_t tp_groups = n_groups / 2;
+        /* DS4_TP_ABLATE=attnout: the group-sliced, k-windowed output
+         * projection pair (attn_out_a + attn_out_b), 2560 threadgroups. */
+        if (metal_graph_tp_ablate("attnout")) ok = true; else
         ok = metal_graph_attention_output_dense_quant_tp(
                 g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN],
                 metal_graph_attn_low(g),
@@ -24828,7 +24878,12 @@ static bool metal_graph_encode_decode_layer_phase(
         if (!ok) {
             fprintf(stderr, "ds4: TP shared expert width %u is not sliceable\n", shared_dim);
         }
-        if (ok && layer->ffn_gate_shexp->type == DS4_TENSOR_Q8_0) {
+        /* DS4_TP_ABLATE=shared covers both halves of the shared expert: this
+         * lane-split gate/up and the k-sliced down below. Note this stage is
+         * already an intra-expert split (shared_tp_local = shared_dim / 2),
+         * the same decomposition proposed for the routed experts. */
+        if (ok && !metal_graph_tp_ablate("shared") &&
+            layer->ffn_gate_shexp->type == DS4_TENSOR_Q8_0) {
             ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(metal_graph_shared_gate(g),
                                                            metal_graph_shared_up(g),
                                                            metal_graph_shared_mid(g),
@@ -25017,6 +25072,8 @@ static bool metal_graph_encode_decode_layer_phase(
                     DS4_N_EMBD,
                     DS4_N_HC) != 0;
         }
+    } else if (ok && tp_split_shared && metal_graph_tp_ablate("shared")) {
+        /* paired with the gate/up skip above */
     } else if (ok && tp_split_shared) {
         ok = metal_graph_matmul_dense_quant_kslice(metal_graph_shared_out(g),
                                                    model,
@@ -26917,9 +26974,13 @@ static DS4_MAYBE_UNUSED bool metal_graph_decode_pipeline_fast_lookup_eligible(
         uint32_t             pos,
         bool                 allow_split_flush) {
 #if defined(__APPLE__)
+    /* The mirror key is the complete pipeline specialisation, which carries no
+     * rank-dependent state, so the cache is as valid under tensor parallelism
+     * as without it. Excluding tp_world > 1 only denied TP a host-side lookup
+     * cache on the order of 500 fetches per token. */
     if (!g || !weights || !allow_split_flush ||
         g->quality || g->ssd_streaming || g->ssd_streaming_cold ||
-        g->placement != NULL || g->tp_world > 1u || g->mtp_enabled ||
+        g->placement != NULL || g->mtp_enabled ||
         DS4_N_LAYER <= 4u) {
         return false;
     }
@@ -26998,10 +27059,15 @@ static uint32_t metal_graph_token_adaptive_second_split_after_layers(
         layer->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
         layer->ffn_up_exps->type == DS4_TENSOR_MXFP4 &&
         layer->ffn_down_exps->type == DS4_TENSOR_MXFP4;
+    /* No TP exclusion here. The flush site itself asks
+     * ds4_gpu_tp_split_safe() before acting on either split value and falls
+     * closed to one command buffer per TP token, so excluding tp_world == 2
+     * a second time only cost the second split its whole effect under tensor
+     * parallelism. */
     const bool eligible =
         allow_split_flush && pos < 3328u &&
         g && !g->quality && !g->ssd_streaming && !g->ssd_streaming_cold &&
-        g->tp_world != 2u && mxfp4_routed &&
+        mxfp4_routed &&
         ds4_gpu_device_is_pre_m5_apple_silicon();
     /* Once the raw SWA window is full, short eval prompts leave less GPU work
      * in the four-layer prefix while the host still has the same remaining
@@ -27564,6 +27630,7 @@ static bool metal_graph_encode_token_raw_swa(
             allow_split_flush);
 
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ds4_gpu_trace_tag_layer(il, "decode");
         ok = metal_graph_encode_decode_layer(g,
                                              model,
                                              &weights->layer[il],
@@ -27578,12 +27645,21 @@ static bool metal_graph_encode_token_raw_swa(
         g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
         g->after_ffn_hc_by_tier[g->active_tier] = tmp;
         if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
-        /* A TP gate uses one monotonic shared event for the whole token. A
-         * later command buffer may signal a higher value while the prefix is
-         * blocked at an earlier gate, making the transport consume a slab
-         * slot before its payload is ready. Keep each TP token in one command
-         * buffer; non-TP decode retains the encode/execute overlap. */
-        if (ok && allow_split_flush && g->tp_world != 2 &&
+        /* The seam falls on a layer boundary, so no gate straddles it: each
+         * gate's fence wait and the combine that consumes its slab slot are
+         * both inside metal_graph_encode_decode_layer.
+         *
+         * TP used to be excluded here because a gate signalled one monotonic
+         * shared event per token, so a command buffer running ahead could
+         * signal a sequence the prefix had not reached and the transport could
+         * consume a slab slot before its payload was ready. Per-slot arrival
+         * flags and per-slot release words removed that ambiguity - a gate
+         * publishes its own slot with its own value - so ask whether both
+         * directions are actually on the per-slot path rather than assuming
+         * they are not. Falls closed to one command buffer per TP token. */
+        if (ok && allow_split_flush &&
+            (g->tp_world != 2 ||
+             ds4_gpu_tp_split_safe((uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER)) &&
             ((split_after_layers != 0 && il + 1u == split_after_layers) ||
              (second_split_after_layers != 0 &&
               il + 1u == second_split_after_layers))) {
@@ -58482,6 +58558,10 @@ int ds4_engine_tp_vocab_split(ds4_engine *e) {
     return e && e->tp.active && e->tp.vocab_split;
 }
 
+int ds4_engine_tp_active(ds4_engine *e) {
+    return e && e->tp.active;
+}
+
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
 static int ds4_engine_tp_exchange(void *ud, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_tp *tp = ud;
@@ -62046,16 +62126,65 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
     /* Vocab-split head: merge the halves after every eval (DS4 only). */
     if (rc == 0 && s->engine && s->engine->tp.active && s->engine->tp.vocab_split) {
         const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
+        /* The vocabulary half rides the plain TCP control socket, not RDMA,
+         * and rank 0 blocks on the receive, so this sits on the per-token
+         * critical path. What matters is not the wire time but the EXPOSED
+         * cost: rank 1 sends once it has finished its half while rank 0 is
+         * still working on its own, so an overlap of unknown size hides part
+         * of it. Measure before optimising - a top-k plus (max, sumexp) merge
+         * would shrink the payload ~128x but changes the sampling path, whose
+         * failure mode is silently worse text rather than a visible break.
+         *
+         * DS4_TP_LOGITS_PROFILE=1. Off the critical path when unset: one
+         * memoized getenv, no clock reads. */
+        static int logits_profile = -1;
+        if (logits_profile < 0) {
+            logits_profile = getenv("DS4_TP_LOGITS_PROFILE") != NULL ? 1 : 0;
+        }
+        /* Diagnostic payload divisor, DS4_TP_LOGITS_PROBE_DIV=N. Separates the
+         * two things the recv timer cannot tell apart: wire time, which scales
+         * with bytes, and rank skew, which does not. Send returns once the
+         * kernel has buffered the frame, so the send timer bounds neither.
+         *
+         * Output is WRONG while this is set - rank 0 keeps stale logits above
+         * the transferred prefix - and both ranks must use the same value or
+         * the frame length check rejects. Timing probe only, like
+         * DS4_TP_ABLATE. */
+        static uint32_t logits_probe_div = 0u;
+        if (logits_probe_div == 0u) {
+            const char *div_env = getenv("DS4_TP_LOGITS_PROBE_DIV");
+            const long div_v = div_env ? strtol(div_env, NULL, 10) : 1;
+            logits_probe_div = (div_v >= 1 && div_v <= 4096) ? (uint32_t)div_v : 1u;
+        }
+        uint32_t logits_xfer = vhalf / logits_probe_div;
+        if (logits_xfer == 0u) logits_xfer = 1u;
+        const double logits_t0 = logits_profile ? now_sec() : 0.0;
         if (s->engine->tp.rank == 0) {
-            if (!ds4_tp_recv_logits_half(s->engine->tp.ctx, s->logits + vhalf, vhalf)) {
+            if (!ds4_tp_recv_logits_half(s->engine->tp.ctx, s->logits + vhalf, logits_xfer)) {
                 snprintf(err, errlen, "tp: worker logits half missing");
                 ds4_session_invalidate(s);
                 return 1;
             }
         } else {
-            if (!ds4_tp_send_logits_half(s->engine->tp.ctx, s->logits + vhalf, vhalf)) {
+            if (!ds4_tp_send_logits_half(s->engine->tp.ctx, s->logits + vhalf, logits_xfer)) {
                 snprintf(err, errlen, "tp: logits half send failed");
                 return 1;
+            }
+        }
+        if (logits_profile) {
+            static double logits_accum_ms;
+            static uint64_t logits_calls;
+            logits_accum_ms += (now_sec() - logits_t0) * 1000.0;
+            logits_calls++;
+            if ((logits_calls % 64u) == 0u) {
+                fprintf(stderr,
+                        "ds4: tp logits half %s accum %.1f ms over %llu tokens "
+                        "(%.3f ms each, %u bytes)\n",
+                        s->engine->tp.rank == 0 ? "recv" : "send",
+                        logits_accum_ms,
+                        (unsigned long long)logits_calls,
+                        logits_accum_ms / (double)logits_calls,
+                        (unsigned)((uint64_t)logits_xfer * sizeof(float)));
             }
         }
     }
@@ -67507,7 +67636,15 @@ void ds4_session_invalidate(ds4_session *s) {
     if (!s) return;
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
-        (void)ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id);
+        /* A dropped invalidate leaves the worker holding state the leader has
+         * thrown away, and the next sync then prefills different chunk counts
+         * on the two ranks. Rare with one resident session; routine once slots
+         * are evicted on every conversation switch. Fail the transport rather
+         * than diverge silently. */
+        if (!ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id)) {
+            fprintf(stderr, "ds4: tp: session invalidate send failed\n");
+            ds4_tp_mark_failed(s->engine->tp.ctx);
+        }
     }
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
@@ -67521,7 +67658,10 @@ void ds4_session_invalidate(ds4_session *s) {
 void ds4_session_rewind(ds4_session *s, int pos) {
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
-        (void)ds4_tp_send_rewind(s->engine->tp.ctx, s->tp_session_id, pos);
+        if (!ds4_tp_send_rewind(s->engine->tp.ctx, s->tp_session_id, pos)) {
+            fprintf(stderr, "ds4: tp: session rewind send failed\n");
+            ds4_tp_mark_failed(s->engine->tp.ctx);
+        }
     }
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;

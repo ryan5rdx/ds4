@@ -2,6 +2,7 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
+#include "ds4_tp.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -51,6 +52,7 @@ typedef struct {
     double step_mul;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
+    ds4_tp_options tp;
     bool warm_weights;
     bool quality;
     bool ssd_streaming;
@@ -234,6 +236,23 @@ static bench_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg,
+                                 &i,
+                                 argc,
+                                 argv,
+                                 &c.tp,
+                                 tp_parse_err,
+                                 sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-bench: %s\n",
+                    tp_parse_err[0] ? tp_parse_err : "invalid tensor-parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--prompt-file")) {
@@ -335,7 +354,21 @@ static bench_config parse_options(int argc, char **argv) {
         }
     }
 
-    if (!!c.prompt_path == !!c.chat_prompt_path) {
+    /* Resolve the role before validating, because a tensor-parallel worker is
+     * not subject to most of these checks. It never reads a prompt and adopts
+     * the leader's context size (ds4_tp_worker_run leaves identity.ctx_size at
+     * 0), returning from ds4_tp_worker_run() long before the prompt is
+     * tokenized. Validating it as though it were the coordinator made
+     * `ds4-bench --tensor-parallel --role worker` demand a --prompt-file and a
+     * --ctx-alloc greater than a --ctx-max it never uses. */
+    char tp_err[256];
+    if (!ds4_tp_adopt_distributed_options(&c.tp, &c.dist, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-bench: %s\n", tp_err);
+        exit(2);
+    }
+    const int tp_worker = c.tp.role == DS4_TP_WORKER;
+
+    if (!tp_worker && !!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
         exit(2);
     }
@@ -356,7 +389,7 @@ static bench_config parse_options(int argc, char **argv) {
         exit(2);
     }
     if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max + c.gen_tokens + 1;
-    if (c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
+    if (!tp_worker && c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
         fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
         exit(2);
     }
@@ -370,6 +403,18 @@ static bench_config parse_options(int argc, char **argv) {
         exit(2);
     }
     return c;
+}
+
+/* Leader-side tensor-parallel transport, torn down with the engine: stop the
+ * worker first, and free the transport only after ds4_engine_close() has shut
+ * the gate service thread down (it holds this pointer raw). */
+static ds4_tp *g_bench_tp;
+
+static void bench_engine_close(ds4_engine *engine) {
+    if (g_bench_tp) ds4_tp_send_stop(g_bench_tp);
+    ds4_engine_close(engine);
+    ds4_tp_free(g_bench_tp);
+    g_bench_tp = NULL;
 }
 
 static void json_write_string(FILE *fp, const char *s) {
@@ -594,10 +639,16 @@ int main(int argc, char **argv) {
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
+        .tp = cfg.tp,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-bench: %s\n", dist_err);
+        return 2;
+    }
+    char tp_err[256];
+    if (!ds4_tp_validate_engine_options(&opt, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-bench: %s\n", tp_err);
         return 2;
     }
     ds4_engine *engine = NULL;
@@ -616,6 +667,19 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &opt) != 0) {
         return 1;
     }
+    if (cfg.tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &cfg.tp);
+        ds4_engine_close(engine);
+        return rc;
+    }
+    if (cfg.tp.role == DS4_TP_LEADER &&
+        !ds4_tp_leader_bind(&g_bench_tp, engine, &cfg.tp, cfg.ctx_alloc,
+                            tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-bench: %s\n", tp_err);
+        ds4_engine_close(engine);
+        return 1;
+    }
+
     log_context_memory(opt.backend,
                        cfg.ctx_alloc,
                        ds4_engine_prefill_chunk(engine),
@@ -636,7 +700,7 @@ int main(int argc, char **argv) {
                 prompt.len,
                 cfg.ctx_max);
         ds4_tokens_free(&prompt);
-        ds4_engine_close(engine);
+        bench_engine_close(engine);
         return 1;
     }
 
@@ -644,7 +708,7 @@ int main(int argc, char **argv) {
     if (ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
         fprintf(stderr, "ds4-bench: failed to create session\n");
         ds4_tokens_free(&prompt);
-        ds4_engine_close(engine);
+        bench_engine_close(engine);
         return 1;
     }
     if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
@@ -652,7 +716,7 @@ int main(int argc, char **argv) {
     {
         ds4_session_free(session);
         ds4_tokens_free(&prompt);
-        ds4_engine_close(engine);
+        bench_engine_close(engine);
         return 1;
     }
     maybe_warn_distributed_step_shape(&cfg, session);
@@ -664,7 +728,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ds4-bench: failed to open %s: %s\n", cfg.csv_path, strerror(errno));
             ds4_session_free(session);
             ds4_tokens_free(&prompt);
-            ds4_engine_close(engine);
+            bench_engine_close(engine);
             return 1;
         }
     }
@@ -705,7 +769,11 @@ int main(int argc, char **argv) {
         const bool need_restore_after_generation =
             cfg.gen_tokens > 0 && frontier < cfg.ctx_max;
         bool have_snapshot = false;
+        /* ds4_session_save/load_snapshot round-trip the KV payload, which
+         * has no tensor-parallel branch: restoring would advance only the
+         * leader's checkpoint and deadlock the next sync. Replay instead. */
         if (need_restore_after_generation && !distributed &&
+            !ds4_engine_tp_active(engine) &&
             getenv("DS4_BENCH_DISABLE_SNAPSHOT") == NULL) {
             const uint64_t payload_bytes = ds4_session_payload_bytes(session);
             const bool large_snapshot_forced =
@@ -817,6 +885,6 @@ int main(int argc, char **argv) {
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);
     ds4_tokens_free(&prompt);
-    ds4_engine_close(engine);
+    bench_engine_close(engine);
     return rc;
 }

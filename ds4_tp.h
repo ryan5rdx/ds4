@@ -227,6 +227,20 @@ int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
 int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t full_accept, int32_t replay_n);
 int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *full_accept, int32_t *replay_n);
 
+/* Leader bring-up for frontends: derives the identity from the loaded engine,
+ * connects to the worker, and binds the engine to the transport. Call after
+ * the engine is open and before the first ds4_session_create(). On success
+ * *out owns the transport; tear down with ds4_tp_send_stop(), then
+ * ds4_engine_close(), then ds4_tp_free() (the gate service thread holds the
+ * raw pointer until the engine is closed). */
+int ds4_tp_leader_bind(
+        ds4_tp **out,
+        ds4_engine *engine,
+        const ds4_tp_options *opt,
+        int ctx_size,
+        char *err,
+        size_t errlen);
+
 /* Standalone worker mode entry. Loads nothing itself: the engine is already
  * open. */
 int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt);

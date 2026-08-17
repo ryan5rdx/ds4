@@ -2023,6 +2023,37 @@ static int tp_worker_send_logits(ds4_tp *tp, ds4_session *session,
            ds4_tp_send_logits_half(tp, logits + vhalf, vhalf);
 }
 
+int ds4_tp_leader_bind(ds4_tp **out, ds4_engine *engine,
+                       const ds4_tp_options *opt, int ctx_size,
+                       char *err, size_t errlen) {
+    if (out) *out = NULL;
+    if (!out || !engine || !opt) {
+        tp_set_err(err, errlen, "invalid tensor-parallel leader bind");
+        return 0;
+    }
+    ds4_tp_identity id = {
+        .gguf_bytes = ds4_engine_model_bytes(engine),
+        .model_id = (uint32_t)ds4_engine_model_id(engine),
+        .n_layer = (uint32_t)ds4_engine_layer_count(engine),
+        .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
+        .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
+        .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
+        .ctx_size = (uint32_t)ctx_size,
+    };
+    ds4_engine_tp_gate_schedule(engine,
+                                &id.gate_slot_start,
+                                &id.gate_slot_step,
+                                &id.gates_per_token);
+    ds4_tp *tp = NULL;
+    if (!ds4_tp_create(&tp, opt, &id, err, errlen)) return 0;
+    if (!ds4_engine_tp_bind(engine, tp, err, errlen)) {
+        ds4_tp_free(tp);
+        return 0;
+    }
+    *out = tp;
+    return 1;
+}
+
 int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
     char err[256] = "";
     ds4_tp_identity id = {

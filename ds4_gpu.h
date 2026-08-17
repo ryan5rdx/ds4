@@ -182,6 +182,10 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
 int ds4_gpu_device_is_m5_apple_silicon(void);
 int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
+/* Calibration only: emits DS4_METAL_DISPATCH_BALLAST extra one-thread
+ * dispatches so the marginal per-dispatch cost can be measured in situ rather
+ * than back-derived. No-op unless the variable is set. */
+void ds4_gpu_decode_dispatch_ballast(void);
 /* Strict test oracle for the fixed decode mul_mv pipeline lookup cache. */
 int ds4_gpu_test_decode_pipeline_fast_lookup(void);
 /* Strict test oracle for the extended decode mul_mv_ext (nsg + nxpsg) cache. */
@@ -478,6 +482,19 @@ int ds4_gpu_embed_tokens_quant_tensor(
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd);
+
+/* Trace annotation for Metal System Trace. All no-ops unless
+ * DS4_METAL_TRACE_LABELS is set: encoders get labelled with the current tag
+ * and hot stages get nested debug groups, so metal-gpu-intervals attributes a
+ * token per layer and per stage with no measurement overhead when off. */
+/* Non-zero when a decode token may be flushed mid-graph under tensor
+ * parallelism, i.e. both gate directions use per-slot words rather than the
+ * monotonic shared event. gate_slots is the total slot count the token will
+ * use. Fails closed. */
+int ds4_gpu_tp_split_safe(uint32_t gate_slots);
+
+void ds4_gpu_trace_tag(const char *tag);
+void ds4_gpu_trace_tag_layer(uint32_t layer, const char *stage);
 
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
