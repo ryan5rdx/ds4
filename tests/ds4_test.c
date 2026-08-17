@@ -11,6 +11,7 @@ bool ds4_test_dspark_history_flush_plan(void);
 bool ds4_test_dspark_pending_lifecycle(void);
 bool ds4_test_dspark_low_yield_backoff(void);
 bool ds4_test_dspark_prefill_capture_roll(void);
+bool ds4_test_hc_rms_scale_project_type_dispatch(void);
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -867,6 +868,10 @@ static void test_dspark_pending_lifecycle(void) {
 
 static void test_dspark_prefill_capture_roll(void) {
     TEST_ASSERT(ds4_test_dspark_prefill_capture_roll());
+}
+
+static void test_hc_rms_scale_project_type_dispatch(void) {
+    TEST_ASSERT(ds4_test_hc_rms_scale_project_type_dispatch());
 }
 
 static void test_metal_q8_0_decode_pair_exact_case(
@@ -4848,6 +4853,7 @@ static void test_metal_kernel_group(void) {
     test_dspark_cache_window_crop();
     test_dspark_pending_lifecycle();
     test_dspark_prefill_capture_roll();
+    test_hc_rms_scale_project_type_dispatch();
     test_metal_q8_0_decode_pair_exact();
 #if defined(__APPLE__)
     test_metal_q8_0_verify_head_rows_exact();

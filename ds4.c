@@ -28548,6 +28548,23 @@ static bool metal_graph_upload_prompt_embeddings_hc(
                                                        n_tokens);
 }
 
+static bool metal_graph_hc_rms_scale_project_f16_eligible(
+        const ds4_tensor *weight) {
+    /* Full-fat DSpark sidecars preserve HC projections as F32.  The fused
+     * kernel decodes its weight buffer as packed F16, so type—not merely the
+     * common HC shape—must gate this path. */
+    return weight && weight->type == DS4_TENSOR_F16;
+}
+
+bool ds4_test_hc_rms_scale_project_type_dispatch(void) {
+    ds4_tensor weight;
+    memset(&weight, 0, sizeof(weight));
+    weight.type = DS4_TENSOR_F16;
+    if (!metal_graph_hc_rms_scale_project_f16_eligible(&weight)) return false;
+    weight.type = DS4_TENSOR_F32;
+    return !metal_graph_hc_rms_scale_project_f16_eligible(&weight);
+}
+
 static bool metal_graph_hc_rms_scale_project(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_scratch,
@@ -28561,20 +28578,22 @@ static bool metal_graph_hc_rms_scale_project(
         return false;
     }
 #if defined(__APPLE__)
-    return ds4_gpu_hc_rms_scale_project_f16_tensor(
-               out,
-               norm_scratch,
-               model->map,
-               model->size,
-               weight->abs_offset,
-               (uint32_t)in_dim,
-               2u * DS4_N_HC + DS4_N_HC * DS4_N_HC,
-               x,
-               n_tokens,
-               DS4_RMS_EPS) != 0;
+    if (metal_graph_hc_rms_scale_project_f16_eligible(weight)) {
+        return ds4_gpu_hc_rms_scale_project_f16_tensor(
+                   out,
+                   norm_scratch,
+                   model->map,
+                   model->size,
+                   weight->abs_offset,
+                   (uint32_t)in_dim,
+                   2u * DS4_N_HC + DS4_N_HC * DS4_N_HC,
+                   x,
+                   n_tokens,
+                   DS4_RMS_EPS) != 0;
+    }
 #else
 #if !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
-    if (weight->type == DS4_TENSOR_F16 &&
+    if (metal_graph_hc_rms_scale_project_f16_eligible(weight) &&
         ds4_gpu_matmul_f16_rms_fold_tensor(
             out,
             model->map,
@@ -28588,6 +28607,7 @@ static bool metal_graph_hc_rms_scale_project(
         return true;
     }
 #endif
+#endif
     bool ok = ds4_gpu_rms_norm_plain_rows_tensor(
                   norm_scratch,
                   x,
@@ -28595,18 +28615,16 @@ static bool metal_graph_hc_rms_scale_project(
                   n_tokens,
                   DS4_RMS_EPS) != 0;
     if (ok) {
-        ok = ds4_gpu_matmul_f16_tensor(
+        ok = metal_graph_matmul_plain_tensor(
                  out,
-                 model->map,
-                 model->size,
-                 weight->abs_offset,
+                 model,
+                 weight,
                  in_dim,
                  2u * DS4_N_HC + DS4_N_HC * DS4_N_HC,
                  norm_scratch,
-                 n_tokens) != 0;
+                 n_tokens);
     }
     return ok;
-#endif
 }
 
 static bool metal_graph_warmup_prefill_kernels(
