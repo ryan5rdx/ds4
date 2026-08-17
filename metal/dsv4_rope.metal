@@ -600,9 +600,17 @@ kernel void kernel_flash_attn_ext_vec_reduce_rope(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    ds4_flash_attn_vec_reduce_row(args, htmp, dst, tgpig, tiisg, sgitg,
-                                  (short)FC_flash_attn_ext_vec_reduce_NWG,
-                                  (short)FC_flash_attn_ext_vec_reduce_DV);
+    if (FC_flash_attn_ext_vec_reduce_NWG == 32) {
+        ds4_flash_attn_vec_reduce_row_legacy(
+            args, htmp, dst, tgpig, tiisg, sgitg,
+            (short)FC_flash_attn_ext_vec_reduce_NWG,
+            (short)FC_flash_attn_ext_vec_reduce_DV);
+    } else {
+        ds4_flash_attn_vec_reduce_row_compact(
+            args, htmp, dst, tgpig, tiisg, sgitg,
+            (short)FC_flash_attn_ext_vec_reduce_NWG,
+            (short)FC_flash_attn_ext_vec_reduce_DV);
+    }
 
     threadgroup_barrier(mem_flags::mem_device);
 

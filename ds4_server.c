@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_tp.h"
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -8420,6 +8421,9 @@ typedef struct {
 struct server_slot {
     server *srv;
     int id;
+    /* Monotonic stamp of the last job routed here, for LRU eviction when more
+     * conversations are live than there are resident slots. */
+    uint64_t last_used;
     ds4_session *session;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
@@ -8446,6 +8450,7 @@ struct server {
     ds4_engine *engine;
     server_slot *slots;
     int slot_count;
+    uint64_t slot_clock;   /* monotonic, stamps server_slot.last_used */
     int ctx_size;
     bool batched_mode;
     pthread_t *slot_threads;
@@ -12399,13 +12404,40 @@ static int job_required_slot_locked(server *s, const job *j) {
     return -1;
 }
 
+/* Highest score wins. Three bands, because a raw common-prefix count
+ * conflates two very different situations: a slot already holding this
+ * conversation, and a slot that merely shares the system preamble. Scoring the
+ * latter above an idle slot made a new request evict a live 54k session while
+ * empty slots sat unused.
+ *
+ *   INT_MAX          the job is pinned to this slot
+ *   MATCH + common   enough shared prefix to be worth continuing here
+ *   EMPTY            nothing resident, so nothing to lose
+ *   -last_used       otherwise evict, least recently used first
+ */
+enum {
+    SLOT_BAND_MATCH = 1 << 30,
+    SLOT_BAND_EMPTY = 1 << 29,
+};
+
 static int job_slot_score(server *s, server_slot *slot, const job *j,
                           int required_slot) {
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
     if (required_slot >= 0 && slot->id != required_slot) return INT_MIN;
     if (required_slot == slot->id) return INT_MAX;
-    int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    return common;
+
+    const int live = ds4_session_pos(slot->session);
+    if (live <= 0) return SLOT_BAND_EMPTY;
+
+    const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
+    /* An eighth of the prompt separates "this conversation" from "the same
+     * tools and system block". A short follow-up to an existing conversation
+     * still clears it; a fresh 62k prompt sharing a 257-token preamble does not. */
+    if (common > 0 && (int64_t)common * 8 >= (int64_t)j->req.prompt.len) {
+        const int capped = common < SLOT_BAND_EMPTY ? common : SLOT_BAND_EMPTY - 1;
+        return SLOT_BAND_MATCH + capped;
+    }
+    return -(int)(slot->last_used & 0x3FFFFFFFu);
 }
 
 static void dispatch_jobs_locked(server *s) {
@@ -12484,12 +12516,34 @@ static job *dequeue(server *s) {
     return j;
 }
 
+/* Route a job to the warmest slot. Serialized mode has one worker, so no slot
+ * is ever busy here and every slot is a candidate; the scorer decides between
+ * continuing a conversation, taking an idle slot, and evicting the least
+ * recently used one. */
+static server_slot *worker_pick_slot(server *s, job *j) {
+    if (s->slot_count <= 1) return &s->slots[0];
+    pthread_mutex_lock(&s->tool_mu);
+    const int required = job_required_slot_locked(s, j);
+    server_slot *best = &s->slots[0];
+    int best_score = INT_MIN;
+    for (int i = 0; i < s->slot_count; i++) {
+        const int score = job_slot_score(s, &s->slots[i], j, required);
+        if (score > best_score) {
+            best_score = score;
+            best = &s->slots[i];
+        }
+    }
+    best->last_used = ++s->slot_clock;
+    pthread_mutex_unlock(&s->tool_mu);
+    return best;
+}
+
 static void *worker_main(void *arg) {
     server *s = arg;
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
-        generate_job(s, &s->slots[0], j);
+        generate_job(s, worker_pick_slot(s, j), j);
         job_complete(j);
     }
     return NULL;
@@ -12948,6 +13002,7 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
     int batched_sessions;
+    int resident_sessions;
     int mixed_prefill_quantum;
 } server_config;
 
@@ -13014,6 +13069,10 @@ static void log_context_memory(ds4_backend backend, int ctx_size,
                        (1024.0 * 1024.0 * 1024.0));
     }
 }
+/* Leader-side tensor-parallel transport. File scope so every exit path in
+ * main() tears it down through server_close_resources(). */
+static ds4_tp *g_tp_leader;
+
 static void server_close_resources(server *s) {
     if (s->trace) {
         fclose(s->trace);
@@ -13039,7 +13098,15 @@ static void server_close_resources(server *s) {
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
+    /* Only now: ds4_session_free() above mirrors a destroy frame and blocks on
+     * the worker's ack, and ds4_tp_send_stop() does not mark the transport
+     * failed, so stopping first would leave every shutdown waiting on a worker
+     * that has already left its command loop. Free after ds4_engine_close(),
+     * which is what shuts the gate service thread holding this pointer down. */
+    if (g_tp_leader) ds4_tp_send_stop(g_tp_leader);
     ds4_engine_close(s->engine);
+    ds4_tp_free(g_tp_leader);
+    g_tp_leader = NULL;
     memset(s, 0, sizeof(*s));
 }
 
@@ -13117,6 +13184,23 @@ static server_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg,
+                                 &i,
+                                 argc,
+                                 argv,
+                                 &c.engine.tp,
+                                 tp_parse_err,
+                                 sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: %s",
+                       tp_parse_err[0] ? tp_parse_err : "invalid tensor-parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
@@ -13158,6 +13242,8 @@ static server_config parse_options(int argc, char **argv) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--resident-sessions")) {
+            c.resident_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
@@ -13276,6 +13362,12 @@ static server_config parse_options(int argc, char **argv) {
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }
+    char tp_err[256];
+    if (!ds4_tp_adopt_distributed_options(&c.engine.tp, &c.engine.distributed,
+                                          tp_err, sizeof(tp_err))) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
@@ -13283,6 +13375,25 @@ static server_config parse_options(int argc, char **argv) {
                                         sizeof(dist_err)) != 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: %s", dist_err);
         exit(2);
+    }
+    if (!ds4_tp_validate_engine_options(&c.engine, tp_err, sizeof(tp_err))) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
+        exit(2);
+    }
+    if (c.engine.tp.role != DS4_TP_NONE) {
+        /* Batched decode under TP emits one gate stream per row and would
+         * overrun the gate queue past ~11 rows; the mirrored control socket
+         * is only serialized because non-batched mode has one inference
+         * thread. Both are Phase 2 work. */
+        if (c.batched_sessions > 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: --batched-session is not supported with "
+                       "--tensor-parallel yet");
+            exit(2);
+        }
+        /* --kv-disk-dir stays available: storing only reads local KV. The
+         * restore side is skipped in kv_cache_try_load_text() because
+         * ds4_session_load_payload() is not mirrored to the worker. */
     }
     return c;
 }
@@ -13323,8 +13434,10 @@ int main(int argc, char **argv) {
     cfg.engine.context_size = cfg.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.ctx_size;
     cfg.engine.placement_session_count_hint =
-        cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
-    cfg.engine.share_session_prefill_workspace = cfg.batched_sessions > 0;
+        cfg.batched_sessions > 0 ? cfg.batched_sessions :
+        cfg.resident_sessions > 0 ? cfg.resident_sessions : 1;
+    cfg.engine.share_session_prefill_workspace =
+        cfg.batched_sessions > 0 || cfg.resident_sessions > 0;
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = {0};
@@ -13356,6 +13469,12 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    if (cfg.engine.tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
+        ds4_engine_close(engine);
+        return rc;
+    }
+
     if (cfg.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options gen = {
             .ctx_size = cfg.ctx_size,
@@ -13365,7 +13484,23 @@ int main(int argc, char **argv) {
         return rc;
     }
 
-    const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
+    if (cfg.engine.tp.role == DS4_TP_LEADER) {
+        char tp_err[256] = "";
+        if (!ds4_tp_leader_bind(&g_tp_leader, engine, &cfg.engine.tp,
+                                cfg.ctx_size, tp_err, sizeof(tp_err))) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: %s", tp_err);
+            ds4_engine_close(engine);
+            return 1;
+        }
+    }
+
+    /* Resident slots and batched decode are separate concerns. Batched mode
+     * pushes several rows through one decode step and is refused under TP;
+     * resident slots merely keep N conversations warm and still serialize
+     * every request through inference_mu, so they are TP-legal. */
+    const int slot_count =
+        cfg.batched_sessions > 0 ? cfg.batched_sessions :
+        cfg.resident_sessions > 0 ? cfg.resident_sessions : 1;
     log_context_memory(cfg.engine.backend,
                        cfg.ctx_size,
                        ds4_engine_prefill_chunk(engine),
@@ -13418,8 +13553,24 @@ int main(int argc, char **argv) {
     }
 
     if (cfg.kv_disk_dir) {
-        kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
-                      cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        /* Restoring a payload is not mirrored to a tensor-parallel worker
+         * (ds4_session_load_payload branches on s->distributed only), so the
+         * leader's checkpoint would jump ahead of the worker's and the next
+         * sync would deadlock both ranks. Storing without restoring is not a
+         * partial benefit: the evict-time store at the miss path exists purely
+         * to protect the load that follows it, so leaving it on would write the
+         * payload synchronously on every miss and then re-prefill anyway -
+         * strictly worse than no cache. Warm reuse under TP needs a mirrored
+         * load frame alongside SYNC/EVAL. */
+        if (ds4_engine_tp_active(engine)) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: --kv-disk-dir is ignored under "
+                       "--tensor-parallel (restore is not mirrored to the "
+                       "worker; storing alone would only add cost)");
+        } else {
+            kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
+                          cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        }
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,

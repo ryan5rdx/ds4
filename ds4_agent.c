@@ -3,6 +3,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
+#include "ds4_tp.h"
 #include "ds4_web.h"
 #include "linenoise.h"
 
@@ -605,6 +606,23 @@ static agent_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg,
+                                 &i,
+                                 argc,
+                                 argv,
+                                 &c.engine.tp,
+                                 tp_parse_err,
+                                 sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-agent: %s\n",
+                    tp_parse_err[0] ? tp_parse_err : "invalid tensor-parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-p") || !strcmp(arg, "--prompt")) {
             c.gen.prompt = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--non-interactive")) {
@@ -746,12 +764,22 @@ static agent_config parse_options(int argc, char **argv) {
 
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
+    char tp_err[256];
+    if (!ds4_tp_adopt_distributed_options(&c.engine.tp, &c.engine.distributed,
+                                          tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-agent: %s\n", tp_err);
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.engine.distributed,
                                         &c.engine,
                                         dist_err,
                                         sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-agent: %s\n", dist_err);
+        exit(2);
+    }
+    if (!ds4_tp_validate_engine_options(&c.engine, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-agent: %s\n", tp_err);
         exit(2);
     }
     if (c.engine.distributed.role == DS4_DISTRIBUTED_WORKER) {
@@ -3957,6 +3985,15 @@ static bool worker_cancel_session_cb(void *ud) {
     return worker_should_interrupt(ud);
 }
 
+/* Mid-prefill cancellation is not mirrored to a tensor-parallel worker: the
+ * leader aborts between chunks while the worker keeps waiting for chunks that
+ * never arrive, and both ranks then block forever in untimed reads. Under TP
+ * we simply do not arm it, so Ctrl-C acts between whole operations instead. */
+static void worker_arm_session_cancel(agent_worker *w) {
+    if (ds4_engine_tp_active(w->engine)) return;
+    ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
+}
+
 typedef struct {
     char *ptr;
     size_t len;
@@ -4264,8 +4301,16 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
         }
     }
 
+    /* ds4_session_load_payload() has no tensor-parallel branch: restoring it
+     * advances only the leader's checkpoint, so the next mirrored sync makes
+     * the two ranks prefill different chunk counts and both block forever in
+     * untimed reads. The rendered text is still valid, so replay it instead.
+     * Guarded here rather than at the call sites so every caller is covered. */
+    const bool use_payload =
+        hdr.payload_bytes != 0 && !ds4_engine_tp_active(w->engine);
+
     char load_err[160] = {0};
-    if (ok && hdr.payload_bytes == 0) {
+    if (ok && !use_payload) {
         ds4_tokens rebuilt = {0};
         ds4_tokenize_rendered_chat(w->engine, text, &rebuilt);
         expected_tokens = (uint32_t)rebuilt.len;
@@ -4625,7 +4670,7 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
     ds4_session_set_display_progress(w->session,
                                      publish_progress ? worker_progress_cb : NULL,
                                      publish_progress ? w : NULL);
-    ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
+    worker_arm_session_cancel(w);
     double t_sync0 = now_sec();
     int rc = ds4_session_sync(w->session, tokens, err, err_len);
     double t_sync1 = now_sec();
@@ -8265,7 +8310,7 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
 
     ds4_session_set_progress(w->session, worker_progress_cb, w);
     ds4_session_set_display_progress(w->session, worker_progress_cb, w);
-    ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
+    worker_arm_session_cancel(w);
     int sync_rc = ds4_session_sync(w->session, &prompt, err, err_len);
     ds4_session_set_cancel(w->session, NULL, NULL);
     ds4_session_set_progress(w->session, NULL, NULL);
@@ -8620,7 +8665,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         char err[160];
         ds4_session_set_progress(w->session, worker_progress_cb, w);
         ds4_session_set_display_progress(w->session, worker_progress_cb, w);
-        ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
+        worker_arm_session_cancel(w);
         double t_sync0 = now_sec();
         int sync_rc = ds4_session_sync(w->session, prompt_for_sync, err, sizeof(err));
         double t_sync1 = now_sec();
@@ -10480,7 +10525,12 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
         .cancel_privdata = w,
     };
     w->web = ds4_web_create(&web_cfg);
-    w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
+    /* ds4_session_load_payload() has no tensor-parallel branch, so restoring
+     * a cached KV payload advances only the leader's checkpoint; the next
+     * sync then prefills different chunk counts on the two ranks and both
+     * block forever. Under TP, replay the system prompt instead of caching. */
+    w->sysprompt_path = ds4_engine_tp_active(engine) ?
+        NULL : ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
         if (!w->trace) {
@@ -11288,6 +11338,22 @@ int main(int argc, char **argv) {
     }
     agent_apply_model_sampling_defaults(engine, &cfg.gen);
 
+    if (cfg.engine.tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &cfg.engine.tp);
+        ds4_engine_close(engine);
+        return rc;
+    }
+    ds4_tp *tp_leader = NULL;
+    if (cfg.engine.tp.role == DS4_TP_LEADER) {
+        char tp_err[256] = "";
+        if (!ds4_tp_leader_bind(&tp_leader, engine, &cfg.engine.tp,
+                                cfg.gen.ctx_size, tp_err, sizeof(tp_err))) {
+            fprintf(stderr, "ds4-agent: %s\n", tp_err);
+            ds4_engine_close(engine);
+            return 1;
+        }
+    }
+
     struct sigaction old_int;
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
@@ -11301,7 +11367,9 @@ int main(int argc, char **argv) {
         run_agent(engine, &cfg);
 
     if (sigint_installed) sigaction(SIGINT, &old_int, NULL);
+    if (tp_leader) ds4_tp_send_stop(tp_leader);
     ds4_engine_close(engine);
+    ds4_tp_free(tp_leader);
     return rc;
 }
 #endif
