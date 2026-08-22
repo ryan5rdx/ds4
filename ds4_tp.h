@@ -104,6 +104,14 @@ uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
 
+/* Hold/release the control-plane lock across a whole (send command -> wait
+ * ack) round trip so at most one command is in flight per rank and each
+ * COMMAND_ACK is consumed by the waiter that sent it.  Safe to hold across
+ * GPU encode (gate exchanges run on the service thread over data_fd/RDMA and
+ * never take this lock).  Recursive. */
+void ds4_tp_control_lock(ds4_tp *tp);
+void ds4_tp_control_unlock(ds4_tp *tp);
+
 /* Gate slab.  The engine allocates one shared GPU-visible block and hands
  * its base VA here; ds4_tp registers it with the NIC (RDMA) and exchanges
  * remote keys.  Layout, all offsets from base, S = n_layer * 2 slots:

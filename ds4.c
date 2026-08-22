@@ -64576,12 +64576,14 @@ static int ds4_sessions_eval_batch_metal(
         char *err,
         size_t errlen) {
     const bool mirror = e->tp.active && e->tp.rank == 0;
+    if (mirror) ds4_tp_control_lock(e->tp.ctx);
     if (mirror) {
         ds4_tp_batch_item *wire = ds4_sessions_tp_batch_items(items, count);
         const bool sent = wire &&
             ds4_tp_send_eval_batch(e->tp.ctx, wire, (uint32_t)count);
         free(wire);
         if (!sent) {
+            ds4_tp_control_unlock(e->tp.ctx);
             if (err && errlen) snprintf(err, errlen,
                                         "tp: worker decode batch send failed");
             for (int i = 0; i < count; i++) {
@@ -64652,6 +64654,7 @@ static int ds4_sessions_eval_batch_metal(
              ds4_sessions_tp_recv_logits(e, NULL, items, count,
                                           err, errlen);
     }
+    if (mirror) ds4_tp_control_unlock(e->tp.ctx);
     if (!ok) {
         for (int i = 0; i < count; i++) {
             ds4_session_invalidate(items[i].session);
@@ -64753,6 +64756,7 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const bool mirror = e->tp.active && e->tp.rank == 0;
 
+    if (mirror) ds4_tp_control_lock(e->tp.ctx);
     if (mirror) {
         ds4_tp_batch_item *wire = ds4_sessions_tp_batch_items(items, count);
         const bool sent = wire &&
@@ -64763,6 +64767,7 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
                 wire, (uint32_t)count);
         free(wire);
         if (!sent) {
+            ds4_tp_control_unlock(e->tp.ctx);
             if (err && errlen) snprintf(err, errlen,
                                         "tp: worker mixed batch send failed");
             ds4_session_invalidate(prefill_session);
@@ -64891,6 +64896,7 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
              ds4_sessions_tp_recv_logits(
                  e, prefill_session, items, count, err, errlen);
     }
+    if (mirror) ds4_tp_control_unlock(e->tp.ctx);
     if (!ok) {
         ds4_session_invalidate(prefill_session);
         for (int i = 0; i < count; i++) {

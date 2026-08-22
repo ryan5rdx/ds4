@@ -13382,15 +13382,27 @@ static server_config parse_options(int argc, char **argv) {
         exit(2);
     }
     if (c.engine.tp.role != DS4_TP_NONE) {
-        /* Batched decode under TP emits one gate stream per row and would
-         * overrun the gate queue past ~11 rows; the mirrored control socket
-         * is only serialized because non-batched mode has one inference
-         * thread. Both are Phase 2 work. */
+        /* Batched decode under TP mirrors the whole batch to the worker once
+         * per decode step.  Each row fires 86 gates (43 layers x ATTN+FFN)
+         * into the shared 4096-deep gate queue, so the theoretical ceiling
+         * is ~47 rows; the queue's preflight aborts the step rather than
+         * corrupting past that.  We cap at 32 for comfortable headroom and
+         * keep the preflight as a runtime fail-safe.  The mirrored control
+         * socket stays serialized because every request runs under
+         * inference_mu and the per-rank control lock. */
         if (c.batched_sessions > 0) {
+            if (c.batched_sessions > 32) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --batched-session %d exceeds the TP "
+                           "gate-queue ceiling of 32 rows (86 gates/row into "
+                           "a 4096-deep queue); reduce N",
+                           c.batched_sessions);
+                exit(2);
+            }
             server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: --batched-session is not supported with "
-                       "--tensor-parallel yet");
-            exit(2);
+                       "ds4-server: TP batched decode enabled "
+                       "(batched_sessions=%d, gate-queue ceiling 32 rows)",
+                       c.batched_sessions);
         }
         /* --kv-disk-dir stays available: storing only reads local KV. The
          * restore side is skipped in kv_cache_try_load_text() because
