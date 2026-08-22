@@ -138,6 +138,8 @@ int main(void) {
         }
         opt.tp.listen_port = tp_port;
         opt.tp.transport = tp_transport_from_env();
+        const char *rdma_dev = getenv("DS4_TEST_TP_RDMA_DEVICE");
+        if (rdma_dev && rdma_dev[0]) opt.tp.rdma_device = rdma_dev;
     } else if (tp_worker) {
         opt.tp.role = DS4_TP_WORKER;
         opt.tp.leader_host = getenv("DS4_TEST_TP_LEADER_HOST");
@@ -147,6 +149,8 @@ int main(void) {
         }
         opt.tp.leader_port = tp_port;
         opt.tp.transport = tp_transport_from_env();
+        const char *rdma_dev = getenv("DS4_TEST_TP_RDMA_DEVICE");
+        if (rdma_dev && rdma_dev[0]) opt.tp.rdma_device = rdma_dev;
     }
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &opt) != 0) fail("engine open", -1, -1);
