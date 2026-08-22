@@ -10391,7 +10391,15 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     const bool fast_release =
         g_tp_fast_sync && g_tp_release_words != NULL &&
         gate_slot < DS4_TP_FENCE_SLOTS;
-    const bool event_arrival = g_tp_session_batch_mode || !g_tp_flag_gates;
+    /* Under the fast release fence the command processor spins inside
+     * kernel_dsv4_tp_fence_wait and never publishes the shared-event signal
+     * to the host, so event arrival would strand the service thread and the
+     * gate would never be released.  Flag arrival (system-scope coherent
+     * store) stays CPU-visible during the spin, so when the fence is active
+     * we must use it regardless of session-batch mode.  Non-fast paths are
+     * unchanged. */
+    const bool event_arrival = !g_tp_flag_gates ||
+                               (g_tp_session_batch_mode && !g_tp_fast_sync);
     const uint32_t value = ds4_gpu_tp_fence_value(seq);
     if (!event_arrival) {
         /* Publish arrival through the slab word; the buffer hazard against
@@ -10466,7 +10474,11 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
     const bool fast_release =
         g_tp_fast_batch_sync && g_tp_release_words != NULL &&
         gate_slot < DS4_TP_FENCE_SLOTS;
-    const bool event_arrival = g_tp_session_batch_mode || !g_tp_flag_gates;
+    /* Same constraint as the row gate: the fast release fence requires flag
+     * arrival because the host cannot observe the shared-event signal while
+     * the command processor is spinning in the fence kernel. */
+    const bool event_arrival = !g_tp_flag_gates ||
+                               (g_tp_session_batch_mode && !g_tp_fast_batch_sync);
     const uint32_t value = ds4_gpu_tp_fence_value(seq);
     if (!event_arrival) {
         int owned = 0;
