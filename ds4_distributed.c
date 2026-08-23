@@ -232,9 +232,12 @@ typedef struct ds4_dist_worker_entry {
     uint32_t n_layers;
     uint32_t listen_port;
     uint32_t features;
-    /* Connected RDMA QP for this worker (transport==rdma), awaiting wrap into
-     * route_entry[0].chan by the route plan; NULL once wrapped or for TCP. */
-    ds4_dist_rdma_conn *rdma_conn;
+    /* Persistent RDMA channel for this worker (transport==rdma), created once
+     * at registration and borrowed (not owned) by each route plan so the QP
+     * pair outlives any single generation. NULL for TCP. Torn down once when
+     * the worker is removed / the coordinator shuts down, mirroring the TP
+     * transport's single process-lifetime connection. */
+    ds4_dist_dchan *rdma_chan;
     struct ds4_dist_worker_entry *next;
 } ds4_dist_worker_entry;
 
@@ -410,6 +413,12 @@ typedef struct {
     uint32_t flags;
     uint32_t features;
     ds4_dist_dchan *chan;
+    /* True when chan is borrowed from a persistent worker-entry channel (RDMA)
+     * rather than owned by this plan. Owned channels (TCP dup'd fd, forwarder
+     * QP) are closed by dist_route_plan_free; borrowed ones must survive the
+     * plan so the RDMA connection persists across generations, mirroring the
+     * TP transport's single process-lifetime connection. */
+    bool chan_borrowed;
 } ds4_dist_route_entry;
 
 typedef struct {
@@ -2203,6 +2212,13 @@ static void dist_worker_entry_free_conn(ds4_dist_rdma_conn *conn) {
     if (conn) ds4_dist_rdma_conn_destroy(conn);
 }
 
+/* Close the worker's persistent RDMA channel (owns the QP pair). Used at worker
+ * removal / coordinator shutdown so the connection is torn down exactly once,
+ * mirroring TP's single process-lifetime connection. */
+static void dist_worker_entry_free_chan(ds4_dist_dchan *chan) {
+    if (chan) ds4_dist_dchan_close(chan);
+}
+
 static void dist_coordinator_report_plan(ds4_dist_coordinator_state *state);
 
 static bool dist_coordinator_debug_enabled(const ds4_dist_coordinator_state *state) {
@@ -2237,8 +2253,19 @@ static void dist_coordinator_add_worker(
         return;
     }
 
+    /* Wrap the handshake QP pair into the worker's persistent channel once, at
+     * registration, so it survives every route plan. Ownership of rdma_conn
+     * moves into the channel (destroyed by ds4_dist_dchan_close); NULL for TCP. */
+    entry->rdma_chan = rdma_conn ? ds4_dist_dchan_from_rdma_conn(rdma_conn, fd) : NULL;
+    if (rdma_conn && !entry->rdma_chan) {
+        /* ds4_dist_dchan_from_rdma_conn destroys rdma_conn on failure; nothing
+         * left to free here. */
+        DIST_COORD_DEBUG(state, "ds4: distributed coordinator: failed to wrap worker RDMA channel\n");
+        free(entry);
+        return;
+    }
+
     entry->fd = fd;
-    entry->rdma_conn = rdma_conn;
     snprintf(entry->peer_host, sizeof(entry->peer_host), "%s", peer_host);
     snprintf(entry->peer_port, sizeof(entry->peer_port), "%s", peer_port);
     snprintf(entry->model_name, sizeof(entry->model_name), "%s", model_name ? model_name : "unknown");
@@ -2256,7 +2283,7 @@ static void dist_coordinator_add_worker(
     pthread_mutex_lock(&state->mu);
     if (state->shutting_down) {
         pthread_mutex_unlock(&state->mu);
-        dist_worker_entry_free_conn(entry->rdma_conn);
+        dist_worker_entry_free_chan(entry->rdma_chan);
         free(entry);
         return;
     }
@@ -2277,7 +2304,7 @@ static void dist_coordinator_add_worker(
                              old->layer_start,
                              old->layer_end,
                              old->has_output ? "+output" : "");
-            dist_worker_entry_free_conn(old->rdma_conn);
+            dist_worker_entry_free_chan(old->rdma_chan);
             free(old);
             continue;
         }
@@ -2457,7 +2484,11 @@ static void dist_coordinator_report_plan(ds4_dist_coordinator_state *state) {
 static void dist_route_plan_free(ds4_dist_route_plan *plan) {
     if (!plan) return;
     for (uint32_t i = 0; i < plan->count; i++) {
-        ds4_dist_dchan_close(plan->entry[i].chan);
+        /* Borrowed RDMA channels are owned by the worker entry and must survive
+         * the plan; only owned channels (TCP dup'd fd, forwarder QP) close here. */
+        if (!plan->entry[i].chan_borrowed) {
+            ds4_dist_dchan_close(plan->entry[i].chan);
+        }
     }
     free(plan->entry);
     free(plan->blob);
@@ -2490,7 +2521,7 @@ static void dist_coordinator_forget_route_workers(
             }
             *link = entry->next;
             close(entry->fd);
-            dist_worker_entry_free_conn(entry->rdma_conn);
+            dist_worker_entry_free_chan(entry->rdma_chan);
             DIST_COORD_DEBUG(state,
                              "ds4: distributed coordinator: forgot failed route worker %s:%u layers=%u:%u%s\n",
                              plan->entry[i].host,
@@ -2650,10 +2681,11 @@ static bool dist_coordinator_build_route_plan(
         entry.features = w->features;
         if (build_channels && state->use_control_for_work && plan->count == 0) {
             if (state->transport == DS4_DIST_TRANSPORT_RDMA) {
-                /* First hop uses the pre-connected RDMA QP as its work channel.
-                 * Ownership moves into the plan (freed by dist_route_plan_free). */
-                entry.chan = w->rdma_conn ? ds4_dist_dchan_from_rdma_conn(w->rdma_conn, w->fd) : NULL;
-                w->rdma_conn = NULL;
+                /* First hop borrows the worker's persistent RDMA channel. The
+                 * channel is owned by the worker entry (survives the plan), so
+                 * mark it borrowed so dist_route_plan_free does not close it. */
+                entry.chan = w->rdma_chan;
+                entry.chan_borrowed = entry.chan != NULL;
                 if (!entry.chan) {
                     pthread_mutex_unlock(&state->mu);
                     free(workers);
@@ -2695,7 +2727,7 @@ static bool dist_coordinator_build_route_plan(
             pthread_mutex_unlock(&state->mu);
             free(workers);
             free(path);
-            ds4_dist_dchan_close(entry.chan);
+            if (!entry.chan_borrowed) ds4_dist_dchan_close(entry.chan);
             dist_route_plan_free(plan);
             if (errlen) snprintf(err, errlen, "out of memory building route entries");
             return false;
@@ -4559,7 +4591,7 @@ static void dist_coordinator_remove_worker(ds4_dist_coordinator_state *state, in
                              entry->layer_end,
                              entry->has_output ? "+output" : "");
             pthread_mutex_unlock(&state->mu);
-            dist_worker_entry_free_conn(entry->rdma_conn);   /* NULL once wrapped into a route */
+            dist_worker_entry_free_chan(entry->rdma_chan);   /* tear down the persistent RDMA connection once */
             free(entry);
             if (dist_coordinator_debug_enabled(state)) dist_coordinator_report_plan(state);
             return;
