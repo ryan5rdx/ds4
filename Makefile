@@ -23,8 +23,12 @@ DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed_cpu.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+# RDMA-over-Thunderbolt (ds4_tp.o and ds4_distributed_rdma.o) resolves librdma at
+# runtime via dlopen (ds4_rdma_verbs.o), so there is no -lrdma link step and no
+# build flag to set: the code compiles wherever <infiniband/verbs.h> exists and
+# falls back to TCP where the provider is absent. See Apple TN3205.
+CORE_OBJS = ds4.o ds4_distributed.o ds4_distributed_rdma.o ds4_rdma_verbs.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed_cpu.o ds4_distributed_rdma.o ds4_rdma_verbs.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= $(shell if [ -x /usr/local/cuda/bin/nvcc ]; then \
@@ -49,8 +53,10 @@ NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NA
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
 MMQ_INCLUDES := -Icuda/mmq
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
-CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed_cpu.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+# ds4_distributed_rdma.o / ds4_rdma_verbs.o compile to TCP-only stubs off Apple
+# (no <infiniband/verbs.h>), so the distributed layer links the same everywhere.
+CORE_OBJS = ds4.o ds4_distributed.o ds4_distributed_rdma.o ds4_rdma_verbs.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed_cpu.o ds4_distributed_rdma.o ds4_rdma_verbs.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
@@ -223,7 +229,7 @@ cuda:
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_distributed_rdma.o ds4_rdma_verbs.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -238,7 +244,7 @@ test-rocm:
 	$(MAKE) -B ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
 		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 		ds4 ds4-server ds4-bench ds4-agent \
-		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_distributed_rdma.o ds4_rdma_verbs.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -294,17 +300,23 @@ ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
 
-ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h linenoise.h
+ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_distributed_rdma.h ds4_help.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
-ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h ds4_ssd.h
+ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4_distributed_rdma.h ds4_dist_dchan.h ds4.h ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_distributed.c
 
-ds4_distributed_cpu.o: ds4_distributed.c ds4_distributed.h ds4.h ds4_ssd.h
+ds4_distributed_cpu.o: ds4_distributed.c ds4_distributed.h ds4_distributed_rdma.h ds4_dist_dchan.h ds4.h ds4_ssd.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_distributed.c
 
-ds4_tp.o: ds4_tp.c ds4_tp.h ds4.h ds4_ssd.h
+ds4_tp.o: ds4_tp.c ds4_tp.h ds4.h ds4_ssd.h ds4_rdma_verbs.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_tp.c
+
+ds4_distributed_rdma.o: ds4_distributed_rdma.c ds4_distributed_rdma.h ds4_dist_dchan.h ds4_rdma_verbs.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_distributed_rdma.c
+
+ds4_rdma_verbs.o: ds4_rdma_verbs.c ds4_rdma_verbs.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_rdma_verbs.c
 
 ds4_help.o: ds4_help.c ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_help.c
@@ -441,13 +453,13 @@ ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_distributed_cpu.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_distributed_cpu.o ds4_distributed_rdma.o ds4_rdma_verbs.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_sampling.o: tests/test_sampling.c ds4.h
 	$(CC) $(CFLAGS) -fno-finite-math-only -DDS4_TEST_HOOKS -I. -c -o $@ $<
 
-tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_distributed_cpu.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_distributed_cpu.o ds4_distributed_rdma.o ds4_rdma_verbs.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 ifneq ($(UNAME_S),Darwin)
