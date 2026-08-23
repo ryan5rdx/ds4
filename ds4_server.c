@@ -11890,6 +11890,13 @@ decode_again:
 
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
+        /* A cancelled generation left every partially-sampled token in the
+         * live checkpoint (no stop-string, so hit_stop's invalidate never ran).
+         * Rewind to the committed prefill frontier so the next request can
+         * still cache-hit on the prompt instead of doing a full re-prefill. */
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_rewind(slot->session, effective_prompt.len);
+        pthread_mutex_unlock(&s->inference_mu);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
