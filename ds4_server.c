@@ -12233,6 +12233,12 @@ decode_again:
                     trace_event(s, trace_id,
                                 "tool-error continuation appended %d tokens",
                                 recovery_tokens);
+                    /* Reset the raw-truncation capture from the previous
+                     * iteration: this re-entry must not leak it, and must not
+                     * transfer a stale iteration-1 block under iteration-2 call
+                     * ids at the remember site. */
+                    free(trunc_raw_block);
+                    trunc_raw_block = NULL;
                     free(parsed_content);
                     free(parsed_reasoning);
                     tool_calls_free(&parsed_calls);
