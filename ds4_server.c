@@ -697,6 +697,14 @@ typedef struct {
     bool anthropic_requires_live_tool_state;
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
+    /* Chat/completions last-turn tool binding: mirrors the Anthropic live
+     * continuation contract for plain OpenAI chat.  A request whose trailing
+     * tool-result ids match the live sampled frontier is a direct protocol
+     * continuation; we keep the sampled KV (including exact DSML bytes) and
+     * append only the rendered tool-result suffix instead of re-rendering the
+     * whole transcript (which can diverge from the sampled bytes). */
+    stop_list chat_live_call_ids;
+    char *chat_live_suffix_text;
     tool_replay_stats tool_replay;
 } request;
 
@@ -838,6 +846,9 @@ static void request_free(request *r) {
     stop_list_clear(&r->anthropic_live_call_ids);
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
+    stop_list_clear(&r->chat_live_call_ids);
+    free(r->chat_live_call_ids.v);
+    free(r->chat_live_suffix_text);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
 }
@@ -2965,6 +2976,51 @@ static void anthropic_prepare_live_continuation(request *r,
                                          &r->tool_orders, r->think_mode);
 }
 
+/* A chat/completions trailing tool-result message: role tool/function, or a
+ * user message carrying a tool_call_id.  These are the messages a live agent
+ * loop appends after an assistant tool-call turn, and they identify a direct
+ * continuation of the sampled frontier. */
+static bool chat_msg_is_tool_result_tail(const chat_msg *m) {
+    return m && (role_is_user_like(m->role) ||
+                 !strcmp(m->role, "tool") ||
+                 !strcmp(m->role, "function")) &&
+           ((m->tool_call_id && m->tool_call_id[0]) ||
+            m->tool_call_ids_len > 0);
+}
+
+/* Prepare the chat/completions live-tool fast path.
+ *
+ * Plain OpenAI chat replays the whole transcript, but a local agent loop that
+ * just got a tool-call turn sends back tool results whose ids match the live
+ * sampled frontier.  When that holds, generate_job() can skip replay matching
+ * entirely and append just the rendered tool-result tail to the real KV,
+ * exactly like the Anthropic path. */
+static void chat_prepare_live_continuation(request *r,
+                                           const chat_msgs *msgs) {
+    if (!r || r->api != API_OPENAI || !msgs || msgs->len == 0) return;
+
+    int tail_end = msgs->len;
+    while (tail_end > 0 && role_is_system(msgs->v[tail_end - 1].role)) tail_end--;
+    int tail_start = tail_end;
+    while (tail_start > 0 &&
+           chat_msg_is_tool_result_tail(&msgs->v[tail_start - 1]))
+    {
+        tail_start--;
+    }
+    if (tail_start == tail_end) return;
+
+    stop_list_clear(&r->chat_live_call_ids);
+    for (int i = tail_start; i < msgs->len; i++) {
+        chat_msg_collect_tool_call_ids(&msgs->v[i], &r->chat_live_call_ids);
+    }
+    if (r->chat_live_call_ids.len == 0) return;
+
+    free(r->chat_live_suffix_text);
+    r->chat_live_suffix_text =
+        render_live_tool_tail_for_syntax(r->model_syntax, msgs, tail_start,
+                                         &r->tool_orders, r->think_mode);
+}
+
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
@@ -3127,6 +3183,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    chat_prepare_live_continuation(r, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
@@ -8427,6 +8484,7 @@ struct server_slot {
     ds4_session *session;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
+    live_tool_state chat_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
 
@@ -8815,9 +8873,30 @@ static void anthropic_live_clear(server *s, server_slot *slot) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
+static void chat_live_remember(server *s, server_slot *slot,
+                               const tool_calls *calls) {
+    if (!s || !slot || !calls || calls->len == 0) return;
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clear_locked(&slot->chat_live);
+    for (int i = 0; i < calls->len; i++) {
+        id_list_push_unique(&slot->chat_live.call_ids, calls->v[i].id);
+    }
+    slot->chat_live.live_tokens = ds4_session_pos(slot->session);
+    slot->chat_live.valid = slot->chat_live.call_ids.len > 0;
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void chat_live_clear(server *s, server_slot *slot) {
+    if (!s || !slot) return;
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clear_locked(&slot->chat_live);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
 static void request_live_state_clear(server *s, server_slot *slot) {
     responses_live_clear(s, slot);
     anthropic_live_clear(s, slot);
+    chat_live_clear(s, slot);
     thinking_live_clear(s, slot);
 }
 
@@ -8870,6 +8949,21 @@ static bool anthropic_live_matches_request(server *s, server_slot *slot,
               slot->anthropic_live.call_ids.len == ids->len;
     for (int i = 0; ok && i < ids->len; i++) {
         ok = id_list_contains(&slot->anthropic_live.call_ids, ids->v[i]);
+    }
+    pthread_mutex_unlock(&s->tool_mu);
+    return ok;
+}
+
+static bool chat_live_matches_request(server *s, server_slot *slot,
+                                      const stop_list *ids,
+                                      int live_tokens) {
+    if (!s || !slot || !ids || ids->len == 0) return false;
+    pthread_mutex_lock(&s->tool_mu);
+    bool ok = slot->chat_live.valid &&
+              slot->chat_live.live_tokens == live_tokens &&
+              slot->chat_live.call_ids.len == ids->len;
+    for (int i = 0; ok && i < ids->len; i++) {
+        ok = id_list_contains(&slot->chat_live.call_ids, ids->v[i]);
     }
     pthread_mutex_unlock(&s->tool_mu);
     return ok;
@@ -9771,6 +9865,36 @@ static int anthropic_live_continuation_prompt(server *s, server_slot *slot,
         s->engine, live_tokens, req->anthropic_live_suffix_text,
         effective_prompt);
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
+    return live_tokens->len;
+}
+
+/* Tool-result chat/completions continuation.
+ *
+ * Plain OpenAI chat has no response object or tool_use_id protocol handle, but
+ * a live local agent loop still sends tool results whose ids match the sampled
+ * frontier.  This mirrors anthropic_live_continuation_prompt: when the ids and
+ * live token frontier match, continue from the sampled DSML state and append
+ * only the rendered tool-result suffix, avoiding the canonical re-render that
+ * can diverge from the sampled bytes. */
+static int chat_live_continuation_prompt(server *s, server_slot *slot,
+                                         const request *req,
+                                         int live_pos,
+                                         ds4_tokens *effective_prompt,
+                                         int *matched_ids) {
+    if (!s || !slot || !req || !effective_prompt) return 0;
+    if (req->api != API_OPENAI || !req->chat_live_suffix_text) return 0;
+    if (req->chat_live_call_ids.len == 0) return 0;
+    if (!chat_live_matches_request(s, slot,
+                                   &req->chat_live_call_ids,
+                                   live_pos)) return 0;
+
+    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
+    if (!live_tokens || live_tokens->len != live_pos) return 0;
+
+    build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, live_tokens, req->chat_live_suffix_text,
+        effective_prompt);
+    if (matched_ids) *matched_ids = req->chat_live_call_ids.len;
     return live_tokens->len;
 }
 
@@ -11203,9 +11327,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     bool responses_live_continuation = false;
     bool anthropic_live_continuation = false;
     bool thinking_live_continuation = false;
+    bool chat_live_continuation = false;
     const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
+    int chat_live_match_ids = 0;
     /* Responses gets the first chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
      * output by visible transcript or tool call ids does not need to prove an
@@ -11241,6 +11367,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         if (cached > 0) {
             anthropic_live_continuation = true;
             cache_source = "anthropic-tool-output";
+            prompt_for_sync = &effective_prompt;
+        }
+    }
+    if (cached == 0) {
+        cached = chat_live_continuation_prompt(s, slot, &j->req, old_pos,
+                                               &effective_prompt,
+                                               &chat_live_match_ids);
+        if (cached > 0) {
+            chat_live_continuation = true;
+            cache_source = "chat-tool-output";
             prompt_for_sync = &effective_prompt;
         }
     }
@@ -11306,10 +11442,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
+                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s tool_replay=mem:%d/disk:%d/canonical:%d/missing:%d",
                    responses_protocol ? " RESPPROTO" : "",
                    old_pos, j->req.prompt.len, common,
-                   trace_cache_miss_reason(&cache_diag));
+                   trace_cache_miss_reason(&cache_diag),
+                   j->req.tool_replay.mem,
+                   j->req.tool_replay.disk,
+                   j->req.tool_replay.canonical,
+                   j->req.tool_replay.missing_ids);
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
@@ -11506,6 +11646,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!responses_live_continuation) responses_live_clear(s, slot);
     if (!anthropic_live_continuation) anthropic_live_clear(s, slot);
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
+    if (!chat_live_continuation) chat_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
     kv_cache_maybe_store_continued(s, slot);
@@ -11604,6 +11745,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
 
     bool dsml_recovery_attempted = false;
+    char *trunc_raw_block = NULL;
     uint64_t rng = j->req.seed ? j->req.seed :
         (((uint64_t)time(NULL) << 32) ^ (response_seq << 1) ^
          (uint64_t)(uintptr_t)j);
@@ -11931,7 +12073,17 @@ decode_again:
             free(test_content);
             free(test_reasoning);
             if (repair_ok && test_calls.len > 0) {
-                /* Repair succeeded - replace text with repaired version */
+                /* Repair succeeded - replace text with repaired version.
+                 * Capture the raw (unrepaired) DSML block span first: the live
+                 * checkpoint holds the exact sampled (truncated) tokens, not
+                 * the repaired bytes.  Replaying the repaired block would
+                 * diverge from the checkpoint on the next tool-result request,
+                 * so remember the raw block instead (Step 2). */
+                const char *raw_start = find_any_tool_start(text.ptr);
+                if (raw_start) {
+                    trunc_raw_block = xstrndup(raw_start,
+                        (size_t)((text.ptr + text.len) - raw_start));
+                }
                 free(text.ptr);
                 text.ptr = buf_take(&repaired);
                 text.len = strlen(text.ptr);
@@ -12015,6 +12167,7 @@ decode_again:
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
         responses_stream_free(&responses_live);
+        free(trunc_raw_block);
         buf_free(&text);
         ds4_tokens_free(&effective_prompt);
         return;
@@ -12130,6 +12283,7 @@ decode_again:
             free(parsed_content);
             free(parsed_reasoning);
             tool_calls_free(&parsed_calls);
+            free(trunc_raw_block);
             anthropic_stream_free(&anthropic_live);
             openai_stream_free(&openai_live);
             responses_stream_free(&responses_live);
@@ -12142,10 +12296,24 @@ decode_again:
             if (j->req.api == API_ANTHROPIC && j->req.stream)
                 apply_anthropic_stream_tool_ids(&parsed_calls, &anthropic_live);
             assign_tool_call_ids(s, &parsed_calls, j->req.api);
+            /* Step 2: for a repaired truncation, the parser captured the
+             * repaired (closed) DSML block as raw_tool_text, but the live
+             * checkpoint holds the raw sampled (truncated) block.  Override so
+             * exact replay reproduces the checkpoint bytes on the next
+             * tool-result request. */
+            if (trunc_raw_block) {
+                free(parsed_calls.raw_tool_text);
+                parsed_calls.raw_tool_text = trunc_raw_block;
+                trunc_raw_block = NULL;
+            }
             tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
-        } else if (j->req.api == API_RESPONSES) {
-            responses_live_clear(s, slot);
+        } else {
+            free(trunc_raw_block);
+            trunc_raw_block = NULL;
+            if (j->req.api == API_RESPONSES) {
+                responses_live_clear(s, slot);
+            }
         }
     }
     if (job_cancelled(j)) {
@@ -12200,10 +12368,26 @@ decode_again:
             anthropic_live_clear(s, slot);
         }
     }
+    if (j->req.api == API_OPENAI) {
+        if (parsed_calls.len && strcmp(final_finish, "error") &&
+            strcmp(final_finish, "length"))
+        {
+            chat_live_remember(s, slot, &parsed_calls);
+        } else {
+            chat_live_clear(s, slot);
+        }
+    }
 
+    /* Step 3 (recovery edge): after a model-visible tool-error continuation
+     * (dsml_recovery_attempted) yields valid calls, the live checkpoint holds
+     * a hidden error exchange the client never saw.  Exact DSML replay cannot
+     * repair that divergence, so force canonicalization (which rebuilds the
+     * checkpoint to exactly what the client will render next) regardless of
+     * whether raw_tool_text is present. */
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
-        should_canonicalize_tool_checkpoint(s, &parsed_calls))
+        (dsml_recovery_attempted ||
+         should_canonicalize_tool_checkpoint(s, &parsed_calls)))
     {
         /* Chat/completions has no protocol object that binds the next request
          * to this live KV state.  Canonicalize only the fallback tool-call
