@@ -11318,6 +11318,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     err[0] = '\0';
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
+    /* Position of the committed prefill frontier once the prompt is synced and
+     * before generation appends any sampled tokens.  A cancelled generation
+     * must rewind here (not to effective_prompt.len, which is 0 for a fresh
+     * request with no live continuation), so the next request can still
+     * cache-hit on the prompt instead of re-prefilling from scratch. */
+    int committed_frontier = 0;
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
                         &j->req.prompt, old_pos, common);
@@ -11633,6 +11639,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         return;
     }
     free(disk_cache_path);
+    committed_frontier = ds4_session_pos(slot->session);
     if (job_cancelled(j)) {
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
@@ -12035,9 +12042,11 @@ decode_again:
         /* A cancelled generation left every partially-sampled token in the
          * live checkpoint (no stop-string, so hit_stop's invalidate never ran).
          * Rewind to the committed prefill frontier so the next request can
-         * still cache-hit on the prompt instead of doing a full re-prefill. */
+         * still cache-hit on the prompt instead of doing a full re-prefill.
+         * Do not use effective_prompt.len here: for a fresh request with no
+         * live continuation it is 0, which would wipe the checkpoint entirely. */
         pthread_mutex_lock(&s->inference_mu);
-        ds4_session_rewind(slot->session, effective_prompt.len);
+        ds4_session_rewind(slot->session, committed_frontier);
         pthread_mutex_unlock(&s->inference_mu);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
         anthropic_stream_free(&anthropic_live);
