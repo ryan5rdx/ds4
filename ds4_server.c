@@ -10265,35 +10265,11 @@ static void trace_write_cache_diag(
     }
 }
 
-/* Where to rewind the live session so the incoming prompt can be extended
- * instead of re-prefilled from zero, or -1 when there is nothing to gain.
- *
- * The reuse test one level up is all-or-nothing: unless the whole live
- * checkpoint is a prefix of the prompt it scores zero, so a conversation that
- * diverges anywhere -- even in its last two tokens -- discards every shared
- * token with it.  That is routine, not exotic: the rendered prompt ends with
- * the assistant generation prefix, so a cancelled turn, an edited history or a
- * compaction leaves a short tail that does not match while tens of thousands of
- * leading tokens still do.  Rewinding to the common prefix turns those into a
- * cache hit and re-evaluates only the tail.
- *
- * The target is capped at prompt_len - 1 because the sync that follows prefills
- * [target, prompt_len) and must evaluate at least one token to produce logits.
- * That cap is also what the GLM shrinking-prompt case needs (common ==
- * prompt_len < old_pos), so both collapse into one rule.
- *
- * This was gated to GLM-DSA when it only handled the shrinking-prompt case.
- * The gate is gone: ds4_session_rewind() is backend-generic -- it crops the
- * DSpark caches with a reset fallback -- and the cancel path already exercises
- * it at arbitrary positions on every backend. */
-static int live_prefix_rewind_target(int old_pos, int prompt_len, int common) {
-    if (prompt_len <= 1 || old_pos <= 0 || common <= 0) return -1;
-    /* The entire checkpoint already matches, so there is nothing to discard and
-     * the plain prefix-match path scores it higher than any rewind would. */
-    if (common >= old_pos) return -1;
-    const int target = common < prompt_len ? common : prompt_len - 1;
-    if (target <= 0 || target >= old_pos) return -1;
-    return target;
+static int live_prefix_rewind_target(bool backend_can_rewind,
+                                     int old_pos, int prompt_len, int common) {
+    if (!backend_can_rewind || prompt_len <= 1 || prompt_len >= old_pos) return -1;
+    if (common != prompt_len) return -1;
+    return prompt_len - 1;
 }
 
 static void trace_time(FILE *fp) {
@@ -11538,7 +11514,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         return;
     } else if (cached == 0) {
         const int rewind_to = live_prefix_rewind_target(
-            old_pos, j->req.prompt.len, common);
+            ds4_engine_is_glm_dsa(s->engine), old_pos,
+            j->req.prompt.len, common);
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_rewind(slot->session, rewind_to);
@@ -11547,9 +11524,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cache_source = "memory-rewind";
             cache_diag.rewind_to = rewind_to;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: rewound live prefix from %d to %d; reevaluating %d prompt token(s) instead of %d",
-                       old_pos, rewind_to,
-                       j->req.prompt.len - rewind_to, j->req.prompt.len);
+                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
+                       old_pos, rewind_to);
         } else {
             cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
             cache_source = cached > 0 ? "memory-token" : "none";
@@ -17729,40 +17705,12 @@ static void test_model_metadata_clamps_completion_to_context(void) {
 }
 
 static void test_live_prefix_rewind_target(void) {
-    /* Shrinking prompt: prompt is a strict prefix of the checkpoint, so the
-     * target is capped one short to leave a token to evaluate. */
-    TEST_ASSERT(live_prefix_rewind_target(17, 8, 8) == 7);
-    TEST_ASSERT(live_prefix_rewind_target(49826, 48379, 48379) == 48378);
-    TEST_ASSERT(live_prefix_rewind_target(8, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(17, 1, 1) == -1);
-
-    /* Diverging tail -- the case that used to score zero and re-prefill the
-     * whole conversation.  Numbers are the reported ESC-during-thinking miss:
-     * a 2-token tail difference was discarding 25747 shared tokens. */
-    TEST_ASSERT(live_prefix_rewind_target(25749, 25760, 25747) == 25747);
-    TEST_ASSERT(live_prefix_rewind_target(17, 20, 7) == 7);
-
-    /* No divergence: the plain prefix-match path owns this, not the rewind. */
-    TEST_ASSERT(live_prefix_rewind_target(17, 20, 17) == -1);
-    /* Nothing in common is a cold prefill; rewinding to 0 would only discard
-     * the DSpark caches for no reuse. */
-    TEST_ASSERT(live_prefix_rewind_target(17, 20, 0) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(0, 20, 0) == -1);
-
-    /* The target must always leave at least one token for the sync to
-     * evaluate, and must never move the session forward. */
-    for (int old_pos = 0; old_pos < 12; old_pos++) {
-        for (int prompt_len = 0; prompt_len < 12; prompt_len++) {
-            for (int common = 0; common <= (old_pos < prompt_len ? old_pos : prompt_len); common++) {
-                const int t = live_prefix_rewind_target(old_pos, prompt_len, common);
-                if (t < 0) continue;
-                TEST_ASSERT(t < prompt_len);
-                TEST_ASSERT(t < old_pos);
-                TEST_ASSERT(t <= common);
-                TEST_ASSERT(t > 0);
-            }
-        }
-    }
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
+    TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
+    TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
 }
 
 static void test_client_socket_nonblocking_flag(void) {
