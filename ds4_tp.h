@@ -163,6 +163,9 @@ int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token);
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
+/* Abort the mirrored prefill the worker is currently running for this session.
+ * Only meaningful between a SYNC and its COMMAND_ACK; see DS4_TP_FRAME_CANCEL. */
+int ds4_tp_send_cancel(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
                            uint32_t count);
 int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
@@ -172,6 +175,13 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status);
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen);
+/* As above, but reports the worker's status so a caller can distinguish a
+ * coordinated stop from a genuine failure.  *status_out is 0 on success, the
+ * worker's non-zero status when it acked one, and -1 when no well-formed ack
+ * for this session arrived at all. */
+int ds4_tp_wait_command_ack_status(ds4_tp *tp, uint64_t session_id,
+                                   const char *operation, int *status_out,
+                                   char *err, size_t errlen);
 int ds4_tp_send_stop(ds4_tp *tp);
 
 /* Worker: blocks for the next mirrored command.  Frame types below; for
@@ -196,6 +206,13 @@ typedef enum {
     DS4_TP_FRAME_EVAL_BATCH = 15,
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
+    /* Leader -> worker, valid only while the worker is executing a mirrored
+     * SYNC.  The prefill cancel predicate is host-side and leader-only, so
+     * without this the worker keeps prefilling chunks whose gates the leader
+     * has already stopped sending and eats a bounded fence timeout per chunk.
+     * On receipt the worker stops at its next chunk boundary, leaving its
+     * checkpoint at the pre-sync length the leader also holds. */
+    DS4_TP_FRAME_CANCEL = 18,
 } ds4_tp_frame_type;
 
 typedef struct {

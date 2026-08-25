@@ -8938,27 +8938,14 @@ static void request_cancel_rollback(server *s, server_slot *slot,
                                     int committed_frontier) {
     request_live_state_clear(s, slot);
     pthread_mutex_lock(&s->inference_mu);
-    if (ds4_engine_tp_active(s->engine)) {
-        /* Under tensor parallelism, rewind is only symmetric when both ranks
-         * agree on their checkpoint length going in -- and after a cancel they
-         * frequently do not.  A cancelled prefill is the clear case: the cancel
-         * callback is host-side and leader-only, so the leader abandons its
-         * mirrored prefill while the worker runs the whole prompt to
-         * completion.  Rewinding then lands the two ranks on different lengths,
-         * the next sync prefills different chunk counts, and the worker's gate
-         * waits time out -- surfacing as a GPU command-buffer timeout and a
-         * dead transport rather than as a cache miss.
-         *
-         * Invalidate is unconditionally symmetric (both ranks go to zero) and
-         * ds4_session_invalidate() escalates a dropped mirror to a transport
-         * failure instead of diverging silently.  This costs a full re-prefill
-         * on the next request, which is the pre-22568ab behaviour: the cache
-         * win is not worth crashing the worker for. */
-        ds4_session_invalidate(slot->session);
-        pthread_mutex_unlock(&s->inference_mu);
-        slot->continued_last_store_tokens = 0;
-        return;
-    }
+    /* Safe to rewind under tensor parallelism as well, because this is only
+     * reachable once the prompt sync has *succeeded*: an interrupted or failed
+     * sync returns long before committed_frontier is captured, and the leader
+     * only gets past ds4_session_sync() when the worker acked success.  From
+     * that shared position both ranks move together -- decode appends mirror
+     * per token, and canonicalize_tool_checkpoint() mutates only through
+     * ds4_session_sync()/ds4_session_invalidate(), which mirror too -- so both
+     * are at the same length here and clamp the same way. */
     ds4_session_rewind(slot->session, committed_frontier);
     pthread_mutex_unlock(&s->inference_mu);
     /* The rewind also un-does the continued-store high-water mark: leaving it

@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
@@ -338,6 +339,75 @@ static int tp_send_frame(int fd, uint32_t type, const void *payload, uint32_t by
     if (!tp_write_full(fd, &h, sizeof(h))) return 0;
     if (bytes && !tp_write_full(fd, payload, bytes)) return 0;
     return 1;
+}
+
+/* Worker-side cancel poll for a mirrored prefill.
+ *
+ * Installed as the session cancel predicate only for the duration of one SYNC,
+ * and called between prefill chunks.  Reading control_fd here is exclusive:
+ * the worker's command loop is the sole reader and it is blocked inside this
+ * very sync, and the leader is blocked awaiting our COMMAND_ACK, so CANCEL is
+ * the only frame that can legitimately arrive.  Anything else means the stream
+ * is misframed, which we report rather than try to interpret.
+ *
+ * Consuming the frame here is what keeps framing intact: the command loop must
+ * not see a CANCEL for a sync that has already returned. */
+typedef struct {
+    ds4_tp *tp;
+    uint64_t session_id;
+    bool cancelled;
+    bool broken;
+} tp_worker_cancel_state;
+
+static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes);
+
+static bool tp_worker_prefill_cancelled(void *ud) {
+    tp_worker_cancel_state *st = (tp_worker_cancel_state *)ud;
+    if (!st) return false;
+    if (st->cancelled) return true;
+    if (st->broken) return false;
+
+    const int fd = st->tp->control_fd;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+    const int ready = poll(&pfd, 1, 0);
+    if (ready <= 0 || !(pfd.revents & POLLIN)) return false;
+
+    uint32_t type = 0, bytes = 0;
+    if (!tp_read_frame_header(fd, &type, &bytes)) {
+        st->broken = true;
+        ds4_log(stderr, DS4_LOG_ERROR,
+                "tp worker: bad frame header while polling for cancel");
+        ds4_tp_mark_failed(st->tp);
+        return false;
+    }
+    if (type != (uint32_t)DS4_TP_FRAME_CANCEL || bytes != sizeof(uint64_t)) {
+        st->broken = true;
+        ds4_log(stderr, DS4_LOG_ERROR,
+                "tp worker: unexpected frame %u (%u bytes) during mirrored prefill",
+                type, bytes);
+        ds4_tp_mark_failed(st->tp);
+        return false;
+    }
+    uint64_t session_id = 0;
+    if (!tp_read_full(fd, &session_id, sizeof(session_id))) {
+        st->broken = true;
+        ds4_tp_mark_failed(st->tp);
+        return false;
+    }
+    if (session_id != st->session_id) {
+        /* Only one sync is in flight at a time, so a cancel for a different
+         * session means the leader and worker disagree about which session is
+         * running -- worse than a stale cancel, so do not silently drop it. */
+        st->broken = true;
+        ds4_log(stderr, DS4_LOG_ERROR,
+                "tp worker: cancel for session %llu during sync of %llu",
+                (unsigned long long)session_id,
+                (unsigned long long)st->session_id);
+        ds4_tp_mark_failed(st->tp);
+        return false;
+    }
+    st->cancelled = true;
+    return true;
 }
 
 static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes) {
@@ -1718,6 +1788,14 @@ int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id) {
     return ok;
 }
 
+int ds4_tp_send_cancel(ds4_tp *tp, uint64_t session_id) {
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_CANCEL,
+                                 &session_id, sizeof(session_id));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
+}
+
 static int ds4_tp_send_eval_batch_unlocked(
         ds4_tp *tp, const ds4_tp_batch_item *items, uint32_t count) {
     const uint64_t bytes64 = sizeof(ds4_tp_batch_command_header) +
@@ -1791,9 +1869,14 @@ int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status) {
     return ok;
 }
 
+/* status_out, when non-NULL, receives the worker's reported status so callers
+ * can tell a coordinated stop from a real failure.  It is left at -1 when no
+ * well-formed ack for this session arrived, i.e. when the status is unknown
+ * rather than merely non-zero. */
 static int ds4_tp_wait_command_ack_unlocked(
         ds4_tp *tp, uint64_t session_id,
-        const char *operation, char *err, size_t errlen) {
+        const char *operation, int *status_out, char *err, size_t errlen) {
+    if (status_out) *status_out = -1;
     uint32_t type = 0, bytes = 0;
     ds4_tp_command_ack ack;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
@@ -1805,20 +1888,31 @@ static int ds4_tp_wait_command_ack_unlocked(
         return 0;
     }
     if (ack.session_id != session_id || ack.status != 0) {
+        if (status_out && ack.session_id == session_id) {
+            *status_out = (int)ack.status;
+        }
         tp_set_err(err, errlen,
                    "tp: worker %s failed (session %llu, status %d)",
                    operation ? operation : "command",
                    (unsigned long long)ack.session_id, (int)ack.status);
         return 0;
     }
+    if (status_out) *status_out = 0;
     return 1;
 }
 
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen) {
+    return ds4_tp_wait_command_ack_status(tp, session_id, operation, NULL,
+                                          err, errlen);
+}
+
+int ds4_tp_wait_command_ack_status(ds4_tp *tp, uint64_t session_id,
+                                   const char *operation, int *status_out,
+                                   char *err, size_t errlen) {
     pthread_mutex_lock(&tp->control_lock);
     const int ok = ds4_tp_wait_command_ack_unlocked(
-            tp, session_id, operation, err, errlen);
+            tp, session_id, operation, status_out, err, errlen);
     pthread_mutex_unlock(&tp->control_lock);
     return ok;
 }
@@ -1896,6 +1990,12 @@ static int ds4_tp_recv_command_unlocked(ds4_tp *tp, ds4_tp_command *command,
     }
     case DS4_TP_FRAME_SESSION_DESTROY:
     case DS4_TP_FRAME_INVALIDATE:
+    /* A CANCEL is normally consumed by the prefill poll inside the SYNC it
+     * aborts.  It can still surface here when it lost the race with the
+     * worker's own completion -- the leader sent it just as the prefill
+     * finished -- so it must parse as a valid frame rather than fall into the
+     * unknown-type path, which is fatal. */
+    case DS4_TP_FRAME_CANCEL:
         if (bytes != sizeof(command->session_id)) { ok = 0; break; }
         memcpy(&command->session_id, payload, sizeof(command->session_id));
         break;
@@ -2274,6 +2374,17 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             continue;
         }
 
+        if (command.type == DS4_TP_FRAME_CANCEL) {
+            /* Lost the race with our own completion: the prefill it was meant
+             * to abort has already finished and been acked, so there is nothing
+             * to stop.  Dropping it is correct and must not be fatal -- and it
+             * carries no ack, so the control stream stays aligned.  Handled
+             * before the session lookup so a cancel for a session that has
+             * since been destroyed is also harmless. */
+            ds4_tp_command_free(&command);
+            continue;
+        }
+
         ds4_session *session =
             tp_worker_session_find(&sessions, command.session_id);
         if (command.type != DS4_TP_FRAME_EVAL_BATCH &&
@@ -2292,10 +2403,30 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             for (uint32_t i = 0; i < command.n_tokens; i++) {
                 ds4_tokens_push(&prompt, command.tokens[i]);
             }
+            /* Watch for a leader cancel between chunks for the duration of this
+             * sync only, so an aborted prefill stops here at the same boundary
+             * instead of spinning on gates the leader will never send. */
+            tp_worker_cancel_state cancel_state = {
+                .tp = tp, .session_id = command.session_id,
+                .cancelled = false, .broken = false,
+            };
+            ds4_session_set_cancel(session, tp_worker_prefill_cancelled,
+                                   &cancel_state);
             int sync_rc = ds4_session_sync(session, &prompt, err, sizeof(err));
+            ds4_session_set_cancel(session, NULL, NULL);
             if (!ds4_tp_send_command_ack(tp, command.session_id, sync_rc)) {
                 /* Transport is gone; there is nothing left to serve. */
                 rc = 1;
+            } else if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                /* Clean, coordinated stop: an interrupted prefill leaves the
+                 * checkpoint at the pre-sync length, which is exactly where the
+                 * leader rewinds to, so both ranks remain at the same position.
+                 * Do not invalidate -- that would drop to zero while the leader
+                 * kept the prefix, and the conversation would re-prefill from
+                 * scratch on the next request (or worse, diverge). */
+                ds4_log(stderr, DS4_LOG_KVCACHE,
+                        "tp worker sync: cancelled by leader; checkpoint kept at %d",
+                        ds4_session_pos(session));
             } else if (sync_rc != 0) {
                 /* A failed prefill is a failed *session*, not a failed worker.
                  * The common cause is the leader cancelling mid-prefill: the

@@ -50968,6 +50968,12 @@ struct ds4_session {
     void *display_progress_ud;
     ds4_session_cancel_fn cancel;
     void *cancel_ud;
+    /* Set only while ds4_session_sync() is mirroring a prefill to a TP worker.
+     * Lets the cancel predicate forward the abort the moment it is observed,
+     * rather than after the whole local prefill unwinds, so the worker stops at
+     * its next chunk boundary instead of timing out on missing gates. */
+    bool tp_mirroring_sync;
+    bool tp_cancel_sent;
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
@@ -60778,7 +60784,20 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) 
 }
 
 static bool ds4_session_cancelled(ds4_session *s) {
-    return s && s->cancel && s->cancel(s->cancel_ud);
+    if (!s || !s->cancel || !s->cancel(s->cancel_ud)) return false;
+    /* Forward the abort to the worker at the point of detection, not after the
+     * local prefill unwinds: the worker only checks between chunks, so telling
+     * it early is the difference between it stopping on the next boundary and
+     * it burning a bounded fence timeout first.  Latched so a predicate polled
+     * once per chunk sends exactly one frame. */
+    if (s->tp_mirroring_sync && !s->tp_cancel_sent) {
+        s->tp_cancel_sent = true;
+        if (!ds4_tp_send_cancel(s->engine->tp.ctx, s->tp_session_id)) {
+            fprintf(stderr, "ds4: tp: session cancel send failed\n");
+            ds4_tp_mark_failed(s->engine->tp.ctx);
+        }
+    }
+    return true;
 }
 
 static bool ds4_session_cancelled_cb(void *ud) {
@@ -61752,14 +61771,26 @@ static bool ds4_session_dspark_commit_current_capture(ds4_session *s,
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     const bool mirror = ds4_session_tp_leader(s);
+    /* Only a SYNC that was actually mirrored may be cancelled: sending a CANCEL
+     * the worker is not inside a sync for would arrive as a top-level frame it
+     * has no prefill to abort. */
+    bool sync_sent = false;
     if (mirror && prompt && prompt->len > 0) {
         if (!ds4_tp_send_sync(s->engine->tp.ctx, s->tp_session_id,
                               prompt->v, (uint32_t)prompt->len)) {
             snprintf(err, errlen, "tp: worker sync send failed");
             return 1;
         }
+        sync_sent = true;
     }
+    /* Position both ranks shared before this sync.  An interrupted prefill
+     * rewinds here instead of invalidating, which keeps the whole prior
+     * conversation cached and costs only the tokens this request added. */
+    const int pre_sync_len = s->checkpoint_valid ? s->checkpoint.len : 0;
+    s->tp_mirroring_sync = sync_sent;
+    s->tp_cancel_sent = false;
     int rc = ds4_session_sync_internal(s, prompt, err, errlen);
+    s->tp_mirroring_sync = false;
 #ifndef DS4_NO_GPU
     if (rc == 0) glm_debug_dump_prefill_logits(s->logits);
     if (rc == 0) {
@@ -61787,8 +61818,10 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
 #endif
     if (mirror) {
-        const bool worker_ok = ds4_tp_wait_command_ack(
-            s->engine->tp.ctx, s->tp_session_id, "prefill sync", err, errlen);
+        int worker_status = -1;
+        const bool worker_ok = ds4_tp_wait_command_ack_status(
+            s->engine->tp.ctx, s->tp_session_id, "prefill sync", &worker_status,
+            err, errlen);
         bool logits_ok = true;
         /* A successful worker sends its split logits even if the leader's
          * local prefill failed. Drain them to keep the control stream framed
@@ -61800,7 +61833,25 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                 logits_ok = false;
             }
         }
+        /* Coordinated stop: we were cancelled, and the worker either honoured
+         * the cancel (status INTERRUPTED, checkpoint left at the pre-sync
+         * length) or had already finished (status 0, checkpoint at prompt->len).
+         * Either way the worker sits at or above pre_sync_len, so the mirrored,
+         * clamped rewind lands both ranks on it.  Invalidating here instead --
+         * the old behaviour -- threw away the whole cached conversation for a
+         * cancel that only added this request's tokens.
+         *
+         * Any other status means the worker failed for its own reasons and
+         * dropped its state, so no shared position is left to rewind to. */
+        if (rc == DS4_SESSION_SYNC_INTERRUPTED && logits_ok &&
+            (worker_status == 0 || worker_status == DS4_SESSION_SYNC_INTERRUPTED)) {
+            ds4_session_rewind(s, pre_sync_len);
+            return rc;
+        }
         if (rc != 0 || !worker_ok || !logits_ok) {
+            /* Either a real failure, or a cancel the worker could not confirm.
+             * No position is known to be shared any more, so zero is the only
+             * one both ranks can reach. */
             ds4_session_invalidate(s);
             return rc != 0 ? rc : 1;
         }
