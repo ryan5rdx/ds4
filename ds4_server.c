@@ -11749,7 +11749,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                 free(disk_cache_path);
                 request_live_state_clear(s, slot);
                 trace_event(s, trace_id, "cancelled during prefill");
-                ds4_gpu_set_decode_phase(0);
                 log_job_cancelled(j, ctx_span);
                 return;
             }
@@ -11803,7 +11802,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled after prefill");
-        ds4_gpu_set_decode_phase(0);
         log_job_cancelled(j, ctx_span);
         ds4_tokens_free(&effective_prompt);
         return;
@@ -12200,7 +12198,6 @@ decode_again:
     if (job_cancelled(j)) {
         request_cancel_rollback(s, slot, committed_frontier);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
-        ds4_gpu_set_decode_phase(0);
         log_job_cancelled(j, ctx_span);
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
@@ -12339,7 +12336,6 @@ decode_again:
     if (job_cancelled(j)) {
         request_cancel_rollback(s, slot, committed_frontier);
         trace_event(s, trace_id, "cancelled while flushing generation");
-        ds4_gpu_set_decode_phase(0);
         log_job_cancelled(j, ctx_span);
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
@@ -12463,7 +12459,6 @@ decode_again:
         if (job_cancelled(j)) {
             request_cancel_rollback(s, slot, committed_frontier);
             trace_event(s, trace_id, "cancelled during response parsing");
-            ds4_gpu_set_decode_phase(0);
             log_job_cancelled(j, ctx_span);
             free(parsed_content);
             free(parsed_reasoning);
@@ -12504,7 +12499,6 @@ decode_again:
     if (job_cancelled(j)) {
         request_cancel_rollback(s, slot, committed_frontier);
         trace_event(s, trace_id, "cancelled before publishing response state");
-        ds4_gpu_set_decode_phase(0);
         log_job_cancelled(j, ctx_span);
         free(parsed_content);
         free(parsed_reasoning);
