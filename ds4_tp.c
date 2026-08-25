@@ -2294,10 +2294,26 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             }
             int sync_rc = ds4_session_sync(session, &prompt, err, sizeof(err));
             if (!ds4_tp_send_command_ack(tp, command.session_id, sync_rc)) {
+                /* Transport is gone; there is nothing left to serve. */
                 rc = 1;
             } else if (sync_rc != 0) {
-                ds4_log(stderr, DS4_LOG_ERROR, "tp worker sync: %s", err);
-                rc = 1;
+                /* A failed prefill is a failed *session*, not a failed worker.
+                 * The common cause is the leader cancelling mid-prefill: the
+                 * cancel callback is host-side and leader-only, so the leader
+                 * stops issuing gates and this rank's gate waits time out.
+                 * Terminating here turned a cancelled request into a dead pair
+                 * that had to be restarted by hand.
+                 *
+                 * The ack above already carried the failure, and the leader
+                 * reads split logits only when that ack said success, so the
+                 * control stream stays framed.  Drop this session's state and
+                 * keep serving: the leader invalidates its own side on the same
+                 * failed ack, so both ranks land at zero and the next request
+                 * re-prefills from scratch in lockstep. */
+                ds4_log(stderr, DS4_LOG_ERROR,
+                        "tp worker sync: %s (session invalidated, worker continuing)",
+                        err);
+                ds4_session_invalidate(session);
             } else if (ds4_engine_tp_vocab_split(engine) &&
                        !tp_worker_send_logits(tp, session, logits, vocab)) {
                 rc = 1;

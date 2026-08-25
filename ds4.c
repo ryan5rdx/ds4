@@ -70085,6 +70085,15 @@ void ds4_session_invalidate(ds4_session *s) {
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {
+    /* Clamp before mirroring, not after.  Both ranks clamp the value they end
+     * up applying to their own checkpoint length, so sending the raw pos let
+     * the leader land on min(pos, leader_len) while the worker landed on
+     * min(pos, worker_len) -- different positions whenever the two lengths
+     * disagree, which is precisely the "next sync prefills different chunk
+     * counts on the two ranks" divergence ds4_session_invalidate() warns about.
+     * Sending the already-clamped value removes that half of the asymmetry. */
+    if (pos < 0) pos = 0;
+    if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         if (!ds4_tp_send_rewind(s->engine->tp.ctx, s->tp_session_id, pos)) {
@@ -70092,8 +70101,6 @@ void ds4_session_rewind(ds4_session *s, int pos) {
             ds4_tp_mark_failed(s->engine->tp.ctx);
         }
     }
-    if (pos < 0) pos = 0;
-    if (pos > s->checkpoint.len) pos = s->checkpoint.len;
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
 #ifndef DS4_NO_GPU

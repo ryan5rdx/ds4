@@ -8938,6 +8938,27 @@ static void request_cancel_rollback(server *s, server_slot *slot,
                                     int committed_frontier) {
     request_live_state_clear(s, slot);
     pthread_mutex_lock(&s->inference_mu);
+    if (ds4_engine_tp_active(s->engine)) {
+        /* Under tensor parallelism, rewind is only symmetric when both ranks
+         * agree on their checkpoint length going in -- and after a cancel they
+         * frequently do not.  A cancelled prefill is the clear case: the cancel
+         * callback is host-side and leader-only, so the leader abandons its
+         * mirrored prefill while the worker runs the whole prompt to
+         * completion.  Rewinding then lands the two ranks on different lengths,
+         * the next sync prefills different chunk counts, and the worker's gate
+         * waits time out -- surfacing as a GPU command-buffer timeout and a
+         * dead transport rather than as a cache miss.
+         *
+         * Invalidate is unconditionally symmetric (both ranks go to zero) and
+         * ds4_session_invalidate() escalates a dropped mirror to a transport
+         * failure instead of diverging silently.  This costs a full re-prefill
+         * on the next request, which is the pre-22568ab behaviour: the cache
+         * win is not worth crashing the worker for. */
+        ds4_session_invalidate(slot->session);
+        pthread_mutex_unlock(&s->inference_mu);
+        slot->continued_last_store_tokens = 0;
+        return;
+    }
     ds4_session_rewind(slot->session, committed_frontier);
     pthread_mutex_unlock(&s->inference_mu);
     /* The rewind also un-does the continued-store high-water mark: leaving it
@@ -11751,7 +11772,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         if (job_cancelled(j)) {
             /* See above: an interrupted sync leaves a valid prefix and a valid
              * disk entry.  Keep both -- unlinking the snapshot the session was
-             * loaded from turns an ESC into a guaranteed cold re-prefill. */
+             * loaded from turns an ESC into a guaranteed cold re-prefill.
+             * (No TP special case needed: the disk cache is refused outright
+             * under --tensor-parallel, so disk_cache_path is always NULL there
+             * and the discard helper this skips would no-op anyway.) */
             free(disk_cache_path);
             request_live_state_clear(s, slot);
             trace_event(s, trace_id, "cancelled during prefill");
