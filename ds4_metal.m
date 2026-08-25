@@ -10603,12 +10603,29 @@ int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
     return ds4_gpu_tp_big_gate_wait(seq);
 }
 
+int ds4_gpu_tp_fence_timed_out(void) {
+    return g_tp_fence_timeout_word &&
+        __atomic_load_n(g_tp_fence_timeout_word, __ATOMIC_ACQUIRE) != 0u;
+}
+
+void ds4_gpu_tp_clear_fence_timeout(void) {
+    if (!g_tp_fence_timeout_word) return;
+    /* Release order pairs with the acquire load in ds4_gpu_tp_fence_timed_out().
+     * Only ever called from the host after the step that latched it has already
+     * completed and been rejected, so there is no race with the GPU writer: the
+     * next fence kernel is not encoded until after this point. */
+    __atomic_store_n(g_tp_fence_timeout_word, 0u, __ATOMIC_RELEASE);
+}
+
 int ds4_gpu_tp_failed(void) {
+    /* Two causes with deliberately different lifetimes.  g_tp_failed_flag is
+     * sticky: a failed exchange means the transport is gone and every later
+     * step is doomed.  The fence timeout is per-step and recoverable, so the
+     * consumer clears it via ds4_gpu_tp_clear_fence_timeout(); see that
+     * function for why a stale release word cannot mis-satisfy a later wait. */
     const int exchange_failed =
         __atomic_load_n(&g_tp_failed_flag, __ATOMIC_ACQUIRE);
-    const int fence_timed_out = g_tp_fence_timeout_word &&
-        __atomic_load_n(g_tp_fence_timeout_word, __ATOMIC_ACQUIRE) != 0u;
-    return exchange_failed || fence_timed_out;
+    return exchange_failed || ds4_gpu_tp_fence_timed_out();
 }
 
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label) {

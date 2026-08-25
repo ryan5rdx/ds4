@@ -351,8 +351,29 @@ void ds4_gpu_tp_set_attn_head_split(int enabled);
  * owned ranges are warmed; the rest must never be paged in). Call before
  * the model is mapped. */
 void ds4_gpu_model_residency_skip(int skip);
-/* Nonzero after any gate exchange failed; the eval must abort. */
+/* Nonzero after any gate exchange failed, or after the bounded release fence
+ * timed out; the eval must abort.  These two causes have different lifetimes --
+ * see ds4_gpu_tp_clear_fence_timeout(). */
 int ds4_gpu_tp_failed(void);
+/* Nonzero when the cause is specifically a latched fence timeout (as opposed to
+ * a failed exchange).  For diagnostics; ds4_gpu_tp_failed() covers both. */
+int ds4_gpu_tp_fence_timed_out(void);
+/* Consume a latched fence timeout.
+ *
+ * The bounded spin in kernel_dsv4_tp_fence_wait latches this when it gives up
+ * before the service thread writes the release word, which means that step's
+ * kernels consumed stale peer rows -- so the host must reject that step.  It
+ * does NOT mean the transport died: the service thread writes the release
+ * unconditionally, and every wait is an exact match on a strictly increasing
+ * seq-derived value, so a stale word cannot satisfy a later step's wait.  The
+ * condition is therefore recoverable, and whoever rejects the step must clear
+ * it.  Leaving it latched makes one slow gate -- a long peer prefill chunk, a
+ * page fault, an RDMA retransmit -- fail every subsequent decode for the life
+ * of the process, which presents as an unexplained throughput collapse rather
+ * than as a fault.
+ *
+ * Genuine transport death stays sticky and is unaffected by this call. */
+void ds4_gpu_tp_clear_fence_timeout(void);
 
 /* Tensor-parallel sliced projections (Metal decode path only).
  *

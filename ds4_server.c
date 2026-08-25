@@ -12726,7 +12726,15 @@ static bool live_state_contains_all(const live_tool_state *state,
 
 /* Return the only slot eligible for an explicit live continuation, or -1 when
  * the request has no resident binding. A missing binding is intentionally not
- * treated as ineligible: generate_job() then emits the existing 409 response. */
+ * treated as ineligible: generate_job() then emits the existing 409 response.
+ *
+ * Chat/completions is deliberately absent here even though it now has a live
+ * binding too. Responses and Anthropic pin because their protocols promise a
+ * continuation and the request body alone cannot rebuild it -- without the slot
+ * there is nothing to fall back to but a 409. A chat request always carries the
+ * full replayable transcript, so a hard pin would only make it wait behind a
+ * busy slot for a speedup it can also get later. It gets soft affinity in
+ * job_slot_score() instead. */
 static int job_required_slot_locked(server *s, const job *j) {
     if (!s || !j) return -1;
     const request *r = &j->req;
@@ -12753,11 +12761,17 @@ static int job_required_slot_locked(server *s, const job *j) {
  * empty slots sat unused.
  *
  *   INT_MAX          the job is pinned to this slot
+ *   BOUND            holds the live tool frontier this request continues from
  *   MATCH + common   enough shared prefix to be worth continuing here
  *   EMPTY            nothing resident, so nothing to lose
  *   -last_used       otherwise evict, least recently used first
+ *
+ * BOUND must outrank every MATCH score, so it starts above
+ * SLOT_BAND_MATCH + (SLOT_BAND_EMPTY - 1), the largest value that band can
+ * reach, and stays below INT_MAX so a real pin still wins.
  */
 enum {
+    SLOT_BAND_BOUND = 3 << 29,
     SLOT_BAND_MATCH = 1 << 30,
     SLOT_BAND_EMPTY = 1 << 29,
 };
@@ -12768,6 +12782,27 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
     if (required_slot >= 0 && slot->id != required_slot) return INT_MIN;
     if (required_slot == slot->id) return INT_MAX;
 
+    /* Soft affinity for a chat/completions tool-result continuation.
+     *
+     * The frontier that makes this slot special is the *sampled* DSML the model
+     * emitted, which no re-render reproduces -- so the common_prefix test below
+     * cannot see it and would happily send the request to an empty slot, making
+     * the fast path added for chat never fire on a multi-slot server.
+     *
+     * A preference rather than a pin: a busy slot already returned INT_MIN
+     * above, so this silently degrades to ordinary scoring instead of queueing
+     * behind it.  chat_live_call_ids is non-empty only for an OpenAI chat turn
+     * whose tail is tool results, so the common case pays one int compare, and
+     * a hit here skips the ds4_session_common_prefix token walk entirely. */
+    if (j->req.chat_live_call_ids.len > 0 &&
+        live_state_contains_all(&slot->chat_live, &j->req.chat_live_call_ids)) {
+        return SLOT_BAND_BOUND;
+    }
+
+    /* No session is the same proposition as an empty one -- nothing resident,
+     * nothing to lose -- and saying so here keeps every path below free to
+     * dereference it. */
+    if (!slot->session) return SLOT_BAND_EMPTY;
     const int live = ds4_session_pos(slot->session);
     if (live <= 0) return SLOT_BAND_EMPTY;
 
@@ -14173,6 +14208,44 @@ static void test_batched_live_continuation_slot_binding(void) {
     request_free(&j.req);
     live_tool_state_free(&slots[1].responses_live);
     live_tool_state_free(&slots[2].anthropic_live);
+
+    /* Chat/completions gets soft affinity, not a pin.  Assert both halves of
+     * that: never a required slot, but outranks an empty slot when free, and
+     * yields rather than queueing when the bound slot is busy. */
+    server cs = {0};
+    server_slot cslots[3] = {0};
+    cs.slots = cslots;
+    cs.slot_count = 3;
+    for (int i = 0; i < 3; i++) cslots[i].id = i;
+
+    job cj = {0};
+    id_list_push_unique(&cj.req.chat_live_call_ids, "call-chat-1");
+    cslots[1].chat_live.valid = true;
+    id_list_push_unique(&cslots[1].chat_live.call_ids, "call-chat-1");
+
+    TEST_ASSERT(job_required_slot_locked(&cs, &cj) == -1);
+
+    const int bound = job_slot_score(&cs, &cslots[1], &cj, -1);
+    const int empty = job_slot_score(&cs, &cslots[0], &cj, -1);
+    TEST_ASSERT(bound == SLOT_BAND_BOUND);
+    TEST_ASSERT(bound > empty);
+    /* Must also beat the best possible prefix-match score, or a slot holding an
+     * unrelated but similar conversation would steal the continuation. */
+    TEST_ASSERT(bound > SLOT_BAND_MATCH + (SLOT_BAND_EMPTY - 1));
+    TEST_ASSERT(bound < INT_MAX);
+
+    cslots[1].busy = true;
+    TEST_ASSERT(job_slot_score(&cs, &cslots[1], &cj, -1) == INT_MIN);
+    TEST_ASSERT(job_slot_score(&cs, &cslots[0], &cj, -1) > INT_MIN);
+    cslots[1].busy = false;
+
+    /* An unrelated id must not bind. */
+    stop_list_clear(&cj.req.chat_live_call_ids);
+    id_list_push_unique(&cj.req.chat_live_call_ids, "call-other");
+    TEST_ASSERT(job_slot_score(&cs, &cslots[1], &cj, -1) != SLOT_BAND_BOUND);
+
+    request_free(&cj.req);
+    live_tool_state_free(&cslots[1].chat_live);
 }
 
 static void test_tool_schema_order_from_anthropic_schema(void) {

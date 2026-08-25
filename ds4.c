@@ -36615,6 +36615,44 @@ static bool metal_graph_dspark_verify_selected_profile_enabled(void) {
            getenv("DS4_DSPARK_DISABLE_VERIFY_SELECTED_PROFILE") == NULL;
 }
 
+#if defined(__APPLE__)
+/* Did this TP step fail, and consume the per-step part of the reason.
+ *
+ * Every caller of this is about to reject the step it just ran, which is
+ * exactly what a latched fence timeout is asking for.  Clearing it here keeps
+ * the flag scoped to one step: the bounded release-fence spin gives up when the
+ * peer is merely slow (a long prefill chunk on the other rank, a page fault, an
+ * RDMA retransmit), and that must cost one step, not the process.  Before this
+ * was consumed, a single such stall latched ds4_gpu_tp_failed() forever and
+ * every later batched decode was invalidated -- visible only as throughput
+ * quietly collapsing, never as a TP error.
+ *
+ * A dead transport still fails permanently: that is a separate sticky flag
+ * inside ds4_gpu_tp_failed() which this does not touch, and it is re-set by the
+ * exchange path on every subsequent attempt anyway.
+ *
+ * Hot path cost is unchanged -- the clear only runs on a step already failing. */
+static bool ds4_tp_step_failed(const char *what) {
+    if (!ds4_gpu_tp_failed()) return false;
+    if (ds4_gpu_tp_fence_timed_out()) {
+        static uint64_t fence_timeouts;
+        fence_timeouts++;
+        /* Log the first, then thin out: a recurring stall is a real signal
+         * (retune DS4_TP_FENCE_MAX_ITERS, or the peer is genuinely sick) and
+         * must not be silent, but it must not flood a decode loop either. */
+        if ((fence_timeouts & (fence_timeouts - 1)) == 0) {
+            fprintf(stderr,
+                    "ds4: tp: release fence timed out in %s; rejecting this step "
+                    "(occurrence %llu, DS4_TP_FENCE_MAX_ITERS may be too low)\n",
+                    what ? what : "tp step",
+                    (unsigned long long)fence_timeouts);
+        }
+        ds4_gpu_tp_clear_fence_timeout();
+    }
+    return true;
+}
+#endif
+
 /* Layer-major speculative target verifier for tiny MTP suffixes.
  *
  * This is the first production-shaped verifier attempt: unlike repeated decode
@@ -36903,6 +36941,14 @@ static bool metal_graph_verify_suffix_tops(
     /* The service thread releases a Metal fence even after a transport error
      * so command buffers can drain.  That release is not proof that the peer
      * rows are valid: fail the verifier before it can commit stale slabs. */
+    /* Deliberately a non-consuming read, unlike the eval-level checks: this is
+     * an inner verifier whose false return lands in a caller's `ok`, and some
+     * callers may treat that as "speculation failed, fall back" rather than as
+     * a hard error.  Consuming the latch here could therefore hide a real
+     * timeout from the eval-level check that is the actual backstop.  Leaving
+     * it set costs at most one extra rejected step before that check consumes
+     * it, which is still bounded -- the pathology being fixed is a latch that
+     * survived forever. */
     if (ok && g && g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
 #endif
     ds4_gpu_tp_keepalive_pause(0);
@@ -64077,7 +64123,8 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         return rc;
     }
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
-    if (rc == 0 && s->engine && s->engine->tp.active && ds4_gpu_tp_failed()) {
+    if (rc == 0 && s->engine && s->engine->tp.active &&
+        ds4_tp_step_failed("session eval")) {
         snprintf(err, errlen, "tp: gate transport failed");
         if (ds4_session_tp_leader(s)) ds4_session_invalidate(s);
         return 1;
@@ -64633,7 +64680,7 @@ static int ds4_sessions_eval_batch_metal(
     else (void)ds4_gpu_synchronize();
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(0);
-    if (ok && e->tp.active && ds4_gpu_tp_failed()) {
+    if (ok && e->tp.active && ds4_tp_step_failed("batch eval")) {
         if (err && errlen) snprintf(err, errlen, "tp: batch gate transport failed");
         ok = false;
     }
@@ -64867,7 +64914,7 @@ static int ds4_sessions_eval_batch_with_prefill_metal(
     else (void)ds4_gpu_synchronize();
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(0);
-    if (ok && e->tp.active && ds4_gpu_tp_failed()) {
+    if (ok && e->tp.active && ds4_tp_step_failed("mixed batch eval")) {
         if (err && errlen) snprintf(err, errlen,
                                     "tp: mixed batch gate transport failed");
         ok = false;
@@ -69144,7 +69191,8 @@ static int ds4_session_eval_speculative_argmax_impl(
             int rc = ds4_session_glm_spec_cycle(s, first_token, accepted,
                                                 accepted_cap, err, errlen);
 #if defined(__APPLE__)
-            if (rc >= 0 && s->engine && s->engine->tp.active && ds4_gpu_tp_failed()) {
+            if (rc >= 0 && s->engine && s->engine->tp.active &&
+                ds4_tp_step_failed("glm spec cycle")) {
                 snprintf(err, errlen, "tp: gate transport failed");
                 return -1;
             }
@@ -69258,7 +69306,7 @@ static int ds4_session_eval_speculative_argmax_impl(
                                                        errlen) :
             n_accept;
 #if defined(__APPLE__)
-        if (rc >= 0 && e->tp.active && ds4_gpu_tp_failed()) {
+        if (rc >= 0 && e->tp.active && ds4_tp_step_failed("dspark verify cycle")) {
             snprintf(err, errlen, "tp: gate transport failed during DSpark verify");
             s->checkpoint_valid = false;
             return -1;
