@@ -18167,8 +18167,31 @@ int ds4_gpu_indexer_score_one_tensor(
         }
 
         if (n_head == 64 && head_dim == 128) {
-            id<MTLComputePipelineState> direct_pipeline =
-                ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_direct_pipeline,
+            /* Lightning-indexer organization for the decode scorer (upstream
+             * #782, decode half only).  One 256-thread threadgroup owns 64
+             * compressed rows, staged once and transposed into per-simdgroup
+             * registers, so the 64-head loop reuses register-resident K
+             * instead of re-reading threadgroup K per head.  Same kernel the
+             * prefill path can use, run here with n_tokens == 1 and causal
+             * masking off.
+             *
+             * Deliberately NOT wired into ds4_gpu_indexer_scores_batch_tensor:
+             * prefill there belongs to the tiled2/4/5 stack, whose scores are
+             * bit-identical, whereas #782's prefill half was independently
+             * measured non-exact (full-vocab logit mismatch).  Decode is the
+             * half a third party confirmed bit-exact, and it is the half that
+             * is worth anything here -- the gain is long-context decode, which
+             * is where our sweep degrades.  DS4_METAL_DISABLE_INDEXER_LLT is
+             * the A/B rollback; read per call so a variant bench can toggle it
+             * inside one process. */
+            const bool score_llt =
+                getenv("DS4_METAL_DISABLE_INDEXER_LLT") == NULL;
+            const bool score_nsg4 = getenv("DS4_METAL_INDEXER_LLT_NSG4") != NULL;
+            id<MTLComputePipelineState> direct_pipeline = score_llt
+                ? ds4_gpu_get_pipeline(score_nsg4
+                        ? "kernel_dsv4_indexer_scores_llt_nsg4"
+                        : "kernel_dsv4_indexer_scores_llt")
+                : ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_direct_pipeline,
                                         "kernel_dsv4_indexer_score_one_direct");
             if (!direct_pipeline) return 0;
 
@@ -18197,11 +18220,31 @@ int ds4_gpu_indexer_score_one_tensor(
             [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
             [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(index_comp) atIndex:3];
             [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-            [enc setThreadgroupMemoryLength:(128u + 64u) * sizeof(float) atIndex:0];
-            ds4_gpu_trace_push(enc, "indexer_score");
-            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_comp, 1, 1)
-                 threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
-            ds4_gpu_trace_pop(enc);
+            if (score_llt && score_nsg4) {
+                /* NSG=4: sk[32x128]half + sq[8x128]half + sw[8] + sqk[256] f32 */
+                [enc setThreadgroupMemoryLength:(32u*128u + 8u*128u) * sizeof(uint16_t) +
+                                                (8u + 256u) * sizeof(float) atIndex:0];
+                ds4_gpu_trace_push(enc, "indexer_score_llt_nsg4");
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                ds4_gpu_trace_pop(enc);
+            } else if (score_llt) {
+                /* sk[64x128]half + sq[8x128]half + sw[8] + sqk[512] f32 */
+                [enc setThreadgroupMemoryLength:(64u*128u + 8u*128u) * sizeof(uint16_t) +
+                                                (8u + 512u) * sizeof(float) atIndex:0];
+                ds4_gpu_trace_push(enc, "indexer_score_llt");
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 63u) / 64u, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                ds4_gpu_trace_pop(enc);
+            } else {
+                /* Legacy direct scorer.  Keeps our threadgroup sizing, which
+                 * differs from upstream's (128 + 64 vs 128 + 4 floats). */
+                [enc setThreadgroupMemoryLength:(128u + 64u) * sizeof(float) atIndex:0];
+                ds4_gpu_trace_push(enc, "indexer_score");
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_comp, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+                ds4_gpu_trace_pop(enc);
+            }
             ds4_gpu_end_compute_encoder(cb, enc);
 
             if (!ds4_gpu_finish_command_buffer(cb, owned, "indexer direct score")) return 0;
