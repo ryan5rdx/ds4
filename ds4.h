@@ -253,6 +253,11 @@ int ds4_engine_tp_vocab_split(ds4_engine *e);
 /* True once ds4_engine_tp_bind() has attached a tensor-parallel transport.
  * Frontends use this to skip paths that are not mirrored to the worker. */
 int ds4_engine_tp_active(ds4_engine *e);
+/* Nonzero once the GPU backend has reported a command-buffer error (typically a
+ * watchdog timeout on a hung submission).  Sticky and unrecoverable in-process:
+ * a component that cannot produce correct results without the GPU should stop
+ * rather than keep serving.  Always 0 on CPU-only builds. */
+int ds4_backend_device_lost(void);
 bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
                                         uint32_t layer,
                                         uint32_t full_live,

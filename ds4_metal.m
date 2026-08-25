@@ -1057,6 +1057,23 @@ static void ds4_gpu_invalidate_completion_counters(void) {
     g_dsv4_hc_producer_last_completion = nil;
 }
 
+/* Sticky once a command buffer comes back MTLCommandBufferStatusError.
+ *
+ * The usual cause is the GPU watchdog killing a hung submission
+ * (kIOGPUCommandBufferCallbackErrorTimeout), after which nothing this process
+ * submits can be trusted.  Reporting the error and carrying on leaves a
+ * plausible-looking process that cannot actually compute -- which matters most
+ * on a TP worker, whose whole job is to stay in lockstep with a peer. */
+static int g_gpu_device_lost;
+
+static void ds4_gpu_note_command_buffer_error(void) {
+    __atomic_store_n(&g_gpu_device_lost, 1, __ATOMIC_RELEASE);
+}
+
+int ds4_gpu_device_lost(void) {
+    return __atomic_load_n(&g_gpu_device_lost, __ATOMIC_ACQUIRE);
+}
+
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
     [cb waitUntilCompleted];
     if (getenv("DS4_METAL_DISPATCH_PROFILE")) {
@@ -1079,6 +1096,7 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
     if (cb.status == MTLCommandBufferStatusError) {
         fprintf(stderr, "ds4: Metal %s failed: %s\n",
                 label, [[cb.error localizedDescription] UTF8String]);
+        ds4_gpu_note_command_buffer_error();
         ds4_gpu_invalidate_completion_counters();
         return 0;
     }
@@ -2787,6 +2805,7 @@ static int ds4_gpu_warm_model_views(void) {
     if (cb.status == MTLCommandBufferStatusError) {
         fprintf(stderr, "ds4: Metal model warmup failed: %s\n",
                 [[cb.error localizedDescription] UTF8String]);
+        ds4_gpu_note_command_buffer_error();
         return 0;
     }
 
@@ -9732,6 +9751,7 @@ int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *
             fprintf(stderr, "ds4: Metal %s failed: %s\n",
                     what,
                     [[cb.error localizedDescription] UTF8String]);
+            ds4_gpu_note_command_buffer_error();
             (void)ds4_gpu_wait_pending_command_buffers(what);
             [g_transient_buffers removeAllObjects];
             return 0;
@@ -10686,6 +10706,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
             fprintf(stderr, "ds4: Metal %s failed: %s\n",
                     label ? label : "selected-id readback",
                     [[cb.error localizedDescription] UTF8String]);
+            ds4_gpu_note_command_buffer_error();
             (void)ds4_gpu_wait_pending_command_buffers(label ? label : "selected-id readback");
             [g_transient_buffers removeAllObjects];
             return 0;

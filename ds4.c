@@ -59996,6 +59996,14 @@ int ds4_engine_tp_active(ds4_engine *e) {
     return e && e->tp.active;
 }
 
+int ds4_backend_device_lost(void) {
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    return ds4_gpu_device_lost();
+#else
+    return 0;
+#endif
+}
+
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
 static int ds4_engine_tp_exchange(void *ud, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_tp *tp = ud;

@@ -1515,7 +1515,18 @@ bool ds4_tp_failed(const ds4_tp *tp) {
     return tp && atomic_load_explicit(&tp->failed, memory_order_acquire);
 }
 void ds4_tp_mark_failed(ds4_tp *tp) {
-    if (tp) atomic_store_explicit(&tp->failed, true, memory_order_release);
+    if (!tp) return;
+    /* Set in several places and cleared in none: once the control stream is
+     * misframed there is no in-band way to resynchronise, so the pair is done
+     * for this process.  That is defensible, but it used to happen in total
+     * silence -- every later ds4_session_rewind()/ds4_session_invalidate()
+     * quietly skipped its mirror and the ranks drifted apart with no log line
+     * to explain why the pair had gone useless.  Say it once, loudly. */
+    if (!atomic_exchange_explicit(&tp->failed, true, memory_order_acq_rel)) {
+        ds4_log(stderr, DS4_LOG_ERROR,
+                "tp: transport marked failed; this pair can no longer stay in "
+                "sync and both ranks must be restarted");
+    }
 }
 
 /* ------------------------------------------------------------------------
@@ -2427,14 +2438,21 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
                 ds4_log(stderr, DS4_LOG_KVCACHE,
                         "tp worker sync: cancelled by leader; checkpoint kept at %d",
                         ds4_session_pos(session));
+            } else if (ds4_backend_device_lost()) {
+                /* Not survivable.  A command-buffer error means the GPU
+                 * watchdog killed a submission, and nothing this process
+                 * submits afterwards can be trusted -- so continuing produces a
+                 * worker that answers the control protocol while computing
+                 * nothing, which is strictly worse than exiting: the operator
+                 * sees a live process and has to work out by hand that it needs
+                 * restarting.  Stop loudly and let the supervisor restart us. */
+                ds4_log(stderr, DS4_LOG_ERROR,
+                        "tp worker sync: %s -- GPU reported a command buffer error, "
+                        "so this worker cannot serve any further work; exiting for restart",
+                        err);
+                rc = 1;
             } else if (sync_rc != 0) {
                 /* A failed prefill is a failed *session*, not a failed worker.
-                 * The common cause is the leader cancelling mid-prefill: the
-                 * cancel callback is host-side and leader-only, so the leader
-                 * stops issuing gates and this rank's gate waits time out.
-                 * Terminating here turned a cancelled request into a dead pair
-                 * that had to be restarted by hand.
-                 *
                  * The ack above already carried the failure, and the leader
                  * reads split logits only when that ack said success, so the
                  * control stream stays framed.  Drop this session's state and

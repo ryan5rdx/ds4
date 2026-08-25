@@ -351,6 +351,10 @@ void ds4_gpu_tp_set_attn_head_split(int enabled);
  * owned ranges are warmed; the rest must never be paged in). Call before
  * the model is mapped. */
 void ds4_gpu_model_residency_skip(int skip);
+/* Nonzero once a Metal command buffer returned an error -- typically the GPU
+ * watchdog killing a hung submission.  Sticky and process-wide: nothing
+ * submitted afterwards can be trusted, and there is no in-process way back. */
+int ds4_gpu_device_lost(void);
 /* Nonzero after any gate exchange failed, or after the bounded release fence
  * timed out; the eval must abort.  These two causes have different lifetimes --
  * see ds4_gpu_tp_clear_fence_timeout(). */
