@@ -3,6 +3,14 @@
 Rig: **2 x Mac Studio M2 Ultra, 60-core GPU, 128 GB each**, DeepSeek V4 Flash MXFP4,
 tensor parallel over Thunderbolt RDMA. Branch `tp-frontends-phase1`.
 
+> **2026-08-19 handoff note:** use
+> [`README.md`](README.md) for the current branch graph, latest 41.98 t/s
+> control, settled RDMA/PP/DSpark results, and the revised four-node plan.  This
+> file remains the detailed two-node evidence log.  Statements below such as
+> "the only remaining target," the old decode-split conclusion, the deferred
+> DSpark section, and the original 43.7 t/s four-node estimate are historical
+> unless reaffirmed by the 2026-08-14 addendum or the handoff.
+
 > **2026-08-14 audit note:** the original conclusion that routed MoE was the
 > only remaining target is superseded by the addendum below.  In particular,
 > the reported decode-split sweep did not execute the attention kernel used at
@@ -154,9 +162,10 @@ is written so a new session can pick up without re-deriving anything.
 Both are with `DS4_METAL_FAST_SYNC=1`. The ctx-512 figure is the one to use for
 stage work: it is reproducible to ~1% and every ablation below is against it.
 
-**The only stage carrying recoverable waste is the routed MoE, and the waste is
-load imbalance, not kernel inefficiency.** Worth ~1.47 ms = +2.7 t/s. Everything
-else is at or near its measured kernel ceiling.
+The largest measured two-node opportunity is routed-MoE load imbalance, worth
+about 1.47 ms or +2.7 t/s.  The later attention audit also found substantial
+empty short-context FlashAttention work and produced an exact compact schedule;
+do not reuse the older claim that every other stage was already closed.
 
 ---
 
@@ -352,7 +361,7 @@ were already serialised. Dependency stalls are ruled out.
 
 ---
 
-## 7. The one remaining target: MoE expert straggler
+## 7. Largest measured two-node target: MoE expert straggler
 
 Routed experts are sharded **contiguously 128/128**. With 6 experts selected
 uniformly, the per-layer critical path is `E[max(k, 6-k)] = 252/64 = 3.9375`
@@ -392,24 +401,20 @@ file.
 `ds4.c:23922`) and measures at its predicted rate. The obstacle is purely
 mapping, not throughput.
 
-### Scaling to 4 nodes — do not expect much
+### Scaling to four nodes — revised full-mesh plan
 
-| N | E[max] | ideal | imbalance |
-|---|---|---|---|
-| 2 | 3.938 | 3.0 | 1.31x |
-| 4 | 2.818 | 1.5 | **1.88x** |
+The original 43.7 t/s estimate assumed a multi-hop/ring-like collective and is
+superseded.  On a true six-link mesh, a 16 KiB decode gate should use one-round
+flat all-gather: every rank sends its partial to all three peers concurrently,
+then performs a canonical rank-ordered local sum.  A ring would require six
+serial phases and is the wrong algorithm for 86 latency-bound gates/token.
 
-MoE critical path improves only 1.40x, not 2x, and relative imbalance gets
-*worse*. Meanwhile half the attention is replicated (`q_a`, `kv` don't split)
-and gate cost roughly doubles for a 2-hop all-reduce. Estimated 4-node total
-~22.9 ms = ~43.7 t/s: **+5% for double the hardware.** Intra-expert splitting
-would improve that to ~48 t/s, which is why C matters more at 4 nodes than 2.
-
-On all-reduce libraries: the gate payload is 16 KB exchanged 86 times per token
-at 38 us — **latency-bound, not bandwidth-bound**. QuickReduce's central trick
-is inline-quantized all-reduce, a bandwidth optimisation, and buys nothing.
-MLX's `jaccl` is more relevant as it is Apple/Thunderbolt-native. But no library
-beats the fabric: **the lever is fewer gates, not faster ones.**
+The current planning ranges are **47--51 t/s** for disjoint 64-expert quarters,
+**52--56 t/s** with two-copy cyclic expert placement, and **53--58 t/s** with a
+repacked intra-expert layout.  The aggressive ideal ceiling is about 60--63
+t/s.  These are projections, not measurements, and depend on a three-peer
+16 KiB collective reaching roughly 40--60 us p50.  See the central handoff for
+the topology, gate-latency sensitivity, required code changes, and risks.
 
 ---
 
@@ -418,7 +423,7 @@ beats the fabric: **the lever is fewer gates, not faster ones.**
 | tried | result |
 |---|---|
 | `DS4_METAL_MODEL_UNTRACKED=1` | 41.71 vs 41.61, noise. Hazard tracking serialises *across queues*; one serial queue has nothing to serialise |
-| `DS4_METAL_DECODE_SPLITS` 12/16/20/24/30 | 41.56 / 41.62 / 41.58 / 41.71 / 41.68 — **flat**. 48 -> 120 threadgroups changed nothing, so `attncore` is not split-K occupancy bound |
+| `DS4_METAL_DECODE_SPLITS` 12/16/20/24/30 | Historical flat numbers only.  This flag did not select the raw/gathered ctx-512 attention kernel, so the sweep is **invalid evidence** for that kernel and must not be retried/interpreted as the old conclusion |
 | Dependency-chain bench mode | 452.2 vs 450.3 GB/s, identical |
 | `32ef898` three TP gate-exclusion removals | +0.019 ms, nothing |
 | Host-side caching generally | `0c0ee5e` removed 0.87 ms of host time; none of it converted to throughput |
@@ -532,7 +537,9 @@ Read **`gen_steady_tps`** (8th CSV column) — it drops the first token.
   explicitly and confirm `transport=rdma` in the log — a silent TCP fallback
   would change gate cost and invalidate any comparison.
 - Confirm `ds4: TP fast release fence enabled` appears. Without
-  `DS4_METAL_FAST_SYNC` the gates cost ~180 us each instead of 38, worth ~15 ms.
+  `DS4_METAL_FAST_SYNC` the gates cost ~180 us each instead of 38.  The quoted
+  86-gate delta is 12.2 ms/token; broader full-run estimates were about
+  12--15 ms/token.
 - **AppleThunderboltRDMA accepts RDMA WRITE work requests and never executes
   them** (`ds4_tp.c:118-127`); only UC QPs exist. One-sided transfer is
   permanently off the table.
@@ -600,7 +607,15 @@ will fight you.
 
 ---
 
-## 13. Deferred: DSpark
+## 13. Historical pre-MTP diagnosis: DSpark
+
+This section predates `tp-mtp-hunt`.  Its four bottlenecks motivated the later
+work, but they have since been implemented or reworked: batch fast fences,
+head/output splitting experiments, batched verifier MoE, direct accepted-state
+commits, GPU Markov, official proposer semantics, and the low-yield policy are
+all covered in [`tp_mtp_hunt.md`](tp_mtp_hunt.md).  Current forced performance
+is still poor because proposal acceptance/economics, not these original missing
+features, now dominate.
 
 Enabling DSpark drops 37 -> ~24 t/s. Four verified TP-specific causes:
 
@@ -621,16 +636,17 @@ it contributes nothing to the decode goal.
 
 ## 14. Where to start a new investigation
 
-1. **Re-establish the baseline** with §10. Expect 41.5-41.7 at ctx 512.
-2. **The only measured target left is the MoE straggler** (§7), 1.47 ms /
-   +2.7 t/s. Pick Option A or C.
-3. If looking for something new, the unmeasured remainder is **~1.76 ms of
-   residual** (compressor, router, norms) plus **~1.94 ms of dispatch
-   overhead** — both small and both hard.
-4. **`attncore` at 2.68 ms is the one stage not explained by bandwidth.** It
-   moves ~45 MB at ctx 512, i.e. ~17 GB/s, and is not split-K occupancy bound
-   (§8). Nobody has worked out what it *is* bound by. That is the most
-   interesting open question in the file.
-5. Before quoting any byte figure, reconcile it against the 60.17 MB/layer in
-   §3. Three separate wrong conclusions in this investigation came from skipping
-   that check.
+1. **Re-establish the baseline** with §10. The latest target-only observation is
+   41.98 steady t/s; treat changes below about 1% as noise until interleaved.
+2. **Balance the routed experts** (§7), still the largest measured two-node
+   opportunity at about 1.47 ms / +2.7 t/s. Collect real route traces before
+   choosing replication or a repacked split.
+3. **For four nodes, benchmark the collective first.** Prove concurrent
+   three-peer 16 KiB all-gather at <=50--60 us p50 before changing model views.
+4. **Keep DSpark as a separate acceptance investigation.** The structural TP
+   fixes are on `tp-mtp-hunt`, but forced Promessi runs remain 19--21 t/s.
+5. If looking for a new two-node target, use the compact-attention addendum and
+   live profiles rather than the invalidated `DS4_METAL_DECODE_SPLITS` sweep.
+6. Before quoting any byte figure, reconcile it against the 60.17 MB/layer in
+   §3. Three wrong conclusions in this investigation came from skipping that
+   check.

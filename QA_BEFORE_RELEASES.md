@@ -271,6 +271,25 @@ than a failure. `--dspark-strict` remains the byte-identical target-only mode.
   47.15/49.08/48.19 t/s, a median gain of about 8.3%. A surreal-prose control
   measured 44.46 t/s ordinary and 41.66 t/s opportunistic. DSpark remains
   opt-in because prompts with little useful speculation can still be slower.
+- On `tp-mtp-hunt`, run the physical two-Mac TP matrix with
+  `DS4_METAL_FAST_SYNC=1` on both ranks.  Record a target-only context-512 /
+  generation-512 control, a forced arm with `DS4_DSPARK_SCHEDULER=0`,
+  `DS4_DSPARK_STATS=1`, and `--dspark-confidence 0`, and a production arm with
+  `DS4_DSPARK_STATS=1` and `--dspark`.  Require zero `errors`,
+  `verifier_unavailable`, replay fallbacks, and replayed tokens in the optimized
+  path.  Save the complete CSV, stats, detail, `by_draft`, and `outcomes` lines.
+- Run the TP reused-session smoke from `speed-bench/tp_mtp_hunt.md`:
+  `--ctx-start 256 --ctx-max 512 --step-incr 256 --gen-tokens 16`.  It must
+  produce two CSV rows without losing the support ring or leaving a stale
+  pending proposal.
+- If target-hidden capture, slot-row packing, or support prefill changes, run a
+  short forced probe with `DS4_DSPARK_SPEC_LOG=1 DS4_DSPARK_PROBE=1`.  Reject
+  `Metal slot-row pack received undersized buffers`, failed initial-cache seed,
+  an invalid 128-row support window, or zero proposals after bootstrap.
+- If F32 HC projection dispatch or the `dflash` importer changes, repeat the
+  short forced probe with the 10.8 GB imported full-fat sidecar.  F32 HC weights
+  must take the type-aware path; the pre-`242642c` zero-hit behavior is a
+  regression signature, not a valid quality result.
 
 ### Session Microbatching And Metal TP
 
@@ -551,6 +570,23 @@ loading code changes.
 - Save and restore a distributed KV snapshot if that code changed.
 - If CUDA distributed is relevant, test across the CUDA hosts and record
   generation speed, not just "it works".
+- On `apple-rdma-pp`, test the same two-node layer split over explicit TCP and
+  RDMA.  PP uses `--dist-transport rdma --dist-rdma-adj-devices DEVICE`, not
+  TP's `--transport/--rdma-device`.  Require route formation, short decode, a
+  multi-chunk prefill, clean shutdown, and no silent fallback after an RDMA
+  request.
+- Use one short `DS4_DIST_RDMA_TRACE=1` proof to confirm WORK and RESULT traffic
+  use the RDMA channel, then remove tracing for throughput.  Keep snapshot
+  save/load in the matrix because snapshots intentionally retain a TCP side
+  channel.
+- A/B the PP activation fence with `DS4_METAL_FAST_SYNC` unset versus set on
+  every node, restarting both processes between arms.  It is decode-only and
+  is currently expected to be neutral with fixed 128 KiB RDMA segments; a
+  feature log is not evidence of a speedup.  Prefill must remain unchanged.
+- For multi-hop PP, give each middle worker an explicit
+  `peerhost=device[,peerhost=device]` adjacency map.  Kill or disconnect a
+  middle worker during WORK and verify the route fails and can be rebuilt
+  without an RDMA receive or evaluator-thread hang.
 
 ## 11. Disk KV Cache
 
@@ -679,6 +715,7 @@ claims across different models or contexts.
 | MacBook Pro M5 Max 128 GB, Metal | Flash 0731 q2, opportunistic temperature-1 128-token code prompt | - | 44.49 t/s ordinary median; 48.19 t/s DSpark median |
 | Mac Studio M3 Ultra 512 GB, Metal | Flash q2, 11,709-token prompt | 468.03 t/s | 27.39 t/s |
 | Mac Studio M3 Ultra 512 GB, Metal | Flash q4, 12,018-token prompt | 448.82 t/s | 26.62 t/s |
+| Two M2 Ultra 128 GB Macs, Metal TP over TB RDMA | Flash 0731 MXFP4 experts, context 512 / generation 512 | 274.75 t/s in the latest target-only sample | **41.98 steady t/s target-only** |
 | Two M5 Max 128 GB Macs, Metal TP over TB5 RDMA | GLM 5.2 IQ2_XXS, 4,096-token context | about 94 t/s | 15.4 t/s |
 | DGX Spark GB10, CUDA | Flash q2, 7,047-token prompt | 343.81 t/s | 13.75 t/s |
 | DGX Spark GB10, CUDA | Flash q2 DSpark, 64-token C fixture | - | 24.48 t/s direct; 13.93 t/s replay predecessor |

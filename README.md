@@ -90,8 +90,8 @@ next sections.
   how local GGUFs are scored against official DeepSeek V4 Flash/PRO continuations.
 - [dir-steering/README.md](dir-steering/README.md): directional steering data,
   vector generation, and usage.
-- [speed-bench/README.md](speed-bench/README.md): benchmark commands, charts,
-  and CSV generation.
+- [speed-bench/README.md](speed-bench/README.md): the current TP/PP/RDMA/DSpark
+  engineering handoff, benchmark commands, settled results, and future work.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
   continuation vectors used for regression checks.
 
@@ -267,6 +267,14 @@ decoding, which is useful for reproducibility checks.
 The same DSpark flags work with `ds4-agent` and with non-batched
 `ds4-server` requests. Session-batched serving currently uses ordinary target
 decoding.
+
+On the current two-M2-Ultra TP test fixture, DSpark is not yet a throughput
+win: target-only decode is about 42 t/s, forced five-token drafting is about
+19--21 t/s, and the production low-yield policy stays near target-only speed by
+probing very sparsely.  The structural proposer/cache bugs found during that
+work are fixed, but proposal acceptance remains the open problem.  See the
+[performance handoff](speed-bench/README.md#dsparkmtp-on-tp-mtp-hunt) before
+using TP DSpark results or starting another optimization pass.
 
 ## Speed
 
@@ -446,6 +454,14 @@ tested two-host Strix Halo split uses `--layers 0:21` on the coordinator and
 model that does not fit on one 128 GB system; it does not add ROCm SSD
 streaming support for Flash.
 
+The base distributed path uses TCP.  The experimental `apple-rdma-pp` branch
+adds `--dist-transport rdma` and `--dist-rdma-adj-devices ...` so steady WORK,
+RESULT, and worker-to-worker forwarding use Apple Thunderbolt RDMA; TCP remains
+for registration/bootstrap, liveness, and KV snapshots.  This PP transport is
+on a sibling branch to `tp-mtp-hunt`; consult the
+[performance handoff](speed-bench/README.md#pipeline-parallelism-and-apple-rdma)
+before combining the work.
+
 ### How it works and how to configure it
 
 The prefill path is pipelined (this is why it can go faster than in a single machine).
@@ -514,7 +530,8 @@ TCP and also works over slower links, including WiFi, but fast Ethernet or
 Thunderbolt networking is strongly recommended. Slow links mostly hurt
 generation latency and short prefills; large prefills can still benefit when
 the layer split is balanced. In the normal performance path, the last worker
-owns the output head and returns logits directly.
+owns the output head and produces logits there; the RESULT currently relays
+back through upstream workers.
 
 Minimal two-host configuration:
 
@@ -536,7 +553,7 @@ Minimal two-host configuration:
 
 Normally the final worker should own the output head too, for example
 `--layers 20:output`. This avoids returning a full final hidden-state batch
-after prefill and lets the final worker produce the logits directly. On very
+after prefill and lets the final worker produce the logits. On very
 slow or metered links, `--layers 20:42` is also supported: the coordinator will
 load the output head and compute logits locally, trading extra coordinator work
 for smaller per-token replies.
@@ -611,6 +628,15 @@ receives into a reusable shared staging slot, and releases the GPU after the
 activation is complete. `DS4_PP_FENCE_MAX_ITERS` bounds the GPU wait and is a
 diagnostic/rollback knob rather than a normal tuning parameter.
 
+This PP fence does not accelerate prefill.  On the current Apple RDMA branch,
+the fixed 128 KiB segment layout also makes the fast route-prefix flush turn a
+normal one-segment 64 KiB Flash activation into two physical sends.  The
+user's qualitative A/B found no noticeable change, despite the feature log
+appearing; no quantitative PP fence benchmark has been preserved yet.  The
+data plane is still RDMA, so the null result is an economics result, not
+evidence of a TCP fallback.  See the
+[PP/RDMA handoff](speed-bench/README.md#pipeline-parallelism-and-apple-rdma).
+
 **If a worker disconnects, the coordinator removes that worker from the active
 route**. The request already in flight can fail, and later calls report an
 incomplete route until a compatible worker reconnects and sends a new
@@ -632,13 +658,15 @@ At the protocol level there are two kinds of connections. Workers keep a
 control TCP connection open to the coordinator and send a `HELLO` with their
 model ID, model family, quant profile, layer slice, context capacity, and data
 port. The coordinator uses these registrations to build a route that covers all
-layers. Work then moves over low-latency TCP data connections: the coordinator
-computes the first slice, sends a `WORK` frame with session ID, token positions,
+layers. Work then moves over low-latency data connections (TCP on the base
+path, an RDMA data channel on `apple-rdma-pp`): the coordinator computes the
+first slice, sends a `WORK` frame with session ID, token positions,
 rolling token-prefix hashes before and after the span, route information, and
 hidden-state payload, and each worker computes its slice. Middle workers can
-forward directly to the next worker. The final worker returns logits to the
-coordinator, or ACKs for non-final prefill chunks so the prefill pipeline can
-stay full. `RESULT` frames echo the request ID and the post-span hash. A worker
+forward directly to the next worker. The final worker produces logits and
+returns them upstream through the route (currently relayed hop-by-hop), or ACKs
+for non-final prefill chunks so the prefill pipeline can stay full. `RESULT`
+frames echo the request ID and the post-span hash. A worker
 status error is handled differently from a socket failure: KV/hash mismatch can
 be recovered by replaying the token history on the same route, while transport
 failure drops the route and waits for a replacement worker. For persistent KV,
@@ -659,10 +687,12 @@ otherwise). Unlike the pipelined distributed mode above, both
 machines work on the *same token at the same time*, so it reduces
 per-token latency instead of just fitting a bigger model.
 
-Each machine keeps one contiguous half of the routed experts resident. Dense,
-attention, shared-expert, embedding, and output weights remain replicated.
-This lets a model whose routed experts do not fit on one machine run fully
-resident across the pair; routed kernels never touch the peer's expert half.
+Each machine keeps one contiguous half of the routed experts resident.  The
+large attention-head/output-group projections, shared-expert intermediate, and
+vocabulary output are also split across the pair.  Smaller `q_a`/KV, router,
+HC/norm, and embedding work remains replicated.  This lets a model whose
+routed experts do not fit on one machine run fully resident across the pair;
+routed kernels never touch the peer's expert half.
 
 ### Running GLM 5.2 across two 128 GB MacBooks
 
@@ -714,7 +744,10 @@ The active verbs device and IPv4-mapped GID are selected automatically. If that
 is ambiguous, add `--rdma-device rdma_en6 --rdma-gid-index 1` on the worker and
 the matching `rdma_en1` flags on the coordinator. Use `--transport tcp` on both
 sides to force TCP. Tensor parallel roles are currently exposed by the `ds4`
-CLI, not by `ds4-server` or `ds4-agent`.
+CLI and, on the TP frontend branches, by `ds4-bench`, `ds4-eval`, `ds4-agent`,
+and `ds4-server`.  Use `ds4-bench` for reproducible performance work; advanced
+batched-session and disk-KV behavior is still more restricted under TP than in
+the single-process server.
 
 Startup takes about 9 seconds per machine: each rank pre-faults its
 ~100 GiB shard from SSD and pins it through a Metal residency set.

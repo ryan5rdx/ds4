@@ -167,6 +167,8 @@ their normal defaults or explicit `--tensor-type` overrides.
 The published `DeepseekV4-Flash-20260731-DSpark.gguf` uses llama.cpp's
 `dflash` architecture and cannot be passed directly to DS4's `--mtp` option.
 The pinned public artifact is 10,896,057,568 bytes.
+Its expected Hugging Face LFS SHA-256 is
+`835d0fc5216b8a71111492c3f9e64add1d72345befa750610fdfae1011adf08f`.
 Import it without downloading the Hugging Face safetensor shards:
 
 ```sh
@@ -188,6 +190,12 @@ quality-focused sidecar.
 
 For the pinned public artifact, the expected output inventory is 45 F32, 27
 Q8_0, and 9 MXFP4 tensors, with an exact file size of 10,835,055,488 bytes.
+
+The imported file preserves the source's F32 HC projection weights.  Use it
+only with `tp-mtp-hunt` commit `242642c` or a descendant containing the
+type-aware DSpark HC projection fix.  Older Metal builds send the stage F32 HC
+weights through an F16-only helper and can produce zero useful proposals even
+though the GGUF validates successfully.
 
 The input and output must be different files.  Existing outputs require
 `--overwrite`.  Conversion is written to a same-directory temporary file and

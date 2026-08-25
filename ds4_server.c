@@ -46,6 +46,12 @@ static volatile sig_atomic_t g_listen_fd = -1;
 #define DS4_SERVER_IO_TIMEOUT_SEC 10
 #define DS4_SERVER_SEND_STALL_TIMEOUT_MS 2000
 
+/* Mirror of DS4_GPU_TP_QUEUE in ds4_metal.m, used only to size the
+ * --batched-session ceiling under TP.  The queue's own preflight is the
+ * authoritative guard; this just rejects an impossible -N at startup instead of
+ * aborting decode steps later. */
+#define DS4_SERVER_TP_GATE_QUEUE 4096u
+
 #if defined(__GNUC__) || defined(__clang__)
 #define DS4_SERVER_MAYBE_UNUSED __attribute__((unused))
 #else
@@ -8503,6 +8509,8 @@ struct server_slot {
 
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
+static bool byte_prefix_match(const char *text, size_t text_len,
+                              const char *prefix, size_t prefix_len);
 
 struct server {
     ds4_engine *engine;
@@ -8873,16 +8881,27 @@ static void anthropic_live_clear(server *s, server_slot *slot) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
+/* `visible_text` is the rendered prompt of the turn that produced these calls.
+ * A genuine append-only continuation re-renders it byte-for-byte and appends the
+ * assistant tool-call turn plus the tool results, so it stays a prefix of the
+ * next request's prompt; a client that rewrites the head does not.  Without it
+ * the ids alone would bind (see chat_live_matches_request). */
 static void chat_live_remember(server *s, server_slot *slot,
+                               const char *visible_text,
                                const tool_calls *calls) {
     if (!s || !slot || !calls || calls->len == 0) return;
     pthread_mutex_lock(&s->tool_mu);
     live_tool_state_clear_locked(&slot->chat_live);
+    if (visible_text && visible_text[0]) {
+        slot->chat_live.visible_text = xstrdup(visible_text);
+        slot->chat_live.visible_len = strlen(visible_text);
+    }
     for (int i = 0; i < calls->len; i++) {
         id_list_push_unique(&slot->chat_live.call_ids, calls->v[i].id);
     }
     slot->chat_live.live_tokens = ds4_session_pos(slot->session);
-    slot->chat_live.valid = slot->chat_live.call_ids.len > 0;
+    slot->chat_live.valid = slot->chat_live.call_ids.len > 0 &&
+                            slot->chat_live.visible_text != NULL;
     pthread_mutex_unlock(&s->tool_mu);
 }
 
@@ -8898,6 +8917,36 @@ static void request_live_state_clear(server *s, server_slot *slot) {
     anthropic_live_clear(s, slot);
     chat_live_clear(s, slot);
     thinking_live_clear(s, slot);
+}
+
+/* Cancellation cleanup for a job that already committed its prompt.
+ *
+ * A cancelled generation (ESC, client disconnect, a failed SSE write) leaves
+ * every partially-sampled token in the live checkpoint.  The next request from
+ * the same conversation then diverges from the checkpoint at the prompt
+ * frontier and re-prefills the whole context, which is the regression this
+ * exists to prevent.  Rewind to the frontier that was committed before
+ * generation appended anything; ds4_session_rewind clamps to
+ * [0, checkpoint.len], so it is safe even if the cancel raced a mid-prefill
+ * interrupt.  Every post-prefill cancel exit must go through here -- doing it
+ * at only one of them is what shipped, and the rest kept re-prefilling.
+ *
+ * `committed_frontier` must be the position captured after the prompt sync, not
+ * effective_prompt.len: the latter is 0 for a fresh request and would wipe the
+ * checkpoint entirely. */
+static void request_cancel_rollback(server *s, server_slot *slot,
+                                    int committed_frontier) {
+    request_live_state_clear(s, slot);
+    pthread_mutex_lock(&s->inference_mu);
+    ds4_session_rewind(slot->session, committed_frontier);
+    pthread_mutex_unlock(&s->inference_mu);
+    /* The rewind also un-does the continued-store high-water mark: leaving it
+     * above the frontier makes the next generation skip its disk snapshot at
+     * that boundary, because the retry now cache-hits and the cached == 0 reset
+     * no longer fires. */
+    if (slot->continued_last_store_tokens > committed_frontier) {
+        slot->continued_last_store_tokens = committed_frontier;
+    }
 }
 
 static bool responses_live_has_call_id(server *s, const char *id) {
@@ -8954,14 +9003,30 @@ static bool anthropic_live_matches_request(server *s, server_slot *slot,
     return ok;
 }
 
+/* Unlike Responses and Anthropic, plain chat/completions has no protocol object
+ * binding a request to prior server state: the messages array is authoritative.
+ * Matching on tool_call ids alone would let a client that rewrote the head of
+ * the transcript -- a re-injected system block, a compaction, a changed tool
+ * schema -- continue from the live KV and silently be served the stale head,
+ * because the continuation replaces req->prompt with live tokens + tool-result
+ * tail and the tail renderer skips system messages.  So also require the
+ * request's rendered text to still begin with the text that was live when these
+ * ids were sampled, the same guard responses_live and thinking_live use. */
 static bool chat_live_matches_request(server *s, server_slot *slot,
                                       const stop_list *ids,
-                                      int live_tokens) {
-    if (!s || !slot || !ids || ids->len == 0) return false;
+                                      int live_tokens,
+                                      const char *prompt_text) {
+    if (!s || !slot || !ids || ids->len == 0 || !prompt_text) return false;
+    const size_t prompt_len = strlen(prompt_text);
     pthread_mutex_lock(&s->tool_mu);
     bool ok = slot->chat_live.valid &&
               slot->chat_live.live_tokens == live_tokens &&
-              slot->chat_live.call_ids.len == ids->len;
+              slot->chat_live.call_ids.len == ids->len &&
+              slot->chat_live.visible_text &&
+              slot->chat_live.visible_len < prompt_len &&
+              byte_prefix_match(prompt_text, prompt_len,
+                                slot->chat_live.visible_text,
+                                slot->chat_live.visible_len);
     for (int i = 0; ok && i < ids->len; i++) {
         ok = id_list_contains(&slot->chat_live.call_ids, ids->v[i]);
     }
@@ -9883,10 +9948,12 @@ static int chat_live_continuation_prompt(server *s, server_slot *slot,
                                          int *matched_ids) {
     if (!s || !slot || !req || !effective_prompt) return 0;
     if (req->api != API_OPENAI || !req->chat_live_suffix_text) return 0;
+    if (!req->prompt_text) return 0;
     if (req->chat_live_call_ids.len == 0) return 0;
     if (!chat_live_matches_request(s, slot,
                                    &req->chat_live_call_ids,
-                                   live_pos)) return 0;
+                                   live_pos,
+                                   req->prompt_text)) return 0;
 
     const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
     if (!live_tokens || live_tokens->len != live_pos) return 0;
@@ -10052,9 +10119,35 @@ static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
     if (!d || !d->valid) return "unknown";
     if (d->old_pos == 0) return "no-live-checkpoint";
     if (d->rewind_to >= 0) return "live-prefix-rewind";
-    if (d->common != d->old_pos) return "token-mismatch";
+    if (d->common != d->old_pos) {
+        /* Where the prefix diverges decides both how expensive the miss is and
+         * which fix applies, so do not fold every divergence into one reason.
+         * A client that injects a per-request-varying block into the system
+         * prompt (editor extensions that re-inject session state, cwd, git
+         * status) diverges inside the first few hundred tokens and loses the
+         * entire context; an ordinary re-render difference diverges near the
+         * tail and loses almost nothing.  Both used to log "token-mismatch",
+         * which is why an injected-prefix regression is hard to spot. */
+        if (d->common < d->old_pos / 8) return "leading-block-divergence";
+        if (d->old_pos - d->common > d->old_pos / 8) return "mid-prefix-divergence";
+        return "token-mismatch";
+    }
     if (d->prompt_len < d->old_pos) return "incoming-prompt-shorter-than-live-checkpoint";
     return "live-prefix-match";
+}
+
+/* First token ids that differ, for the cache-miss log.  The capture window is
+ * centred on `common`, so the divergent pair is at that offset when it is in
+ * range; -1 means "past the end of that side". */
+static void trace_cache_diverge_tokens(const trace_cache_diag *d,
+                                       int *live_tok, int *prompt_tok) {
+    *live_tok = -1;
+    *prompt_tok = -1;
+    if (!d || !d->valid) return;
+    const int idx = d->common - d->start;
+    if (idx < 0 || idx >= d->count) return;
+    *live_tok = d->live_id[idx];
+    *prompt_tok = d->prompt_id[idx];
 }
 
 static bool trace_cache_memory_reusable(const trace_cache_diag *d) {
@@ -11090,8 +11183,15 @@ done:
     free(suffix_text);
 }
 
-static bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *calls) {
+/* `recovery_attempted` means a model-visible tool-error continuation ran, so the
+ * live checkpoint holds a hidden error exchange the client never saw.  Exact
+ * DSML replay cannot repair that divergence, so canonicalization is forced even
+ * when raw_tool_text is present.  It lives here rather than at the call site so
+ * the whole decision stays in one tested pure function. */
+static bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *calls,
+                                                bool recovery_attempted) {
     if (!calls || calls->len == 0) return false;
+    if (recovery_attempted) return true;
     if (s && !s->disable_exact_dsml_tool_replay &&
         calls->raw_tool_text && calls->raw_tool_text[0])
     {
@@ -11447,11 +11547,20 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         }
     }
     if (cached == 0 && old_pos > 0) {
+        /* slot= separates the two root causes that otherwise produce an
+         * identical line on a multi-slot server: the conversation was scored
+         * onto a different slot (a routing fix), or it stayed put and the
+         * render diverged (a rendering fix).  diverge= names the first token
+         * pair that differs, which pins the divergence to a concrete edit. */
+        int live_tok = -1, prompt_tok = -1;
+        trace_cache_diverge_tokens(&cache_diag, &live_tok, &prompt_tok);
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s tool_replay=mem:%d/disk:%d/canonical:%d/missing:%d",
+                   "ds4-server: live kv cache miss%s slot=%d live=%d prompt=%d common=%d lost=%d reason=%s diverge=%d/%d tool_replay=mem:%d/disk:%d/canonical:%d/missing:%d",
                    responses_protocol ? " RESPPROTO" : "",
-                   old_pos, j->req.prompt.len, common,
+                   slot->id,
+                   old_pos, j->req.prompt.len, common, old_pos - common,
                    trace_cache_miss_reason(&cache_diag),
+                   live_tok, prompt_tok,
                    j->req.tool_replay.mem,
                    j->req.tool_replay.disk,
                    j->req.tool_replay.canonical,
@@ -11527,6 +11636,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    anthropic_live_match_ids,
                    cached,
                    prompt_tokens);
+    } else if (chat_live_continuation) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: chat live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   chat_live_match_ids,
+                   cached,
+                   prompt_tokens);
     } else if (thinking_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
@@ -11597,13 +11712,19 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
-            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
-            free(disk_cache_path);
             if (job_cancelled(j)) {
+                /* A cancelled sync is not a failed sync.  ds4.h documents an
+                 * interrupted sync as leaving the live checkpoint a valid token
+                 * prefix, and the disk snapshot it was restored from is still
+                 * good, so discarding either would make the retry strictly more
+                 * expensive than if the cancel had never happened. */
+                free(disk_cache_path);
                 request_live_state_clear(s, slot);
                 trace_event(s, trace_id, "cancelled during prefill");
                 return;
             }
+            kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+            free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
             return;
@@ -11627,13 +11748,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
-        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
-        free(disk_cache_path);
         if (job_cancelled(j)) {
+            /* See above: an interrupted sync leaves a valid prefix and a valid
+             * disk entry.  Keep both -- unlinking the snapshot the session was
+             * loaded from turns an ESC into a guaranteed cold re-prefill. */
+            free(disk_cache_path);
             request_live_state_clear(s, slot);
             trace_event(s, trace_id, "cancelled during prefill");
             return;
         }
+        kv_cache_discard_failed_disk_entry(s, slot, disk_cache_path);
+        free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
@@ -12038,16 +12163,7 @@ decode_again:
     server_generation_leave(s);
 
     if (job_cancelled(j)) {
-        request_live_state_clear(s, slot);
-        /* A cancelled generation left every partially-sampled token in the
-         * live checkpoint (no stop-string, so hit_stop's invalidate never ran).
-         * Rewind to the committed prefill frontier so the next request can
-         * still cache-hit on the prompt instead of doing a full re-prefill.
-         * Do not use effective_prompt.len here: for a fresh request with no
-         * live continuation it is 0, which would wipe the checkpoint entirely. */
-        pthread_mutex_lock(&s->inference_mu);
-        ds4_session_rewind(slot->session, committed_frontier);
-        pthread_mutex_unlock(&s->inference_mu);
+        request_cancel_rollback(s, slot, committed_frontier);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
@@ -12088,8 +12204,21 @@ decode_again:
                  * the repaired bytes.  Replaying the repaired block would
                  * diverge from the checkpoint on the next tool-result request,
                  * so remember the raw block instead (Step 2). */
-                const char *raw_start = find_any_tool_start(text.ptr);
+                /* Anchor the span exactly where the parsers do, or the
+                 * remembered bytes will not reproduce the checkpoint and the
+                 * next turn re-prefills anyway.  Two rules to match: the scan
+                 * starts after the last </think> (DSML quoted inside reasoning
+                 * is not the executable block, same rule try_repair_dsml
+                 * applies), and raw_block_start includes the "\n\n" separator
+                 * that precedes the block. */
+                const char *think_end = find_last_substr(text.ptr, "</think>");
+                const char *raw_start =
+                    find_any_tool_start(think_end ? think_end + 8 : text.ptr);
                 if (raw_start) {
+                    if (raw_start >= text.ptr + 2 &&
+                        raw_start[-2] == '\n' && raw_start[-1] == '\n') {
+                        raw_start -= 2;
+                    }
                     trunc_raw_block = xstrndup(raw_start,
                         (size_t)((text.ptr + text.len) - raw_start));
                 }
@@ -12171,7 +12300,7 @@ decode_again:
         free(tail);
     }
     if (job_cancelled(j)) {
-        request_live_state_clear(s, slot);
+        request_cancel_rollback(s, slot, committed_frontier);
         trace_event(s, trace_id, "cancelled while flushing generation");
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
@@ -12293,7 +12422,7 @@ decode_again:
             }
         }
         if (job_cancelled(j)) {
-            request_live_state_clear(s, slot);
+            request_cancel_rollback(s, slot, committed_frontier);
             trace_event(s, trace_id, "cancelled during response parsing");
             free(parsed_content);
             free(parsed_reasoning);
@@ -12332,7 +12461,7 @@ decode_again:
         }
     }
     if (job_cancelled(j)) {
-        request_live_state_clear(s, slot);
+        request_cancel_rollback(s, slot, committed_frontier);
         trace_event(s, trace_id, "cancelled before publishing response state");
         free(parsed_content);
         free(parsed_reasoning);
@@ -12387,22 +12516,21 @@ decode_again:
         if (parsed_calls.len && strcmp(final_finish, "error") &&
             strcmp(final_finish, "length"))
         {
-            chat_live_remember(s, slot, &parsed_calls);
+            chat_live_remember(s, slot, j->req.prompt_text, &parsed_calls);
         } else {
             chat_live_clear(s, slot);
         }
     }
 
-    /* Step 3 (recovery edge): after a model-visible tool-error continuation
-     * (dsml_recovery_attempted) yields valid calls, the live checkpoint holds
-     * a hidden error exchange the client never saw.  Exact DSML replay cannot
-     * repair that divergence, so force canonicalization (which rebuilds the
-     * checkpoint to exactly what the client will render next) regardless of
-     * whether raw_tool_text is present. */
+    /* Step 3 (recovery edge): the dsml_recovery_attempted case -- where the
+     * live checkpoint holds a hidden tool-error exchange the client never saw,
+     * which exact DSML replay cannot repair -- is folded into
+     * should_canonicalize_tool_checkpoint so the whole decision stays in one
+     * tested pure function. */
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
-        (dsml_recovery_attempted ||
-         should_canonicalize_tool_checkpoint(s, &parsed_calls)))
+        should_canonicalize_tool_checkpoint(s, &parsed_calls,
+                                            dsml_recovery_attempted))
     {
         /* Chat/completions has no protocol object that binds the next request
          * to this live KV state.  Canonicalize only the fallback tool-call
@@ -12414,6 +12542,13 @@ decode_again:
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
         thinking_live_clear(s, slot);
+        /* Canonicalization rewrites the session, so the frontier recorded by
+         * the *_live_remember calls just above no longer exists.  Drop those
+         * bindings rather than leave them pointing at a stale position: the
+         * canonicalized checkpoint is exactly what the client renders next, so
+         * the plain token-prefix path already covers the following turn. */
+        anthropic_live_clear(s, slot);
+        chat_live_clear(s, slot);
     } else if (parsed_calls.len) {
         thinking_live_clear(s, slot);
     } else if (!parsed_calls.len &&
@@ -12482,7 +12617,10 @@ decode_again:
         job_mark_cancelled(j);
         final_finish = "error";
         snprintf(err, sizeof(err), "client disconnected");
-        request_live_state_clear(s, slot);
+        /* The client never received this turn, so it will retry without it.
+         * Roll the sampled answer back off the checkpoint so that retry is a
+         * prompt cache hit rather than a full re-prefill. */
+        request_cancel_rollback(s, slot, committed_frontier);
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: %s ctx=%s%s%s client disconnected",
                    j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -13288,6 +13426,7 @@ static void server_close_resources(server *s) {
         server_slot *slot = &s->slots[i];
         live_tool_state_free(&slot->responses_live);
         live_tool_state_free(&slot->anthropic_live);
+        live_tool_state_free(&slot->chat_live);
         visible_live_free(&slot->thinking_live);
         if (slot->session) ds4_session_free(slot->session);
     }
@@ -13589,26 +13728,40 @@ static server_config parse_options(int argc, char **argv) {
     }
     if (c.engine.tp.role != DS4_TP_NONE) {
         /* Batched decode under TP mirrors the whole batch to the worker once
-         * per decode step.  Each row fires 86 gates (43 layers x ATTN+FFN)
-         * into the shared 4096-deep gate queue, so the theoretical ceiling
-         * is ~47 rows; the queue's preflight aborts the step rather than
-         * corrupting past that.  We cap at 32 for comfortable headroom and
-         * keep the preflight as a runtime fail-safe.  The mirrored control
-         * socket stays serialized because every request runs under
-         * inference_mu and the per-rank control lock. */
+         * per decode step.  Each row fires DS4_N_LAYER x ATTN+FFN gates into
+         * the shared 4096-deep gate queue, so the row ceiling depends on the
+         * model shape: 86 gates/row for the 43-layer Flash build, 122 for the
+         * 61-layer Pro build.  Derive it instead of hardcoding the Flash
+         * number, keep 25% headroom, and leave the queue's preflight as the
+         * runtime fail-safe.  The mirrored control socket stays serialized
+         * because every request runs under inference_mu and the per-rank
+         * control lock.
+         *
+         * ds4_engine_tp_gate_schedule reports a compile-time schedule and
+         * ignores its engine argument, which is why this can run here, before
+         * the model is loaded, rather than costing the user a full model load
+         * before rejecting a bad -N. */
+        uint32_t gate_start = 0, gate_step = 0, gates_per_row = 0;
+        ds4_engine_tp_gate_schedule(NULL, &gate_start, &gate_step,
+                                    &gates_per_row);
+        int tp_row_cap = gates_per_row > 0 ?
+            (int)((DS4_SERVER_TP_GATE_QUEUE * 3u / 4u) / gates_per_row) : 32;
+        if (tp_row_cap > 32) tp_row_cap = 32;
+        if (tp_row_cap < 1) tp_row_cap = 1;
         if (c.batched_sessions > 0) {
-            if (c.batched_sessions > 32) {
+            if (c.batched_sessions > tp_row_cap) {
                 server_log(DS4_LOG_DEFAULT,
                            "ds4-server: --batched-session %d exceeds the TP "
-                           "gate-queue ceiling of 32 rows (86 gates/row into "
-                           "a 4096-deep queue); reduce N",
-                           c.batched_sessions);
+                           "gate-queue ceiling of %d rows (%u gates/row into "
+                           "a %u-deep queue); reduce N",
+                           c.batched_sessions, tp_row_cap,
+                           gates_per_row, (unsigned)DS4_SERVER_TP_GATE_QUEUE);
                 exit(2);
             }
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: TP batched decode enabled "
-                       "(batched_sessions=%d, gate-queue ceiling 32 rows)",
-                       c.batched_sessions);
+                       "(batched_sessions=%d, %u gates/row, gate-queue ceiling %d rows)",
+                       c.batched_sessions, gates_per_row, tp_row_cap);
         }
         /* --kv-disk-dir stays available: storing only reads local KV. The
          * restore side is skipped in kv_cache_try_load_text() because
@@ -13714,9 +13867,10 @@ int main(int argc, char **argv) {
     }
 
     /* Resident slots and batched decode are separate concerns. Batched mode
-     * pushes several rows through one decode step and is refused under TP;
-     * resident slots merely keep N conversations warm and still serialize
-     * every request through inference_mu, so they are TP-legal. */
+     * pushes several rows through one decode step and is TP-legal up to the
+     * gate-queue ceiling checked in parse_options; resident slots merely keep N
+     * conversations warm.  Both serialize every request through inference_mu
+     * and, under TP, the per-rank control lock. */
     const int slot_count =
         cfg.batched_sessions > 0 ? cfg.batched_sessions :
         cfg.resident_sessions > 0 ? cfg.resident_sessions : 1;
@@ -16446,6 +16600,177 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
     request_free(&r);
 }
 
+/* Mirror of the Anthropic test above for plain chat/completions.  The two tail
+ * finders are near-identical, so a change to one that is not made to the other
+ * silently drops the chat fast path back to full re-render. */
+static void test_chat_live_tail_renders_tool_results_only(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.think_mode = DS4_THINK_HIGH;
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_live");
+    tc.name = xstrdup("Bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("/tmp");
+    tool.tool_call_id = xstrdup("call_live");
+    chat_msgs_push(&msgs, tool);
+
+    /* A trailing system message must not stop the tail scan. */
+    chat_msg system = {0};
+    system.role = xstrdup("system");
+    system.content = xstrdup("You are terse.");
+    chat_msgs_push(&msgs, system);
+
+    chat_prepare_live_continuation(&r, &msgs);
+    TEST_ASSERT(r.chat_live_call_ids.len == 1);
+    TEST_ASSERT(!strcmp(r.chat_live_call_ids.v[0], "call_live"));
+    TEST_ASSERT(r.chat_live_suffix_text != NULL);
+    /* The tail is only the tool result plus the next assistant prefix: the
+     * assistant tool-call turn is already in the sampled KV, so re-rendering it
+     * would double it. */
+    TEST_ASSERT(strstr(r.chat_live_suffix_text, "/tmp") != NULL);
+    TEST_ASSERT(strstr(r.chat_live_suffix_text, "Bash") == NULL);
+
+    chat_msgs_free(&msgs);
+    request_free(&r);
+
+    /* Negative: a trailing user message with no tool_call_id is a new turn, not
+     * a continuation, and must not arm the fast path. */
+    request r2;
+    request_init(&r2, REQ_CHAT, 128);
+    r2.api = API_OPENAI;
+    chat_msgs plain = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("what now?");
+    chat_msgs_push(&plain, user);
+    chat_prepare_live_continuation(&r2, &plain);
+    TEST_ASSERT(r2.chat_live_call_ids.len == 0);
+    TEST_ASSERT(r2.chat_live_suffix_text == NULL);
+    chat_msgs_free(&plain);
+    request_free(&r2);
+}
+
+/* The chat_live fast path is guarded by byte_prefix_match(next request's
+ * prompt_text, the prompt_text remembered when the calls were sampled).  That
+ * guard is only sound if the renderer is append-only across a tool round trip.
+ * If some future render change rewrites an earlier byte when the transcript
+ * grows -- the reasoning-visibility branch keyed on last_user_idx is the one to
+ * watch -- the guard would silently disable the fast path forever and every
+ * agentic turn would re-prefill, with no test failing.  Pin the invariant. */
+static void test_chat_render_is_append_only_across_tool_turn(void) {
+    const char *tool_schemas =
+        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{}}}}";
+
+    /* Turn N: system + user; the model is about to emit a tool call. */
+    chat_msgs turn_n = {0};
+    chat_msg sys_n = {0};
+    sys_n.role = xstrdup("system");
+    sys_n.content = xstrdup("You are terse.");
+    chat_msgs_push(&turn_n, sys_n);
+    chat_msg user_n = {0};
+    user_n.role = xstrdup("user");
+    user_n.content = xstrdup("what dir?");
+    chat_msgs_push(&turn_n, user_n);
+
+    /* Turn N+1: identical history, plus the sampled assistant tool call and the
+     * tool result the client returns for it. */
+    chat_msgs turn_n1 = {0};
+    chat_msg sys_n1 = {0};
+    sys_n1.role = xstrdup("system");
+    sys_n1.content = xstrdup("You are terse.");
+    chat_msgs_push(&turn_n1, sys_n1);
+    chat_msg user_n1 = {0};
+    user_n1.role = xstrdup("user");
+    user_n1.content = xstrdup("what dir?");
+    chat_msgs_push(&turn_n1, user_n1);
+    chat_msg asst = {0};
+    asst.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_1");
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&asst.calls, tc);
+    chat_msgs_push(&turn_n1, asst);
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("/tmp");
+    tool.tool_call_id = xstrdup("call_1");
+    chat_msgs_push(&turn_n1, tool);
+
+    const ds4_think_mode modes[] = { DS4_THINK_NONE, DS4_THINK_HIGH };
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        char *a = render_chat_prompt_text_for_syntax(
+            SERVER_MODEL_SYNTAX_DEEPSEEK, &turn_n, tool_schemas, NULL, modes[i]);
+        char *b = render_chat_prompt_text_for_syntax(
+            SERVER_MODEL_SYNTAX_DEEPSEEK, &turn_n1, tool_schemas, NULL, modes[i]);
+        TEST_ASSERT(a != NULL && b != NULL);
+        TEST_ASSERT(strlen(b) > strlen(a));
+        TEST_ASSERT(!strncmp(b, a, strlen(a)));
+        free(a);
+        free(b);
+    }
+
+    chat_msgs_free(&turn_n);
+    chat_msgs_free(&turn_n1);
+}
+
+/* Plain chat/completions has no protocol handle binding a request to server
+ * state, so matching on tool_call ids alone would let a client that rewrote the
+ * head of the transcript be served the stale head from live KV.  Pin the
+ * visible-prefix guard that prevents it. */
+static void test_chat_live_match_requires_visible_prefix(void) {
+    server s = {0};
+    server_slot slot;
+    test_server_bind_slot(&s, &slot);
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    const char *live_prompt = "SYSTEM v1\nUser: hi\nAssistant:";
+    slot.chat_live.valid = true;
+    slot.chat_live.live_tokens = 42;
+    slot.chat_live.visible_text = xstrdup(live_prompt);
+    slot.chat_live.visible_len = strlen(live_prompt);
+    id_list_push_unique(&slot.chat_live.call_ids, "call_live");
+
+    stop_list ids = {0};
+    id_list_push_unique(&ids, "call_live");
+
+    /* Append-only continuation: the next prompt still starts with the text that
+     * was live when the ids were sampled. */
+    char appended[256];
+    snprintf(appended, sizeof(appended), "%s tool result\nAssistant:", live_prompt);
+    TEST_ASSERT(chat_live_matches_request(&s, &slot, &ids, 42, appended));
+
+    /* Rewritten head, same ids: must NOT bind.  This is the injected-prefix
+     * shape, where a client refreshes its system block every request. */
+    TEST_ASSERT(!chat_live_matches_request(&s, &slot, &ids, 42,
+                                           "SYSTEM v2\nUser: hi\nAssistant: tool result\nAssistant:"));
+
+    /* Frontier moved (another job ran on the slot): must not bind. */
+    TEST_ASSERT(!chat_live_matches_request(&s, &slot, &ids, 43, appended));
+
+    /* Unknown id: must not bind. */
+    stop_list other = {0};
+    id_list_push_unique(&other, "call_other");
+    TEST_ASSERT(!chat_live_matches_request(&s, &slot, &other, 42, appended));
+
+    id_list_free(&other);
+    id_list_free(&ids);
+    live_tool_state_free(&slot.chat_live);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 static void test_anthropic_tool_result_id_validation(void) {
     server s = {0};
     server_slot slot;
@@ -16576,15 +16901,20 @@ static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
         "</｜DSML｜invoke>\n"
         DS4_TOOL_CALLS_END);
 
-    TEST_ASSERT(!should_canonicalize_tool_checkpoint(&s, &calls));
+    TEST_ASSERT(!should_canonicalize_tool_checkpoint(&s, &calls, false));
+
+    /* A tool-error recovery continuation leaves a hidden error exchange in the
+     * checkpoint that exact DSML replay cannot reproduce, so canonicalization
+     * is forced even though raw_tool_text is present and replay is enabled. */
+    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls, true));
 
     s.disable_exact_dsml_tool_replay = true;
-    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls));
+    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls, false));
 
     s.disable_exact_dsml_tool_replay = false;
     free(calls.raw_tool_text);
     calls.raw_tool_text = NULL;
-    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls));
+    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls, false));
 
     tool_calls_free(&calls);
 }
@@ -18742,6 +19072,9 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();
     test_anthropic_live_tail_renders_tool_results_only();
+    test_chat_live_tail_renders_tool_results_only();
+    test_chat_render_is_append_only_across_tool_turn();
+    test_chat_live_match_requires_visible_prefix();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
     test_anthropic_tool_use_parses_before_role();

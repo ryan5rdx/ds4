@@ -26,12 +26,14 @@ attn/shared/output).
 ## Branches
 
 - `tp-multi-slot-batching` — current TP base. Includes ESC-cancel live-KV fix
-  (`2fa324b`: rewind live session to prefill frontier on job cancel).
+  (`22568ab`: rewind live session to prefill frontier on job cancel).
 - `pp-rdma-new` — PP-RDMA rebuilt off `tp-multi-slot-batching` base:
-  - `762886a` cherry-pick of PP-RDMA transport (`f7d3837`)
-  - `4349dbf` PP RDMA connection lifecycle fix (persistent worker chan, borrowed
+  - `180e853` cherry-pick of PP-RDMA transport (from `apple-rdma-pp`'s `f7d3837`)
+  - `ecea7be` PP RDMA connection lifecycle fix (persistent worker chan, borrowed
     by route plans) — eliminated per-generation teardown/reconnect.
-- Old `apple-rdma-pp` branch is 54 commits behind HEAD — do not use.
+- Old `apple-rdma-pp` branch — do not use. Check the real gap with
+  `git rev-list --count apple-rdma-pp..tp-multi-slot-batching` rather than
+  trusting a number written here; it goes stale on every commit.
 
 ## Launch commands
 
@@ -41,8 +43,12 @@ attn/shared/output).
   DS4_METAL_FAST_SYNC=1 ./ds4-bench -m <MODEL> --role coordinator \
     --tensor-parallel --transport rdma --listen 0.0.0.0 1234 \
     --rdma-device rdma_en6 --prompt-file /tmp/bench_long.txt \
-    --ctx-start N --ctx-max N --gen-tokens 128 --csv FILE
+    --ctx-start 2048 --ctx-max 131072 --step-mul 2 \
+    --gen-tokens 128 --csv /tmp/tp_sweep_full.csv
   ```
+  `--step-mul 2` is what produces the ×2 sweep table below. Without it
+  `step_incr` defaults to 2048 (`ds4_bench.c`), i.e. a 64-point linear sweep —
+  many hours at 128k rather than the seven points published here.
 - **mat (worker):**
   ```
   DS4_METAL_FAST_SYNC=1 ./ds4-bench -m <MODEL> --role worker \
@@ -56,7 +62,8 @@ attn/shared/output).
   DS4_METAL_FAST_SYNC=1 ./ds4-bench -m <MODEL> --role coordinator \
     --layers 0:21 --listen 0.0.0.0 9000 --dist-transport rdma \
     --dist-rdma-adj-devices rdma_en6 --prompt-file /tmp/bench_long.txt \
-    --ctx-start N --ctx-max N --step-mul 2 --gen-tokens N --csv FILE
+    --ctx-start 2048 --ctx-max 131072 --step-mul 2 \
+    --gen-tokens 128 --csv /tmp/pp_sweep_full.csv
   ```
 - **mat (worker):** layers 22:output — **must use `./ds4`** (serving binary), not
   `ds4-bench` (rejects `--role worker`)
@@ -124,6 +131,13 @@ During **TP prefill**, node power drops as context grows:
 - ~120 W prefill at < 50k context
 - ~100 W prefill at ~180k+ context
 
+Caveat before reproducing: these two readings predate the sweep table above and
+are not from it — the documented sweep stops at 131072, so the ~180k point is
+not reachable by re-running it. The measurement command, per-node vs pair basis,
+and host were not recorded. Re-measure with
+`sudo powermetrics --samplers gpu_power` on a named host and record the context
+of each reading before treating the delta as a quantitative result.
+
 Interpretation: lower power = GPU under-utilization / more waiting as context
 grows. See investigation notes in `docs/TP-PREFILL-LONG-CTX-INVESTIGATION.md`
 (if present) / the conversation for root-cause analysis and improvement options.
@@ -135,16 +149,24 @@ grows. See investigation notes in `docs/TP-PREFILL-LONG-CTX-INVESTIGATION.md`
   one full-batch hidden-state exchange per layer over the latency QP, chunked
   into 16 KiB messages with a 1 MiB receive window (`tp_rdma_big_gate_exchange`,
   `ds4_tp.c`).
-- Attention heads ARE split across nodes in TP (`tp_split_attn = g->tp_world==2`).
+- Attention **head** splitting (`tp_split_attn = g->tp_world==2`) is the **decode**
+  path only. **Prefill** splits attention **rows** (`tp_row_split_attn` in
+  `metal_graph_encode_layer_attention_batch`), and only for `pos0 == 0` chunks —
+  `const bool zero_prefix = pos0 == 0` gates every split shape. With the default
+  4096-token chunking, a 131072-token prefill row-splits chunk 0 and runs the
+  whole attention path replicated on both ranks for the other 31 chunks. Do not
+  read the decode fact as a prefill fact; it changes which fix is worth doing.
 - Prefill chunking is layer-major; chunk cap from `ds4_prefill_cap_for_prompt`
   (env `DS4_METAL_PREFILL_CHUNK`, default 4096 for prompt > 4096).
 - Compressed KV cache grows with context: `comp_cap = ctx_size/4 + 2`
   (per-layer ratio). Raw SWA cache is bounded by sliding window (`DS4_N_SWA`).
 - **Indexer top-k scoring over the compressed cache is replicated on both TP
-  ranks** (comment at `ds4.c:28893`: score/top-k selection "stays replicated
-  while the attention consumption splits by rows"; both ranks update the
-  compressor/indexer from full rows). This replicated work grows linearly with
-  context and does not benefit from TP.
+  ranks** — see the TP row-split comment at the top of
+  `metal_graph_encode_layer_attention_batch()` in `ds4.c`: score/top-k selection
+  "stays replicated while the attention consumption splits by rows", and both
+  ranks update the compressor/indexer from full rows. This replicated work grows
+  linearly with context and does not benefit from TP. (Anchor on the function
+  name, not a line number — line citations here rot within a few commits.)
 - CUDA TP has cache-duplication/peer-read infra (`cuda_tp_attn_cache_dup`,
   `cuda_tp_attn_peer_read`, `layer_attn_comp_cache_tp[]`, `copy_xdev`) that could
   be a template for splitting the Metal TP compressed cache / indexer.

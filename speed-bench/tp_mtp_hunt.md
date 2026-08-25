@@ -5,6 +5,38 @@ matrix.  It is a companion to `tp_decode_investigation.md`.  Measurements
 explicitly listed below are from the M2 Ultra pair; remaining gains are
 estimates until their corresponding A/B runs complete.
 
+For the branch graph, target-only control, PP/RDMA status, and prioritized
+cross-branch roadmap, start with the central
+[`speed-bench` handoff](README.md).
+
+## 2026-08-19 current verdict
+
+The major proposer semantics, capture/cache lifecycle, compact-view, and F32-HC
+runtime bugs are fixed.  DSpark is nevertheless **not a throughput win** on the
+current context-512 Promessi sposi fixture:
+
+| Arm | Steady decode | Result |
+|---|---:|---|
+| Target only | **41.98 t/s** | Current control |
+| Published 5.99 GB support, forced d5 | **21.29--21.35 t/s** | 189/1,596 accepted (11.84%), no `d5>a5` |
+| Current low-yield production policy | **41.57 t/s** | No verifier launched; about 112 ms total DSpark overhead |
+| Published support + verifier head split | **20.18 t/s** | 151/1,785 accepted; verifier timing slightly lower but headline worse |
+| Full-fat MXFP4 support after the F32-HC fix, forced d5 | **19.91 t/s** | 157/1,767 accepted (8.89%); no full d5 |
+
+The production policy is a successful stop-loss: it backs off unproductive
+probes and returns close to target-only speed.  It does not demonstrate a
+speculative gain.  Further work should establish proposal parity and acceptance
+on matched code and prose fixtures before spending more time on verifier
+micro-optimizations.
+
+The public llama.cpp/GaelicThunder headline of about 50% acceptance and mean
+3.5 is not an equivalent fixture.  It is predictable code generation on a
+single GB10 with a different target quant; the same card reports roughly 25%
+for literary prose.  Llama's mean also includes the unconditional target token,
+so 3.5 means about 2.5 accepted draft tokens plus one target token per verify
+cycle, not 3.5 accepted drafts out of five.  The referenced GaelicThunder GGUF
+is also a Q2_K/Q8 presentation rather than the 10.8 GB full-fat artifact.
+
 ## What changed
 
 The default DSpark TP path now:
@@ -43,8 +75,10 @@ It automatically enables the output split, slices `attn_q_b` to this rank's 32
 heads, keeps those heads compact through raw/indexed attention, and reconstructs
 the full 4K attention row with the same one batch gate per layer.  The option
 changes verifier gate participation and therefore must be set identically on
-both ranks.  Expected incremental saving over output-split alone is roughly
-6--9 ms per five-row verify block; measure rather than promoting it by default.
+both ranks.  The design estimate was 6--9 ms per five-row block, but the first
+remote run measured about 106 versus 108 ms/verifier on different generated
+paths and reduced headline throughput to 20.18 t/s.  It remains default-off and
+is not a promotion candidate without a controlled same-path A/B.
 
 Correctness guards added with the performance work:
 
@@ -96,7 +130,7 @@ main KV through the support block, and exposed a much larger history than the
 checkpoint was trained for.  Do not use their acceptance rates to judge the
 support model; rerun both the forced-five and production arms.
 
-## Corrected two-node results
+## First corrected two-node results
 
 The corrected proposer and compact-capture fix produced these 512-token
 Promessi sposi measurements with the published 5.99 GB support GGUF.  Throughput
@@ -121,7 +155,9 @@ verifier to save only 48.1 ms of target work (`net_saved=-896.1 ms`).  That
 result motivated the default Apple TP policy below: make cold probing sparse,
 batch its support-KV catch-up, and reserve the verifier for d5.  The policy,
 one-pass Q8 verifier head, and optional attention-head split were implemented
-after these measurements and still require the A/B matrix below.
+after these measurements.  Their later outcomes are summarized in the
+current-verdict table above; retain this section for the detailed economics
+that motivated them.
 
 ## Required setup
 
@@ -253,6 +289,15 @@ file.  F32 Markov W1/W2 overrides are useful as a quality diagnostic, but they
 disable the current Q8-only GPU Markov fast path and therefore are not a clean
 throughput comparison.
 
+The first full-fat run produced zero first hits because the runtime incorrectly
+sent F32 HC projection weights through an F16-only fused helper.  That result is
+invalid and led to `242642c`.  After the type-aware F32 fix, the forced run was
+still only 19.91 t/s with 157/1,767 accepted drafts (8.89%), below the published
+support file on this prompt.  Full-fat weights therefore did not resolve the
+acceptance problem.  Direct native `dflash` loading would preserve additional
+precision only for the two Markov matrices; the other 79 imported tensors are
+copied losslessly or expanded exactly.
+
 ## Isolation matrix
 
 Run these only after the forced-five optimized arm succeeds.  Apply an option
@@ -269,7 +314,7 @@ on both ranks unless the table says coordinator-only.
 | CPU Markov | `DS4_DSPARK_NO_GPU_MARKOV=1` (coordinator only) | Metal Markov argmax | Slower; inspect proposal timing |
 | Pad verifier head to eight | `DS4_DSPARK_VERIFY_HEAD_PAD8=1` | Native/four-row Apple Q8 verifier head | ~0.5--1.1 ms/block slower; no dispatch-count change |
 | Split attention output | `DS4_DSPARK_TP_VERIFY_ATTN_OUT_SPLIT=1` | Default-off projection split | Unknown; likely -1 to +2 ms/block |
-| Split verifier heads | `DS4_DSPARK_TP_VERIFY_HEAD_SPLIT=1` | q_b + attention core + output projection, 32 heads/rank | Expected 6--9 ms/block over output-only split |
+| Split verifier heads | `DS4_DSPARK_TP_VERIFY_HEAD_SPLIT=1` | q_b + attention core + output projection, 32 heads/rank | About 106 vs 108 ms/verifier on different generated paths; headline 20.18 t/s, so inconclusive/not promotable |
 | Verify one-row drafts | `DS4_DSPARK_VERIFY_SINGLE=1` (coordinator only) | One-row economic guard | Always slower when exercised |
 
 For any arm, the high-value diagnostics are `gen_tps`, `gen_steady_tps`,
@@ -284,30 +329,37 @@ dequantized W1 row directly.  The target verifier still decides every committed
 token, so compare both proposal timing and acceptance rather than treating this
 arm as a proposal-parity test.
 
-## Read-only RDMA/synchronization follow-ups
+## RDMA/synchronization experiment outcome
 
-No RDMA hot-path optimization is applied on this branch.  The fast release
-fence itself relies on the undocumented Apple Metal system-scope mechanism
-demonstrated in [MLX PR #1773](https://github.com/ml-explore/mlx/pull/1773),
-and retains shared-event fallback when it is unavailable.  The current measured
-~38 us gate is already much closer to a CPU-posted two-sided Apple/RDMA floor
-than to the link's raw ~10 us latency.  The following are the remaining options
-from a fresh hot-path audit; gains are estimated against the 23.83 ms/token,
-41.96 t/s control and are not additive.
+No later RDMA hot-path optimization is applied on this branch.  The fast
+release fence itself remains essential: it reduces the ordinary 86 TP gates
+from roughly 180 us to 38 us and relies on the undocumented Apple Metal
+system-scope mechanism demonstrated in
+[MLX PR #1773](https://github.com/ml-explore/mlx/pull/1773).
 
-| Option | Estimated gain | Complexity | Risk | Notes |
-|---|---:|---|---|---|
-| Fuse GPU arrival publish and release polling into one persistent gate kernel | 0.16--0.38 ms/token, +0.28--0.68 t/s; 0.08--0.19 ms/DSpark block | Medium | Medium | Removes one tiny dispatch per gate and its encoder boundary |
-| Clean the RDMA hot path | 0.15--0.43 ms/token, +0.27--0.77 t/s; 0.05--0.20 ms/block | Low--medium | Low | Cache trace env, delay disconnect peeks, signal every 8--16 sends, prepost/chained receives, prebuild WRs, remove uncontended lock work |
-| Dedicated verifier QP/CQ | 0.6--1.4 ms/DSpark block | Medium | Medium | Removes per-layer TCP header/barrier and the first-verifier dummy-window drain |
-| NIC-delivered flag polled directly by GPU | 0.2--0.6 ms/token, +0.36--1.08 t/s; 0.1--0.4 ms/block | High | High | Must prove NIC-to-GPU coherence; `coherent(system)` only establishes CPU/GPU behavior |
-| Pipeline verifier row exchanges | 0.5--1.8 ms/block | High | Medium | Overlap adjacent verifier-layer communication/compute with multiple safe slab slots |
-| Exchange exact greedy `(max,id)` instead of half logits | 0.12--0.18 ms/token, +0.21--0.32 t/s; 0.5--0.8 ms/block | Medium | Low in greedy mode | Requires exact tie/NaN semantics and is not a sampled-decoding protocol |
-| Probe >16 KiB messages on macOS 26.3+ | 0.1--0.4 ms/block | Medium | Low | MLX/JACCL suggests up to 512 KiB can work; runtime capability probe required |
-| Pin/realtime-tune the gate service thread | 0--0.15 ms/token, up to +0.27 t/s | Low | Medium | Mostly reduces tail jitter and can harm the rest of the system |
-| FP16 verifier communication | 0.2--0.5 ms/token; 1--2 ms/block | Medium | High | Numerical/argmax risk; not an exact transport optimization |
+The proposed software cleanup and fused gate were implemented together in
+commit `fa47b1c` on `backup/pre-shared-base-20260816/tp-frontends-phase1` and
+then tested separately.  They did not produce a
+reproducible gain.  One combined sample was 41.50 steady t/s with both flags
+versus 41.86 with both off, and isolated arms were also indistinguishable from
+noise.  `DS4_TP_RDMA_HOTPATH` and `DS4_METAL_FUSED_TP_GATE` are therefore not
+present in the active branch stack.
 
-A conservative endpoint is about 42.5--43.4 t/s with software hot-path work,
-43.5--44.4 t/s if a direct NIC marker is reliable, and roughly 45--46 t/s only
-under near-ideal gate elimination.  These are ceilings to prioritize work, not
-promised benchmark results.
+The result is technically plausible.  A Flash gate is already one 16 KiB WR;
+prebuilt/chained WRs do not reduce the steady verbs-call count, receive CQEs are
+still polled every gate, and the removed second Metal dispatch was largely
+hidden underneath the exchange.  The fused kernel may also delay CPU
+observation of a coherent store made in the middle of a dispatch.
+
+Remaining DSpark-specific communication ideas are lower priority than proposal
+quality:
+
+- a dedicated verifier QP/CQ could save roughly 0.6--1.4 ms/block;
+- pipelining adjacent verifier-layer exchanges may save 0.5--1.8 ms/block;
+- exact distributed greedy `(max,id)` could reduce output-head traffic; and
+- a direct NIC-delivered marker is interesting only after NIC-to-GPU coherence
+  is proved.
+
+None can compensate for the current 108 ms verifier accepting only about 1.66
+draft tokens.  Revisit them after a matched code fixture reaches high, stable
+acceptance.
