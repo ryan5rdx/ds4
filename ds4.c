@@ -28963,6 +28963,31 @@ static uint32_t metal_graph_tp_prefill_split_min(void) {
     return (uint32_t)cached;
 }
 
+/* Opt-in: extend the TP attention row split to pos0 > 0 chunks.
+ *
+ * Today the split is gated on pos0 == 0, so with the default 4096-token chunk
+ * a 131072 prefill splits 1 chunk of 32 and runs the whole attention path --
+ * q_b, the attention core, the output projection, and the indexer score/top-k
+ * -- at full width on BOTH ranks for the other 31.  That is why TP2 prefill
+ * degrades faster with context than a single node does (measured: -47% from
+ * 16k to 131k versus -31%), and why two machines land near half of one.
+ *
+ * Must be set on BOTH ranks.  Like DS4_TP_SUBGATE_PIPELINE below it changes
+ * the per-layer gate count -- a split chunk adds the attn_out row swap -- so
+ * an asymmetric setting deadlocks the big gates rather than degrading.
+ *
+ * Default off: this cannot be measured without the two-machine rig, and the
+ * arithmetic that says it should win (halving ~45% of executed FLOPs against
+ * a ~1.4% added wire cost) is static analysis, not a measurement. */
+static bool metal_graph_tp_split_nonzero_prefix(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_TP_PREFILL_SPLIT_NONZERO");
+        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 /* Opt-in sub-chunk gate pipelining for the TP prefill row swaps.  Must be
  * set on BOTH ranks (it changes the per-layer gate count; asymmetric
  * settings deadlock the big gates).  Default off: measured net-negative
@@ -29018,10 +29043,39 @@ static bool metal_graph_encode_layer_attention_batch(
         !(ratio == 4 && tp_attn_n_comp > DS4_N_INDEXER_TOP_K);
     const bool tp_attn_indexed = zero_prefix && ratio == 4 &&
         tp_attn_n_comp > DS4_N_INDEXER_TOP_K;
+    /* Fourth shape (opt-in): any pos0 > 0 chunk that reaches a batched
+     * attention path.  Unlike the three above this does not need to name the
+     * shape, because all three pos0 > 0 paths -- raw ubatch, static mixed and
+     * indexed -- take absolute pos0 + n_tokens plus explicit ring parameters,
+     * so a row sub-range is expressed by recomputing n_raw/raw_start for
+     * (pos0 + tp_row0, tp_rows) rather than by selecting a different kernel.
+     *
+     * n_tokens <= raw_cap is load-bearing twice over: it is the condition the
+     * batched paths themselves test, and it keeps us off the per-token
+     * fallback loop, which indexes q_work/heads_work by chunk-relative row and
+     * would read past the end of a half-height view. */
+    const bool tp_attn_nonzero_prefix =
+        !zero_prefix &&
+        n_tokens <= g->raw_cap &&
+        /* Only the two pos0 > 0 paths that carry no comp mask: the raw ubatch
+         * path (ratio 0) and the indexed path (ratio 4 with more compressed
+         * keys than top-k).  The static-mixed path consumes an n_keys x
+         * n_tokens mask that would have to be sliced on the token axis too, so
+         * it stays full-width for now.
+         *
+         * pos0 / ratio underestimates n_comp -- the real count also includes
+         * this chunk's own compressed keys -- so if it already exceeds top-k
+         * the indexed path is guaranteed.  Both ranks evaluate it from pos0
+         * and the model shape, so it cannot diverge, and unlike n_comp itself
+         * it is known here, before the tp_q/tp_heads views are built. */
+        (ratio == 0 ||
+         (ratio == 4 && (pos0 / ratio) > DS4_N_INDEXER_TOP_K)) &&
+        metal_graph_tp_split_nonzero_prefix();
     const bool tp_row_split_attn =
         g->tp_world == 2 &&
         g->tp_batch_rows != n_tokens &&
-        (tp_attn_full_raw || tp_attn_static_mixed || tp_attn_indexed) &&
+        (tp_attn_full_raw || tp_attn_static_mixed || tp_attn_indexed ||
+         tp_attn_nonzero_prefix) &&
         !metal_graph_directional_steering_attn_enabled(g) &&
         n_tokens >= metal_graph_tp_prefill_split_min();
     const uint32_t tp_half_rows = (n_tokens + 1u) / 2u;
@@ -29535,13 +29589,24 @@ static bool metal_graph_encode_layer_attention_batch(
          * mask.  This avoids mixing prefill with the different single-token
          * attention path.
          */
-        const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, n_tokens);
+        /* Under the row split this rank consumes only its own query rows, so
+         * the ring window is derived from that sub-range rather than the whole
+         * chunk.  tp_row0 is 0 and q_work_rows is n_tokens when the split is
+         * off, so this reduces exactly to the unsplit form.  Both values come
+         * from (pos0, n_tokens, rank), which both ranks compute identically,
+         * so the two cannot disagree about the window. */
+        const uint32_t attn_pos0 = pos0 + tp_row0;
+        const uint32_t n_raw = metal_graph_raw_span_for_batch(g, attn_pos0,
+                                                              q_work_rows);
         /* Nonzero prompt chunks read the SWA cache as a ring.  FlashAttention
          * receives a linearized window starting at raw_start, not physical row
          * zero; otherwise wrapped chunks silently miss recent raw keys. */
         const uint32_t raw_start = metal_graph_raw_start_for_span(g,
-                                                                  pos0 + n_tokens - 1u,
+                                                                  attn_pos0 + q_work_rows - 1u,
                                                                   n_raw);
+        /* The SWA store stays full-width even when the attention splits: every
+         * row of this chunk has to reach the ring on both ranks, because the
+         * next chunk's window reads rows this rank did not attend over. */
         ok = ds4_gpu_store_raw_kv_batch_tensor(g->layer_raw_cache[il],
                                                  metal_graph_batch_kv(g),
                                                  g->raw_cap,
@@ -29562,8 +29627,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                    sinks_work_offset,
                                                                    q_work,
                                                                    g->layer_raw_cache[il],
-                                                                   n_tokens,
-                                                                   pos0,
+                                                                   q_work_rows,
+                                                                   attn_pos0,
                                                                    n_raw,
                                                                    g->raw_cap,
                                                                    raw_start,
@@ -30190,11 +30255,17 @@ static bool metal_graph_encode_layer_attention_batch(
         if (ratio == 4) DS4_METAL_PROFILE_ATTN_STAGE("indexer_setup");
 
         if (ok && !zero_prefix && n_tokens <= g->raw_cap) {
-            const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, n_tokens);
+            /* Row-split sub-range, as in the raw-only branch above: this rank
+             * attends over its own query rows only, so the ring window is
+             * derived from (pos0 + tp_row0, q_work_rows).  Reduces to the
+             * unsplit form when tp_row0 == 0 and q_work_rows == n_tokens. */
+            const uint32_t attn_pos0 = pos0 + tp_row0;
+            const uint32_t n_raw = metal_graph_raw_span_for_batch(g, attn_pos0,
+                                                                  q_work_rows);
             /* See the raw-only branch above: batched mixed attention also
              * consumes a logical raw window, linearized out of the ring. */
             const uint32_t raw_start = metal_graph_raw_start_for_span(g,
-                                                                      pos0 + n_tokens - 1u,
+                                                                      attn_pos0 + q_work_rows - 1u,
                                                                       n_raw);
             uint32_t use_comp_mask = 0;
             bool use_indexed_comp = false;
@@ -30271,7 +30342,17 @@ static bool metal_graph_encode_layer_attention_batch(
             }
             if (ok) {
                 if (use_indexed_comp) {
-                    ok = ds4_gpu_attention_indexed_mixed_batch_heads_tensor(heads_work,
+                    /* Score/top-k above ran replicated over all rows, exactly
+                     * as the pos0 == 0 split does; only the consumption below
+                     * takes this rank's rows.  The top-k rows are therefore
+                     * sliced to match q_work/heads_work, which are already the
+                     * half-height views when the split is on. */
+                    ds4_gpu_tensor *tp_topk = tp_row_split_attn ?
+                        metal_graph_tensor_row_range_view(metal_graph_comp_selected(g),
+                                                          tp_row0, tp_rows,
+                                                          DS4_N_INDEXER_TOP_K) : NULL;
+                    ok = (!tp_row_split_attn || tp_topk != NULL) &&
+                         ds4_gpu_attention_indexed_mixed_batch_heads_tensor(heads_work,
                                                                               model->map,
                                                                               model->size,
                                                                               sinks_work_offset,
@@ -30279,9 +30360,10 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               g->layer_raw_cache[il],
                                                                               g->layer_attn_comp_cache[il],
                                                                               metal_graph_attn_comp_cache_is_f16(),
-                                                                              metal_graph_comp_selected(g),
-                                                                              n_tokens,
-                                                                              pos0,
+                                                                              tp_topk ? tp_topk :
+                                                                                  metal_graph_comp_selected(g),
+                                                                              q_work_rows,
+                                                                              attn_pos0,
                                                                               n_raw,
                                                                               g->raw_cap,
                                                                               raw_start,
@@ -30291,6 +30373,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                               ratio,
                                                                               q_work_heads,
                                                                               DS4_N_HEAD_DIM) != 0;
+                    ds4_gpu_tensor_free(tp_topk);
                     if (ok && index_stage_profile) {
                         ok = metal_graph_indexer_stage_profile_boundary("attention",
                                                                         il,
