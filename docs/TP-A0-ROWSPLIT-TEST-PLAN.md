@@ -14,8 +14,31 @@ This doc is the **request** side of a loop: results go into
 | 1 — inertness / baseline | done | 221.50 t/s @131k prefill, 28.06 decode. Indexer stack +20.8%, LLT decode +10.8% vs old base. Startup hang did not reproduce at `3746eae`. |
 | 2 — correctness | done | **Pass.** 128/128 tokens identical, 305/305 argmax identical, max Δlogit 0.049 vs a 0.0055 control-vs-control baseline (~2 f16 ULP). Criterion rewritten below. |
 | 3 — A0 throughput | done | +7.2% @131k (221.50 → 237.44), peaking +11.1% at 8k. Real, correct, decode untouched — but **not** the predicted ~1.5×. |
-| 3b — cold single point | in progress | |
-| 4 — gate + stage profile | **requested below** | |
+| 3b — cold single point | done | 259.90 → 281.20 t/s, +8.2%. |
+| R1 — indexer stage profile | done | score 317.7 : topk 10.0 : attention 41.3 ms @comp 32768. **score ≈ 8× attention**, scales linearly with comp. Model confirmed. |
+| R2 — gate profile | done | BIG 1419 → 2132 gates; per-gate wait *fell* 318 → 190 ms, exchange 30.5 → 23.7 ms. Effective 2.2–2.8 GB/s. |
+| R3 — utilisation | done | **~90% in both arms at both 8k and 131k.** Flat, not A0-induced, not context-dependent. |
+| R4 — argsort canon | done + **fixed** | +5.6% @2048, +2.5% @4096 when disabled. Now gated on `n_tokens >= 32` (`6fa977c`). |
+| R5 — indexer split | **requested below** | code landed `589e93e`, unmeasured |
+
+### Two readings to correct before they propagate
+
+**A0 did not make gate stalls worse.** Per-gate wait *fell* (318 → 190 ms)
+because each swap moves a smaller row range. In aggregate 1419×318 = 451 s
+became 2132×190 = 405 s, a ~10% improvement, against +17% total wire time. The
++50% gate count was not the drag it looked like, and R3 confirms it: idle is
+identical in both arms.
+
+**`avg gpu-wait` is not additive stall.** 1419 × 318 ms = 451 s against a ~504 s
+prefill at 90% residency cannot both be true unless the waits overlap — and they
+do: the service thread keeps many gates in flight, and the metric measures
+encode-to-satisfied per gate, not exclusive idle. Use it as a *ratio* against
+exchange (the cost is drain/wait, not the link), never as a time budget.
+
+The honest stall number is R3's flat ~10%. That **bounds every gate-related
+optimisation at roughly +11%**, and it is why the RDMA staging/window workstream
+is closed: effective bandwidth is 2.2–2.8 GB/s, but exchange is only ~9% of the
+run and the 10× larger wait term is not bandwidth.
 
 **Why Run 3 came in low, and it is not noise.** A0 splits the attention
 *consumption*, which `top_k` caps at a constant `(512 + 128) × 64 × 512 × 2`
@@ -38,7 +61,46 @@ rows, feeds its own top-k into its own attention rows, and the existing
 
 ## Open requests
 
-Ordered by value. R1 is the one that unblocks the next change.
+### R5 — indexer split (the main event; `589e93e`)
+
+Splits the score + top-k by query row, which R1 measured at ~61% of the
+layer-chunk against the ~8% A0 splits. Needs **no extra gates** — each rank
+scores its own rows and feeds its own top-k into attention rows it already
+owns — so unlike A0 it should convert compute saving straight to throughput.
+
+**Requires A0 on.** It reuses `tp_row0`/`tp_rows`/`attn_pos0`.
+
+```
+DS4_TP_PREFILL_SPLIT_NONZERO=1 DS4_TP_PREFILL_SPLIT_INDEXER=1    # BOTH ranks
+```
+
+**R5a — correctness first**, same protocol as Run 2: `DS4_TP_FORCE_DENSE_ATTN_OUT=1`
+on both arms, temp 0, compare against the A0-only arm (not against flags-off).
+Gate: tokens byte-identical, argmax identical at every frontier, `max |Δlogit|`
+in the same ULP class as the 0.0055 control baseline. Expect a *smaller*
+deviation than A0's 0.049 — this split does not move the FlashAttention block
+geometry, it only changes which rows a rank scores.
+
+**R5b — throughput**: cold single point at 131072, plus the full sweep. Compare
+against the A0-on arm (237.44 sweep / 281.20 cold), not the baseline.
+
+| | A0 only | A0 + indexer | Δ |
+|---|---|---|---|
+| cold 131072 | 281.20 | | |
+| sweep 131072 | 237.44 | | |
+| sweep 8192 | 422.05 | | |
+
+**R5c — re-run R1 with the split on.** `score` per layer-chunk should roughly
+halve (317.7 → ~160 ms) if the split is doing what it claims. This is the
+cleanest confirmation that the mechanism works, independent of end-to-end noise.
+
+No throughput prediction from me this time. The last two were wrong — 7× high on
+A0, and then wrong about which term the gate cost lived in. R1's score share
+bounds it; the rig decides the rest.
+
+### Answered — kept for protocol reference
+
+R1–R4 are complete; see the status table. Commands retained below.
 
 ### R1 — indexer stage breakdown at 131k (highest value)
 
