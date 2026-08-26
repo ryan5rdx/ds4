@@ -18,9 +18,19 @@ attn/shared/output).
   A/B between configs on the same rig; use a cold single point
   (`--ctx-start 131072 --ctx-max 131072`) for an honest cross-machine number.
 - Prompt file: a text file with **≥ `--ctx-max` tokens** (the bench rejects
-  shorter prompts). `/tmp/bench_long.txt` is ~135k tokens; it is lost on reboot
-  — regenerate (seeded python word-soup, see conversation 2026-08-25) and copy
-  to both hosts.
+  shorter prompts). Standard prompt since 2026-08-26: **`speed-bench/promessi_sposi.txt`**
+  (Manzoni, *I promessi sposi*; 1,329,139 bytes, md5 `2edade70f1d2d24c8c34c3861170fa9d`,
+  >200k tokens — verified against the bench at `--ctx-max 200000`). Persistent
+  copies at `~/Downloads/promessi_sposi.txt` on both hosts (survive reboot;
+  re-copy from the repo after a fresh checkout).
+  - Earlier runs (Runs 1–3, R1–R11) used a seeded word-soup `/tmp/bench_long.txt`
+    (~135k tokens, lost on reboot): in-campaign A/B stays comparable, but
+    cross-campaign numbers across the prompt switch are not 1:1, and the
+    word-soup's degenerate repetition regime inflated control-vs-control
+    logit deltas (see R11b).
+  - One observed worker GPU timeout (`kIOGPUCommandBufferCallbackErrorTimeout`)
+    during a 200k-token prefill attempt on 2026-08-26 — an artifact of that
+    size check, no conclusion drawn; benchmark contexts stay ≤131072.
 - `--step-mul 2` is what makes it 7 points; without it the step defaults to a
   2048-token linear sweep (64 points, many hours at 128k).
 - `prefill_tps` in a row = incremental prefill of the added tokens.
@@ -82,7 +92,7 @@ cd ~/Downloads/rdma-tb4/tests && ./setup-rdma-net.sh
 ```
 DS4_METAL_FAST_SYNC=1 ./ds4-bench -m <MODEL> --role coordinator \
   --tensor-parallel --transport rdma --listen 0.0.0.0 1234 \
-  --rdma-device rdma_en6 --prompt-file /tmp/bench_long.txt \
+  --rdma-device rdma_en6 --prompt-file ~/Downloads/promessi_sposi.txt \
   --ctx-start 2048 --ctx-max 131072 --step-mul 2 \
   --gen-tokens 128 --csv /tmp/tp_sweep.csv
 ```
@@ -108,7 +118,7 @@ Notes:
   ```
   DS4_METAL_FAST_SYNC=1 ./ds4-bench -m <MODEL> --role coordinator \
     --layers 0:21 --listen 0.0.0.0 9000 --dist-transport rdma \
-    --dist-rdma-adj-devices rdma_en6 --prompt-file /tmp/bench_long.txt \
+    --dist-rdma-adj-devices rdma_en6 --prompt-file ~/Downloads/promessi_sposi.txt \
     --ctx-start 2048 --ctx-max 131072 --step-mul 2 \
     --gen-tokens 128 --csv /tmp/pp_sweep.csv
   ```
