@@ -151,6 +151,102 @@ Cold 131k prefill (TP): 402.64 — +54.9% over the pre-workstream flag-off cold
 baseline (259.90); sweep +65.8% (221.50 → 367.29). TP wins prefill at
 ≤16k and decode at every point; PP wins prefill from 32k up.
 
+### R11 — decode gate count halved via replicated attention — `upstream-metal-wins` @ `a0cf853` build, 2026-08-26 — **NEGATIVE: decode −8.5 to −11.8%, avenue closed**
+
+Flag: `DS4_TP_DECODE_REPLICATE_ATTN=1` on both ranks (`a0cf853`). Replicates
+the whole decode attention block on both ranks; the per-layer ATTN row-gate
+disappears and the decode schedule becomes `start=DS4_TP_GATE_FFN, step=2,
+per_token=43` (43 gates/token instead of 86). Prefill code is untouched
+(code review + measurement below). The build also carries `dedc830`
+(compressor-frontier rewind); the flag-off A arms reproduce the R10-era
+baseline (2k decode 40.86 vs 40.91; 131k cold prefill 399.99 vs ~399–402;
+131k decode 28.27 vs 28.13–28.31), so the new binary is inert and every A/B
+delta below isolates the flag.
+
+**R11b correctness (16384 greedy, 7 frontiers 4096→16384; control / candidate /
+control-2): PASS, with a baseline note.** Frontier dumps cover the first decode
+position; the 128-token texts were compared per frontier.
+
+| frontier | B vs A max\|Δlogit\| | A2 vs A max\|Δlogit\| |
+|---|---|---|
+| 4096 | 0.0448 | 0.0000 |
+| 6144 | 0.0000 | **0.6876** |
+| 8192 | 0.3255 | 0.0000 |
+| 10240 | **0.6651** | 0.0000 |
+| 12288 | 0.0000 | 0.0000 |
+| 14336 | 0.6593 | 0.0000 |
+| 16384 | 0.0000 | 0.0000 |
+
+argmax: 7/7 identical in both comparisons. The in-session control-vs-control
+baseline (0.688) is ~125× the R2-era 0.0055 — this prompt plus the
+restore/incremental frontier chain amplifies run-to-run nondeterminism far
+more; the candidate (0.665) sits *inside* the in-session baseline (0.97×),
+which is the gate the protocol actually defines. Generated text: 2/7
+frontiers identical over all 128 tokens (4096, 8192 — including the 0.3255
+frontier: the first-position Δ never flipped a greedy choice), 5/7 diverge
+within 1–2 tokens of a degenerate "of/and" repetition regime. No O(1) logit
+spike, no collapse → summation-order effect as predicted, not a gate-slot bug
+(a slot carrying a partial nobody sums would diverge ~10× at logit magnitude
+~27). Dense-attn-out b-arms cross-check: decode 36.4→35.5 (A) vs
+33.1→32.3 (B), same ~−9% shape.
+
+**R11c throughput — the verdict.** Same flag set otherwise; flag off vs on:
+
+| ctx | decode off | decode on | Δ |
+|---|---|---|---|
+| 2048 (cold) | 40.86 | 36.05 | **−11.8%** |
+| 131072 (cold) | 28.27 | 25.88 | **−8.5%** |
+
+Same-protocol 7-point warm sweep, flag off (run same day) vs on:
+
+| ctx | 2048 | 4096 | 8192 | 16384 | 32768 | 65536 | 131072 |
+|---|---|---|---|---|---|---|---|
+| decode off (A_sweep) | 40.86 | 36.40 | 35.95 | 35.42 | 33.70 | 31.56 | 28.13 |
+| decode on (B_sweep) | 36.03 | 33.18 | 32.80 | 32.34 | 30.87 | 28.80 | 25.78 |
+| B/A | 0.882 | 0.912 | 0.912 | 0.913 | 0.916 | 0.913 | 0.916 |
+
+Uniform −8.4 to −11.8% at all 7 contexts, worst at the short end.
+
+**Prefill is not moved by the flag — but this rig's sweep prefill is noisier
+than the doc had suggested.** Per-point sweep prefill, B vs A:
++0.6 / −0.3 / +0.3 / +5.5 / +14.1 / −12.7 / +1.7%. The two extreme points
+(32768: B 460.95 vs A 404.00; 65536: B 371.31 vs A 425.21) are each a
+~12–13% single-point dip in *one* sweep, and at both points the *other* flag
+state sits on the historical baseline (461.20 / 427.08). The flag does not
+enter prefill code, the cold A/B prefill agrees to 0.4% (2k: 443.73/444.80;
+131k: 399.99/401.47), and the dips sit in opposite runs — per-sweep rig
+noise, not a leak. Treat warm-sweep prefill rows as ±5% with occasional
+single-point ~13% dips; same-day A/B is the only clean comparison.
+
+**Why the bet lost (interpretation, labeled).** R10c was right that decode is
+stall-bound (30 W, ~54% of prefill power) and wrong about the *content* of the
+stall. A TP gate wait is not idle: it is the window in which the peer rank's
+half of the attention runs, and at 2k each rank's GPU is already ~54% busy, so
+that work hides inside the waits. Replication removes 43 waits (43 × 293 µs ≈
+12.6 ms/token at 2k) but also removes the peer compute that overlapped them,
+and adds real traffic — full `q_b`/`o_a` weights (+1.6 GB/token/node) plus
+full-head KV reads, which only bite at long context. Measured net: a uniform
++2.9 to +3.2 ms/token *cost*. The bubble the lever assumed was not free space;
+it was the peer's attention.
+
+**Verdict: clean negative, avenue closed.** As the request predicted: "I would
+not be surprised by a negative result — record it either way, because a clean
+negative closes the last lever and says the 86-gate structure is load
+bearing." Reducing the gate count has to come from a structure that does not
+add per-token work on the ranks (replication does); what remains of decode
+work is per-gate fixed cost (R10e), which is transport/engine design, not a
+knob.
+
+**Ops notes.** (1) `--dump-frontier-logits-dir` does not mkdir its target; a
+missing dir aborts the arm with a header-only CSV — the driver now
+pre-creates it and validates row count. (2) The worker redirect targets the
+results tree on the *worker* host; the driver now mkdirs it there too — the
+campaign's first launch silently never started a worker, and the coordinator
+sits in "waiting for worker" with no timeout (arm timeout is the only
+resolution). (3) A fixed-timeout driver pkill kills a live sweep mid-run
+(65536→131072 is ~150 s): the same-day A_sweep control was killed once by its
+own 420 s timer and re-run at 780 s — wait on process exit, not a sleep.
+
 ### R10 — gate path + first decode profiling — `upstream-metal-wins` @ `f3668a1`/`627ccc1` build, 2026-08-26
 
 Binary: the same `ds4-bench` build as Runs 1–3 and R1–R9 (built Aug 26 00:16;

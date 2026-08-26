@@ -178,7 +178,7 @@ Cheaper alternatives already ruled out: `C` tuning (C=128 slower on both NSG
 values *and* skips less work — 1280 vs 1216 executed keys/row; C=32 will not
 build), and the CPU/ANE offload evaluated below.
 
-### R11 — halve the decode gate count (`DS4_TP_DECODE_REPLICATE_ATTN=1`)
+### R11 — halve the decode gate count (`DS4_TP_DECODE_REPLICATE_ATTN=1`) — **DONE, 2026-08-26, NEGATIVE: decode −8.5 to −11.8%, recorded in `BENCHMARKS-TP-PP.md`**
 
 Built on `upstream-metal-wins`. Opt-in, default off, must be set on BOTH ranks.
 Builds warning-clean; `ds4_test --server`, `ds4_agent_test`,
