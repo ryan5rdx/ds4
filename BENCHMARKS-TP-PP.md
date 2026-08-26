@@ -72,16 +72,49 @@ cd ~/Downloads/rdma-tb4/tests && ./setup-rdma-net.sh
 - If pingpong/RTR starts failing errno=1 (EPERM, "inet_arp_lookup failed") after
   working: run `./setup-rdma-net.sh --reset` on BOTH ends of the cable.
 
+### GPU wired limit (re-run after every reboot)
+
+Also runtime-only, and unlike the RDMA setup nothing in the launch path warns
+loudly if it is missing. On **both** nodes:
+
+```
+sudo sysctl iogpu.wired_limit_mb=120000
+```
+
+- 120 GB of the 128 GB box, leaving ~8 GB for the OS. The in-tree suggestion is
+  the same value (`ds4.c:59891`).
+- **Why it matters:** with the sysctl at 0, `ds4.c:59886` takes
+  `ds4_gpu_model_residency_skip(1)` and TP **skips the residency set entirely**
+  — the 76.7 GiB shard is then paged in lazily instead of pinned. That produces
+  a flat, stall-shaped, neither-bandwidth-nor-compute-bound decode profile,
+  i.e. it looks exactly like the thing several runs here have been trying to
+  explain.
+- **Verify:** `sysctl iogpu.wired_limit_mb` on both hosts *and* grep the run log
+  for `wired_limit_mb is 0`. The engine prints that warning once at startup; it
+  is easy to lose in a `nohup` log, so check for it explicitly rather than
+  assuming a clean run.
+- Any arm whose log contains that warning should be discarded and re-run.
+
 ## Prerequisites for a comparable run
 
 1. **Same commit on both hosts**: `git rev-parse HEAD` must match. `git pull`,
    then `make -j ds4-bench ds4-server ds4` on both. Do not reuse stale binaries.
 2. **Env symmetry**: flags that change per-layer gate counts
-   (`DS4_TP_PREFILL_SPLIT_NONZERO`, `DS4_TP_FORCE_DENSE_ATTN_OUT`,
-   `DS4_TP_SUBGATE_PIPELINE`, …) **must be set on both ranks or neither** —
-   asymmetric settings deadlock the gate exchange, they do not degrade.
-3. **`DS4_METAL_FAST_SYNC=1` on both ranks** for all published numbers.
-4. RDMA device names are host-local (lanfear=`rdma_en6`, mat=`rdma_en7` per the
+   (`DS4_TP_FORCE_DENSE_ATTN_OUT`, `DS4_TP_SUBGATE_PIPELINE`, …) **must be set
+   on both ranks or neither** — asymmetric settings deadlock the gate exchange,
+   they do not degrade. The three prefill splits are now **default on**
+   (`f45b535`), so a flag-off baseline means explicitly setting
+   `DS4_TP_PREFILL_SPLIT_{NONZERO,INDEXER,STATIC_MIXED}=0` on both ranks.
+3. **`DS4_METAL_FAST_SYNC=1` on both ranks** for all published numbers. It is
+   default-off (`ds4_metal.m:10263`) and nothing in the tree sets it. Beyond the
+   fast release fence, `ds4_gpu_tp_split_safe()` returns 0 without it, which
+   makes the decode command-buffer split a no-op under TP — so any split-schedule
+   experiment run without it returns a null result for the wrong reason.
+   **Confirm it is in the `ds4-server` launch path too**, not just the bench.
+4. **`sudo sysctl iogpu.wired_limit_mb=120000` on both hosts** — see the section
+   above. Runtime-only, lost on reboot, and silently degrades to a lazily-paged
+   shard rather than failing.
+5. RDMA device names are host-local (lanfear=`rdma_en6`, mat=`rdma_en7` per the
   table above); a wrong name is a failed QP bring-up, not a silent slowdown.
 
 ## Launch commands

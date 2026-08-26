@@ -168,6 +168,28 @@ baseline means explicitly setting the three to `0`.
 
 ## Open requests
 
+### Sequencing — run in this order
+
+Ordered by (information gained) / (rig time), not by expected gain. The first
+two are minutes and one of them can invalidate three completed runs.
+
+| # | Do | Time | Why first |
+|---|---|---|---|
+| 0 | **`sysctl iogpu.wired_limit_mb` on both hosts**, and grep every saved log for `wired_limit_mb is 0` | 2 min | If it was 0 after the 2026-08-26 reboot, the shard was paging lazily and **R10d, R10e and R11 are all suspect**. Set it to `120000` on both and note it in the prerequisites (done — `BENCHMARKS-TP-PP.md`). |
+| 0b | Confirm `DS4_METAL_FAST_SYNC=1` is in the **`ds4-server`** launch path | 2 min | Bench always sets it; production may not. Worth ~186 µs of a 508 µs gate, and without it the decode command-buffer split is a no-op under TP. |
+| 1 | **M3** — `uc_pingpong` at 4 KB and 16 KB | 10 min | Decides T1, the largest sized item, before any code is written. ≲20 µs half-RTT → ~2.5 ms/token available; ~45 µs → T1 closes. |
+| 2 | **Env battery: T2 + T3 + T4** at 32k and 131k, `DS4_NGRAM_SPEC` **off** | ~1.5 h | Three knobs, no code, no correctness arm needed beyond top-1 + bounded Δlogit. T3 pre-screens free on the dev box with `tests/bench_indexer_score`. |
+| 3 | **T8 pricing** — `tests/bench_moe_mxfp4_decode 256` with the five disable envs, **on the rig** | 30 min | Prices four layers of MoE specialisation before writing the port. Model-free harness. |
+| 4 | **M2** — ablation battery at 32k and 131k, incl. the never-run indexer ablations | ~2 h | The 11.1 ms/token of unattributed long-context decode growth — the largest unknown in the document. |
+| 5 | **R12a** split-schedule sweep + **R12b** reduced ballast arm + the encoder-boundary instrument | ~1.5 h | R12b is now a confirmation, not a discovery; the encoder-boundary half is the genuinely unmeasured one. |
+| 6 | **R13 n-gram rig arms** (inertness / correctness / decode A/B on repetitive vs novel text) | ~1 h | Independent of the above; run whenever convenient. |
+| 7 | T1 implementation if step 1 says yes; T8 port if step 3 says yes | — | Both are code, both are gated on a measurement above. |
+| 8 | Cleanup batch: T6, T9, T10, T13 | — | Small, low-risk, individually sub-1%. |
+
+Steps 0–3 are about four hours of rig time and settle whether the last three
+campaigns are valid, whether the largest sized item is real, and whether the
+MoE port is worth writing. Nothing below step 3 should start before they land.
+
 ### R9 — the `nqptg = 8` ceiling (scoping, no code yet)
 
 R8 took the attention kernel from ~2.4 to ~3.3 TFLOP/s on the rig. `q_path` on
