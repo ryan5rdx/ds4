@@ -186,8 +186,9 @@ ranks, `DS4_TP_FORCE_DENSE_ATTN_OUT` unset, 2026-08-25):
   gain is mechanistic, not noise: A0 splits attention *consumption* (constant
   4.19e7 MACs/token/layer) but not indexer *scoring* (n_comp × 64 × 128, grows
   linearly; 2.68e8 MACs/token/layer at 131k, 6.4× larger). Confirmed by R1
-  below, and fixed by the indexer split (R5): sweep +19.5% @131k, cold
-  +14.8% over the A0 arm; +28.1% over the flag-off sweep baseline.
+  below, and fixed by the indexer split (R5) and static-mixed split (R7):
+  cold 131k 259.90 → 380.27 (+46.4% total), sweep 221.50 → 342.25 (+54.4%),
+  **first TP sweep prefill above PP at 131k** with the decode lead intact.
 
 **R5 — indexer split** (`DS4_TP_PREFILL_SPLIT_INDEXER=1` + A0, both ranks;
 `589e93e`, 2026-08-25)
@@ -272,6 +273,48 @@ routed_moe 52.3/65.0, hc_post 50.2/23.9, shared 4.5/2.4 both layers.
   (182.8 ms on the even layer) spans the full attention consumption, while R1's
   indexer-stage `attention` (39.4 ms on the same layer) covers only the
   top-k-selected rows sub-stage.
+
+**R7 — static-mixed (ratio-128) row split** (`DS4_TP_PREFILL_SPLIT_STATIC_MIXED=1`
++ the two split flags, both ranks; `e672c22`, 2026-08-25)
+
+R7a — inertness: full sweep with the R5 flags only on the new binary.
+Reproduces the R5 arm within ~1–2% at every point (131k: 284.03 vs 283.64,
+4k: 359.24 vs 352.31, 8k: 432.06 vs 427.45). **Pass.**
+
+R7b — correctness (16384, `DS4_TP_FORCE_DENSE_ATTN_OUT=1` both arms, greedy):
+
+| | A0+indexer (control) | + static-mixed (candidate) |
+|---|---|---|
+| prefill t/s (dense) | 430.86 | 472.61 |
+| tokens | 128/128 byte-identical | |
+| frontier argmax | 305 (27.2699318) | 305 (27.2699318) |
+| max \|Δlogit\| | **0.0 — bit-identical, 0 of 129,280 differ** | |
+
+As predicted: the mask is rebuilt per call from the origin, so a row sub-range
+reproduces its own rows exactly. **Pass.**
+
+R7c — throughput, all three flags, vs the R5 arm (projection from R6's
+numbers, recorded before the run: sweep 131k → ~340, cold → ~380):
+
+| ctx | R5 arm (A0+idx) | + static-mixed | Δ | PP |
+|---|---|---|---|---|
+| 2048 | 391.77 | 391.51 | ~0% | 393.90 |
+| 4096 | 359.24 | 405.11 | +12.8% | 412.78 |
+| 8192 | 432.06 | 485.69 | +12.4% | 454.20 |
+| 16384 | 412.35 | 467.73 | +13.4% | 444.70 |
+| 32768 | 386.93 | 444.99 | +15.0% | 438.98 |
+| 65536 | 345.37 | 401.92 | +16.4% | 373.38 |
+| **131072** | **284.03** | **342.25** | **+20.5%** (proj. ~340) | 334.53 |
+
+Cold single point: 322.64 → **380.27** (+18.2%; projection ~380). Full arc,
+cold 131k: 259.90 → 281.20 (A0) → 322.64 (A0+indexer) → **380.27** (A0+indexer+
+static-mixed), **+46.4%** over the flag-off baseline; sweep +54.4% (221.50 →
+342.25). Decode untouched (28.28 steady).
+
+**TP sweep prefill now exceeds PP at 131k (342.25 vs 334.53) for the first
+time**, while keeping the ~40% decode lead (28.28 vs 20.09). Both projections
+landed within model error; no CPU-mask undershoot observed, so R6's
+single-threaded mask-fill concern did not bite at this size.
 
 **Run 3b — cold single point (the honest number), 2026-08-25**
 
