@@ -27,6 +27,7 @@ This doc is the **request** side of a loop: results go into
 | R10 — gate path + decode | done, no code change | Sub-gate re-test: **wash at every context, avenue closed**. Link ceiling: **4.4/4.1 GB/s per direction** (4 KiB WR cap — 64 MiB messages structurally impossible); gate path at ~65–75% of it. First decode profiling: decode is **stall-bound** (~30 W vs ~55 W prefill), NWG default already optimal (plateau 8–32), the 2048 decode floor is **per-gate fixed cost**, and the only lever left is the 86 gates/token — a design change. Full numbers in `BENCHMARKS-TP-PP.md`. |
 | R11 — decode gate count | done — **clean negative, avenue closed** | Decode **−8.4 to −11.8% at all 7 contexts**, prefill unmoved. Cost is flat ~3.25 ms/token at both 2k and 131k. The gate wait was never idle: it is the window the peer's half of the attention runs in. Falsifies R10e's headline — see below. |
 | R12 — decode data-gathering | **requested below** | Two zero-code sweeps: the TP-excluded command-buffer split schedule, and the never-run dispatch-ballast slope. Both target the same hypothesis. |
+| R13 — audit findings | **partly verified below** | `DS4_METAL_FAST_SYNC` is default-off and gates the TP decode split (ops check, possibly live); MXFP4 fixed-route MoE decode is TP-disabled by a host clause; one more device-name gate missed by the earlier sweep. |
 
 **Arc at ctx 131072 (sweep):** 183.4 (old base) → 221.50 (upstream indexer
 stack) → 237.44 (A0) → 283.64 (indexer split) → 342.25 (static-mixed split) →
@@ -206,6 +207,111 @@ justifies anything. **No code yet — flagging the target and the cost.**
 Cheaper alternatives already ruled out: `C` tuning (C=128 slower on both NSG
 values *and* skips less work — 1280 vs 1216 executed keys/row; C=32 will not
 build), and the CPU/ANE offload evaluated below.
+
+### R13 — decode audit findings (verified against source)
+
+From a code audit of decode fast paths that are off for our configuration.
+Every claim below I re-checked at the anchor; three further audit items did
+**not** survive verification and are recorded at the end so they are not
+re-raised. A fuller ranked list is still outstanding.
+
+#### R13a — `DS4_METAL_FAST_SYNC` is default-off and gates the TP decode split — **ops check first**
+
+`g_tp_fast_sync = getenv("DS4_METAL_FAST_SYNC") != NULL` (`ds4_metal.m:10263`)
+— **default off, and nothing in the tree sets it**. A repo-wide search finds it
+only in docs (`BENCHMARKS-TP-PP.md:83`, `README.md:622`,
+`QA_BEFORE_RELEASES.md:275`) and one read in `ds4_distributed.c:793`. It is not
+in any `ds4-server` launch path.
+
+Two things depend on it under TP:
+
+1. **The fast release fence.** Its own comment: *"Resuming the command
+   processor from `g_tp_cpu_event` costs ~186 µs of a 508 µs gate"*
+   (`ds4_metal.m:9948`). At 86 gates/token that is up to **~16 ms/token**.
+   Against the measured 24.5 ms token at 2048 that is a ~40% decode loss —
+   an upper bound, since not every gate need serialise, but R11 established
+   these gates are close to serial.
+2. **The decode command-buffer split.** `ds4_gpu_tp_split_safe()` returns 0
+   without it (`ds4_metal.m:10369`), and the split site *"falls closed to one
+   command buffer per TP token"* (`ds4.c:28425`).
+
+Corroboration that the bench arms *do* have it: our measured row-gate wait is
+292.6 µs, consistent with 508 − 186 ≈ 322 and not with 508. So **no published
+number is affected** — the bench protocol always sets it. The question is only
+whether production does.
+
+**Action: check the `ds4-server` launch command on both ranks.** If it is
+missing, that is the largest single decode number in this document and it costs
+nothing to fix. Consider whether it should be a default rather than an env var
+the operator has to remember — the reason it is opt-in ("relies on an
+undocumented Metal qualifier, so fall back to the shared event if anything is
+unavailable") is a *capability* argument, and the capability is already probed
+separately via `g_tp_flag_gates` and `g_tp_release_words`.
+
+**This also constrains R12a.** The split schedule sweep is meaningless without
+`DS4_METAL_FAST_SYNC=1` on both ranks: `tp_split_safe()` would return 0 and
+every arm would collapse to one command buffer, producing a flat null result
+for the wrong reason. Set it explicitly in every R12a arm.
+
+#### R13b — MXFP4 fixed-route MoE decode is disabled under TP
+
+`ds4_metal.m:39387` and `:39399` both require `tp_world == 1 &&
+tp_expert_base == 0` before selecting
+`kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_f32` /
+`..._sum6_fixed_route`. Under TP2 we therefore fall back to the generic
+`mul_mv_id` path for the largest byte-mover in decode (~1.7 GB/token/node of
+routed experts).
+
+The reason is in the kernels, and the fix has a working template two lines
+away. The **generic** kernel handles TP correctly (`metal/moe.metal:4578-4584`):
+
+```c
+if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) return;
+...
+device const char *gate_expert = src0_gate +
+    (int64_t)(expert - args.tp_expert_base) * args.nb02;
+```
+
+The fixed-route twin (`metal/moe.metal:4592+`) has neither the ownership test
+nor the `- tp_expert_base` rebase. So the port is that ownership line plus the
+rebase, across five kernels (`moe.metal:4593, 4734, 6478, 6523, 6616`), then
+dropping the two host clauses — not a redesign.
+
+Two hazards to respect: `add_in != NULL` from the shared-expert fold needs
+handling separately, and the `nr0`/grid-width hazard that forced the `d9eba30`
+revert (`ds4_metal.m:39135-39148`) still applies. Size the prize with
+`tests/bench_moe_mxfp4_decode 256` before writing any of it.
+
+#### R13c — one more device-name gate the earlier sweep missed
+
+`ds4_metal.m:28922`:
+```c
+const bool use_shared_kvpad = has_kvpad &&
+    ds4_gpu_device_name_contains("M3") &&
+    getenv("DS4_METAL_DISABLE_SHARED_KV_PAD") == NULL;
+```
+A bare device-*name* test with no `pre_m5 || m5` family arm, on the decode
+gathered-FlashAttention path — the 20 ratio-128 layers. This is exactly the
+defect class `speed-bench/tp_decode_investigation.md:574-584` documents
+(*"a device-name string test where the surrounding code used a device-family
+predicate"*), of which eight were already fixed; this one was missed. It only
+fires when `n_keys % 32 != 0`, so the hit rate is context-dependent and the
+yield is probably small. Widen following `ds4_metal.m:20915-20922`.
+
+#### Did not survive verification — do not re-raise
+
+- **`hc_rms_scale_project`'s `n_rows > 8u` gate** (`ds4_metal.m:21770`) — not
+  on the decode path; all three callers are prefill/batch.
+- **cluster2 HC norm-mix M5 gate** (`ds4_metal.m:43592`) — guards a fallback we
+  do not take; the fusion we do take already selects the cluster2 pre-norm
+  kernel unconditionally.
+- **`vec_hc` M5 gate** (`ds4_metal.m:44656`) — only reachable through the
+  `fuse_attn_out_hc` branch, which is TP-disabled.
+
+Also recorded: there is no `#if 0` anywhere in the decode sources, and
+`DS4_METAL_NORM_RSQRT_DISABLE` being default-on is a deliberate determinism
+requirement (`metal/norm.metal:231`), **not** a missed optimisation — do not
+flip it for speed.
 
 ### R12 — two zero-code decode sweeps (split schedule + dispatch ballast)
 
