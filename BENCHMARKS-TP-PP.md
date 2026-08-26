@@ -182,10 +182,77 @@ ranks, `DS4_TP_FORCE_DENSE_ATTN_OUT` unset, 2026-08-25):
 - Gain is real but **not the predicted shape**: expected ~0% at 2048 rising to
   ~1.5× at 131072; observed a mid-context peak (~+11% at 8k/32k) falling back
   to +7.2% at 131k. 2048 is ~0% as constructed. Decode untouched.
-- 131072 target was ~1.5× (≈332 t/s); measured 237.4 (+7.2%). Cold single-point
-  (Run 3b) and gate profile (Run 4) pending; the long-context bottleneck is
-  likely not the replicated attention row work A0 removes (indexer replication
-  and/or big-gate bandwidth are the suspects).
+- 131072 target was ~1.5× (≈332 t/s); measured 237.4 (+7.2%). The low long-ctx
+  gain is mechanistic, not noise: A0 splits attention *consumption* (constant
+  4.19e7 MACs/token/layer) but not indexer *scoring* (n_comp × 64 × 128, grows
+  linearly; 2.68e8 MACs/token/layer at 131k, 6.4× larger). Confirmed by R1
+  below.
+
+**Run 3b — cold single point (the honest number), 2026-08-25**
+
+| | flag off | flag on | Δ |
+|---|---|---|---|
+| cold 131072 prefill t/s | 259.90 | 281.20 | +8.2% |
+
+**R1 — indexer stage profile @131k** (`DS4_METAL_INDEXER_STAGE_PROFILE=1`,
+split on; throughput under the flag not comparable — stage-boundary command
+buffer splits. Relative split is the signal.)
+
+Late-chunk prefill rows (pos=126976, tokens=4096, comp=32768), even layers:
+
+| layer | score ms | topk ms | attention ms |
+|---|---|---|---|
+| 2 | 317.68 | 10.00 | 41.33 |
+| 4 | 317.67 | 10.33 | 39.43 |
+| 6 | 317.14 | 11.12 | 39.54 |
+
+- **score : attention ≈ 8 : 1** (predicted 6.4× from the MAC count) — score
+  dominates, exactly as the model predicted. The indexer split is the next
+  change; its ceiling is roughly the score share (~61% of the ~519 ms/layer-chunk).
+- Score grows linearly with `comp` (layer 2): 20.0 ms @ comp=1024 (pos 0) →
+  141.0 @ 15360 → 237.7 @ 24576 → 317.7 @ 32768.
+
+**R2 — gate profile @131k cold** (`DS4_TP_GATE_PROFILE=1`, both arms)
+
+| BIG | A0 off | A0 on |
+|---|---|---|
+| gates | 1419 | 2132 |
+| avg gpu-wait µs | 318,073 | 190,223 |
+| avg exchange µs | 30,503 | 23,741 |
+| eff. per-direction bandwidth (67,108,864 / exchange) | 2.20 GB/s | 2.83 GB/s |
+
+ROW gates: off 10,621 @ 427/28 µs, on 10,768 @ 423/26 µs (wait/exchange); VERIFY
+0 in both. A0 adds ~50% more big gates but each swaps a smaller row range
+(per-gate time falls); the gpu-wait bubble (0.2–0.3 s per big gate) dwarfs the
+wire time (0.024–0.031 s) — the cost is encoder drain / GPU wait, not the
+link. Effective 2.2–2.8 GB/s per direction is far below TB4 line rate.
+
+**R3 — GPU utilisation shape** (`powermetrics --samplers gpu_power`, during
+131k cold prefills, 2026-08-25)
+
+| arm / ctx | lanfear residency / power | mat residency / power |
+|---|---|---|
+| off, 131k | 87–90% / 59.9–62.7 W | 92% / 59.7–60.7 W |
+| on, 131k | 90–91% / 55.1–55.9 W | 91% / 54.5–54.7 W |
+| off, 8k | pending | pending |
+| on, 8k | pending | pending |
+
+~90% residency in **both** arms at 131k: the ~90% is structural, not A0-
+introduced. 8k points pending (running).
+
+**R4 — short-context regression** (`DS4_METAL_DISABLE_ARGSORT_CANON=1` both
+ranks, 2048/4096/8192 points, 2026-08-25)
+
+| ctx | Run 1 (canon on) | canon off | Δ | old base |
+|---|---|---|---|---|
+| 2048 | 378.94 | 400.19 | +5.6% | 381.3 |
+| 4096 | 346.12 | 354.65 | +2.5% | 353.8 |
+| 8192 | 379.73 | 378.92 | ~0% | 377.1 |
+
+Hypothesis supported: the canonical argsort comparator (not token-count gated
+like its siblings) costs ~2.5% at 4k and ~5% at 2k; disabling it recovers the
+4096 point to old-base level. Suggested fix: gate it on `n_tokens >= 32`
+like the other indexer-stack pieces.
 
 ### TP — `tp-multi-slot-batching` (old base, superseded)
 
