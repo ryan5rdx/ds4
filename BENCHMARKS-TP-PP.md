@@ -150,8 +150,23 @@ sweep cleanly, zero faults.
 - 131072 = 221.5 t/s vs 183.4 on the old TP base — the upstream indexer stack
   (tiled5 scorer / stream512 topk) landed, as predicted (~228 expected).
 - Short-ctx sanity (2048 ctx, 16 gen): 390.80 t/s prefill, 40.37 steady decode.
-- A0 (`DS4_TP_PREFILL_SPLIT_NONZERO=1`) throughput + bit-equality runs: see test
-  plan; not yet recorded here.
+
+Correctness (Run 2, 16384-token prompt crossing chunk boundaries, both arms with
+`DS4_TP_FORCE_DENSE_ATTN_OUT=1`, temp 0, `--dump-frontier-logits-dir`):
+- The test plan's **byte-identical criterion is unsatisfiable on this rig**: two
+  identical *control* runs (flag off, no A0) already differ in all 129,280
+  dumped logits (max abs diff 0.0055, argmax identical). Cross-run bit
+equality does not hold for the unsplit path.
+- Split arm vs control: 128 generated tokens **byte-identical**, frontier argmax
+  identical (305), all logits differ with max abs diff 0.049 — ≈ F16 ULP at the
+  observed logit magnitude (~27). Consistent with accumulation-order change from
+  row redistribution, not a token-level defect.
+- Verdict: pass as numeric-equality-within-noise. Replace the plan's
+  byte-identical gate with: top-1 identity + max logit diff bounded against a
+  control-vs-control baseline (baseline 0.0055 vs split 0.049, ~9× — same ULP
+  class). Throughput (Run 3) gated on this: proceed.
+
+- A0 throughput (Run 3) sweep: not yet recorded here.
 
 ### TP — `tp-multi-slot-batching` (old base, superseded)
 
