@@ -3733,6 +3733,38 @@ static uint32_t ds4_gpu_flash_attn_vec_nsg(uint32_t n_keys, uint32_t nwg, uint32
     return nsg;
 }
 
+/* Simdgroups per threadgroup for the non-vec (prefill) dk512 FlashAttention
+ * kernel.  The historical choice is 8 for head_dim >= 512, but 8 is the worst
+ * legal value for this kernel at C = 64, on two counts that compound:
+ *
+ *   - NC = (C/8)/NSG is the number of 8x8 QK tiles a simdgroup produces per
+ *     key block.  NSG=8 pins NC at its floor of 1 -- one tile, then
+ *     simdgroup_store and the barriers -- where NSG=4 does two, halving
+ *     sync overhead per unit work.  static_assert((C/8) % NSG == 0) makes 8
+ *     the largest value the kernel even admits.
+ *   - the QK loop unrolls by MIN(DK8/2, 4*NSG), which jumps from 16x to a
+ *     full 32x at NSG=8, doubling live simdgroup matrices.  There is no
+ *     occupancy to win it back: shared memory is Q*(DK + 2*PV + 2*SH)*2 =
+ *     28,672 B against a 32,768 B limit, so exactly one threadgroup is
+ *     resident per core regardless of NSG.
+ *
+ * Measured standalone on an M1 Max at four real chunk shapes (4096- and
+ * 1024-token chunks, n_comp 64..1024): NSG=4 is 1.94-2.20x faster and
+ * bit-identical -- 0 of 134,217,728 output floats differ.  Default is left at
+ * the historical value until the rig confirms it on M2 Ultra; set
+ * DS4_METAL_FA_NSG=4 on BOTH ranks to A/B it.  Output is bit-identical either
+ * way, so this cannot change results, only speed. */
+static uint32_t ds4_gpu_flash_attn_nonvec_nsg(uint32_t head_dim) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_METAL_FA_NSG");
+        const int v = (env && env[0]) ? atoi(env) : 0;
+        cached = (v == 4 || v == 8) ? v : 0;
+    }
+    if (cached != 0) return (uint32_t)cached;
+    return head_dim >= 512 ? 8u : 4u;
+}
+
 static int ds4_gpu_trace_allocs(void) {
     static int initialized;
     static int enabled;
@@ -27649,7 +27681,7 @@ static int ds4_gpu_encode_flash_attention_prefill_static_mixed_heads_nonvec_long
 
     const uint32_t nqptg = 8;
     const uint32_t ncpsg = 64;
-    const uint32_t nsg = head_dim >= 512 ? 8u : 4u;
+    const uint32_t nsg = ds4_gpu_flash_attn_nonvec_nsg(head_dim);
     const bool has_kvpad = (n_keys % ncpsg) != 0;
     const bool bc_mask = (n_q % nqptg) != 0;
     const NSUInteger row_bytes = (NSUInteger)head_dim * sizeof(float);
@@ -28289,7 +28321,7 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads_nonvec(
 
     const uint32_t nqptg = 8;
     const uint32_t ncpsg = 64;
-    const uint32_t nsg = head_dim >= 512 ? 8u : 4u;
+    const uint32_t nsg = ds4_gpu_flash_attn_nonvec_nsg(head_dim);
     const bool has_kvpad = (n_kv % ncpsg) != 0;
     const bool bc_mask = (n_q % nqptg) != 0;
     const NSUInteger row_bytes = (NSUInteger)head_dim * sizeof(float);
@@ -29148,7 +29180,7 @@ static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
 
     const uint32_t nqptg = 8;
     const uint32_t ncpsg = 64;
-    const uint32_t nsg = head_dim >= 512 ? 8u : 4u;
+    const uint32_t nsg = ds4_gpu_flash_attn_nonvec_nsg(head_dim);
     const bool has_kvpad = (n_raw % ncpsg) != 0;
     const bool bc_mask = (n_tokens % nqptg) != 0;
     const NSUInteger row_bytes = (NSUInteger)head_dim * sizeof(float);
@@ -29394,7 +29426,7 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
 
     const uint32_t nqptg = 8;
     const uint32_t ncpsg = 64;
-    const uint32_t nsg = head_dim >= 512 ? 8u : 4u;
+    const uint32_t nsg = ds4_gpu_flash_attn_nonvec_nsg(head_dim);
     const bool has_kvpad = (n_keys % ncpsg) != 0;
     const bool bc_mask = (n_tokens % nqptg) != 0;
     const NSUInteger row_bytes = (NSUInteger)head_dim * sizeof(float);
