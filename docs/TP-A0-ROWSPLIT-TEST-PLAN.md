@@ -25,6 +25,7 @@ This doc is the **request** side of a loop: results go into
 | R8 — FlashAttention `nsg` | done, **default flipped** | **Bit-identical** (0/129,280). Sweep 131k 342.18 → **367.29** (+7.3%), cold 380.27 → **402.64** (+5.9%). Correct direction and shape, but **under** the projected +10–15% — see the transfer factor below. |
 | R9 — `nqptg` ceiling | scoped, no runs | A 2× standalone kernel discounts to ~+6–8% end-to-end. Prototype only if the restructure shows ≥1.5–2×. |
 | R10 — gate path + decode | done, no code change | Sub-gate re-test: **wash at every context, avenue closed**. Link ceiling: **4.4/4.1 GB/s per direction** (4 KiB WR cap — 64 MiB messages structurally impossible); gate path at ~65–75% of it. First decode profiling: decode is **stall-bound** (~30 W vs ~55 W prefill), NWG default already optimal (plateau 8–32), the 2048 decode floor is **per-gate fixed cost**, and the only lever left is the 86 gates/token — a design change. Full numbers in `BENCHMARKS-TP-PP.md`. |
+| R11 — decode gate count | **built, requested below** | `DS4_TP_DECODE_REPLICATE_ATTN=1`. Replicates attention on decode, dropping 86 gates/token to 43. GLM already runs this way. A real trade, not a free win. |
 
 **Arc at ctx 131072 (sweep):** 183.4 (old base) → 221.50 (upstream indexer
 stack) → 237.44 (A0) → 283.64 (indexer split) → 342.25 (static-mixed split) →
@@ -177,7 +178,98 @@ Cheaper alternatives already ruled out: `C` tuning (C=128 slower on both NSG
 values *and* skips less work — 1280 vs 1216 executed keys/row; C=32 will not
 build), and the CPU/ANE offload evaluated below.
 
+### R11 — halve the decode gate count (`DS4_TP_DECODE_REPLICATE_ATTN=1`)
+
+Built on `upstream-metal-wins`. Opt-in, default off, must be set on BOTH ranks.
+Builds warning-clean; `ds4_test --server`, `ds4_agent_test`,
+`ds4-eval --self-test-extractors` and `test_engine_mgpu_placement` (123/123)
+all pass.
+
+R10e closed out every knob and left exactly one lever: **the 86 gates/token**.
+Short-context decode is entirely per-gate fixed cost (86 × ~284 µs ≈ 24.4 ms
+≈ the measured 41 t/s floor), wire is only ~12% of gate time at both contexts,
+and NWG is already optimal. This is the design change that moves the count.
+
+**What it does.** Replicates the whole decode attention block instead of
+splitting it, so the per-layer ATTN gate disappears and the schedule goes from
+2 gates/layer to 1 — `start = DS4_TP_GATE_FFN, step = 2, per_token = 43`.
+
+**The precedent is already in the same function.**
+`ds4_engine_tp_gate_schedule()` gives GLM exactly this shape today ("One FFN
+gate per sparse layer"), so neither the schedule form nor the transport's
+arithmetic-progression slot mapping needs changing. Prefill is untouched: it
+uses `ds4_gpu_tp_big_gate_encode()` with its own sequencing, not the row-gate
+schedule.
+
+**This is a trade, and it can lose.** Correcting my own framing when I proposed
+it — this is not "one branch". Three decode splits have to come off together
+(the head split, the independently group-sliced output projection at the
+`tp_attn_decode_split` branch, and the gate itself) or the gate slot carries a
+partial nobody sums. All three now key off one predicate. The cost is that each
+rank runs the full attention block: roughly **+1.6 GB/token/node** of weight
+traffic on Flash, because `q_b` and `o_a` are 32768-wide.
+
+The bet is R10c: decode runs at ~54% of prefill power, so it is stall-bound,
+and added reads should land in existing bubbles while removed gates take real
+wall time. If decode were bandwidth-bound this would be strictly worse. **I
+would not be surprised by a negative result** — record it either way, because a
+clean negative closes the last lever and says the 86-gate structure is load
+bearing.
+
+**R11a — inertness.** Flag unset must reproduce the current arm exactly; the
+default path is untouched.
+
+**R11b — correctness** (16384, greedy). Expect **not** bit-identical, unlike
+R5/R7/R8: replication changes the attention output from `rank0_partial +
+rank1_partial` to a single full-width computation, so the summation order
+differs. Judge it on the R2-era criterion — top-1 identity plus max |Δlogit|
+bounded against the ~0.0055 control-vs-control baseline. A large divergence
+means a genuine bug, not accumulation order.
+
+**R11c — throughput**: decode at 2048 and 131072, plus a full sweep to confirm
+prefill is unmoved. Decode is the metric; prefill should be flat to within
+noise, and if it is not, something leaked out of the decode path.
+
+No projection recorded, deliberately. The two terms — per-gate fixed cost saved
+and duplicated attention traffic added — are each uncertain by more than their
+difference, and R8 is the standing reminder of what happens when a shaky
+estimate gets quoted as a number. Direction is genuinely unknown; that is why
+it is worth one run.
+
+**Asymmetry fails safe here**, unlike the prefill split flags:
+`gates_per_token` is exchanged in the TP hello and a mismatch is rejected at
+handshake (`ds4_tp.c:1386`) rather than deadlocking mid-run.
+
 ### R10 — the gate path, and the first hard look at decode — **DONE, 2026-08-26, recorded in `BENCHMARKS-TP-PP.md`**
+
+**Two readings to fix before they propagate.**
+
+**The "93% of 2048 prefill wall time is BIG-gate wait+wire, versus 18.5% at
+131k" comparison is apples-to-oranges.** The 18.5% figure is **wire only**; the
+93% is **wait + wire**, and `wait` contains the layer's compute. Σ(wait+wire) ≈
+wall time is near-tautological wherever gates bracket all the work — at 131k
+the same sum is 319 s of 325 s, i.e. **98%**, *higher* than 2048's 93%. The
+comparable number is wire alone: 86 × 13.07 ms = 1.12 s of 4.96 s = **~23% at
+2048** against 19.1% at 131k. Similar, slightly worse at short context. No R10
+conclusion changes, but "the gate *is* the prefill at 2048" reads as an
+overhead finding when it is a bracketing artifact — the third instance of this
+exact trap in this doc, after the two corrections above.
+
+**R10c confirms its prior via a proxy, not directly.** These boxes report GPU
+power, not residency, so the 86–91% prefill residency figure has no
+counterpart. Decode at 30 W against prefill's 55.5 W is 54% of prefill power;
+multiplied through prefill's ~88% residency that is a **~48% residency
+equivalent** — the top edge of the predicted 30–50% band, so confirmed but only
+just, and power is not linear in residency under DVFS. The qualitative finding
+(decode is not compute-saturated) is solid; the number is directional.
+
+**And one prediction that was simply wrong.** R10d was requested on the
+suspicion that `DECODE_NWG`'s bucket heuristic was "exactly the class of
+tuned-once constant `nsg=8` turned out to be". It is not: the default 32 sits at
+the top of the plateau on **both** contexts (40.91 @2k, 0.03% off best @131k).
+The knob is a real lever — NWG=2 costs 14% — with nothing left to tune. One for
+two on suspecting heuristics; worth remembering before the next such request.
+
 
 **No code.** Everything here is an existing knob or a measurement. R9's own
 arithmetic put a kernel rewrite at +6–8%; the R9 gate profile put **BIG-gate
