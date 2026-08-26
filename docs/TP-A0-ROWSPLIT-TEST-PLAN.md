@@ -23,6 +23,8 @@ This doc is the **request** side of a loop: results go into
 | R6 — size ratio-128 layers | done | Prize **311.2 ms/layer-chunk × 20 layers**, ~71% of the odd layer. Odd-layer attention is *larger* than a ratio-4 layer's (255.3 vs 182.8 ms) and grows with context. Two of this doc's premises were wrong — see below. |
 | R7 — static-mixed split | done | **Bit-identical** (0/129,280). Sweep 131k 284.03 → **342.25** (+20.5%), cold 322.64 → **380.27** (+18.2%). Both inside the pre-recorded projection (~340 / ~380). |
 | R8 — FlashAttention `nsg` | done, **default flipped** | **Bit-identical** (0/129,280). Sweep 131k 342.18 → **367.29** (+7.3%), cold 380.27 → **402.64** (+5.9%). Correct direction and shape, but **under** the projected +10–15% — see the transfer factor below. |
+| R9 — `nqptg` ceiling | scoped, no runs | A 2× standalone kernel discounts to ~+6–8% end-to-end. Prototype only if the restructure shows ≥1.5–2×. |
+| R10 — gate path + decode | **requested below** | Sub-gate pipeline re-test, link ceiling at 64 MiB, and the first decode profiling (residency, `DECODE_NWG`, gate scaling). No code. |
 
 **Arc at ctx 131072 (sweep):** 183.4 (old base) → 221.50 (upstream indexer
 stack) → 237.44 (A0) → 283.64 (indexer split) → 342.25 (static-mixed split) →
@@ -30,9 +32,24 @@ stack) → 237.44 (A0) → 283.64 (indexer split) → 342.25 (static-mixed split
 baseline on this branch. Cold single point 259.90 → **402.64** (+54.9%).
 Decode untouched throughout (28.18 steady).
 
-**TP sweep prefill now exceeds PP at 131k** (367.29 vs 334.53), while keeping
-the ~40% decode lead. PP on the same pair remains the only honest scaling
-reference, since a single node cannot hold 145.26 GiB.
+**Correction — TP does *not* beat PP at long context.** That claim was made
+against the stale `pp-rdma-new` figure (334.53) flagged below. Re-measured on
+the same commit, PP at 131k is **444.38**, and the picture is:
+
+| | ≤ 16k | ≥ 32k | decode |
+|---|---|---|---|
+| winner | **TP** (+34% @2k, +44% @8k, +5% @16k) | **PP** (+15% @32k, +22% @65k, +21% @131k) | **TP everywhere** (+37–48%) |
+
+Most of PP's jump is **our own work, not the transport**: the old PP table was
+built off `tp-multi-slot-batching`, which predates the upstream indexer stack
+(+20.8% on TP) and R8's `nsg=4`. Neither is TP-specific —
+`ds4_gpu_flash_attn_nonvec_nsg()` sits on the shared Metal path — so PP
+inherited both. 1.208 × 1.07 = 1.29 against an observed 1.33, leaving little
+for the TCP-over-TB change.
+
+The lesson to carry: several wins in this series lifted *both* architectures,
+so TP-only deltas do not move the TP-vs-PP comparison by the same amount. Score
+cross-architecture claims only against a same-commit PP run.
 
 **Standalone-to-rig transfer factor: ~0.63.** R8 is the first result measured
 both ways, and the two disagree. Backing the kernel speedup out of the
@@ -53,17 +70,14 @@ replicated work*. That well is now dry — the stages that must stay full-width
 (`kv_path` + `compressor`) are only ~3.5–5.5 ms/layer — so everything after R8
 is kernel efficiency or fixed overhead.
 
-**Pin the PP column before quoting the crossover.** The PP figures in R7c
-(393.90 / 412.78 / 454.20 / 444.70 / 438.98 / 373.38 / 334.53) appear nowhere
-else in `BENCHMARKS-TP-PP.md` and no PP run is recorded for 2026-08-25, yet the
-131072 entry matches the older `pp-rdma-new` table to the cent while every
-other point differs by 10–30%. Either it is a fresh run whose 131k point
-coincidentally lands on 334.53, or that one cell was carried over. It matters
-because the "TP now beats PP" headline rests on exactly that number — and note
-the fresh column trends *below* the old one at 65536 (373.38 vs 426.59,
-−12.5%), so a genuinely re-measured 131k PP point may well be lower, which
-would widen the margin rather than erase it. Please confirm which, and if it is
-a new run, record it as its own table.
+**PP column — resolved.** The R7c PP figures were indeed unsourced; the 131072
+cell was carried over from the stale `pp-rdma-new` table. Re-measured on the
+same commit and recorded as its own table. Flagging it was right; the guess
+attached to the flag was not — I reasoned from the fresh column trending
+*below* the old one at 65536 that a re-measured 131k would also be lower and
+widen TP's margin. It came in far higher (444.38 vs 334.53) and reversed the
+result. A number worth flagging as unsourced is a number not worth
+extrapolating from either.
 
 **Do not quote `speed-bench/m2_ultra.csv` or the "1.85× PP scaling" figure as
 scaling references.** The former uses a fixed 2048-token increment per frontier
@@ -86,10 +100,21 @@ do: the service thread keeps many gates in flight, and the metric measures
 encode-to-satisfied per gate, not exclusive idle. Use it as a *ratio* against
 exchange (the cost is drain/wait, not the link), never as a time budget.
 
-The honest stall number is R3's flat ~10%. That **bounds every gate-related
-optimisation at roughly +11%**, and it is why the RDMA staging/window workstream
-is closed: effective bandwidth is 2.2–2.8 GB/s, but exchange is only ~9% of the
-run and the 10× larger wait term is not bandwidth.
+The honest stall number is R3's flat ~10%, which bounds *idle-recovery* at
+roughly +11%.
+
+**Superseded, and it matters: the "exchange is only ~9% of the run, so the RDMA
+staging/window workstream is closed" conclusion was wrong.** It was drawn from
+R2, before the splits raised the BIG gate count to 2752. The R9 profile makes
+the total explicit: 2752 × 21.8 ms = **60 s of wire in a 325 s cold prefill,
+18.5%**, and it is on the critical path rather than overlapped. Wire is
+therefore twice the share that argument assumed and larger than the entire idle
+budget it was weighed against. R10a/R10b reopen it.
+
+The underlying mistake was reasoning about a *ratio* (wait:wire per gate) as
+though it bounded a *total*. Per-gate wire being small next to per-gate wait
+says nothing about what wire sums to across thousands of gates — and the gate
+count is exactly what this workstream kept increasing.
 
 **Why Run 3 came in low, and it is not noise.** A0 splits the attention
 *consumption*, which `top_k` caps at a constant `(512 + 128) × 64 × 512 × 2`
@@ -152,26 +177,83 @@ Cheaper alternatives already ruled out: `C` tuning (C=128 slower on both NSG
 values *and* skips less work — 1280 vs 1216 executed keys/row; C=32 will not
 build), and the CPU/ANE offload evaluated below.
 
-### The flat ~10% residency — the other open lever
+### R10 — the gate path, and the first hard look at decode
 
-R8's power capture makes this hard to ignore. Active residency has sat at
-**86–91% in every arm, at both 8k and 131k**, while attention's share of layer
-time fell substantially across R5–R8. A ceiling that does not move when the
-dominant stage shrinks by half is not attributable to any GPU stage — it is
-fixed per-iteration overhead (gate exchanges, encoder boundaries).
+**No code.** Everything here is an existing knob or a measurement. R9's own
+arithmetic put a kernel rewrite at +6–8%; the R9 gate profile put **BIG-gate
+wire at 60 s of a 325 s cold prefill — 18.5%, on the critical path and not
+overlapped**. That is the larger target, and it is also the structural reason
+PP wins at long context: PP moves activations twice per pipeline pass, TP moves
+them once per layer per chunk, so TP's transfer cost scales with layers ×
+chunks and PP's does not.
 
-That bounds it at roughly **+11%** if fully recovered, comparable to R9, and
-R2's data is the place to start: BIG gates 2132/run at ~190 ms average GPU-wait
-against ~24 ms of wire time. Read `avg gpu-wait` as a ratio against exchange,
-never as a time budget (see the correction below).
+**R10a — re-test `DS4_TP_SUBGATE_PIPELINE=1`** (both ranks; full sweep + cold
+131k against the current arm). Documented as "measured net-negative on the M5
+Max pair", but that predates this entire workstream, when BIG wait:wire was
+**8.0 : 1**. It is now **4.3 : 1** with per-gate wait halved (190 → 93 ms).
+Overlapping sub-chunks is worth much more when wire is a larger share of the
+gate, so the regime it was rejected in no longer exists. Cheapest possible
+probe of an 18.5% target: one flag, no code. If it is still net-negative,
+record it and the sub-gate avenue closes for good.
 
-### Still open from R7 — pin the PP column
+**R10b — link ceiling at the real message size.** Effective BIG-gate wire is
+2.8–3.1 GB/s (67,108,864 B / 21.8 ms) against a link we treat as ~5 GB/s.
+Before anyone tries to overlap the transfer, establish whether it can simply go
+faster: run `uc_pingpong` (or the existing RDMA test harness) at **64 MiB**
+message size, not the default, and record achieved GB/s each way. If the link
+delivers ~5 GB/s at that size, the gate path is leaving ~40% on the floor and
+staging/window tuning is back on the table — the workstream this doc closed
+earlier was closed on the argument that exchange was only ~9% of the run, which
+the 18.5% figure supersedes.
 
-Not addressed in the R8 update. The PP figures in R7c appear nowhere else in
-`BENCHMARKS-TP-PP.md`, no PP run is recorded for 2026-08-25, and the 131072
-entry matches the old `pp-rdma-new` table to the cent while every other point
-moved 10–30%. TP now clears it by 33 t/s rather than 8, so the headline is safe
-either way — but the number should still be sourced or re-measured.
+**Decode.** Prefill has had all the attention; decode has been "untouched" in
+every arm since R3 and has never been profiled on its own. It is now the
+weaker half of the story in absolute terms — 28.13 t/s at 131k against 367
+prefill — and it is where TP's remaining advantage lives (+37–48% over PP at
+every context). Three cheap measurements, in priority order:
+
+**R10c — decode residency and power** (`powermetrics --samplers gpu_power`
+during the *generation* phase only, at 2048 and 131072). **This has never been
+measured** — every residency figure in this doc is from prefill. It decides the
+other two: prefill sits at 86–91%, and if decode sits far below that, decode is
+stall-bound and the gate chain is the target; if it is also ~90%, decode is
+compute-bound and the kernels are.
+
+Prior expectation, so it can be scored: **low**, 30–50%. Decode moves ~3.3 GB
+per token per node (experts + attention weights + KV) which is ~4 ms at 800
+GB/s, against a measured 35.5 ms/token at 131k — about 12% of bandwidth and,
+per the standing note, ~2% of peak FLOPs. If residency comes back at ~90% that
+prediction is wrong in an interesting way and worth stopping on.
+
+**R10d — `DS4_METAL_DECODE_NWG` sweep** (2, 4, 8, 12, 16, 24, 32; both ranks;
+at 2048 and 131072). An existing env knob (`ds4_gpu_flash_attn_decode_nwg`,
+range 2–32) whose default is a **coarse bucket heuristic** — "bound runtime PSO
+compilation while still removing most empty work". That is exactly the class of
+tuned-once constant `nsg=8` turned out to be, and it costs nothing to sweep.
+Note it only branches on `ds4_gpu_tp_world_is_two()`, so world-1 keeps NWG=32
+regardless — sweep under TP.
+
+**R10e — decode gate profile at two contexts** (`DS4_TP_GATE_PROFILE=1` at
+2048 and 131072). We have ROW-gate data only at 131k: 11,008 gates
+(= 128 tokens × 86, the fixed per-token schedule) at 418 µs wait / 29.9 µs
+wire. One context cannot separate fixed overhead from context-dependent
+compute; two can.
+
+What to read from it, and what **not** to. Decode's 86 gates run in fixed
+sequential order, so unlike the bulk prefill gates they cannot overlap — which
+means Σwait ≈ token time is close to **tautological** (86 × 418 µs = 35.9 ms
+against a measured 35.5 ms/token) and is *not* evidence of anything. Two prior
+readings in this doc went wrong exactly here. The informative quantities are:
+
+- **wire as a fraction of wait** — currently 29.9/418 = **7.2%**, i.e. the link
+  is not decode's problem and R10b will not help decode;
+- **how wait scales with context** — 2048 decode is 40.91 t/s → 284 µs/gate
+  implied, 131k is 418 µs. If wire is flat ~29 µs at both, the growth is
+  compute and the floor is ~284 µs/gate × 86 = 24.4 ms/token ≈ 41 t/s, which
+  is precisely the measured 2048 number. That would mean **short-context decode
+  is entirely per-gate fixed cost**, and the only lever with real headroom is
+  reducing the 86 gates/token (2 per layer) — a design change, not a knob, but
+  worth knowing before anyone tunes kernels for it.
 
 ### R8 — FlashAttention simdgroup count — **DONE, default flipped**
 
