@@ -25,7 +25,7 @@ This doc is the **request** side of a loop: results go into
 | R8 — FlashAttention `nsg` | done, **default flipped** | **Bit-identical** (0/129,280). Sweep 131k 342.18 → **367.29** (+7.3%), cold 380.27 → **402.64** (+5.9%). Correct direction and shape, but **under** the projected +10–15% — see the transfer factor below. |
 | R9 — `nqptg` ceiling | scoped, no runs | A 2× standalone kernel discounts to ~+6–8% end-to-end. Prototype only if the restructure shows ≥1.5–2×. |
 | R10 — gate path + decode | done, no code change | Sub-gate re-test: **wash at every context, avenue closed**. Link ceiling: **4.4/4.1 GB/s per direction** (4 KiB WR cap — 64 MiB messages structurally impossible); gate path at ~65–75% of it. First decode profiling: decode is **stall-bound** (~30 W vs ~55 W prefill), NWG default already optimal (plateau 8–32), the 2048 decode floor is **per-gate fixed cost**, and the only lever left is the 86 gates/token — a design change. Full numbers in `BENCHMARKS-TP-PP.md`. |
-| R11 — decode gate count | **built, requested below** | `DS4_TP_DECODE_REPLICATE_ATTN=1`. Replicates attention on decode, dropping 86 gates/token to 43. GLM already runs this way. A real trade, not a free win. |
+| R11 — decode gate count | done — **clean negative, avenue closed** | Decode **−8.4 to −11.8% at all 7 contexts**, prefill unmoved. Cost is flat ~3.25 ms/token at both 2k and 131k. The gate wait was never idle: it is the window the peer's half of the attention runs in. Falsifies R10e's headline — see below. |
 
 **Arc at ctx 131072 (sweep):** 183.4 (old base) → 221.50 (upstream indexer
 stack) → 237.44 (A0) → 283.64 (indexer split) → 342.25 (static-mixed split) →
@@ -179,6 +179,62 @@ values *and* skips less work — 1280 vs 1216 executed keys/row; C=32 will not
 build), and the CPU/ANE offload evaluated below.
 
 ### R11 — halve the decode gate count (`DS4_TP_DECODE_REPLICATE_ATTN=1`) — **DONE, 2026-08-26, NEGATIVE: decode −8.5 to −11.8%, recorded in `BENCHMARKS-TP-PP.md`**
+
+**What it cost, and why that number is the finding.** Decode fell uniformly:
+B/A = 0.882 / 0.912 / 0.912 / 0.913 / 0.916 / 0.913 / 0.916 across the sweep.
+In per-token terms that is **+3.28 ms at 2048 and +3.24 ms at 131072** — flat
+to within 1% across a 64× context range. Flat means the cost is the duplicated
+*weight* traffic (+1.6 GB/token/node of `q_b`/`o_a`, which does not scale with
+context) and **not** the full-head KV re-read (which would). At ~500 GB/s that
++1.6 GB is ~3.2 ms: the measured cost is the duplicated weights, essentially
+in full.
+
+**Now the part that matters. Removing 43 gates saved approximately nothing.**
+Those gates carried 43 × 293 µs ≈ **12.6 ms/token** of wait at 2048, against a
+24.5 ms token. Had that been transport/sync overhead, deleting it would have
+paid for the 3.2 ms of extra traffic several times over. Net was +3.25 ms,
+i.e. the ~12.6 ms of removed wait bought ~0 — because a TP gate wait is not
+idle, it is **the window in which the peer rank's half of the attention runs**.
+Replication does not remove that work, it moves it onto both ranks and
+serialises what used to be two half-attentions in parallel.
+
+**This falsifies R10e's headline, and the error was mine.** R10e concluded
+"short-context decode is entirely per-gate fixed cost" from 86 × ~284 µs ≈
+24.4 ms ≈ the 41 t/s floor. That sum is the same tautology this doc has now
+flagged four times: Σwait ≈ token time wherever gates bracket the work, because
+`wait` *contains* the compute. I wrote that warning into the R10e request and
+then used the quantity it warns about to argue the floor was overhead — and
+built R11 on it.
+
+The corrected reading, and it closes the subject: subtracting the duplicated
+traffic from the measured delta leaves **~0 recoverable per-gate sync
+overhead**. The decode gate mechanism is not costing us anything worth
+reclaiming; the 86 gates/token are measuring compute. **Decode is closed as a
+TP-structural problem.** What remains is making the compute itself cheaper —
+kernels, quantisation, or fewer active parameters — not restructuring the
+exchange.
+
+**Two harness findings worth acting on before the next campaign.**
+
+*The correctness gate has degraded ~125×.* In-session control-vs-control max
+|Δlogit| is **0.688**, against the R2-era 0.0055 — at logit magnitude ~27 that
+is 2.5% relative, and 5 of 7 frontiers fall into a degenerate "of/and"
+repetition regime where near-tied logits amplify any perturbation. The
+candidate (0.665) passing "inside the in-session baseline" is therefore a very
+weak pass. The degenerate prompt is the likely cause, but `dedc830`
+(compressor-frontier rewind) is also new in this build and the frontier chain
+exercises restore paths, so **confirm the cause rather than assume it** before
+this harness gates anything non-bit-identical again. R5/R7/R8's bit-identical
+results are unaffected — 0 differing logits needs no baseline.
+
+*Warm-sweep prefill is ±5% with occasional single-point ~13% dips*, evidenced
+by two opposite-direction outliers (32768 and 65536) in runs where the flag
+cannot reach prefill. Same-day A/B is the only clean comparison. This does not
+disturb the large deltas in the arc (R7 +20.5%, R8 +7.3% at 131k), but it does
+mean the small ones — R8's +1.5% at 4096, +2.8% at 16384, and R10a's ±1%
+agreements — sit at or inside the noise floor and should not be quoted as
+individually resolved.
+
 
 Built on `upstream-metal-wins`. Opt-in, default off, must be set on BOTH ranks.
 Builds warning-clean; `ds4_test --server`, `ds4_agent_test`,
