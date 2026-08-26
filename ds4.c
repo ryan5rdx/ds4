@@ -28988,6 +28988,25 @@ static bool metal_graph_tp_split_nonzero_prefix(void) {
     return cached != 0;
 }
 
+/* Force the dense-quant attention output projection, disabling the fused f16
+ * path, so that a split and an unsplit run use the same output kernel.
+ *
+ * Without this an A/B of DS4_TP_PREFILL_SPLIT_NONZERO can never be a bit
+ * equality test: the row split already disables attn_out_f16 (see the
+ * !tp_row_split_attn term in its guard), so the two arms would differ by the
+ * output projection as well as by the split, and every comparison would report
+ * a mismatch that says nothing about whether the split is correct.  Set this
+ * on BOTH arms of the comparison; it costs throughput and is a test tool, not
+ * a tuning knob. */
+static bool metal_graph_force_dense_attn_out(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_TP_FORCE_DENSE_ATTN_OUT");
+        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 /* Opt-in sub-chunk gate pipelining for the TP prefill row swaps.  Must be
  * set on BOTH ranks (it changes the per-layer gate count; asymmetric
  * settings deadlock the big gates).  Default off: measured net-negative
@@ -30751,6 +30770,7 @@ static bool metal_graph_encode_layer_attention_batch(
     bool attn_out_f16 = false;
     if (ok &&
         !attn_out_debug &&
+        !metal_graph_force_dense_attn_out() &&
         !tp_row_split_attn &&
         !tp_verify_output_split &&
         layer->attn_output_a->type == DS4_TENSOR_Q8_0 &&
