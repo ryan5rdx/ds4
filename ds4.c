@@ -20401,7 +20401,6 @@ static bool metal_graph_layer_stage_profile_boundary(
         uint32_t    n_tokens,
         double     *stage_t0);
 static bool metal_graph_decode_stage_profile_enabled(uint32_t il);
-static bool metal_graph_tp_replicate_decode_attn(void);
 static bool metal_graph_matmul_plain_tensor(
         ds4_gpu_tensor       *out,
         const ds4_model        *model,
@@ -22136,12 +22135,12 @@ static bool metal_graph_encode_decode_layer_phase(
     const int cuda_tp_home_tier = g->active_tier;
     const int cuda_tp_partner_tier = g->cuda_tp_decode
         ? metal_graph_cuda_tp_partner_tier(cuda_tp_home_tier) : -1;
-    /* Every decode-side attention split keys off this, not tp_world, so
-     * DS4_TP_DECODE_REPLICATE_ATTN turns off the head split, the
-     * group-sliced output projection and the ATTN gate together -- the
-     * three have to agree or the gate slot carries a partial nobody sums. */
-    const bool tp_attn_decode_split =
-        g->tp_world == 2 && !metal_graph_tp_replicate_decode_attn();
+    /* The three decode attention splits -- head split, group-sliced output
+     * projection, ATTN gate -- must agree or the gate slot carries a
+     * partial nobody sums.  R11 measured replicating all three (to halve
+     * the 86 gates/token) at -8.4 to -11.8% decode and removed it: the
+     * gate wait is the window the peer's half runs in, not idle time. */
+    const bool tp_attn_decode_split = g->tp_world == 2;
     const bool tp_split_attn = tp_attn_decode_split;
     const uint32_t tp_heads = tp_split_attn ?
         (uint32_t)DS4_N_HEAD / 2u : (uint32_t)DS4_N_HEAD;
@@ -29014,11 +29013,14 @@ static uint32_t metal_graph_tp_prefill_split_min(void) {
  * Default off: this cannot be measured without the two-machine rig, and the
  * arithmetic that says it should win (halving ~45% of executed FLOPs against
  * a ~1.4% added wire cost) is static analysis, not a measurement. */
+/* PRODUCTIONISED: default ON.  A0 row-split at pos0 > 0.  Sweep 131k 221.50 -> 237.44 (+7.2%), cold
+ * 259.90 -> 281.20 (+8.2%); correctness pass (Run 2).
+ * Set DS4_TP_PREFILL_SPLIT_NONZERO=0 on BOTH ranks to disable for an A/B. */
 static bool metal_graph_tp_split_nonzero_prefix(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_TP_PREFILL_SPLIT_NONZERO");
-        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+        cached = (env && env[0] == '0') ? 0 : 1;
     }
     return cached != 0;
 }
@@ -29048,11 +29050,14 @@ static bool metal_graph_tp_split_nonzero_prefix(void) {
  * it reuses tp_row0/tp_rows and the same attn_pos0.
  *
  * Must be set on BOTH ranks. */
+/* PRODUCTIONISED: default ON.  Indexer score + top-k row split.  Sweep 131k 237.44 -> 283.64 (+19.5%),
+ * cold 281.20 -> 322.64; bit-identical (R5a, 0/129,280 logits).
+ * Set DS4_TP_PREFILL_SPLIT_INDEXER=0 on BOTH ranks to disable for an A/B. */
 static bool metal_graph_tp_split_indexer(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_TP_PREFILL_SPLIT_INDEXER");
-        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+        cached = (env && env[0] == '0') ? 0 : 1;
     }
     return cached != 0;
 }
@@ -29078,47 +29083,18 @@ static bool metal_graph_tp_split_indexer(void) {
  *
  * Adds no gate traffic beyond the attn_out row swap A0 already performs.
  * Requires the A0 split.  Must be set on BOTH ranks. */
+/* PRODUCTIONISED: default ON.  Static-mixed (ratio-128) row split.  Sweep 131k 284.03 -> 342.25 (+20.5%),
+ * cold 322.64 -> 380.27 (+18.2%); bit-identical (R7b).
+ * Set DS4_TP_PREFILL_SPLIT_STATIC_MIXED=0 on BOTH ranks to disable for an A/B. */
 static bool metal_graph_tp_split_static_mixed(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_TP_PREFILL_SPLIT_STATIC_MIXED");
-        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+        cached = (env && env[0] == '0') ? 0 : 1;
     }
     return cached != 0;
 }
 
-/* Opt-in: replicate the whole attention block on DECODE instead of splitting
- * it, which drops the per-layer ATTN gate and halves the decode schedule from
- * 2 gates per layer to 1 (86 -> 43 on Flash).
- *
- * R10e measured short-context decode to be entirely per-gate fixed cost:
- * 86 x ~284 us ~= 24.4 ms/token ~= the 41 t/s floor, with wire only ~12% of
- * gate time at both 2048 and 131k.  Gate *count* is therefore the only lever
- * with headroom left, and this is the one change that moves it.
- *
- * The precedent is in ds4_engine_tp_gate_schedule() already: GLM runs decode
- * exactly this way ("One FFN gate per sparse layer"), so the schedule shape and
- * the transport's arithmetic-progression slot mapping both already support it.
- *
- * It is a real trade, not a free win.  Both the head split and the
- * group-sliced output projection go away, so each rank does the full attention
- * block -- roughly +1.6 GB/token/node of weight traffic on Flash, against
- * 43 fewer gate round trips.  The bet is that R10c's finding (decode runs at
- * ~54% of prefill power, i.e. stall-bound) means the added reads land in
- * existing bubbles while the removed gates take real wall time.  That is a
- * measurement, and it could come out negative.
- *
- * Must be set on BOTH ranks -- but unlike the prefill split flags this one
- * fails safe: gates_per_token is exchanged in the hello and a mismatch is
- * rejected there (ds4_tp.c:1386) rather than deadlocking mid-run. */
-static bool metal_graph_tp_replicate_decode_attn(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_TP_DECODE_REPLICATE_ATTN");
-        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
-    }
-    return cached != 0;
-}
 
 static bool metal_graph_force_dense_attn_out(void) {
     static int cached = -1;
@@ -60445,20 +60421,6 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
         *start = DS4_N_LEADING_DENSE * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
         *step = DS4_TP_GATES_PER_LAYER;
         *per_token = DS4_N_LAYER - DS4_N_NEXTN_PREDICT - DS4_N_LEADING_DENSE;
-#ifndef DS4_NO_GPU
-    } else if (metal_graph_tp_replicate_decode_attn()) {
-        /* Attention replicated on decode, so only the FFN gate fires -- the
-         * same shape GLM uses above, minus the dense/nextn trim DeepSeek does
-         * not have.  Still one arithmetic progression, so the transport's slot
-         * mapping (ds4_tp.c) needs no change.
-         *
-         * Guarded with the graph it has to agree with: the flag only changes
-         * which gates the decode graph emits, and TP refuses non-Metal
-         * backends anyway (ds4_tp.c:599). */
-        *start = DS4_TP_GATE_FFN;
-        *step = DS4_TP_GATES_PER_LAYER;
-        *per_token = DS4_N_LAYER;
-#endif
     } else {
         *start = 0;
         *step = 1;
