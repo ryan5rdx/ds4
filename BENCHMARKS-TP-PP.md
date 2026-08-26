@@ -188,8 +188,10 @@ ranks, `DS4_TP_FORCE_DENSE_ATTN_OUT` unset, 2026-08-25):
   linearly; 2.68e8 MACs/token/layer at 131k, 6.4× larger). Confirmed by R1
   below, and fixed by the indexer split (R5) and static-mixed split (R7),
   then the FlashAttention simdgroup fix (R8): cold 131k 259.90 → 402.64
-  (+54.9% total), sweep 221.50 → 367.29 (+65.8%), **first TP sweep prefill
-  above PP at 131k** with the decode lead intact.
+  (+54.9% total), sweep 221.50 → 367.29 (+65.8%). Against **same-commit** PP
+  (re-measured, 444.38 @131k) TP wins prefill at ≤16k and PP wins from 32k up;
+  TP keeps the decode lead everywhere. (The earlier "TP above PP at 131k"
+  headline was against the stale pp-rdma-new table — see the correction below.)
 
 **R5 — indexer split** (`DS4_TP_PREFILL_SPLIT_INDEXER=1` + A0, both ranks;
 `589e93e`, 2026-08-25)
@@ -362,7 +364,71 @@ residency did not rise, the ceiling is consistent with a fixed per-iteration
 overhead (gates/boundaries), not with any single GPU stage. Recorded for the
 follow-up residency investigation. Suggested follow-up per the plan: if NSG=4
 stays, flip the `ds4_gpu_flash_attn_nonvec_nsg()` default and drop the env
-knob.
+knob. (Default flipped in `f3668a1`; the env knob now only forces a value.)
+
+**PP column re-measured** (R7 carry-over; `upstream-metal-wins` @ `f3668a1`,
+2026-08-25). The R7c PP column cited the old `pp-rdma-new` table; re-measured
+PP on the *same commit* as the TP column. Transport note: this branch's PP
+hidden-state path is plain low-latency TCP pinned to the TB interface
+(`DS4_DIST_CONNECT_BIND_IF=en6/en7`); the old `--dist-transport rdma`
+flag/path no longer exists in this tree, so these are same-tree numbers, not
+the old RDMA-PP ones.
+
+| ctx | PP prefill t/s | PP decode t/s | TP prefill (R8) | TP decode |
+|---|---|---|---|---|
+| 2048 | 316.98 | 27.67 | 423.03 | 40.91 |
+| 4096 | 310.46 | 26.29 | 417.54 | 36.47 |
+| 8192 | 348.21 | 26.08 | 500.16 | 35.98 |
+| 16384 | 459.38 | 25.54 | 480.79 | 35.43 |
+| 32768 | 530.00 | 24.11 | 461.20 | 33.73 |
+| 65536 | 520.42 | 22.52 | 427.08 | 31.52 |
+| 131072 | **444.38** | **20.57** | 367.29 | 28.13 |
+
+**Headline correction:** the R7 "first TP sweep prefill above PP at 131k" was
+against the stale pp-rdma-new number (334.53). Against same-commit PP
+(444.38), **PP wins prefill from 32k up** (530/520/444 vs TP 461/427/367) and
+TP wins at 8k and below (500 vs 348 at 8k; 481 vs 459 at 16k). TP keeps the
+decode lead at every point (28.13 vs 20.57 at 131k, +37%). The PP column is
+now sourced to this run; the old table is kept for history only.
+
+**R9 — `nqptg = 8` ceiling (scoping, no runs, 2026-08-25).** No code, no
+bench: the request is a sizing/decision input. Decision arithmetic using this
+rig's own numbers: attention is ~27–28% of a late 131k chunk post-R7/R8
+(~128 ms/odd-layer + ~39 ms/even-layer of ~12.5 s). A standalone 2× on the
+kernel, discounted by R8's measured ~0.63 transfer factor, lands ~1.27× on the
+stage → roughly **+6–8% end-to-end** on 131k prefill — same order as the flat
+~10% residency lever, so a prototype is only worth it if the M1 Max
+restructure shows ≥ ~1.5–2×. The MQA head-sharing prize (64× K/V re-read) is
+in the same workstream and is not separately quantifiable from here.
+
+**R9 gate profile — current flags** (`DS4_TP_GATE_PROFILE=1`, all three splits
+on, cold 131k, 403.47 t/s; flag is `DS4_TP_GATE_PROFILE`, not
+`DS4_METAL_GATE_PROFILE` — the first launch used the wrong name and produced
+no data). Final cumulative rows:
+
+| | this run (all splits + nsg4) | R2 ON arm (A0 only) |
+|---|---|---|
+| total gates | 13,760 | — |
+| row gates | 11,008 @ 418.0 µs wait / 29.9 µs wire | 10,768 @ 423 / 26 |
+| BIG gates | **2,752 @ 93,314.9 µs wait / 21,841.2 µs wire** | 2,132 @ 190,223 / 23,741 |
+| wait:wire ratio (BIG) | **4.3 : 1** | 8.0 : 1 |
+
+- BIG count rose exactly +620 = 20 odd layers × 31 split chunks — the
+  `attn_out` swaps static-mixed adds, as designed (no other traffic).
+- Per-BIG-gate GPU-wait **halved** (190.2 → 93.3 ms): smaller stages mean
+  shorter encoder drains per gate. Wire per gate is unchanged (~22 ms, ~60 MB
+  of attn_out at ~2.8 GB/s).
+- Totals for the 325 s cold prefill: BIG wire = 2752 × 21.8 ms ≈ **60 s
+  (18.5% of wall time)**; row-gate wire ≈ 0.3 s (negligible). The rest of the
+  gate time is GPU-wait — the CPU sitting in the gate until the GPU reaches
+  the boundary. So the flat ~10% residency ceiling is a serialization story:
+  the GPU cannot run ahead of the encoder past a gate, and even the wire
+  portion (18.5%) is currently on the critical path rather than overlapped.
+
+Ops note (hit this round): the PP worker (`./ds4`) **does not exit** when the
+PP coordinator finishes — it sat idle holding the model for ~20 min and
+blocked the next TP launch with the single-instance guard. Kill the PP worker
+explicitly after PP runs.
 
 **Run 3b — cold single point (the honest number), 2026-08-25**
 
