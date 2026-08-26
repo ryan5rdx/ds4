@@ -97,12 +97,36 @@ ranks.
 cmp -s /tmp/a0_ctrl.txt /tmp/a0_cand.txt && echo IDENTICAL || echo MISMATCH
 ```
 
-Pass criteria: **byte-identical**. Each output row is an independent
-accumulation over the same key sequence, so the split changes which rows a rank
-computes, never how one row is computed. A mismatch means a real defect, not
-float noise.
+**Superseded criterion (2026-08-25).** The original gate here was
+"byte-identical logits". That is unsatisfiable on this rig and always was:
+**two identical control runs** (flag off) already differ in all 129,280 dumped
+logits, max abs 0.0055, argmax identical. The unsplit TP path is not
+bit-deterministic run to run, so cross-run bit equality cannot be a gate for
+anything.
 
-**If this fails, stop.** Do not proceed to throughput.
+The earlier reasoning — "each output row is an independent accumulation over the
+same key sequence, so the split cannot change how a row is computed" — is right
+about the per-row math and wrong about the surrounding blocking. The split
+changes `n_raw` and `raw_start`, so the SWA ring is linearised from a different
+offset and the FlashAttention block geometry moves with it (`has_kvpad` from
+`n_keys`, `bc_mask` from `n_tokens % 8`). Same keys, same values, different
+block boundaries, different rounding.
+
+**Actual pass criteria — all three:**
+
+1. Generated tokens **byte-identical** to the control at temp 0. This is the
+   strong one: it means every sampling decision matched.
+2. Frontier **argmax identical at every dumped frontier**.
+3. `max |Δlogit|` within a few ULP of f16 at the observed logit magnitude, and
+   within ~10× the control-vs-control baseline measured in the same session.
+   Record both numbers; the baseline is the scale, not zero.
+
+Measured 2026-08-25: control-vs-control 0.0055, split-vs-control 0.049 at logit
+magnitude ~27 (f16 ULP there is ~0.026, so ~2 ULP). 128/128 tokens identical,
+305/305 argmax identical. **Pass.**
+
+**If criteria 1 or 2 fail, stop.** Criterion 3 alone drifting means investigate
+before trusting the throughput numbers, not necessarily abort.
 
 ## Run 3 — A0 throughput sweep
 
