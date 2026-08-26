@@ -78,6 +78,8 @@ uint32_t ds4_test_planner_prefill_cap(int prompt_len,
 uint32_t ds4_test_prefill_watchdog_chunk(uint32_t prompt_len);
 uint32_t ds4_test_compressor_rewind_align(void);
 uint32_t ds4_test_layer_compress_ratio(uint32_t il);
+int      ds4_test_ngram_propose(const int *hist, int hist_len, int k,
+                                int max_draft, int *out);
 uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap);
 size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size);
 size_t ds4_test_compute_glm_entry_bytes_sum_with_sessions(
@@ -695,6 +697,47 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
  * counters as pos / ratio, which is only correct if the alignment really is a
  * multiple of every ratio.  That divisibility is the load-bearing invariant, so
  * assert it against the per-layer schedule rather than against a literal. */
+/* n-gram speculative proposer (PR #846 port).  Pure function of the token
+ * array, which is what makes it TP-safe: both ranks mirror that array through
+ * ds4_session_sync(), so an identical draft block falls out without any
+ * exchange.  Pin the properties that determinism rests on. */
+static void test_ngram_propose(void) {
+    fprintf(stderr, "RUN: test_ngram_propose\n");
+    int out[8];
+
+    const int tiny[] = {1, 2, 3};
+    CHECK(ds4_test_ngram_propose(tiny, 3, 3, 4, out) == 0,
+          "a history shorter than k+1 cannot propose");
+
+    /* "1 2 3" recurs; what followed it the first time is the proposal. */
+    const int rep[] = {7, 8, 9, 1, 2, 3, 4, 5, 6, 1, 2, 3};
+    int n = ds4_test_ngram_propose(rep, 12, 3, 4, out);
+    CHECK(n > 0, "a repeated 3-gram must produce a proposal");
+    CHECK(n > 0 && out[0] == 4, "proposal must continue with what followed the match");
+    CHECK(n < 2 || out[1] == 5, "second proposed token must follow the first");
+
+    const int novel[] = {1, 2, 3, 4, 5, 6, 7, 8};
+    CHECK(ds4_test_ngram_propose(novel, 8, 3, 4, out) == 0,
+          "no repeated k-gram must propose nothing");
+
+    /* Most recent match wins: both ranks must agree on which occurrence, and
+     * "any match" would not be well defined. */
+    const int two[] = {1, 2, 3, 0, 1, 2, 9, 0, 1, 2};
+    n = ds4_test_ngram_propose(two, 10, 2, 2, out);
+    CHECK(n > 0 && out[0] == 9,
+          "the most recent earlier match must win, not the first");
+
+    n = ds4_test_ngram_propose(rep, 12, 3, 1, out);
+    CHECK(n <= 1, "proposal must not exceed max_draft");
+
+    int a[8], b[8];
+    const int na = ds4_test_ngram_propose(rep, 12, 3, 4, a);
+    const int nb = ds4_test_ngram_propose(rep, 12, 3, 4, b);
+    bool same = (na == nb);
+    for (int i = 0; same && i < na; i++) same = (a[i] == b[i]);
+    CHECK(same, "the proposer must be deterministic (TP ranks derive it independently)");
+}
+
 static void test_compressor_rewind_alignment(void) {
     fprintf(stderr, "RUN: test_compressor_rewind_alignment\n");
 
@@ -845,6 +888,7 @@ int main(void) {
     test_cuda_tp_prefill_default_accounting();
     test_prefill_watchdog_bound();
     test_compressor_rewind_alignment();
+    test_ngram_propose();
     test_cuda_tp_output_head_moves_to_lower_half();
 
     fprintf(stderr, "\ntest_engine_mgpu_placement: %d/%d checks passed (%d failed)\n",
