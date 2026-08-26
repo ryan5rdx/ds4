@@ -19,7 +19,24 @@ This doc is the **request** side of a loop: results go into
 | R2 — gate profile | done | BIG 1419 → 2132 gates; per-gate wait *fell* 318 → 190 ms, exchange 30.5 → 23.7 ms. Effective 2.2–2.8 GB/s. |
 | R3 — utilisation | done | **~90% in both arms at both 8k and 131k.** Flat, not A0-induced, not context-dependent. |
 | R4 — argsort canon | done + **fixed** | +5.6% @2048, +2.5% @4096 when disabled. Now gated on `n_tokens >= 32` (`6fa977c`). |
-| R5 — indexer split | **requested below** | code landed `589e93e`, unmeasured |
+| R5 — indexer split | done | **Bit-identical** (0/129,280 logits differ). score 317.7 → 138.2 ms, topk 10.0 → 5.2, attention unchanged. Sweep 131k 237.44 → **283.64** (+19.5%), cold 281.20 → **322.64**. |
+| R6 — size ratio-128 layers | **requested below** | measurement only, do not build |
+
+**Arc so far at ctx 131072 (sweep):** 183.4 (old base) → 221.50 (upstream
+indexer stack) → 237.44 (A0) → **283.64** (indexer split). **+55%.**
+Cold single point 259.90 → 322.64. Decode untouched at 28.09.
+
+Against the only honest scaling baseline available — PP on the same pair, same
+protocol, same model, since a single node cannot hold 145.26 GiB — the prefill
+gap has closed from **PP +51%** to **PP +18%** (334.53 vs 283.64), while TP
+retains its ~39% decode lead.
+
+**Do not quote `speed-bench/m2_ultra.csv` or the "1.85× PP scaling" figure as
+scaling references.** The former uses a fixed 2048-token increment per frontier
+(vs this sweep's doubling increment) and cannot be running this model on one
+128 GiB node; the latter compares a two-node **Q4** run against a single-process
+**Q2** reference, which `speed-bench/README.md:264` itself flags as
+"directional rather than an apples-to-apples speedup".
 
 ### Two readings to correct before they propagate
 
@@ -61,7 +78,58 @@ rows, feeds its own top-k into its own attention rows, and the existing
 
 ## Open requests
 
-### R5 — indexer split (the main event; `589e93e`)
+### R6 — size the ratio-128 layers before splitting them (measurement only)
+
+**Do not build anything on this yet.** This is a sizing request.
+
+The `pos0 > 0` split predicate covers `ratio 0` (2 layers) and `ratio 4` (21
+layers). It excludes the **20 `ratio 128` layers** (odd `il` ≥ 3), which are
+nearly half the model and still run `q_b`, the attention core and the output
+projection fully replicated at every chunk. They were excluded because the
+static-mixed path carries a CPU-materialised `n_keys × n_tokens` mask that
+needs its own token-axis slice — real work, and worth it only if the layers
+are.
+
+Nothing measured so far covers them: R1 and R5c both profile ratio-4 layers
+(even `il`), and `comp = 1024` on ratio-128 means their *attention* is small.
+The open question is whether their **projections** justify the mask work.
+
+```
+DS4_METAL_FAST_SYNC=1 DS4_TP_PREFILL_SPLIT_NONZERO=1 DS4_TP_PREFILL_SPLIT_INDEXER=1 \
+DS4_METAL_LAYER_STAGE_PROFILE=1 DS4_METAL_LAYER_STAGE_PROFILE_LAYER=<odd il ≥ 3> \
+  ./ds4-bench ... --ctx-start 131072 --ctx-max 131072
+```
+
+Emits `part=attn` stage lines. Record, for a late chunk, one **odd** layer and
+one **even** layer for comparison:
+
+| stage | odd `il` (ratio 128) | even `il` (ratio 4) |
+|---|---|---|
+| `norm` | | |
+| `hc_pre` | | |
+| `q_path` | | |
+| `kv_path` | | |
+| `compressor` / `_prefill` / `_commit` / `_refresh` | | |
+| `indexer_setup` | | |
+| `attention` | | |
+| `output_proj` | | |
+| `inv_rope`, `hc_post` | | |
+
+Same caveat as R1: the boundary helper splits the command buffer per stage, so
+absolute throughput under the flag is not comparable — the **relative** split is
+the signal, and the even-layer column is the control that makes the odd-layer
+numbers readable.
+
+What it decides: **`q_path` + `attention` + `output_proj` on an odd layer, times
+20 layers**, is the entire prize. If that sum is a small fraction of the odd
+layer, the mask slicing is not worth doing and the ratio-128 layers should stay
+replicated. If it is large, it is the next change.
+
+Also useful from the same run: `compressor*` and `kv_path` are the stages that
+must stay full-width forever (shared state written from all rows). Knowing their
+size sets the hard floor on how far row-splitting can ever take TP.
+
+### R5 — indexer split (the main event; `589e93e`) — **DONE, passed**
 
 Splits the score + top-k by query row, which R1 measured at ~61% of the
 layer-chunk against the ~8% A0 splits. Needs **no extra gates** — each rank
