@@ -186,7 +186,55 @@ ranks, `DS4_TP_FORCE_DENSE_ATTN_OUT` unset, 2026-08-25):
   gain is mechanistic, not noise: A0 splits attention *consumption* (constant
   4.19e7 MACs/token/layer) but not indexer *scoring* (n_comp × 64 × 128, grows
   linearly; 2.68e8 MACs/token/layer at 131k, 6.4× larger). Confirmed by R1
-  below.
+  below, and fixed by the indexer split (R5): sweep +19.5% @131k, cold
+  +14.8% over the A0 arm; +28.1% over the flag-off sweep baseline.
+
+**R5 — indexer split** (`DS4_TP_PREFILL_SPLIT_INDEXER=1` + A0, both ranks;
+`589e93e`, 2026-08-25)
+
+R5a — correctness (16384, `DS4_TP_FORCE_DENSE_ATTN_OUT=1` both arms, greedy):
+
+| | A0 only | A0 + indexer |
+|---|---|---|
+| prefill t/s | 417.81 | 432.56 |
+| tokens | 128/128 **byte-identical** to A0 arm | |
+| frontier argmax | 305 (logit 27.2699318) | 305 (27.2699318) |
+| max \|Δlogit\| | **0.0 — bit-identical, 0 of 129,280 logits differ** | |
+
+Stronger than the ULP-class criterion expected: the split moves no
+FlashAttention block geometry, so per-row score/top-k is bit-identical
+regardless of which rank computes which rows. **Pass.**
+
+R5c — stage profile re-run (cold 131k, split +
+`DS4_METAL_INDEXER_STAGE_PROFILE=1`; profile-run throughput not comparable,
+but it also rose 279.81 → 320.30 t/s):
+
+| layer (comp=32768) | score ms | topk ms | attention ms |
+|---|---|---|---|
+| 2 | 138.20 (was 317.68) | 5.17 (was 10.00) | 41.33 (was 41.33) |
+| 4 | 137.96 (was 317.67) | 5.61 (was 10.33) | 39.43 (was 39.43) |
+| 6 | 137.44 (was 317.14) | 5.59 (was 11.12) | 39.54 (was 39.54) |
+
+**Mechanism confirmed:** score nearly halved (predicted ~160, got ~138), top-k
+halved, attention untouched. score:attention fell 8:1 → 3.4:1.
+
+R5b — throughput (sweep, A0+indexer vs A0-only arm):
+
+| ctx | A0 only | A0 + indexer | Δ |
+|---|---|---|---|
+| 2048 | 384.72 | 395.36 | +2.8% |
+| 4096 | 353.77 | 352.31 | −0.4% |
+| 8192 | 422.05 | 427.45 | +1.3% |
+| 16384 | 385.54 | 410.85 | +6.6% |
+| 32768 | 363.75 | 387.11 | +6.4% |
+| 65536 | 309.28 | 344.55 | +11.4% |
+| **131072** | **237.44** | **283.64** | **+19.5%** |
+
+Cold single point: 281.20 → **322.64** (+14.8%). Against the flag-off
+baseline: sweep 221.50 → 283.64 (**+28.1%**), cold 259.90 → 322.64
+(**+24.2%**). The gain now rises with context exactly as the mechanism
+predicts (splittable share grows with `comp`). Decode untouched
+(28.09 steady).
 
 **Run 3b — cold single point (the honest number), 2026-08-25**
 
@@ -256,8 +304,20 @@ ranks, 2048/4096/8192 points, 2026-08-25)
 
 Hypothesis supported: the canonical argsort comparator (not token-count gated
 like its siblings) costs ~2.5% at 4k and ~5% at 2k; disabling it recovers the
-4096 point to old-base level. Suggested fix: gate it on `n_tokens >= 32`
-like the other indexer-stack pieces.
+4096 point to old-base level. Fixed in `6fa977c` (gated on `n_tokens >= 32`;
+re-verify on the next short-sweep).
+
+---
+
+## Indexer split — `589e93e` (upstream-metal-wins, 2026-08-25)
+
+Opt-in via `DS4_TP_PREFILL_SPLIT_INDEXER=1` (requires
+`DS4_TP_PREFILL_SPLIT_NONZERO=1`; both ranks or neither). Splits the indexer
+score + top-k by query row at `pos0 > 0` — the term R1 measured at ~61% of the
+layer-chunk at 131k. No extra gate traffic. Full results in the R5 section of
+the `upstream-metal-wins` entry above: **cold 131k 259.90 → 281.20 → 322.64
+t/s** (off → A0 → A0+indexer), sweep +19.5% @131k, correctness
+bit-identical (R5a), score stage 317.7 → 138.0 ms (R5c).
 
 ### TP — `tp-multi-slot-batching` (old base, superseded)
 
