@@ -28998,6 +28998,30 @@ static bool metal_graph_tp_split_nonzero_prefix(void) {
  * a mismatch that says nothing about whether the split is correct.  Set this
  * on BOTH arms of the comparison; it costs throughput and is a test tool, not
  * a tuning knob. */
+/* Opt-in: also row-split the indexer score + top-k at pos0 > 0.
+ *
+ * A0 splits the attention consumption, which top_k caps at a constant
+ * (512 + window) keys per query.  It does NOT split the scoring, which is
+ * n_comp * n_indexer_head * n_indexer_head_dim and grows linearly with
+ * context.  Measured on the pair at ctx 131072, comp 32768, per layer-chunk:
+ * score 317.7 ms, topk 10.0 ms, attention 41.3 ms -- score is ~8x the term A0
+ * split, which is why A0 gained only +7.2% there.
+ *
+ * Score and top-k are per query row: each rank scores its own rows and feeds
+ * its own top-k into its own attention rows, so unlike A0 this adds NO gate
+ * traffic and needs no cross-rank merge.  Requires the A0 split to be on --
+ * it reuses tp_row0/tp_rows and the same attn_pos0.
+ *
+ * Must be set on BOTH ranks. */
+static bool metal_graph_tp_split_indexer(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_TP_PREFILL_SPLIT_INDEXER");
+        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 static bool metal_graph_force_dense_attn_out(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -30313,17 +30337,46 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                     n_comp,
                                                                     &index_stage_t0);
                 }
-                ok = ds4_gpu_indexer_scores_decode_batch_tensor(metal_graph_indexer_scores(g),
-                                                                  metal_graph_batch_indexer_q(g),
-                                                                  metal_graph_batch_indexer_weights(g),
+                /* Row-split the scoring itself when asked.  Every tensor here
+                 * is per query row with a fixed row stride -- q is
+                 * n_head*head_dim floats, weights n_head, scores n_comp,
+                 * comp_selected top_k (u32, same 4 bytes) -- so a row-range
+                 * view expresses this rank's share exactly, and the kernel's
+                 * own args.pos0 + token addressing makes attn_pos0 the right
+                 * origin.  No exchange is added: the top-k this rank produces
+                 * is consumed by the attention rows it already owns. */
+                const bool split_indexer =
+                    tp_row_split_attn && metal_graph_tp_split_indexer();
+                ds4_gpu_tensor *ix_scores = split_indexer ?
+                    metal_graph_tensor_row_range_view(metal_graph_indexer_scores(g),
+                                                      tp_row0, tp_rows, n_comp) : NULL;
+                ds4_gpu_tensor *ix_q = split_indexer ?
+                    metal_graph_tensor_row_range_view(metal_graph_batch_indexer_q(g),
+                                                      tp_row0, tp_rows,
+                                                      (uint64_t)DS4_N_INDEXER_HEAD *
+                                                          DS4_N_INDEXER_HEAD_DIM) : NULL;
+                ds4_gpu_tensor *ix_w = split_indexer ?
+                    metal_graph_tensor_row_range_view(metal_graph_batch_indexer_weights(g),
+                                                      tp_row0, tp_rows,
+                                                      DS4_N_INDEXER_HEAD) : NULL;
+                if (split_indexer && (!ix_scores || !ix_q || !ix_w)) ok = false;
+                ok = ok && ds4_gpu_indexer_scores_decode_batch_tensor(
+                                                                  ix_scores ? ix_scores :
+                                                                      metal_graph_indexer_scores(g),
+                                                                  ix_q ? ix_q :
+                                                                      metal_graph_batch_indexer_q(g),
+                                                                  ix_w ? ix_w :
+                                                                      metal_graph_batch_indexer_weights(g),
                                                                   g->layer_index_comp_cache[il],
                                                                   n_comp,
-                                                                  n_tokens,
-                                                                  pos0,
+                                                                  split_indexer ? q_work_rows : n_tokens,
+                                                                  split_indexer ? attn_pos0 : pos0,
                                                                   DS4_N_INDEXER_HEAD,
                                                                   DS4_N_INDEXER_HEAD_DIM,
                                                                   ratio,
                                                                   index_scale) != 0;
+                ds4_gpu_tensor_free(ix_q);
+                ds4_gpu_tensor_free(ix_w);
                 if (ok && index_stage_profile) {
                     ok = metal_graph_indexer_stage_profile_boundary("score",
                                                                     il,
@@ -30340,11 +30393,25 @@ static bool metal_graph_encode_layer_attention_batch(
                                                   pos0);
                 }
                 if (ok) {
-                    ok = ds4_gpu_indexer_topk_tensor(metal_graph_comp_selected(g),
-                                                       metal_graph_indexer_scores(g),
+                    /* Same row range as the scoring above, and the same range
+                     * the attention consumption reads via tp_topk, so the
+                     * half of comp_selected this rank does not write is never
+                     * read by it.  comp_selected is shared scratch, rewritten
+                     * per layer, so leaving the peer's half stale is safe. */
+                    ds4_gpu_tensor *ix_sel = split_indexer ?
+                        metal_graph_tensor_row_range_view(metal_graph_comp_selected(g),
+                                                          tp_row0, tp_rows,
+                                                          DS4_N_INDEXER_TOP_K) : NULL;
+                    if (split_indexer && !ix_sel) ok = false;
+                    ok = ok && ds4_gpu_indexer_topk_tensor(
+                                                       ix_sel ? ix_sel :
+                                                           metal_graph_comp_selected(g),
+                                                       ix_scores ? ix_scores :
+                                                           metal_graph_indexer_scores(g),
                                                        n_comp,
-                                                       n_tokens,
+                                                       split_indexer ? q_work_rows : n_tokens,
                                                        DS4_N_INDEXER_TOP_K) != 0;
+                    ds4_gpu_tensor_free(ix_sel);
                     if (ok && index_stage_profile) {
                         ok = metal_graph_indexer_stage_profile_boundary("topk",
                                                                         il,
@@ -30361,6 +30428,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                                           pos0);
                     }
                 }
+                ds4_gpu_tensor_free(ix_scores);
                 if (ok) {
                     use_indexed_comp = true;
                 }
