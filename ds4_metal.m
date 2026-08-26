@@ -3749,11 +3749,23 @@ static uint32_t ds4_gpu_flash_attn_vec_nsg(uint32_t n_keys, uint32_t nwg, uint32
  *     resident per core regardless of NSG.
  *
  * Measured standalone on an M1 Max at four real chunk shapes (4096- and
- * 1024-token chunks, n_comp 64..1024): NSG=4 is 1.94-2.20x faster and
- * bit-identical -- 0 of 134,217,728 output floats differ.  Default is left at
- * the historical value until the rig confirms it on M2 Ultra; set
- * DS4_METAL_FA_NSG=4 on BOTH ranks to A/B it.  Output is bit-identical either
- * way, so this cannot change results, only speed. */
+ * 1024-token chunks, n_comp 64..1024): NSG=4 is 1.94-2.20x on the kernel and
+ * bit-identical -- 0 of 134,217,728 output floats differ.  Confirmed on the
+ * M2 Ultra pair (R8): bit-identical again, and +7.3% end-to-end at sweep 131k
+ * / +5.9% cold, positive at every context, growing with context as the
+ * mechanism predicts.  Backing the kernel speedup out of the end-to-end
+ * numbers puts it at ~1.4x on M2 Ultra rather than the 2.2x seen on M1 Max --
+ * the ratio does not fully transfer across microarchitectures, so treat any
+ * future standalone number here as an upper bound.
+ *
+ * C is not worth touching: at C=128 the kernel is slower on both NSG values
+ * and coarser blocks skip less work (1280 vs 1216 executed keys/row), and
+ * C=32 cannot be built at all because the NSG=8 arm of the switch fails
+ * static_assert((C/8) % NSG == 0).  C=64/NSG=4 is the optimum of what the
+ * kernel admits.
+ *
+ * DS4_METAL_FA_NSG=8 restores the historical value for A/B; output is
+ * bit-identical either way, so this can only change speed. */
 static uint32_t ds4_gpu_flash_attn_nonvec_nsg(uint32_t head_dim) {
     static int cached = -1;
     if (cached < 0) {
@@ -3762,7 +3774,8 @@ static uint32_t ds4_gpu_flash_attn_nonvec_nsg(uint32_t head_dim) {
         cached = (v == 4 || v == 8) ? v : 0;
     }
     if (cached != 0) return (uint32_t)cached;
-    return head_dim >= 512 ? 8u : 4u;
+    (void)head_dim;
+    return 4u;
 }
 
 static int ds4_gpu_trace_allocs(void) {

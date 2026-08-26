@@ -22,22 +22,36 @@ This doc is the **request** side of a loop: results go into
 | R5 — indexer split | done | **Bit-identical** (0/129,280 logits differ). score 317.7 → 138.2 ms, topk 10.0 → 5.2, attention unchanged. Sweep 131k 237.44 → **283.64** (+19.5%), cold 281.20 → **322.64**. |
 | R6 — size ratio-128 layers | done | Prize **311.2 ms/layer-chunk × 20 layers**, ~71% of the odd layer. Odd-layer attention is *larger* than a ratio-4 layer's (255.3 vs 182.8 ms) and grows with context. Two of this doc's premises were wrong — see below. |
 | R7 — static-mixed split | done | **Bit-identical** (0/129,280). Sweep 131k 284.03 → **342.25** (+20.5%), cold 322.64 → **380.27** (+18.2%). Both inside the pre-recorded projection (~340 / ~380). |
-| R8 — FlashAttention `nsg` | **built, requested below** | `DS4_METAL_FA_NSG=4`. Measured standalone: **1.94–2.20× on the attention kernel, bit-identical**. Needs rig confirmation on M2 Ultra. |
+| R8 — FlashAttention `nsg` | done, **default flipped** | **Bit-identical** (0/129,280). Sweep 131k 342.18 → **367.29** (+7.3%), cold 380.27 → **402.64** (+5.9%). Correct direction and shape, but **under** the projected +10–15% — see the transfer factor below. |
 
 **Arc at ctx 131072 (sweep):** 183.4 (old base) → 221.50 (upstream indexer
-stack) → 237.44 (A0) → 283.64 (indexer split) → **342.25** (static-mixed
-split). **+87%** over the old base, **+54.4%** over the flag-off baseline on
-this branch. Cold single point 259.90 → **380.27** (+46.4%). Decode untouched
-throughout (28.28 steady).
+stack) → 237.44 (A0) → 283.64 (indexer split) → 342.25 (static-mixed split) →
+**367.29** (FA nsg). **+100%** over the old base, **+65.8%** over the flag-off
+baseline on this branch. Cold single point 259.90 → **402.64** (+54.9%).
+Decode untouched throughout (28.18 steady).
 
-**TP sweep prefill now exceeds PP at 131k** (342.25 vs 334.53) for the first
-time, while keeping the ~40% decode lead. PP on the same pair remains the only
-honest scaling reference, since a single node cannot hold 145.26 GiB.
+**TP sweep prefill now exceeds PP at 131k** (367.29 vs 334.53), while keeping
+the ~40% decode lead. PP on the same pair remains the only honest scaling
+reference, since a single node cannot hold 145.26 GiB.
 
-Worth noting what the last three changes have in common: none of them made the
+**Standalone-to-rig transfer factor: ~0.63.** R8 is the first result measured
+both ways, and the two disagree. Backing the kernel speedup out of the
+end-to-end numbers — the FA kernel is ~24% of the sweep-131k row and ~20% of
+the cold run post-R7 — gives **~1.39× on M2 Ultra from both**, against
+**2.19× measured standalone on M1 Max**. The two independent back-outs agreeing
+to two decimals is what makes this a usable calibration rather than noise.
+
+So the mechanism transferred and the magnitude did not. Discount future
+standalone M1 Max numbers by roughly this factor before projecting, and treat
+them as upper bounds. The projection for R8 quoted the full 2.19× while only
+*verbally* flagging the microarchitecture risk — the flag was right, using the
+undiscounted number anyway was not.
+
+Worth noting what the changes before R8 had in common: none of them made the
 GPU faster. A0, the indexer split and the static-mixed split each *removed
-replicated work* — the same arithmetic being done on both ranks. That well is
-now nearly dry, which is why R8 targets kernel efficiency instead.
+replicated work*. That well is now dry — the stages that must stay full-width
+(`kv_path` + `compressor`) are only ~3.5–5.5 ms/layer — so everything after R8
+is kernel efficiency or fixed overhead.
 
 **Pin the PP column before quoting the crossover.** The PP figures in R7c
 (393.90 / 412.78 / 454.20 / 444.70 / 438.98 / 373.38 / 334.53) appear nowhere
@@ -98,15 +112,78 @@ rows, feeds its own top-k into its own attention rows, and the existing
 
 ## Open requests
 
-### R8 — FlashAttention simdgroup count (`DS4_METAL_FA_NSG=4`)
+### R9 — the `nqptg = 8` ceiling (scoping, no code yet)
 
-Built on `upstream-metal-wins` (`fa94db7`). **Default is unchanged**, so this
-could not have perturbed R7; set `DS4_METAL_FA_NSG=4` on BOTH ranks to enable.
-Builds warning-clean; all three suites pass.
+R8 took the attention kernel from ~2.4 to ~3.3 TFLOP/s on the rig. `q_path` on
+the same GPU does **14.7**, so the kernel is still ~4.4× off a plain GEMM and
+remains the largest stage in prefill. What is left is structural, and R8's own
+shared-memory arithmetic identifies it exactly.
 
-This is the first change in the series that is not about replication. Every
-prior win removed duplicated work between the ranks; this one makes the kernel
-itself faster, and it applies to all four `dk512` call sites.
+The kernel processes **8 query rows per KV pass**, which holds arithmetic
+intensity near **8 FLOP/byte** — far below the ~134 FLOP/byte ridge where this
+GPU becomes compute-bound. It cannot go higher because shared memory is already
+28,672 B of a 32,768 B budget, and `nqptg=16` would need 57,344 B and fails to
+launch (verified). The budget breaks down as:
+
+| region | contents | bytes at Q=8 |
+|---|---|---|
+| `so` | **fp32 output accumulator**, `Q*PV*4` | **16,384** |
+| `sq` | Q tile, `Q*DK*2` | 8,192 |
+| `ss` | scores, `Q*SH*4` | 4,096 |
+
+`so` alone is more than half. Moving it into registers — each of the 4
+simdgroups owning `DV/4 = 128` accumulator lanes — would leave ~12 KB and admit
+`nqptg=16` or `24`, doubling or tripling KV reuse per pass.
+
+There is a second, related prize the same change unlocks: this model is
+**MQA — `n_head_kv = 1`**, so all 64 query heads share one K/V. The dispatch is
+currently `(query_block, head)`, so the same K/V is re-read **64 times**, which
+is where the ~82 GB of KV traffic per attention call comes from. Handling
+several heads per threadgroup would cut that proportionally, and it needs the
+same shared-memory headroom.
+
+Both are real kernel work, not a knob. Before committing to it, worth deciding
+whether a prototype is warranted given the ~0.63 transfer factor: a standalone
+M1 Max prototype can establish whether the restructure works and roughly how
+much intensity it buys, but its speedup number should be discounted before it
+justifies anything. **No code yet — flagging the target and the cost.**
+
+Cheaper alternatives already ruled out: `C` tuning (C=128 slower on both NSG
+values *and* skips less work — 1280 vs 1216 executed keys/row; C=32 will not
+build), and the CPU/ANE offload evaluated below.
+
+### The flat ~10% residency — the other open lever
+
+R8's power capture makes this hard to ignore. Active residency has sat at
+**86–91% in every arm, at both 8k and 131k**, while attention's share of layer
+time fell substantially across R5–R8. A ceiling that does not move when the
+dominant stage shrinks by half is not attributable to any GPU stage — it is
+fixed per-iteration overhead (gate exchanges, encoder boundaries).
+
+That bounds it at roughly **+11%** if fully recovered, comparable to R9, and
+R2's data is the place to start: BIG gates 2132/run at ~190 ms average GPU-wait
+against ~24 ms of wire time. Read `avg gpu-wait` as a ratio against exchange,
+never as a time budget (see the correction below).
+
+### Still open from R7 — pin the PP column
+
+Not addressed in the R8 update. The PP figures in R7c appear nowhere else in
+`BENCHMARKS-TP-PP.md`, no PP run is recorded for 2026-08-25, and the 131072
+entry matches the old `pp-rdma-new` table to the cent while every other point
+moved 10–30%. TP now clears it by 33 t/s rather than 8, so the headline is safe
+either way — but the number should still be sourced or re-measured.
+
+### R8 — FlashAttention simdgroup count — **DONE, default flipped**
+
+`DS4_METAL_FA_NSG` now defaults to 4; set `=8` to restore the old value for
+A/B. Bit-identical on the rig as predicted, inertness exact, positive at every
+context, and the gain grows with context (1.5% @4k → 7.3% @131k) exactly as the
+mechanism implies. The one off-trend point is 2048 at +8.5%, which is above 4k
+and 8k; 2048 is a single `pos0 == 0` chunk served by the zero-prefix path,
+which uses the same kernel, so it is not inert here — but the size looks like
+scatter rather than signal.
+
+What follows is the original request, kept for the projection record.
 
 **Why.** `nsg=8`, which `head_dim >= 512` has always selected, is the worst
 legal value for this kernel at `C = 64`, on two compounding counts:
@@ -165,6 +242,13 @@ solid and the magnitude as unverified — that is exactly what R8c is for.
 
 If it lands, flip the default in `ds4_gpu_flash_attn_nonvec_nsg()` and drop the
 env knob.
+
+**Outcome:** direction, shape and bit-identity all landed; the magnitude did
+not — +7.3% against a projected +10–15%. Default flipped, but the knob is
+**kept** (`=8` restores the old value) rather than dropped: it costs nothing
+and it is the only way to re-A/B this on new silicon or after a kernel change.
+The scoring caveat above was the right one to raise and the wrong one to then
+ignore in the number.
 
 ### R7 — static-mixed row split — **DONE, passed**
 
