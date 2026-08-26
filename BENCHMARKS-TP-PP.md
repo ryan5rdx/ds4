@@ -234,11 +234,16 @@ link. Effective 2.2–2.8 GB/s per direction is far below TB4 line rate.
 |---|---|---|
 | off, 131k | 87–90% / 59.9–62.7 W | 92% / 59.7–60.7 W |
 | on, 131k | 90–91% / 55.1–55.9 W | 91% / 54.5–54.7 W |
-| off, 8k | pending | pending |
-| on, 8k | pending | pending |
+| off, 8k | 87–91% / 51.2–63.6 W | 88–93% / 55.6–63.1 W |
+| on, 8k | 85–87% / 52.7–57.3 W | 88–91% / 56.4–56.5 W |
 
-~90% residency in **both** arms at 131k: the ~90% is structural, not A0-
-introduced. 8k points pending (running).
+(peaks over the run; 8k rows from background powermetrics during cold 8192
+prefills — 8k prefill is ~20 s, so capture the whole window.)
+
+**Answer: the idle is flat (~10%), not growing with context, in both arms.**
+8k and 131k sit in the same ~90% class. A constant idle fraction implicates a
+fixed per-iteration cost (gate/pipeline overhead, encoder drain — see R2's
+gpu-wait ≫ exchange), not context-dependent work.
 
 **R4 — short-context regression** (`DS4_METAL_DISABLE_ARGSORT_CANON=1` both
 ranks, 2048/4096/8192 points, 2026-08-25)
