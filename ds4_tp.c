@@ -366,14 +366,36 @@ static bool tp_worker_prefill_cancelled(void *ud) {
     if (!st) return false;
     if (st->cancelled) return true;
     if (st->broken) return false;
+    /* Kill switch.  This poll is the only always-on part of the cancel
+     * protocol, so it is the first thing to eliminate when the control stream
+     * misbehaves. */
+    if (getenv("DS4_TP_DISABLE_CANCEL_POLL") != NULL) return false;
 
     const int fd = st->tp->control_fd;
+    /* control_lock, not bare access.  An earlier version read control_fd with
+     * no lock on the reasoning that the command loop is the sole reader and is
+     * blocked inside this very sync.  That is wrong: other control-plane
+     * round trips run from this thread during a sync -- ds4_tp_hash_check()
+     * sends and reads a HASH frame under control_lock, and the verify-commit
+     * path does the same -- so an unlocked read here can steal a frame another
+     * reader is waiting for and wedge both ranks.
+     *
+     * trylock rather than lock: this runs between prefill chunks on the hot
+     * path, and a cancel that arrives while the lock is held is simply seen at
+     * the next chunk boundary.  Blocking here to catch it marginally sooner
+     * would be trading a certain stall for an uncertain one. */
+    if (pthread_mutex_trylock(&st->tp->control_lock) != 0) return false;
+
     struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
     const int ready = poll(&pfd, 1, 0);
-    if (ready <= 0 || !(pfd.revents & POLLIN)) return false;
+    if (ready <= 0 || !(pfd.revents & POLLIN)) {
+        pthread_mutex_unlock(&st->tp->control_lock);
+        return false;
+    }
 
     uint32_t type = 0, bytes = 0;
     if (!tp_read_frame_header(fd, &type, &bytes)) {
+        pthread_mutex_unlock(&st->tp->control_lock);
         st->broken = true;
         ds4_log(stderr, DS4_LOG_ERROR,
                 "tp worker: bad frame header while polling for cancel");
@@ -381,6 +403,7 @@ static bool tp_worker_prefill_cancelled(void *ud) {
         return false;
     }
     if (type != (uint32_t)DS4_TP_FRAME_CANCEL || bytes != sizeof(uint64_t)) {
+        pthread_mutex_unlock(&st->tp->control_lock);
         st->broken = true;
         ds4_log(stderr, DS4_LOG_ERROR,
                 "tp worker: unexpected frame %u (%u bytes) during mirrored prefill",
@@ -390,10 +413,12 @@ static bool tp_worker_prefill_cancelled(void *ud) {
     }
     uint64_t session_id = 0;
     if (!tp_read_full(fd, &session_id, sizeof(session_id))) {
+        pthread_mutex_unlock(&st->tp->control_lock);
         st->broken = true;
         ds4_tp_mark_failed(st->tp);
         return false;
     }
+    pthread_mutex_unlock(&st->tp->control_lock);
     if (session_id != st->session_id) {
         /* Only one sync is in flight at a time, so a cancel for a different
          * session means the leader and worker disagree about which session is
