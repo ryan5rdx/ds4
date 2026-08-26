@@ -1116,6 +1116,34 @@ static uint32_t ds4_layer_compress_ratio(uint32_t il) {
     return g_ds4_compress_ratios[il];
 }
 
+/* Positions a session may be rewound to.
+ *
+ * The compressors are rolling accumulators over the last `ratio` tokens, and
+ * their partial window lives only in layer_attn_state_* / layer_index_state_*.
+ * Rebuilding that window at an arbitrary position would mean re-running the
+ * tokens that fed it -- metal_graph_refresh_ratio4_compressor_state() can only
+ * do it from a chunk's own activations, which a rewind does not have.
+ *
+ * A multiple of every non-zero ratio is the one position where the question
+ * does not arise: every window has just closed, so the correct frontier is the
+ * empty one, and the row counters are exactly pos / ratio.  Rewinding lands
+ * there, re-prefilling at most lcm(ratios) - 1 extra tokens (127 on both
+ * DeepSeek variants, whose ratios are {4, 128}).
+ *
+ * Derived from the model shape alone, so both TP ranks compute it identically.
+ * GLM has ratio 0 on every layer and gets 1, i.e. no constraint. */
+static uint32_t ds4_compressor_rewind_align(void) {
+    uint32_t align = 1u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0 || align % ratio == 0) continue;
+        uint32_t a = align, b = ratio;
+        while (b != 0) { const uint32_t t = a % b; a = b; b = t; }
+        align = align / a * ratio;   /* lcm(align, ratio) */
+    }
+    return align == 0 ? 1u : align;
+}
+
 static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
     if (il >= DS4_N_LAYER) ds4_die("DeepSeek4 layer index is outside the loaded model layout");
 
@@ -35664,6 +35692,28 @@ static bool imatrix_collector_save(
     return true;
 }
 
+/* Reset one layer's rolling compressor window to "nothing accumulated yet".
+ * Shared by the full prefill reset and the rewind path, which needs exactly
+ * this state at a ds4_compressor_rewind_align() boundary. */
+static bool metal_graph_reset_layer_compressor_frontier(ds4_gpu_graph *g,
+                                                        uint32_t il) {
+    if (!g->layer_raw_cache[il]) return true;
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (ratio == 0) return true;
+    const uint32_t coff = ratio == 4 ? 2u : 1u;
+    const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
+    const uint64_t attn_rows = (uint64_t)coff * ratio;
+    if (!metal_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, attn_width * attn_rows)) return false;
+    if (!metal_tensor_fill_f32(g->layer_attn_state_score[il], DS4_NEG_INF, attn_width * attn_rows)) return false;
+    if (ratio == 4) {
+        const uint64_t index_width = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM;
+        const uint64_t index_rows = (uint64_t)coff * ratio;
+        if (!metal_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, index_width * index_rows)) return false;
+        if (!metal_tensor_fill_f32(g->layer_index_state_score[il], DS4_NEG_INF, index_width * index_rows)) return false;
+    }
+    return true;
+}
+
 static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     memset(g->layer_n_comp, 0, sizeof(g->layer_n_comp));
     memset(g->layer_n_index_comp, 0, sizeof(g->layer_n_index_comp));
@@ -35672,20 +35722,36 @@ static bool metal_graph_reset_prefill_state(ds4_gpu_graph *g) {
     metal_graph_dspark_history_reset(g);
     metal_graph_dspark_capture_invalidate(g);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        if (!g->layer_raw_cache[il]) continue;
+        if (!metal_graph_reset_layer_compressor_frontier(g, il)) return false;
+    }
+    return true;
+}
+
+/* Rewind the compressed caches to `pos`, which must be a
+ * ds4_compressor_rewind_align() multiple.
+ *
+ * ds4_session_rewind() used to move only checkpoint.len, leaving layer_n_comp[]
+ * and the frontiers at their pre-rewind values.  The resumed prefill starts at
+ * pos0 = checkpoint.len != 0, so zero_prefix is false and the absolute
+ * `layer_n_comp[il] = n_comp` recompute is skipped; the incremental branch then
+ * reads that stale count as its append base and writes compressed rows past the
+ * correct frontier, leaving a gap that attention reads straight across.
+ *
+ * Rows at or below the new frontier are untouched and stay valid -- the caches
+ * are append-only, so, exactly as spec_frontier_commit_prefix() puts it, rows
+ * beyond the prefix "can remain as invisible garbage" and only the counters and
+ * frontiers need rewinding. */
+static bool metal_graph_rewind_compressor_state(ds4_gpu_graph *g, uint32_t pos) {
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint32_t coff = ratio == 4 ? 2u : 1u;
-        const uint64_t attn_width = (uint64_t)coff * DS4_N_HEAD_DIM;
-        const uint64_t attn_rows = (uint64_t)coff * ratio;
-        if (!metal_tensor_fill_f32(g->layer_attn_state_kv[il], 0.0f, attn_width * attn_rows)) return false;
-        if (!metal_tensor_fill_f32(g->layer_attn_state_score[il], DS4_NEG_INF, attn_width * attn_rows)) return false;
-        if (ratio == 4) {
-            const uint64_t index_width = (uint64_t)coff * DS4_N_INDEXER_HEAD_DIM;
-            const uint64_t index_rows = (uint64_t)coff * ratio;
-            if (!metal_tensor_fill_f32(g->layer_index_state_kv[il], 0.0f, index_width * index_rows)) return false;
-            if (!metal_tensor_fill_f32(g->layer_index_state_score[il], DS4_NEG_INF, index_width * index_rows)) return false;
+        if (ratio == 0) {
+            g->layer_n_comp[il] = 0;
+            g->layer_n_index_comp[il] = 0;
+            continue;
         }
+        g->layer_n_comp[il] = pos / ratio;
+        g->layer_n_index_comp[il] = ratio == 4 ? pos / ratio : 0u;
+        if (!metal_graph_reset_layer_compressor_frontier(g, il)) return false;
     }
     return true;
 }
@@ -59160,6 +59226,14 @@ void ds4_test_clear_compress_ratios(void) {
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
 }
 
+uint32_t ds4_test_compressor_rewind_align(void) {
+    return ds4_compressor_rewind_align();
+}
+
+uint32_t ds4_test_layer_compress_ratio(uint32_t il) {
+    return il < DS4_N_LAYER ? g_ds4_compress_ratios[il] : 0u;
+}
+
 uint32_t ds4_test_effective_prefill_chunk(bool cuda_tensor_parallel,
                                           uint32_t requested_chunk) {
     return ds4_effective_prefill_chunk(cuda_tensor_parallel, requested_chunk);
@@ -70512,6 +70586,18 @@ void ds4_session_rewind(ds4_session *s, int pos) {
      * Sending the already-clamped value removes that half of the asymmetry. */
     if (pos < 0) pos = 0;
     if (pos > s->checkpoint.len) pos = s->checkpoint.len;
+    /* Align down to a compressor-window boundary before mirroring, for the same
+     * reason the clamp happens before it: the aligned value is what both ranks
+     * must apply.  The alignment derives from the model shape alone, so the two
+     * ranks would agree anyway -- sending the final value keeps that a property
+     * of the protocol rather than of two independent computations.  Callers
+     * must read the landing position back with ds4_session_pos() instead of
+     * assuming their requested one; this can move it down by up to
+     * lcm(ratios) - 1 tokens. */
+    {
+        const uint32_t align = ds4_compressor_rewind_align();
+        if (align > 1u) pos -= pos % (int)align;
+    }
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         if (!ds4_tp_send_rewind(s->engine->tp.ctx, s->tp_session_id, pos)) {
@@ -70523,6 +70609,18 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     s->mtp_draft_valid = false;
 #ifndef DS4_NO_GPU
     if (!ds4_session_is_cpu(s) && !ds4_session_is_glm(s)) {
+        /* Compressed caches are append-only, so rows at or below the new
+         * frontier stay valid; the row counters and the rolling frontiers are
+         * the only state that has to move.  Without this the resumed prefill
+         * appends past the correct frontier -- see
+         * metal_graph_rewind_compressor_state(). */
+        if (!metal_graph_rewind_compressor_state(&s->graph, (uint32_t)pos)) {
+            fprintf(stderr,
+                    "ds4: session rewind could not reset compressor state; "
+                    "invalidating the checkpoint\n");
+            s->checkpoint.len = 0;
+            (void)metal_graph_reset_prefill_state(&s->graph);
+        }
         if (pos <= 0 ||
             !metal_graph_dspark_cache_crop_to_prefix(
                 &s->graph, (uint32_t)pos) ||
@@ -70565,6 +70663,11 @@ int ds4_session_prefill_cap(ds4_session *s) {
  * window-relevant rows mid-chunk. Returns 0 ("no budget, do not rewind") for
  * GLM, whose dense KV cache has no such ring and is gated separately via
  * ds4_engine_is_glm_dsa(), and for CPU-only builds with no raw cache. */
+uint32_t ds4_session_rewind_align(const ds4_session *s) {
+    (void)s;
+    return ds4_compressor_rewind_align();
+}
+
 uint32_t ds4_session_raw_rewind_budget(const ds4_session *s) {
 #ifndef DS4_NO_GPU
     if (!s || DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) return 0;

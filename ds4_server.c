@@ -8948,13 +8948,17 @@ static void request_cancel_rollback(server *s, server_slot *slot,
      * ds4_session_sync()/ds4_session_invalidate(), which mirror too -- so both
      * are at the same length here and clamp the same way. */
     ds4_session_rewind(slot->session, committed_frontier);
+    /* Clamp against where the rewind actually landed, not what was asked for:
+     * it snaps down to a compressor-window boundary and can end below
+     * committed_frontier. */
+    const int landed = ds4_session_pos(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
     /* The rewind also un-does the continued-store high-water mark: leaving it
      * above the frontier makes the next generation skip its disk snapshot at
      * that boundary, because the retry now cache-hits and the cached == 0 reset
      * no longer fires. */
-    if (slot->continued_last_store_tokens > committed_frontier) {
-        slot->continued_last_store_tokens = committed_frontier;
+    if (slot->continued_last_store_tokens > landed) {
+        slot->continued_last_store_tokens = landed;
     }
 }
 
@@ -11588,20 +11592,31 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * budget correctly refuses, while an abandoned assistant turn discards
          * ~1.3k against a 4224 budget and is safely reusable. */
         const uint32_t discard = old_pos > common ? (uint32_t)(old_pos - common) : 0u;
+        /* ds4_session_rewind() snaps down to a compressor-window boundary, so
+         * the tail it actually discards can exceed old_pos - common by up to
+         * one alignment.  Charge that against the ring budget here rather than
+         * discovering it as an over-deep rewind. */
+        const uint32_t align_slack = is_glm ? 0u :
+            ds4_session_rewind_align(slot->session) - 1u;
         const bool can_rewind = is_glm ||
-            (raw_budget > 0 && discard > 0 && discard < raw_budget);
+            (raw_budget > align_slack && discard > 0 &&
+             discard + align_slack < raw_budget);
         const int rewind_to = live_prefix_rewind_target(
             can_rewind, old_pos, j->req.prompt.len, common);
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_rewind(slot->session, rewind_to);
+            /* Read the landing position back: the alignment can put it below
+             * the requested one, and reporting the request as `cached` would
+             * claim rows the session no longer has. */
+            const int landed = ds4_session_pos(slot->session);
             pthread_mutex_unlock(&s->inference_mu);
-            cached = rewind_to;
+            cached = landed;
             cache_source = "memory-rewind";
-            cache_diag.rewind_to = rewind_to;
+            cache_diag.rewind_to = landed;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: rewound %s live prefix from %d to %d; final prompt token will be reevaluated",
-                       is_glm ? "GLM" : "Flash", old_pos, rewind_to);
+                       "ds4-server: rewound %s live prefix from %d to %d (requested %d); final prompt token will be reevaluated",
+                       is_glm ? "GLM" : "Flash", old_pos, landed, rewind_to);
         } else {
             cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
             cache_source = cached > 0 ? "memory-token" : "none";

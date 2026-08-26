@@ -174,9 +174,15 @@ recurrent layers would make pervasive.
 
 ### Phase 0 — de-risk the gate (do this first, ~2–3 weeks, no model)
 
-1. Fix the rewind defect in §6 and add a regression test: rewind across a
-   compressed-row boundary, resume, compare against a cold prefill of the same
-   prefix. This is worth doing on its own merits.
+1. ~~Fix the rewind defect in §6~~ — **done.** `ds4_session_rewind()` now snaps
+   down to `lcm(non-zero ratios)` (128 on both DeepSeek variants, 1 on GLM) and
+   rebuilds `layer_n_comp[]` / `layer_n_index_comp[]` as `pos / ratio` with the
+   frontiers reset to empty, which is exactly the state at such a boundary.
+   Costs at most 127 tokens of re-prefill. Unit-tested in
+   `tests/test_engine_mgpu_placement.c::test_compressor_rewind_alignment`.
+   **Still owed: the on-rig end-to-end check** — rewind across a compressed-row
+   boundary, resume, and compare logits against a cold prefill of the same
+   prefix. The unit test pins the arithmetic, not the cache contents.
 2. Prototype recurrent-state lifecycle against the **existing** bounded state:
    extend `spec_frontier_*` to snapshot/restore `layer_n_comp` and the
    compressor frontier, and make `ds4_session_rewind` use it.

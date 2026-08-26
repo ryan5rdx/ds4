@@ -76,6 +76,8 @@ uint32_t ds4_test_effective_prefill_chunk(bool cuda_tensor_parallel,
 uint32_t ds4_test_planner_prefill_cap(int prompt_len,
                                       uint32_t prefill_chunk);
 uint32_t ds4_test_prefill_watchdog_chunk(uint32_t prompt_len);
+uint32_t ds4_test_compressor_rewind_align(void);
+uint32_t ds4_test_layer_compress_ratio(uint32_t il);
 uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap);
 size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size);
 size_t ds4_test_compute_glm_entry_bytes_sum_with_sessions(
@@ -679,6 +681,79 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
  *    prompt length, and is the one that must shrink.
  *
  * Pin both, so neither can absorb the other's job again. */
+/* ds4_session_rewind() must land where every compressor's rolling window is
+ * empty.
+ *
+ * The bug this pins: rewind moved only checkpoint.len, leaving layer_n_comp[]
+ * and the compressor frontiers at their pre-rewind values.  The resumed
+ * prefill runs with pos0 != 0, so zero_prefix is false, the absolute
+ * `layer_n_comp[il] = n_comp` recompute is skipped, and the incremental branch
+ * appends from the stale count -- writing compressed rows past the correct
+ * frontier and leaving a gap attention reads straight across.
+ *
+ * The fix snaps the rewind down to lcm(non-zero ratios) and rebuilds the
+ * counters as pos / ratio, which is only correct if the alignment really is a
+ * multiple of every ratio.  That divisibility is the load-bearing invariant, so
+ * assert it against the per-layer schedule rather than against a literal. */
+static void test_compressor_rewind_alignment(void) {
+    fprintf(stderr, "RUN: test_compressor_rewind_alignment\n");
+
+    ds4_test_clear_compress_ratios();
+    CHECK(ds4_test_compressor_rewind_align() == 1,
+          "no compressors (GLM-shaped) must not constrain the rewind");
+
+    ds4_test_seed_compress_ratios();
+    const uint32_t align = ds4_test_compressor_rewind_align();
+    CHECK(align > 0, "alignment must be positive");
+    CHECK(align == 128, "DeepSeek ratios are {4,128}, so alignment must be 128");
+
+    /* The invariant, checked against the schedule itself rather than a literal. */
+    bool divides_all = true;
+    uint32_t max_ratio = 0;
+    for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER_LOCAL; il++) {
+        const uint32_t ratio = ds4_test_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        if (ratio > max_ratio) max_ratio = ratio;
+        if (align % ratio != 0) {
+            divides_all = false;
+            fprintf(stderr, "  layer %u ratio %u does not divide align %u\n",
+                    il, ratio, align);
+        }
+    }
+    CHECK(divides_all, "alignment must be a multiple of every non-zero ratio");
+    CHECK(align >= max_ratio, "alignment must be at least the largest ratio");
+
+    /* Snapping down never moves up, never crosses a boundary, and costs less
+     * than one alignment of re-prefill. */
+    static const uint32_t probes[] = {
+        0, 1, 127, 128, 129, 255, 256, 4095, 4096, 40000, 65536, 131071, 131072,
+    };
+    bool snap_ok = true;
+    for (unsigned i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
+        const uint32_t pos = probes[i];
+        const uint32_t landed = pos - (pos % align);
+        if (landed > pos || pos - landed >= align || landed % align != 0) {
+            snap_ok = false;
+            fprintf(stderr, "  snap failed: pos=%u landed=%u align=%u\n",
+                    pos, landed, align);
+        }
+    }
+    CHECK(snap_ok, "aligning down must stay in [pos - align + 1, pos] and land on a boundary");
+
+    /* At an aligned position every per-layer row count is exact, which is what
+     * lets the rewind reconstruct layer_n_comp without replaying tokens. */
+    bool counts_exact = true;
+    for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER_LOCAL; il++) {
+        const uint32_t ratio = ds4_test_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint32_t pos = 4u * align;
+        if ((pos / ratio) * ratio != pos) counts_exact = false;
+    }
+    CHECK(counts_exact, "an aligned position must divide evenly by every non-zero ratio");
+
+    ds4_test_clear_compress_ratios();
+}
+
 static void test_prefill_watchdog_bound(void) {
     fprintf(stderr, "RUN: test_prefill_watchdog_bound\n");
 
@@ -769,6 +844,7 @@ int main(void) {
     test_glm_session_count_accounting();
     test_cuda_tp_prefill_default_accounting();
     test_prefill_watchdog_bound();
+    test_compressor_rewind_alignment();
     test_cuda_tp_output_head_moves_to_lower_half();
 
     fprintf(stderr, "\ntest_engine_mgpu_placement: %d/%d checks passed (%d failed)\n",

@@ -484,6 +484,10 @@ int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 uint32_t ds4_session_raw_rewind_budget(const ds4_session *s);
+/* Granularity ds4_session_rewind() snaps to (a compressor-window boundary).
+ * A rewind can therefore land up to this many tokens below the requested
+ * position -- budget for it, and read the result back with ds4_session_pos(). */
+uint32_t ds4_session_rewind_align(const ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
