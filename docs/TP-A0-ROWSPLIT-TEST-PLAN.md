@@ -253,34 +253,54 @@ separately via `g_tp_flag_gates` and `g_tp_release_words`.
 every arm would collapse to one command buffer, producing a flat null result
 for the wrong reason. Set it explicitly in every R12a arm.
 
-#### R13b — MXFP4 fixed-route MoE decode is disabled under TP
+#### R13b — MXFP4 fixed-route MoE decode is disabled under TP — **corrected**
 
-`ds4_metal.m:39387` and `:39399` both require `tp_world == 1 &&
-tp_expert_base == 0` before selecting
-`kernel_mul_mv_id_mxfp4_pair_swiglu_fixed_route_f32` /
-`..._sum6_fixed_route`. Under TP2 we therefore fall back to the generic
-`mul_mv_id` path for the largest byte-mover in decode (~1.7 GB/token/node of
-routed experts).
+**What I got wrong.** I wrote that the `tp_world == 1 && tp_expert_base == 0`
+clauses at `ds4_metal.m:39387`/`:39399` are what disable the fixed-route path.
+They are not the binding constraint. Under TP decode `tp_fold_ffn` is true
+(`ds4.c:24961`) so `add_in = metal_graph_shared_out(g)` (`ds4.c:25302`), and a
+non-NULL `add_in` disqualifies `use_mxfp4_moe_decode_tg_multiple`
+(`ds4_metal.m:39360`) — on which every other specialisation is layered. All
+five fall out *before* the `tp_world` clauses are evaluated.
 
-The reason is in the kernels, and the fix has a working template two lines
-away. The **generic** kernel handles TP correctly (`metal/moe.metal:4578-4584`):
+**And we are not falling off a cliff.** What runs is the generic nsg=1
+pair-SwiGLU (`:39443`) and the nsg=1 sum6 swapped to the down-r4 twin
+(`:39497`), so we keep the two structurally biggest wins — the single-simdgroup
+decode mapping and down-r4 (worth +0.74 t/s per `32ef898`) — and the 2-dispatch
+fused shape. A hard guard at `ds4_metal.m:39544` makes TP *fail loudly* rather
+than degrade to a per-expert scalar loop.
 
-```c
-if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) return;
-...
-device const char *gate_expert = src0_gate +
-    (int64_t)(expert - args.tp_expert_base) * args.nb02;
-```
+What we lose is four layers of compile-time specialisation on top:
+`tg_multiple`, `fixed_route_pair`/`_sum6` (bake `nei0=6` and the 0..255 expert
+range as constants), `sum6_full_rows`, and `static_trip_*` (compile-time K-walk
+trip counts).
 
-The fixed-route twin (`metal/moe.metal:4592+`) has neither the ownership test
-nor the `- tp_expert_base` rebase. So the port is that ownership line plus the
-rebase, across five kernels (`moe.metal:4593, 4734, 6478, 6523, 6616`), then
-dropping the two host clauses — not a redesign.
+**The sizing reference in the tree is invalid, in our favour.**
+`tp_decode_investigation.md:289-296` reports routed MoE at 367 GB/s vs ~400
+isolated — "92%", *"the kernels are fine"*. The same document invalidates that
+at `:49-54`: the isolated harness is **world 1 with `add_in == NULL`**, i.e. it
+measures the *fully specialised* kernel while production TP runs the *generic*
+one. The 8% gap is against the wrong reference and the real TP ceiling has
+never been measured. Likewise `:428` records `32ef898`'s tg_multiple
+TP-exclusion removal as *"+0.019 ms, nothing"* — necessarily inert, since
+`add_in` blocks `tg_multiple` regardless of `tp_world`. Do not read either as
+evidence the specialisations are worthless.
 
-Two hazards to respect: `add_in != NULL` from the shared-expert fold needs
-handling separately, and the `nr0`/grid-width hazard that forced the `d9eba30`
-revert (`ds4_metal.m:39135-39148`) still applies. Size the prize with
-`tests/bench_moe_mxfp4_decode 256` before writing any of it.
+**Measure before writing anything.** `tests/bench_moe_mxfp4_decode` with
+`n_total_expert = 256` (the default 128 fails the shape check), toggling each
+`DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_{TG_MULTIPLE,FIXED_ROUTE_PAIR,
+FIXED_ROUTE_SUM6,SUM6_FULL_ROWS,STATIC_TRIP}`. **On the rig, not the M1 Max dev
+box.** That prices each layer at the live shape before any kernel work.
+
+**If it prices well**, the port is the generic sibling's two lines
+(`ds4_tp_owns_expert` test + `- tp_expert_base` rebase, `metal/moe.metal:4578-
+4584`) across five kernels (`:4593, 4734, 6478, 6523, 6616`), plus handling
+`add_in` so `tg_multiple` is reachable under the fold, plus dropping the host
+clauses. Hazard: the `nr0`/grid-width mismatch behind the `d9eba30` revert
+(`ds4_metal.m:39135-39148`) silently halves the grid and leaves the upper half
+of the down projection unwritten. Also fix the stale comment at `:39485-39487`,
+which claims `tg_multiple` needs `g_tp_split_world == 1`; its predicate has no
+such check.
 
 #### R13c — one more device-name gate the earlier sweep missed
 
@@ -313,93 +333,194 @@ Also recorded: there is no `#if 0` anywhere in the decode sources, and
 requirement (`metal/norm.metal:231`), **not** a missed optimisation — do not
 flip it for speed.
 
-### R12 — two zero-code decode sweeps (split schedule + dispatch ballast)
+### R14 — ranked decode targets from the audit
 
-**No code change for either.** Both knobs already exist; both are pure timing
-(no numerics), so neither needs a correctness arm. The point is to gather data:
-R10/R11 closed four decode levers and the remaining hypothesis is unmeasured.
+Full list with anchors is in the audit; this records the ordering, the two
+items that outrank everything I had queued, and one correction to my own
+reasoning. **Sequencing: M1a/M1b first (minutes, and M1a can invalidate two
+campaigns), then the env battery, then the T8 pricing, then the instruments.**
 
-**The hypothesis both test.** Decode achieves 93–135 GB/s of 800 and ~2% of
-peak FLOPs — neither bound. A typical decode GEMV reads ~8 MB, i.e. **~10 µs at
-peak**, against a launch cost the ballast comment puts at **4.4–10.6 µs**, with
-roughly 600–1300 dispatches per token. R11 supplied the corroboration by
-accident: widening each attention GEMV 2× *without adding dispatches* moved the
-marginal bytes at **~492 GB/s** against the 93–135 average. So: per-dispatch
-fixed cost and submission structure, not bandwidth.
+#### M1a — check `iogpu.wired_limit_mb` on both hosts — **do this before anything else**
 
-#### R12a — decode command-buffer split schedule
+`ds4.c:59886` — if `glm_graph_wired_limit_bytes()` returns 0, TP **skips the
+residency set entirely** and the 76.7 GiB shard pages lazily. The sysctl is
+runtime-only and does not survive a reboot. `README.md:704` documents it;
+**`BENCHMARKS-TP-PP.md`'s prerequisites do not list it**, though they do list
+the RDMA setup as reboot-sensitive.
 
-**The adaptive split tuning is disabled under TP and nobody has checked
-whether that exclusion is justified.** Both
-`metal_graph_token_adaptive_split_after_layers()` and
-`..._adaptive_second_split_after_layers()` carry `g->tp_world != 2u`, so TP
-falls back to the flat base schedule — **split after layer 4, then layers 4–42
-as one command buffer**. Single-node reaches 2/32, 3/12 or 5/none depending on
-regime. Upstream PR #846 retunes to **2/8** and measures the GPU bubble falling
-**~9% → ~3%**, +6.8% decode, on an M1 Ultra.
+The R10 ops notes record lanfear being **rebooted mid-campaign on 2026-08-26**,
+`/tmp` wiped, TB IPs re-applied — and nothing told anyone to re-apply the wired
+limit. A lazily-paging shard produces exactly the flat, stall-shaped,
+neither-bandwidth-nor-compute-bound decode profile we have been chasing.
 
-This is the same shape as `nsg=8`: a default tuned for one configuration,
-excluded from ours, never revisited. It has already paid off twice.
+**If it was 0, R10d, R10e and R11 are all suspect.** Check
+`sysctl iogpu.wired_limit_mb` on both hosts and grep every saved bench log for
+`wired_limit_mb is 0`. Then add it to the prerequisites section.
 
-The env overrides **bypass the TP guard** —
-`metal_graph_token_split_after_layers()` reads its env with no `tp_world` test,
-and the second-split function returns the env value before reaching any guard —
-so this is testable today. Our own tree states the safety property: *"Only
-command-buffer boundaries move, so kernel math, ordering, and outputs are
-unchanged."* **Bit-identical by construction.**
+#### T1 — row-gate exchange **latency** — the largest sized item, and I dismissed it
 
-Sweep `DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS` / `_SECOND_SPLIT_LAYERS` on BOTH
-ranks, decode at 2048 and 131072:
+**My error.** I concluded "the link is not decode's problem" from wire being
+~12% of gate time. That is the ratio-vs-total trap this doc has now flagged
+five times. In absolute terms: **86 × 49.7 µs = 4.27 ms of a 35.55 ms token —
+12% of the token**, strictly serial, with the local GPU spinning in
+`kernel_dsv4_tp_fence_wait` throughout.
 
-| arm | first | second |
-|---|---|---|
-| current TP behaviour | 4 | (unset) |
-| PR #846 | 2 | 8 |
-| | 2 | 16 |
-| | 2 | 32 |
-| | 3 | 12 |
-| | 4 | 12 |
+And it is not the fabric. The payload is a fixed 16,384 B (one WR, no
+chunking), which at R10b's measured 4.4 GB/s is **3.7 µs of wire**. The
+exchange takes 49.7. So **~46 µs/gate is software**, and the same measurement
+moved 29.9 → 49.7 µs between R9 and R10e for identical bytes — scheduling, not
+transport. R10b measured *streamed bandwidth* and correctly closed that
+question; it never addressed one 16 KB request/response.
 
-Also record prefill at each arm: the schedule is decode-side, so prefill should
-be flat, and if it is not, the knob reaches further than documented.
+Three ordered changes in `tp_rdma_gate_exchange()` (`ds4_tp.c:1011-1073`):
 
-Calibration caveat: #846's numbers are M1 Ultra, single-node, q2 91 GB. Ours is
-M2 Ultra, TP2, MXFP4. Given the ~0.63 standalone-to-rig transfer factor already
-measured once, treat +6.8% as directional only.
+1. **Hoist the receive re-arm.** `tp_rdma_post_gate_recv()` sits at `:1070`,
+   *after* the wait loop — one more verb call between "peer data arrived" and
+   "GPU unblocked". Verified. ~0.1–0.25 ms/token.
+2. **Stop signalling every send.** `IBV_SEND_SIGNALED` on every send (`:1045`)
+   makes `tp_rdma_drain_cq` chew a send CQE before reaching each recv CQE. The
+   send completion is not needed for correctness; signal every Nth. This is
+   `tp_decode_investigation.md:139-143`'s own open item #3, never executed.
+   Needs care with `send_outstanding` or the send queue overflows.
+3. **Service-thread affinity** — it tight-spins (`1<<20` spins before
+   `sched_yield`) on the same P-cluster as the Metal encode thread.
 
-#### R12b — dispatch ballast slope
+**Gate it on M3 first:** `uc_pingpong` at 4 KB and 16 KB. Half-RTT ≲20 µs means
+~30 µs/gate is recoverable — **2.5 ms/token, +8% at 131k**. ~45 µs means T1 is
+closed and we have documented a hard floor. Minutes to find out.
 
-`DS4_METAL_DISPATCH_BALLAST=N` emits N no-op one-thread dispatches per decode
-layer. Its own comment says the marginal cost "has only ever been back-derived
-from landed changes", lands anywhere in a 2.4× band (4.4–10.6 µs), and that
-budgets built on the derived number "mispredicted four times, always
-optimistically". **The instrument exists and has never been run.**
+#### The env battery — one rig session, `DS4_NGRAM_SPEC` off
 
-Sweep N ∈ {0, 1, 2, 4} at 2048 and 131072, both ranks, and fit
-`d(ms per token) / d(43N)` — that slope is the marginal launch cost in situ,
-at our decode shape, on our hardware.
+**T2 — `DS4_METAL_DECODE_SPLITS`.** Its own comment names our rig: *"12 was
+chosen on unsplit hardware... Under tensor parallelism each rank holds 32
+heads, so the grid halves to 4 × 12 = 48 — under one per core on a 60-core M2
+Ultra... occupancy-bound rather than bandwidth-bound"* (`ds4_metal.m:29988`).
+The only sweep of it ran at **ctx 512, where the flag is inert** — the doc
+retracts its own negative at `:24-31`. Sweep {8, 12, 15, 16, 20, 24} at 32768
+and 131072. Not bit-exact (repartitions the online-softmax reduce); judge on
+top-1 + bounded Δlogit.
 
-What it decides, stated before the run: at 4.4 µs, ~600–1300 dispatches is
-2.6–5.7 ms of a 24.5 ms token and kernel fusion is a second-tier workstream. At
-10.6 µs it is 6.4–13.8 ms and fusion becomes **the** decode workstream. The
-answer picks the next quarter's direction, which is worth one cheap sweep.
+**T3 — `DS4_METAL_INDEXER_LLT_NSG4=1`.** Off because upstream measured it
+*"prefill-negative/decode-slightly-positive"* — but `4333606` wires LLT into
+**decode only** on this branch, so the prefill-negative half cannot fire.
+Structurally the same shape as R8's `nsg=8`. Pre-screen free with
+`tests/bench_indexer_score` (model-free, CPU-reference checked). While there:
+the LLT scorer's own **+6–7% at 117k is unverified on this rig**; control is
+`DS4_METAL_DISABLE_INDEXER_LLT=1`.
 
-Run it on one rank only as well, if cheap: ballast on both ranks perturbs the
-gate rendezvous, so a single-rank arm separates launch cost from gate coupling.
+**T4 — `DS4_METAL_Q8_MV_NSG`.** `ds4_metal.m:5272` gives TP **nsg=2** and
+world-1 **nsg=4**, with no comment explaining why. TP-*aware* but never swept.
+Carries `q_a`, `kv`, `q_b`, shared gate/up/down, attention-output low. Sweep
+{1,2,3,4,6}; set `DS4_BENCH_MAP_GB=16` or the harness under-reports ~18%.
 
-#### Prompt file — switch to `speed-bench/promessi_sposi.txt`
+**Interaction to respect:** with `DS4_NGRAM_SPEC` on, verify steps run
+`n_tokens > 1`, which sets `decode_splits = 1` (`ds4_metal.m:30001`) and makes
+**T2 inert on those steps**. Measure the battery with n-gram off.
 
-Stop using `/tmp/bench_long.txt`. It is 1.33 MB of in-repo text (ample for
-`--ctx-max 131072`), it is version-controlled so both hosts are identical by
-construction rather than by an md5 check, and it survives reboots. The R11 ops
-notes lost a campaign's arms to exactly this: *"The reboot wiped `/tmp`: the
-prompt file was restored from mat (verified by md5)"*. Update the launch
-commands in `BENCHMARKS-TP-PP.md` when convenient.
+#### M2 — attribute the 11.1 ms — the largest unknown
 
-One caveat worth a sanity check on first use: it is Italian prose, not the
-seeded word-soup, so its token/byte ratio and its compressibility differ.
-Prefill numbers on it are **not** comparable to earlier rows — re-baseline
-before quoting any cross-prompt delta.
+Every decode stage number in this tree is from **ctx 512, where the indexer
+path is entirely inactive**. That token is 24.06 ms; ours at 131k is 35.55.
+**11.1 ms/token — 31% of the long-context token — has never been attributed**,
+and code reading accounts for maybe 3–4 ms of it.
+
+Re-run the ablation battery at 32k and 131k (`DS4_TP_ABLATE` chains, plus
+`DS4_METAL_ABLATE_INDEXER_SCORE`/`_TOPK`, which are already wired into decode
+at `ds4.c:23240`/`:23257` and have never been run at long context). Caveats
+from `tp_decode_investigation.md:454-466`: `router` is unusable (ran 0.574 ms
+*slower* while removing 92 dispatches), `kv`/`shared` are fusion rollbacks that
+*add* dispatches, `compidx` has no call site and reports 0.
+
+#### Lower tier
+
+T6 (`stream512` top-k at `n_tokens == 1` — decode never takes it; 0.16–0.46
+ms), T7 (fuse gate flag-set with fence-wait, 86 dispatches + 86 encoder
+boundaries), T9 (indexer compressed cache F32 → F16; lossless by the e2m1
+argument, ~0.2–0.4 ms + 176 MB), T10 (inverse-RoPE fuse, armed only on the
+non-indexed branch so all 21 ratio-4 layers pay it at long context, ~0.04–0.09
+ms), T13 (the `use_shared_kvpad` device-name gate, R13c above). T5 speculative.
+T11 (ICB decode replay) only if the encoder-boundary slope surprises.
+
+#### Structurally blocked — do not re-propose
+
+`fuse_attn_out_hc` and `fuse_shared_down_hc` cannot fuse across a gate
+boundary, and with `DS4_TP_DECODE_REPLICATE_ATTN` deleted that is now
+permanent. Router + shared gate/up fusion is independently non-exact under TP
+(hardcodes NSG=4 against TP's nsg=2). `packed32` flash reduce needs
+`n_head == 64`; TP has 32, already reverted at −1.35 t/s. `parallel_full_ffn`
+is IQ2_XXS/Q2_K only.
+
+### R12 — two decode sweeps — **BOTH RESCOPED, read this before running**
+
+A source audit found that both R12 arms were requested on stale premises. The
+sweeps are still worth running; the reasons and the expected sizes are not what
+was written.
+
+#### R12a — command-buffer split schedule — reframed
+
+**What I got wrong.** I wrote that "the adaptive tuning is disabled under TP,
+so TP runs the flat 4/none while single-node reaches 2/32." Only half true, and
+the half that matters is the other one:
+
+- The **second** split has **no TP exclusion at all**. `ds4.c:27266-27271` says
+  so explicitly: *"No TP exclusion here... excluding `tp_world == 2` a second
+  time only cost the second split its whole effect under tensor parallelism."*
+- It is instead capped at **`pos < 3328u`** — for everyone, TP or not.
+- The **first** split's `tp_world != 2u` guards (`ds4.c:27144`, `:27156`) sit
+  inside the `pos >= 128 && pos < 2048` and `pos >= 2048 && pos < 2816` windows,
+  so they only bite at short context.
+
+**Net: at any context ≥ 4k, TP and single-node run the same schedule — one
+split after layer 4, two command buffers per token.** The TP exclusion I
+highlighted is a short-context effect.
+
+That makes the sweep *more* interesting, not less, but for a different reason:
+at 131k **nobody** gets a second split, so setting `_SECOND_SPLIT_LAYERS`
+explicitly engages a configuration the adaptive path never grants at long
+context — untested for every configuration, not just ours. Arms unchanged
+(4/0, 2/8, 2/16, 2/32, 3/12, 4/12), still bit-identical by construction.
+
+**Hard prerequisite:** `DS4_METAL_FAST_SYNC=1` on both ranks. Without it
+`ds4_gpu_tp_split_safe()` returns 0 and every arm collapses to one command
+buffer — a flat null for the wrong reason. See R13a.
+
+#### R12b — dispatch ballast — **demoted; it has already been run**
+
+**What I got wrong.** I wrote that the instrument "has never been run" and
+quoted a 4.4–10.6 µs band. Both come from the stale comment at
+`ds4_metal.m:1317-1332`. `speed-bench/tp_decode_investigation.md:341-360` has
+the actual in-situ measurements:
+
+- **1021 dispatches/token** at ctx 512.
+- Marginal cost **~1.9 µs**, from the cleanest arm (`kv` adds exactly 43
+  dispatches for 0.081 ms). **Ballast itself gives 3.74 µs**; the mask arm 4.4.
+  Its verdict: *"Use 1.9–4.4 µs, not 8.6."*
+- And the conclusion I should have found before requesting this: **"Dispatch
+  removal is not a productive strategy here."** 1021 × 1.9 µs = **1.94 ms**, and
+  a realistic fusion campaign was scoped at 185 dispatches = 0.35 ms = +0.6 t/s.
+
+So the per-dispatch hypothesis is bounded at **~8% at ctx 512 and ~6% at 131k
+even if you removed every dispatch** — not the 10–25% I projected. The R11
+"492 GB/s marginal vs 135 average" observation is still real, but it cannot be
+worth what I claimed.
+
+**Keep a reduced arm**: N ∈ {0, 2, 4} at **131072 only**, to confirm the
+ctx-512 slope holds at long context where the indexer stage is live. One
+sweep, not a campaign.
+
+**Pair it with the genuinely unmeasured half — encoder boundaries.** Each of
+the 86 gates/token does flag-set dispatch → `close_batch_encoder()` → *fresh*
+encoder for the fence-wait spin → close again (`ds4_metal.m:10412-10434`,
+`:10477-10506`): **172 encoder close/reopen events per token**, which ballast
+cannot see because it emits its no-ops *inside* the open encoder. Build the
+sibling instrument (N extra close/reopen pairs per decode layer, fit
+`d(ms/token)/d(43N)`, ~20 lines) and run both in the same session. External
+datapoint: upstream #590 measured **53.4 → 55.3 t/s** for removing *one*
+encoder close/reopen from a checkpoint copy.
+
+#### Prompt file — unchanged
+
+Switch to `speed-bench/promessi_sposi.txt` as previously described.
 
 ### R11 — halve the decode gate count (`DS4_TP_DECODE_REPLICATE_ATTN=1`) — **DONE, 2026-08-26, NEGATIVE: decode −8.5 to −11.8%, recorded in `BENCHMARKS-TP-PP.md`**
 
