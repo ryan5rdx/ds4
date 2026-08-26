@@ -26,6 +26,7 @@ This doc is the **request** side of a loop: results go into
 | R9 — `nqptg` ceiling | scoped, no runs | A 2× standalone kernel discounts to ~+6–8% end-to-end. Prototype only if the restructure shows ≥1.5–2×. |
 | R10 — gate path + decode | done, no code change | Sub-gate re-test: **wash at every context, avenue closed**. Link ceiling: **4.4/4.1 GB/s per direction** (4 KiB WR cap — 64 MiB messages structurally impossible); gate path at ~65–75% of it. First decode profiling: decode is **stall-bound** (~30 W vs ~55 W prefill), NWG default already optimal (plateau 8–32), the 2048 decode floor is **per-gate fixed cost**, and the only lever left is the 86 gates/token — a design change. Full numbers in `BENCHMARKS-TP-PP.md`. |
 | R11 — decode gate count | done — **clean negative, avenue closed** | Decode **−8.4 to −11.8% at all 7 contexts**, prefill unmoved. Cost is flat ~3.25 ms/token at both 2k and 131k. The gate wait was never idle: it is the window the peer's half of the attention runs in. Falsifies R10e's headline — see below. |
+| R12 — decode data-gathering | **requested below** | Two zero-code sweeps: the TP-excluded command-buffer split schedule, and the never-run dispatch-ballast slope. Both target the same hypothesis. |
 
 **Arc at ctx 131072 (sweep):** 183.4 (old base) → 221.50 (upstream indexer
 stack) → 237.44 (A0) → 283.64 (indexer split) → 342.25 (static-mixed split) →
@@ -136,6 +137,34 @@ rows, feeds its own top-k into its own attention rows, and the existing
 | A0 (landed) | 4.19e7 MACs | +23/chunk (43 → 66) | worse (~90% util observed) |
 | indexer split (next) | 2.68e8 MACs | **0** | unchanged |
 
+## Consolidated defaults (`f45b535`)
+
+The three measured prefill wins are **default ON** and no longer need flags.
+Each keeps an escape hatch — set it to `0` on BOTH ranks to disable — so the
+A/B protocol still works and a regression can be bisected without a rebuild.
+Asymmetry still deadlocks the big gates; only the direction of the default
+changed.
+
+| flag | default | evidence |
+|---|---|---|
+| `DS4_TP_PREFILL_SPLIT_NONZERO` (A0) | **on** | +7.2% @131k, Run 2 correctness pass |
+| `DS4_TP_PREFILL_SPLIT_INDEXER` | **on** | +19.5%, bit-identical (R5a) |
+| `DS4_TP_PREFILL_SPLIT_STATIC_MIXED` | **on** | +20.5%, bit-identical (R7b) |
+| `DS4_METAL_FA_NSG` | **4** | +7.3% @131k, bit-identical (R8) |
+
+**Removed:** `DS4_TP_DECODE_REPLICATE_ATTN` and its code path. R11 measured it
+at −8.4 to −11.8% decode at all seven contexts; a clean negative on a decode
+hot path is worth deleting rather than carrying. `tp_attn_decode_split`
+collapses back to `g->tp_world == 2`, with the predicate comment recording why
+so the idea is not re-derived from the gate count.
+
+**Closed, no code to remove** (upstream knobs, left at their defaults):
+`DS4_TP_SUBGATE_PIPELINE` (R10a wash), `DS4_METAL_DECODE_NWG` (R10d, default
+already optimal).
+
+**Benchmark arms should now run with no TP flags at all.** A "flag-off"
+baseline means explicitly setting the three to `0`.
+
 ## Open requests
 
 ### R9 — the `nqptg = 8` ceiling (scoping, no code yet)
@@ -177,6 +206,94 @@ justifies anything. **No code yet — flagging the target and the cost.**
 Cheaper alternatives already ruled out: `C` tuning (C=128 slower on both NSG
 values *and* skips less work — 1280 vs 1216 executed keys/row; C=32 will not
 build), and the CPU/ANE offload evaluated below.
+
+### R12 — two zero-code decode sweeps (split schedule + dispatch ballast)
+
+**No code change for either.** Both knobs already exist; both are pure timing
+(no numerics), so neither needs a correctness arm. The point is to gather data:
+R10/R11 closed four decode levers and the remaining hypothesis is unmeasured.
+
+**The hypothesis both test.** Decode achieves 93–135 GB/s of 800 and ~2% of
+peak FLOPs — neither bound. A typical decode GEMV reads ~8 MB, i.e. **~10 µs at
+peak**, against a launch cost the ballast comment puts at **4.4–10.6 µs**, with
+roughly 600–1300 dispatches per token. R11 supplied the corroboration by
+accident: widening each attention GEMV 2× *without adding dispatches* moved the
+marginal bytes at **~492 GB/s** against the 93–135 average. So: per-dispatch
+fixed cost and submission structure, not bandwidth.
+
+#### R12a — decode command-buffer split schedule
+
+**The adaptive split tuning is disabled under TP and nobody has checked
+whether that exclusion is justified.** Both
+`metal_graph_token_adaptive_split_after_layers()` and
+`..._adaptive_second_split_after_layers()` carry `g->tp_world != 2u`, so TP
+falls back to the flat base schedule — **split after layer 4, then layers 4–42
+as one command buffer**. Single-node reaches 2/32, 3/12 or 5/none depending on
+regime. Upstream PR #846 retunes to **2/8** and measures the GPU bubble falling
+**~9% → ~3%**, +6.8% decode, on an M1 Ultra.
+
+This is the same shape as `nsg=8`: a default tuned for one configuration,
+excluded from ours, never revisited. It has already paid off twice.
+
+The env overrides **bypass the TP guard** —
+`metal_graph_token_split_after_layers()` reads its env with no `tp_world` test,
+and the second-split function returns the env value before reaching any guard —
+so this is testable today. Our own tree states the safety property: *"Only
+command-buffer boundaries move, so kernel math, ordering, and outputs are
+unchanged."* **Bit-identical by construction.**
+
+Sweep `DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS` / `_SECOND_SPLIT_LAYERS` on BOTH
+ranks, decode at 2048 and 131072:
+
+| arm | first | second |
+|---|---|---|
+| current TP behaviour | 4 | (unset) |
+| PR #846 | 2 | 8 |
+| | 2 | 16 |
+| | 2 | 32 |
+| | 3 | 12 |
+| | 4 | 12 |
+
+Also record prefill at each arm: the schedule is decode-side, so prefill should
+be flat, and if it is not, the knob reaches further than documented.
+
+Calibration caveat: #846's numbers are M1 Ultra, single-node, q2 91 GB. Ours is
+M2 Ultra, TP2, MXFP4. Given the ~0.63 standalone-to-rig transfer factor already
+measured once, treat +6.8% as directional only.
+
+#### R12b — dispatch ballast slope
+
+`DS4_METAL_DISPATCH_BALLAST=N` emits N no-op one-thread dispatches per decode
+layer. Its own comment says the marginal cost "has only ever been back-derived
+from landed changes", lands anywhere in a 2.4× band (4.4–10.6 µs), and that
+budgets built on the derived number "mispredicted four times, always
+optimistically". **The instrument exists and has never been run.**
+
+Sweep N ∈ {0, 1, 2, 4} at 2048 and 131072, both ranks, and fit
+`d(ms per token) / d(43N)` — that slope is the marginal launch cost in situ,
+at our decode shape, on our hardware.
+
+What it decides, stated before the run: at 4.4 µs, ~600–1300 dispatches is
+2.6–5.7 ms of a 24.5 ms token and kernel fusion is a second-tier workstream. At
+10.6 µs it is 6.4–13.8 ms and fusion becomes **the** decode workstream. The
+answer picks the next quarter's direction, which is worth one cheap sweep.
+
+Run it on one rank only as well, if cheap: ballast on both ranks perturbs the
+gate rendezvous, so a single-rank arm separates launch cost from gate coupling.
+
+#### Prompt file — switch to `speed-bench/promessi_sposi.txt`
+
+Stop using `/tmp/bench_long.txt`. It is 1.33 MB of in-repo text (ample for
+`--ctx-max 131072`), it is version-controlled so both hosts are identical by
+construction rather than by an md5 check, and it survives reboots. The R11 ops
+notes lost a campaign's arms to exactly this: *"The reboot wiped `/tmp`: the
+prompt file was restored from mat (verified by md5)"*. Update the launch
+commands in `BENCHMARKS-TP-PP.md` when convenient.
+
+One caveat worth a sanity check on first use: it is Italian prose, not the
+seeded word-soup, so its token/byte ratio and its compressibility differ.
+Prefill numbers on it are **not** comparable to earlier rows — re-baseline
+before quoting any cross-prompt delta.
 
 ### R11 — halve the decode gate count (`DS4_TP_DECODE_REPLICATE_ATTN=1`) — **DONE, 2026-08-26, NEGATIVE: decode −8.5 to −11.8%, recorded in `BENCHMARKS-TP-PP.md`**
 
