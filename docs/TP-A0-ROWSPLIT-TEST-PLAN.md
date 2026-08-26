@@ -24,7 +24,7 @@ This doc is the **request** side of a loop: results go into
 | R7 — static-mixed split | done | **Bit-identical** (0/129,280). Sweep 131k 284.03 → **342.25** (+20.5%), cold 322.64 → **380.27** (+18.2%). Both inside the pre-recorded projection (~340 / ~380). |
 | R8 — FlashAttention `nsg` | done, **default flipped** | **Bit-identical** (0/129,280). Sweep 131k 342.18 → **367.29** (+7.3%), cold 380.27 → **402.64** (+5.9%). Correct direction and shape, but **under** the projected +10–15% — see the transfer factor below. |
 | R9 — `nqptg` ceiling | scoped, no runs | A 2× standalone kernel discounts to ~+6–8% end-to-end. Prototype only if the restructure shows ≥1.5–2×. |
-| R10 — gate path + decode | **requested below** | Sub-gate pipeline re-test, link ceiling at 64 MiB, and the first decode profiling (residency, `DECODE_NWG`, gate scaling). No code. |
+| R10 — gate path + decode | done, no code change | Sub-gate re-test: **wash at every context, avenue closed**. Link ceiling: **4.4/4.1 GB/s per direction** (4 KiB WR cap — 64 MiB messages structurally impossible); gate path at ~65–75% of it. First decode profiling: decode is **stall-bound** (~30 W vs ~55 W prefill), NWG default already optimal (plateau 8–32), the 2048 decode floor is **per-gate fixed cost**, and the only lever left is the 86 gates/token — a design change. Full numbers in `BENCHMARKS-TP-PP.md`. |
 
 **Arc at ctx 131072 (sweep):** 183.4 (old base) → 221.50 (upstream indexer
 stack) → 237.44 (A0) → 283.64 (indexer split) → 342.25 (static-mixed split) →
@@ -177,7 +177,7 @@ Cheaper alternatives already ruled out: `C` tuning (C=128 slower on both NSG
 values *and* skips less work — 1280 vs 1216 executed keys/row; C=32 will not
 build), and the CPU/ANE offload evaluated below.
 
-### R10 — the gate path, and the first hard look at decode
+### R10 — the gate path, and the first hard look at decode — **DONE, 2026-08-26, recorded in `BENCHMARKS-TP-PP.md`**
 
 **No code.** Everything here is an existing knob or a measurement. R9's own
 arithmetic put a kernel rewrite at +6–8%; the R9 gate profile put **BIG-gate

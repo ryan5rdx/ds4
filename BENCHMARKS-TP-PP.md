@@ -151,6 +151,172 @@ Cold 131k prefill (TP): 402.64 — +54.9% over the pre-workstream flag-off cold
 baseline (259.90); sweep +65.8% (221.50 → 367.29). TP wins prefill at
 ≤16k and decode at every point; PP wins prefill from 32k up.
 
+### R10 — gate path + first decode profiling — `upstream-metal-wins` @ `f3668a1`/`627ccc1` build, 2026-08-26
+
+Binary: the same `ds4-bench` build as Runs 1–3 and R1–R9 (built Aug 26 00:16;
+only docs-only commits landed on the branch since). All arms carry the current
+flag set (all three splits + `DS4_METAL_FAST_SYNC`); per-arm additions as
+noted. A/B arms are single replicates unless stated.
+
+**R10a — `DS4_TP_SUBGATE_PIPELINE=1` re-test (wash; the sub-gate avenue is
+closed).** A/B/A battery, control (A) vs subgate-on (B), full 7-point sweep +
+cold 131k. The A2/B2 replicate rows were lost in an ops incident (see notes
+below); the verdict stands on the A1/B1 pair, which is well calibrated against
+the pre-workstream baseline:
+
+| ctx | A1 prefill | B1 prefill | ΔB1-A1 | baseline¹ prefill | A1 dec | B1 dec | baseline¹ dec |
+|---|---|---|---|---|---|---|---|
+| 2048 | 387.98 | 404.04 | +4.1% | 423.03 | 36.66 | 40.54 | 40.91 |
+| 4096 | 378.67 | 415.86 | +9.8% | 417.54 | 32.32 | 36.35 | 36.47 |
+| 8192 | 492.46 | 497.88 | +1.1% | 500.16 | 35.94 | 35.94 | 35.98 |
+| 16384 | 478.28 | 473.37 | −1.0% | 480.79 | 35.39 | 35.34 | 35.43 |
+| 32768 | 459.13 | 456.16 | −0.6% | 461.20 | 33.69 | 33.65 | 33.73 |
+| 65536 | 424.30 | 419.90 | −1.0% | 427.08 | 31.53 | 31.31 | 31.52 |
+| 131072 | 364.29 | 363.74 | −0.2% | 367.29 | 28.31 | 28.32 | 28.13 |
+| cold 131k | 399.34 | 400.22 | +0.2% | 402.64 | 28.30 | 28.22 | 28.13 |
+
+¹ "Current state" table above, same build, earlier sweeps.
+
+The +4/+10% "gains" at 2k/4k are an artifact of the *control* arm, not the
+sub-gate flag: A1 (run first) sits 8–9% below baseline on 2k/4k prefill and
+10–11% below on decode, while B1 matches baseline to within −4.5%/−0.4%
+prefill and −0.9%/−0.3% decode. At every context ≥8k the two arms agree within
+±1.1% prefill and ≤0.7% decode — inside run-to-run noise, and both track
+baseline. So the flag's effect is **indistinguishable from zero at every
+context**, including the 131k point where the 18.5% BIG-wire target lives.
+The R9-era rejection ("net-negative on the M5 Max pair") is superseded by
+"no measurable effect here even at wait:wire 4.3:1" — sub-chunk overlap buys
+nothing on this rig, and the sub-gate avenue closes for good: the hoped-for
+lever on the 18.5% BIG-wire target was a hypothesis about *where* the wait
+lives, and the measurement says it does not live where sub-gating can reach.
+
+**R10b — link ceiling (4.4 / 4.1 GB/s per direction, not 5).** The request
+asked for a 64 MiB message; that is structurally impossible on this provider —
+Apple TB UC SEND is capped at 4096 B per WR (anything larger never completes;
+>4096 posts EPERM), and `-s` is clamped to MTU. The valid proxy is sustained
+4 KiB SEND streaming (50k messages ≈ 205 MB), `uc_bench --bw --send`, both
+directions, twice for stability:
+
+| direction | run 1 | run 2 |
+|---|---|---|
+| mat → lanfear | 35.08 Gb/s (4.39 GB/s) | 35.58 Gb/s (4.45 GB/s) |
+| lanfear → mat | 30.42 Gb/s (3.80 GB/s) | 33.03 Gb/s (4.13 GB/s) |
+
+Effective BIG-gate wire is 2.8–3.1 GB/s against this 3.8–4.4 GB/s ceiling,
+i.e. **~65–75% of the link** — ~25–35% is on the floor, not the ~40% the
+5 GB/s assumption implied, and the two directions are asymmetric (lanfear→mat
+is the weaker one, and it varied more run-to-run). The ceiling is real and
+stable; closing the remaining 25–35% is an overlap/staging-window problem, not
+a "the link can simply go faster" one. R10b's decision criterion ("if the
+link delivers ~5 GB/s, staging tuning is back on the table") resolves as:
+staging/window tuning stays on the table, against a 4.4 GB/s ceiling.
+
+**R10c — decode residency and power @2048 and @131072 (decode is not
+compute-saturated; the gate chain, not the kernels, is the target).**
+`powermetrics --samplers gpu_power` (5 s samples). The sampler on these boxes
+reports GPU *power*, not residency %, so the 86–91% prefill figure cannot be
+reproduced directly; power is the proxy. At 131k the phases are cleanly
+separable (gen 1024 → ~36 s decode window):
+
+| phase | @2048 | @131072 |
+|---|---|---|
+| prefill | ~32 W (merged into the window) | ~55.5 W (55.0–56.9) |
+| decode (window) | ~32 W (31.2–32.5, 12 samples) | **~30 W** (30.2–30.4, 7 samples) |
+| idle | ~0.1 W | ~0.1 W |
+
+decode sits at ~54–58% of prefill power at both contexts and is *flat*
+through the whole window — a stable stall-bound regime, not a decaying one.
+The R10c prior ("low, 30–50%") is confirmed in power terms: decode is now
+measured to be the weaker half in every sense, and the lever order is settled
+— the 86 gates/token (R10e) before the kernels. Combined with R10e, the
+implication is unambiguous: decode's bottleneck is the gate chain, so the
+link speed measured in R10b buys decode nothing, and kernel tuning is second
+queue behind reducing the gate count.
+
+**R10d — `DS4_METAL_DECODE_NWG` sweep @2048 and @131072 (plateau at 8–32 on
+both contexts; small NWG costs real decode; the default is already at the top
+of the plateau).** 7 arms each, gen 128:
+
+| NWG | 2 | 4 | 8 | 12 | 16 | 24 | 32 |
+|---|---|---|---|---|---|---|---|
+| decode @2048 t/s | 35.21 | 38.18 | 40.41 | 40.90 | 40.69 | 40.82 | **40.91** |
+| decode @131072 t/s | 25.32 | 27.11 | 27.92 | 28.12 | **28.18** | 28.08 | 28.09 |
+
+Both contexts show the same shape: a flat plateau from NWG 8 up (2k: 40.4–40.9,
+131k: 28.08–28.18, within noise) and a monotonic climb out of small NWG —
+NWG 2 costs 14% at 2k and 10.6% at 131k (25.32 t/s), NWG 4 costs 6.7% and 3.8%.
+At 131k the first-token latency tracks it too (966 ms at NWG 2 vs 570–618 at
+≥4). Prefill is flat across the sweep (401–402 t/s at 131k), confirming the
+knob only touches decode, as designed. The TP default (32) sits at the top of
+the plateau on **both** contexts — 40.91 @2k (exactly the pre-sweep number)
+and 28.09 @131k (0.03% off the best arm). The "coarse bucket heuristic" the
+request suspected of being a tuned-once constant is in fact already optimal:
+no change warranted, and the knob stays — it is a real lever (small-NWG
+degrades up to 14%), just one with nothing left to tune on this model.
+(One scatter point: the NWG=32 arm's 131k prefill read 373.49 vs 401–402 in
+the other six arms; decode in that arm is on-plateau, so it is a prefill
+run-to-run dip, not an NWG effect — the knob cannot reach prefill.)
+
+**R10e — decode gate profile @2048 and @131072 (the floor is per-gate fixed
+cost; the link is not decode's problem at either context).**
+`DS4_TP_GATE_PROFILE=1`, gen 128, same flags; @131k is a fresh re-profile of
+the R9 run, not the old numbers:
+
+| | @2048 | @131072 (this run) | @131072 (R9) |
+|---|---|---|---|
+| BIG gates | 86 @ 40,681.8 µs wait / 13,073.8 µs wire | 2,752 @ 93,516.4 / 22,530.9 | 2,752 @ 93,314.9 / 21,841.2 |
+| BIG wait:wire | 3.1 : 1 | 4.2 : 1 | 4.3 : 1 |
+| row (decode) gates, final cumulative | 10,234 @ 292.6 µs wait / 34.8 µs wire | 11,008 @ 401.4 / 49.7 | 11,008 @ 418.0 / 29.9 |
+
+- The 86 BIG gates are the single 2048 prefill chunk (43 layers × 2), and
+  they dominate short-context prefill in a way the 131k number hides: 86 ×
+  53.75 ms = 4.62 s of a 4.96 s prefill — **93% of 2048 prefill wall time is
+  BIG-gate wait+wire**, versus 18.5% at 131k where 2,752 gates are spread over
+  325 s. At 2048 there is no other prefill work: the gate *is* the prefill.
+- The @131k re-profile reproduces R9 on the wait side: 401.4 µs vs 418 µs
+  (−4%), and the BIG gates are indistinguishable (93,516/22,531 vs
+  93,315/21,841 — sub-2%). The one discordant number is the row-gate wire:
+  49.7 µs this run vs 29.9 µs in R9 (+66%). It does not change any conclusion
+  below (wire stays a 7–12% minority of gate time either way), but it does
+  mean the 131k wire figure should be treated as 30–50 µs with a wide bar.
+- Wire as a fraction of wait (the informative quantity): 34.8/292.6 =
+  **11.9% @2048** vs 49.7/401.4 = **12.4% @131k** (R9's 29.9 µs would be
+  7.2%) — a minority of gate time at **both** contexts under either 131k
+  measurement. The link is not decode's problem at either context — R10b will
+  not help decode, confirmed.
+- Wait scaling: 292.6 µs/gate @2048 vs 401.4 µs @131k — a 1.37× growth
+  between the two contexts, while wire moves 34.8 → 49.7 µs (+43%, and see the
+  bar above). Most of the growth is on the wait side, i.e. compute, as the
+  request hypothesized. Extrapolating the @2048 gate cost: 86 × ~284 µs ≈
+  24.4 ms/token ≈ 41 t/s — precisely the measured 2048 decode floor.
+  **Short-context decode is entirely per-gate fixed cost**, and the only
+  lever with real headroom is reducing the 86 gates/token (2 per layer) — a
+  design change, not a knob, as the request anticipated.
+- One caution, per the request's own warning: Σwait @2048 = 86 × 292.6 µs =
+  25.2 ms vs the 24.8 ms/token measured (closes to within 2%), but adding the
+  wire (86 × 34.8 µs) puts Σgate at 28.2 ms > token time — so even in decode
+  the gate waits are not all on the critical path at short context; some
+  overlap with GPU work. At 131k Σwait alone is 34.5 ms vs 35.5 ms/token
+  (the near-tautology the request flagged), and Σgate is 38.8 ms > token
+  time — the same overlap, a larger margin. Neither context is a clean
+  "wait sums to the token" story; the wait-side scaling is the signal.
+
+**Ops notes (2026-08-26, cost the campaign ~40 min).** (1) One arm
+(`r10d_nwg8_2k`, first pass) finished its work — CSV written, worker exited
+"leader finished" — but the coordinator deadlocked in teardown (uninterruptible
+kernel wait, state U) on RDMA/Metal release; `kill -9` cannot reap a U-state
+process, so the driver's timeout fired against a corpse. Resolution: rebooted
+lanfear. (2) The reboot wiped `/tmp`: the prompt file was restored from mat
+(verified by md5), the TB /30 IPs had to be re-applied
+(`setup-rdma-net.sh` — runtime-only by design), and the already-collected
+arm CSVs were lost. Everything through A1/B1 sweep+cold was recovered from
+the session transcript; the A2/B2 replicate rows and the first-pass nwg
+2/4/8 @2048 rows were not, and the three 2k NWG arms were re-run (this
+section's nwg @2048 table is the re-run). (3) The PP-worker-doesn't-exit note
+from R9 remains valid; a *TP* coordinator can also wedge in teardown as above
+— the driver now kills both ranks on timeout and the stale-proc guard aborts
+the next arm rather than double-launching, which is exactly what it should do.
+
 ### TP — `upstream-metal-wins` @ `3746eae1`, 2026-08-25 (A0 off = baseline)
 
 Full sweep, `DS4_METAL_FAST_SYNC=1` only, all new flags unset (this is the A0
