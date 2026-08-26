@@ -10265,11 +10265,34 @@ static void trace_write_cache_diag(
     }
 }
 
+/* Where to rewind the live session so the incoming prompt can be extended,
+ * or -1 when there is nothing to gain.  Two shapes:
+ *
+ *   shrinking  common == prompt_len < old_pos.  The prompt is a strict prefix
+ *              of the checkpoint (retry/regenerate).  Target prompt_len - 1, so
+ *              the sync that follows still has a token to evaluate for logits.
+ *
+ *   diverging  common < prompt_len.  The prompt shares a prefix and then
+ *              differs -- the shape an agentic client produces constantly, e.g.
+ *              a completed assistant turn the user abandoned:
+ *                live=50561 prompt=49326 common=49274
+ *              Reuse [0, common) instead of scoring zero and re-prefilling all
+ *              49326 tokens to avoid re-evaluating 52.
+ *
+ * The caller is responsible for the raw-cache budget; see the discard
+ * computation at the call site.  It must be measured as old_pos - common, the
+ * tail actually thrown away, which for the shrinking shape equals
+ * old_pos - prompt_len and for the diverging shape is larger. */
 static int live_prefix_rewind_target(bool backend_can_rewind,
                                      int old_pos, int prompt_len, int common) {
-    if (!backend_can_rewind || prompt_len <= 1 || prompt_len >= old_pos) return -1;
-    if (common != prompt_len) return -1;
-    return prompt_len - 1;
+    if (!backend_can_rewind || prompt_len <= 1 || old_pos <= 0) return -1;
+    if (common <= 0) return -1;
+    /* The whole checkpoint already matches: the plain prefix-match path scores
+     * that higher than any rewind. */
+    if (common >= old_pos) return -1;
+    const int target = common < prompt_len ? common : prompt_len - 1;
+    if (target <= 0 || target >= old_pos) return -1;
+    return target;
 }
 
 static void trace_time(FILE *fp) {
@@ -11531,9 +11554,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * discarded tail is still guaranteed not to have wrapped a row the
          * rewound tail will need. */
         const uint32_t raw_budget = is_glm ? 0 : ds4_session_raw_rewind_budget(slot->session);
+        /* Budget against the tail actually discarded, old_pos - common, not
+         * old_pos - prompt_len.  They coincide for a shrinking prompt; for one
+         * that diverges before its end the discard is larger and using the
+         * smaller number would authorise a rewind past rows the ring has
+         * already overwritten.  This is the bound whose absence corrupted a
+         * compaction: there the discard is tens of thousands of tokens and the
+         * budget correctly refuses, while an abandoned assistant turn discards
+         * ~1.3k against a 4224 budget and is safely reusable. */
+        const uint32_t discard = old_pos > common ? (uint32_t)(old_pos - common) : 0u;
         const bool can_rewind = is_glm ||
-            (raw_budget > 0 && j->req.prompt.len < old_pos &&
-             (uint32_t)(old_pos - j->req.prompt.len) < raw_budget);
+            (raw_budget > 0 && discard > 0 && discard < raw_budget);
         const int rewind_to = live_prefix_rewind_target(
             can_rewind, old_pos, j->req.prompt.len, common);
         if (rewind_to >= 0) {
@@ -17756,12 +17787,42 @@ static void test_model_metadata_clamps_completion_to_context(void) {
 }
 
 static void test_live_prefix_rewind_target(void) {
+    /* Shrinking prompt: strict prefix of the checkpoint, capped one short so
+     * the following sync still has a token to evaluate. */
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
     TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
     TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8) == -1);
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
+
+    /* Diverging tail: shares a prefix, then differs before its own end.  This
+     * used to score zero and re-prefill everything.  Real numbers from an
+     * abandoned assistant turn: live=50561 prompt=49326 common=49274, i.e.
+     * re-evaluate 52 tokens rather than 49326. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 50561, 49326, 49274) == 49274);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == 7);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 20, 7) == 7);
+
+    /* Whole checkpoint already matches -- the plain prefix path owns it. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 20, 17) == -1);
+    /* Nothing shared: a rewind to 0 discards the DSpark caches for no reuse. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 20, 0) == -1);
+
+    /* The target must always leave a token to evaluate, never move the session
+     * forward, and never exceed what the two sides share. */
+    for (int old_pos = 0; old_pos < 12; old_pos++) {
+        for (int prompt_len = 0; prompt_len < 12; prompt_len++) {
+            const int cap = old_pos < prompt_len ? old_pos : prompt_len;
+            for (int common = 0; common <= cap; common++) {
+                const int t = live_prefix_rewind_target(true, old_pos, prompt_len, common);
+                if (t < 0) continue;
+                TEST_ASSERT(t < prompt_len);
+                TEST_ASSERT(t < old_pos);
+                TEST_ASSERT(t <= common);
+                TEST_ASSERT(t > 0);
+            }
+        }
+    }
 }
 
 static void test_client_socket_nonblocking_flag(void) {
