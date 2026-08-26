@@ -130,6 +130,27 @@ Format: one table per (branch, commit, date). Newest first. Every table should
 name the branch + HEAD commit + date + the exact env flags that differ from
 defaults; the sweep semantics above apply to all rows.
 
+### Current state — `upstream-metal-wins` @ `f3668a1`/`627ccc1`, 2026-08-25
+
+Consolidated, from the two full sweeps above (TP = all three splits + nsg4
+default; PP = same-commit TCP-PP). `627ccc1` is server-only
+(`--prefill-quantum`) and does not touch `ds4-bench`; the sweep numbers are
+from `f3668a1` and carry over.
+
+| ctx | TP prefill | PP prefill | prefill winner | TP dec | PP dec | decode winner |
+|---|---|---|---|---|---|---|
+| 2048 | 423.03 | 316.98 | TP +34% | 40.91 | 27.67 | TP +48% |
+| 4096 | 417.54 | 310.46 | TP +35% | 36.47 | 26.29 | TP +39% |
+| 8192 | 500.16 | 348.21 | TP +44% | 35.98 | 26.08 | TP +38% |
+| 16384 | 480.79 | 459.38 | TP +5% | 35.43 | 25.54 | TP +39% |
+| 32768 | 461.20 | 530.00 | PP +15% | 33.73 | 24.11 | TP +40% |
+| 65536 | 427.08 | 520.42 | PP +22% | 31.52 | 22.52 | TP +40% |
+| 131072 | 367.29 | 444.38 | PP +21% | 28.13 | 20.57 | TP +37% |
+
+Cold 131k prefill (TP): 402.64 — +54.9% over the pre-workstream flag-off cold
+baseline (259.90); sweep +65.8% (221.50 → 367.29). TP wins prefill at
+≤16k and decode at every point; PP wins prefill from 32k up.
+
 ### TP — `upstream-metal-wins` @ `3746eae1`, 2026-08-25 (A0 off = baseline)
 
 Full sweep, `DS4_METAL_FAST_SYNC=1` only, all new flags unset (this is the A0
@@ -335,15 +356,20 @@ accumulation-neutral. **Pass.**
 R8c — throughput, all four flags, vs the R7 arm (projection recorded before
 the run: sweep 131k ~375–395, cold ~415–440):
 
-| ctx | R7 arm (NSG=8) | NSG=4 | Δ |
+prefill t/s; decode t/s (steady, 127 tok) in parentheses:
+
+| ctx | R7 arm (NSG=8) | NSG=4 | Δ prefill |
 |---|---|---|---|
-| 2048 | 389.99 | 423.03 | +8.5% |
-| 4096 | 411.25 | 417.54 | +1.5% |
-| 8192 | 484.71 | 500.16 | +3.2% |
-| 16384 | 467.50 | 480.79 | +2.8% |
-| 32768 | 443.12 | 461.20 | +4.1% |
-| 65536 | 400.90 | 427.08 | +6.5% |
-| **131072** | **342.18** | **367.29** | **+7.3%** (proj. ~375–395) |
+| 2048 | 389.99 (40.91) | 423.03 (40.91) | +8.5% |
+| 4096 | 411.25 (36.43) | 417.54 (36.47) | +1.5% |
+| 8192 | 484.71 (35.93) | 500.16 (35.98) | +3.2% |
+| 16384 | 467.50 (35.42) | 480.79 (35.43) | +2.8% |
+| 32768 | 443.12 (33.67) | 461.20 (33.73) | +4.1% |
+| 65536 | 400.90 (31.46) | 427.08 (31.52) | +6.5% |
+| **131072** | **342.18 (28.31)** | **367.29 (28.13)** | **+7.3%** (proj. ~375–395) |
+
+Decode is untouched by the kernel change (±0.2%) — as expected, the nsg knob
+only touches prefill FlashAttention.
 
 Cold single point: 380.27 → **402.64** (+5.9%; projection ~415–440). Gain is
 positive at every point and grows with context (1.5% @4k → 7.3% @131k), as
@@ -374,15 +400,21 @@ hidden-state path is plain low-latency TCP pinned to the TB interface
 flag/path no longer exists in this tree, so these are same-tree numbers, not
 the old RDMA-PP ones.
 
-| ctx | PP prefill t/s | PP decode t/s | TP prefill (R8) | TP decode |
-|---|---|---|---|---|
-| 2048 | 316.98 | 27.67 | 423.03 | 40.91 |
-| 4096 | 310.46 | 26.29 | 417.54 | 36.47 |
-| 8192 | 348.21 | 26.08 | 500.16 | 35.98 |
-| 16384 | 459.38 | 25.54 | 480.79 | 35.43 |
-| 32768 | 530.00 | 24.11 | 461.20 | 33.73 |
-| 65536 | 520.42 | 22.52 | 427.08 | 31.52 |
-| 131072 | **444.38** | **20.57** | 367.29 | 28.13 |
+Full data, same commit, same prompt, same day (TP = all splits + nsg4;
+decode shown as overall/steady over 128/127 tok):
+
+| ctx | PP prefill | PP dec (overall) | PP dec (steady) | TP prefill | TP dec (overall) | TP dec (steady) |
+|---|---|---|---|---|---|---|
+| 2048 | 316.98 | 24.47 | 27.67 | 423.03 | 34.93 | 40.91 |
+| 4096 | 310.46 | 23.38 | 26.29 | 417.54 | 31.74 | 36.47 |
+| 8192 | 348.21 | 23.20 | 26.08 | 500.16 | 30.98 | 35.98 |
+| 16384 | 459.38 | 22.82 | 25.54 | 480.79 | 30.76 | 35.43 |
+| 32768 | 530.00 | 21.68 | 24.11 | 461.20 | 29.26 | 33.73 |
+| 65536 | 520.42 | 20.33 | 22.52 | 427.08 | 27.87 | 31.52 |
+| 131072 | **444.38** | **18.70** | **20.57** | 367.29 | 25.16 | 28.13 |
+
+First-token latency (ms) for reference: PP 614–649 (rises with ctx),
+TP 545–604.
 
 **Headline correction:** the R7 "first TP sweep prefill above PP at 131k" was
 against the stale pp-rdma-new number (334.53). Against same-commit PP
