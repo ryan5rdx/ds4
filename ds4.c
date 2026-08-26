@@ -29022,6 +29022,36 @@ static bool metal_graph_tp_split_indexer(void) {
     return cached != 0;
 }
 
+/* Opt-in: also row-split the pos0 > 0 static-mixed layers (ratio 128, odd
+ * il >= 3 -- 20 of the 43).  These have no indexer, so every query row attends
+ * the whole compressed cache densely; measured at ctx 131072 that is a *larger*
+ * attention than a ratio-4 layer's (255.3 ms vs 182.8), because top_k caps the
+ * indexed layers at 512 + window keys per row while these see 1024 + window and
+ * the count grows with context.  Together with the replicated q_path and
+ * output_proj (whose 2.03x ratio against the already-split even layer is what
+ * confirms they run full-width) that is 311.2 ms per layer-chunk, ~71% of the
+ * layer.
+ *
+ * The earlier predicate excluded them on the belief that this path consumes the
+ * shared n_keys x n_tokens comp_mask tensor and would need a token-axis slice of
+ * it.  It does not: use_comp_mask is set only on the ratio-4 indexed branch,
+ * which never reaches this kernel, so the mask here is the one
+ * ds4_gpu_fill_mixed_decode_batch_mask() rebuilds per call from
+ * (pos0, n_tokens, n_raw, n_comp, window, ratio).  Passing this rank's origin
+ * and row count therefore regenerates exactly this rank's half -- the mask
+ * slices itself, and its CPU fill and transient buffer halve with it.
+ *
+ * Adds no gate traffic beyond the attn_out row swap A0 already performs.
+ * Requires the A0 split.  Must be set on BOTH ranks. */
+static bool metal_graph_tp_split_static_mixed(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_TP_PREFILL_SPLIT_STATIC_MIXED");
+        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 static bool metal_graph_force_dense_attn_out(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -29107,18 +29137,24 @@ static bool metal_graph_encode_layer_attention_batch(
          * A0 makes the final partial chunk splittable, so it becomes live.
          * Skipping the split there costs at most one short chunk. */
         (n_tokens % 2u) == 0u &&
-        /* Only the two pos0 > 0 paths that carry no comp mask: the raw ubatch
-         * path (ratio 0) and the indexed path (ratio 4 with more compressed
-         * keys than top-k).  The static-mixed path consumes an n_keys x
-         * n_tokens mask that would have to be sliced on the token axis too, so
-         * it stays full-width for now.
+        /* Without the static-mixed opt-in, only the two pos0 > 0 paths that
+         * carry no comp mask: the raw ubatch path (ratio 0) and the indexed
+         * path (ratio 4 with more compressed keys than top-k).
          *
          * pos0 / ratio underestimates n_comp -- the real count also includes
          * this chunk's own compressed keys -- so if it already exceeds top-k
          * the indexed path is guaranteed.  Both ranks evaluate it from pos0
          * and the model shape, so it cannot diverge, and unlike n_comp itself
-         * it is known here, before the tp_q/tp_heads views are built. */
-        (ratio == 0 ||
+         * it is known here, before the tp_q/tp_heads views are built.
+         *
+         * With the opt-in the shape no longer has to be named at all: all
+         * three pos0 > 0 kernels take (rows, origin) explicitly and rebuild
+         * any mask they need from it, so whichever one n_comp selects later is
+         * already correct for a row sub-range.  That is also why admitting
+         * ratio 4 below the top-k threshold here is safe -- both branches it
+         * can resolve to now split. */
+        (metal_graph_tp_split_static_mixed() ||
+         ratio == 0 ||
          (ratio == 4 && (pos0 / ratio) > DS4_N_INDEXER_TOP_K)) &&
         metal_graph_tp_split_nonzero_prefix();
     const bool tp_row_split_attn =
@@ -30476,23 +30512,34 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                         n_comp,
                                                                         &index_stage_t0);
                     }
-                } else if (tp_row_split_attn) {
+                } else if (tp_row_split_attn && use_comp_mask) {
                     /* Unreachable by construction, and loud rather than subtle
-                     * if that ever stops being true.  The pos0 > 0 split
-                     * predicate admits ratio 4 only when pos0 / ratio already
-                     * exceeds top-k, and n_comp here is the post-update
-                     * layer_n_comp -- at least (pos0 + n_tokens) / ratio -- so
-                     * use_indexed_comp must have been taken.  This branch
-                     * passes the full n_tokens/pos0 against the half-height
-                     * q_work/heads_work views, which the row-range bounds
-                     * check would reject with a far less obvious message. */
+                     * if that ever stops being true.  use_comp_mask is set only
+                     * by the indexed branch above, which also sets
+                     * use_indexed_comp, so reaching here means the shared
+                     * n_comp x n_tokens comp_mask tensor would be consumed
+                     * whole against half-height q_work/heads_work views -- the
+                     * one mask on this path that does NOT slice itself. */
                     fprintf(stderr,
-                            "ds4: tp: row-split chunk reached the static-mixed "
-                            "attention path (il=%u pos0=%u n_tokens=%u ratio=%u "
-                            "n_comp=%u); refusing rather than mixing row counts\n",
+                            "ds4: tp: row-split chunk reached the mixed attention "
+                            "path carrying a comp_mask (il=%u pos0=%u n_tokens=%u "
+                            "ratio=%u n_comp=%u); refusing rather than mixing row "
+                            "counts\n",
                             il, pos0, n_tokens, ratio, n_comp);
                     ok = false;
                 } else {
+                    /* Static-mixed at pos0 > 0.  Unlike the zero-prefix
+                     * static-mixed path this kernel carries no comp_mask
+                     * tensor (guarded just above); the n_keys x n_tokens mask
+                     * it attends through is rebuilt per call by
+                     * ds4_gpu_fill_mixed_decode_batch_mask() from the origin
+                     * and row count, and the raw ring window in n_raw/raw_start
+                     * was already derived from the same pair.  So handing it
+                     * this rank's rows produces exactly this rank's mask, and
+                     * the whole call reduces to the unsplit form when
+                     * tp_row0 == 0 and q_work_rows == n_tokens.  n_comp stays
+                     * full: both ranks need every compressed key, and per-row
+                     * visibility is (qpos + 1) / ratio inside the fill. */
                     ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(heads_work,
                                                                              model->map,
                                                                              model->size,
@@ -30503,8 +30550,8 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                              metal_graph_attn_comp_cache_is_f16(),
                                                                              use_comp_mask ? metal_graph_comp_mask(g) : NULL,
                                                                              use_comp_mask,
-                                                                             n_tokens,
-                                                                             pos0,
+                                                                             q_work_rows,
+                                                                             attn_pos0,
                                                                              n_raw,
                                                                              g->raw_cap,
                                                                              raw_start,

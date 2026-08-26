@@ -20,7 +20,8 @@ This doc is the **request** side of a loop: results go into
 | R3 — utilisation | done | **~90% in both arms at both 8k and 131k.** Flat, not A0-induced, not context-dependent. |
 | R4 — argsort canon | done + **fixed** | +5.6% @2048, +2.5% @4096 when disabled. Now gated on `n_tokens >= 32` (`6fa977c`). |
 | R5 — indexer split | done | **Bit-identical** (0/129,280 logits differ). score 317.7 → 138.2 ms, topk 10.0 → 5.2, attention unchanged. Sweep 131k 237.44 → **283.64** (+19.5%), cold 281.20 → **322.64**. |
-| R6 — size ratio-128 layers | **requested below** | measurement only, do not build |
+| R6 — size ratio-128 layers | done | Prize **311.2 ms/layer-chunk × 20 layers**, ~71% of the odd layer. Odd-layer attention is *larger* than a ratio-4 layer's (255.3 vs 182.8 ms) and grows with context. Two of this doc's premises were wrong — see below. |
+| R7 — static-mixed split | **built, requested below** | `DS4_TP_PREFILL_SPLIT_STATIC_MIXED=1`. Needs inertness + correctness + throughput. |
 
 **Arc so far at ctx 131072 (sweep):** 183.4 (old base) → 221.50 (upstream
 indexer stack) → 237.44 (A0) → **283.64** (indexer split). **+55%.**
@@ -78,56 +79,101 @@ rows, feeds its own top-k into its own attention rows, and the existing
 
 ## Open requests
 
-### R6 — size the ratio-128 layers before splitting them (measurement only)
+### R7 — static-mixed row split (`DS4_TP_PREFILL_SPLIT_STATIC_MIXED=1`)
 
-**Do not build anything on this yet.** This is a sizing request.
+Built on `upstream-metal-wins`. Opt-in, **requires `DS4_TP_PREFILL_SPLIT_NONZERO=1`**,
+must be set on BOTH ranks (it changes the per-layer gate count — asymmetric
+settings deadlock the big gates, they do not degrade). Builds warning-clean;
+`ds4_test --server`, `ds4_agent_test`, `ds4-eval --self-test-extractors` pass.
 
-The `pos0 > 0` split predicate covers `ratio 0` (2 layers) and `ratio 4` (21
-layers). It excludes the **20 `ratio 128` layers** (odd `il` ≥ 3), which are
-nearly half the model and still run `q_b`, the attention core and the output
-projection fully replicated at every chunk. They were excluded because the
-static-mixed path carries a CPU-materialised `n_keys × n_tokens` mask that
-needs its own token-axis slice — real work, and worth it only if the layers
-are.
+Extends the `pos0 > 0` row split to the **20 `ratio 128` layers** R6 sized, and
+in passing to `ratio 4` chunks below the top-k threshold. Adds **no gate traffic**
+beyond the `attn_out` swap A0 already does.
 
-Nothing measured so far covers them: R1 and R5c both profile ratio-4 layers
-(even `il`), and `comp = 1024` on ratio-128 means their *attention* is small.
-The open question is whether their **projections** justify the mask work.
+**R7a — inertness.** Flag unset must reproduce the R5 arm exactly. Cheapest
+failure; do it first.
 
-```
-DS4_METAL_FAST_SYNC=1 DS4_TP_PREFILL_SPLIT_NONZERO=1 DS4_TP_PREFILL_SPLIT_INDEXER=1 \
-DS4_METAL_LAYER_STAGE_PROFILE=1 DS4_METAL_LAYER_STAGE_PROFILE_LAYER=<odd il ≥ 3> \
-  ./ds4-bench ... --ctx-start 131072 --ctx-max 131072
-```
+**R7b — correctness** (16384 prompt, `DS4_TP_FORCE_DENSE_ATTN_OUT=1` on both
+arms, greedy, `--dump-frontier-logits-dir`), against the A0+indexer arm.
 
-Emits `part=attn` stage lines. Record, for a late chunk, one **odd** layer and
-one **even** layer for comparison:
+Expect **bit-identical**, as R5 was, and for the same reason: the mask is
+rebuilt per call from the origin, so a row sub-range reproduces its own rows
+exactly rather than re-tiling a shared one. If logits differ at all, that is a
+finding — it means something on this path is *not* deriving purely from
+`(attn_pos0, q_work_rows)`, and R7c should not be run until it is explained.
 
-| stage | odd `il` (ratio 128) | even `il` (ratio 4) |
-|---|---|---|
-| `norm` | | |
-| `hc_pre` | | |
-| `q_path` | | |
-| `kv_path` | | |
-| `compressor` / `_prefill` / `_commit` / `_refresh` | | |
-| `indexer_setup` | | |
-| `attention` | | |
-| `output_proj` | | |
-| `inv_rope`, `hc_post` | | |
+**R7c — throughput**: full sweep + cold 131k, all three flags on, vs the R5
+arm (A0 + indexer).
 
-Same caveat as R1: the boundary helper splits the command buffer per stage, so
-absolute throughput under the flag is not comparable — the **relative** split is
-the signal, and the even-layer column is the control that makes the odd-layer
-numbers readable.
+Projection, from R6's own numbers — worth recording *before* the run so it can
+be scored: saving ≈ half of 311.2 ms × 20 layers ≈ **3.1 s per late chunk**,
+~19% of that chunk. Sweep 131k **283.64 → ~340** (+20%), cold **322.64 → ~380**
+(+18%). Softer than R5's mechanism-level certainty: it extrapolates odd-layer
+attention from two points, so treat ±5 points as within model error. Direction
+and rough size are the claim.
 
-What it decides: **`q_path` + `attention` + `output_proj` on an odd layer, times
-20 layers**, is the entire prize. If that sum is a small fraction of the odd
-layer, the mask slicing is not worth doing and the ratio-128 layers should stay
-replicated. If it is large, it is the next change.
+If it lands, TP sweep prefill reaches **approximate parity with PP** (334.53) at
+131k for the first time, while keeping the ~39% decode lead — which would close
+the "why is TP prefill behind" question that started this workstream.
 
-Also useful from the same run: `compressor*` and `kv_path` are the stages that
-must stay full-width forever (shared state written from all rows). Knowing their
-size sets the hard floor on how far row-splitting can ever take TP.
+Also worth a line if it is cheap: R6 showed the odd-layer `attention` stage
+includes a **single-threaded CPU fill of a 43 MB f16 mask** (`n_keys × n_tokens`
+= 5248 × 4096, 21.5M scalar stores) plus a fresh transient buffer of the same
+size, per layer per chunk, ×20 layers ×32 chunks. The split halves both. If R7c
+undershoots the projection, that CPU term is the first place to look, because it
+does not parallelise across the two ranks the way GPU work does.
+
+### R6 — size the ratio-128 layers — **DONE**, and it corrected this doc
+
+Results in `BENCHMARKS-TP-PP.md`. The prize is large: `q_path` + `attention` +
+`output_proj` on an odd layer = **311.2 ms**, ~71% of that layer's chunk time,
+×20 layers ≈ **6.2 s of every late chunk**. The hard floor (`kv_path` +
+`compressor`, which must stay full-width) is only ~3.5–5.5 ms/layer, so
+row-splitting's ceiling on these layers really is the whole attention block.
+
+**The data validates itself.** Odd `output_proj` / even `output_proj` =
+34.857 / 17.190 = **2.03×** — almost exactly the replicated-vs-split ratio, on a
+stage whose cost has nothing to do with `ratio`. That is an internal control
+saying the profiler is faithful and that these layers are indeed running
+full-width.
+
+Two things this doc asserted, both wrong:
+
+**1. "`comp = 1024` on ratio-128 means their attention is small."** Backwards.
+It is 255.3 ms against the ratio-4 layer's 182.8. Having *no indexer* is the
+whole point: `top_k` caps a ratio-4 row at 512 + window keys, while a ratio-128
+row attends its entire compressed cache — 1024 + window at 131k, and **growing
+with context**. Fewer compressed keys, but all of them, beats more compressed
+keys with only 512 read. I inverted the comparison by reasoning from cache size
+instead of from keys-read-per-row.
+
+The growth confirms it: allocated `n_keys` rises only 7.2% from pos 81920 to
+126976 (4896 → 5248), but the stage rises 33% (192.0 → 255.3). Cost tracks
+*visible* keys per row (784 → 1136, +45%), not allocated ones — so the kernel's
+block skipping is working, and what grows is the compressed span.
+
+**2. "The static-mixed path carries a mask that needs a token-axis slice."**
+Not on this path. `use_comp_mask` is set only inside the `ratio == 4 &&
+n_comp > top_k` branch, which then takes `use_indexed_comp` and never reaches
+this kernel — so the `pos0 > 0` mixed call always passes `comp_mask = NULL`.
+Its mask is the one `ds4_gpu_fill_mixed_decode_batch_mask()` rebuilds per call
+from `(pos0, n_tokens, n_raw, n_comp, window, ratio)`. Hand it this rank's
+origin and row count and it regenerates exactly this rank's half: **the mask
+slices itself.** The blocker I described is real, but it belongs to the
+*zero-prefix* static-mixed path, which is a different call site.
+
+So R7 was a predicate relaxation plus one call site passing
+`q_work_rows`/`attn_pos0` instead of `n_tokens`/`pos0` — not the "real work" this
+doc budgeted for. Corroboration that the surrounding machinery was always ready:
+ratio-128 layers **already row-split at chunk 0** through the zero-prefix
+static-mixed kernel, so nothing about those layers was unsafe to split.
+
+Method note for future sizing runs: `DS4_METAL_LAYER_STAGE_PROFILE` **blocks the
+CPU** at every boundary (`ds4_gpu_end_commands()`), unlike
+`DS4_METAL_GPU_STAGE_TIMESTAMPS`. Its numbers are wall time per stage —
+CPU-side work included, which is what made the mask fill visible — but they
+serialise a layer that would otherwise overlap, so read one profiled layer
+against another profiled layer, never against a clean run.
 
 ### R5 — indexer split (the main event; `589e93e`) — **DONE, passed**
 

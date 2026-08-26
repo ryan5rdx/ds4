@@ -454,6 +454,11 @@ grows. See investigation notes in `docs/TP-PREFILL-LONG-CTX-INVESTIGATION.md`
   in TP prefill (default 32).
 - `DS4_TP_PREFILL_SPLIT_NONZERO=1` — A0: row-split attention for `pos0 > 0`
   prefill chunks (opt-in; must be set on BOTH ranks).
+- `DS4_TP_PREFILL_SPLIT_INDEXER=1` — also row-split the indexer score + top-k at
+  `pos0 > 0` (requires the above; BOTH ranks). R5: sweep +19.5% @131k.
+- `DS4_TP_PREFILL_SPLIT_STATIC_MIXED=1` — also row-split the ratio-128
+  (static-mixed) layers at `pos0 > 0` (requires `..._NONZERO`; BOTH ranks).
+  R7, untested on the rig.
 - `DS4_TP_FORCE_DENSE_ATTN_OUT=1` — dense attention output projection on both
   arms of a correctness comparison (costs throughput; unset for speed runs).
 - `DS4_TP_GATE_PROFILE=1` — per-gate-kind (ROW/VERIFY/BIG) counts, avg GPU-wait
