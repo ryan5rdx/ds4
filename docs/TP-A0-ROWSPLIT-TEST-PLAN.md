@@ -32,10 +32,14 @@ be faster because of the indexer stack.
    has lanfear=`rdma_en6`, mat=`rdma_en7`; `speed-bench/README.md` has them
    reversed. Confirm against the actual hardware before the first run — a wrong
    name is a failed QP bring-up, not a silent slowdown.
-4. **The sweep is incremental.** `ds4_bench.c` advances from the previous ctx
-   point, so the `131072` row measures the 65536→131072 increment (65536 tokens),
-   not a 131k prefill from scratch. Every chunk in that row has `pos0 > 0`, which
-   is why it is the cleanest A0 signal in the sweep.
+4. **The sweep is incremental.** `ds4_bench.c:780-795` advances the frontier from
+   the previous ctx point, so the `131072` row measures the 65536→131072
+   increment (65536 tokens), not a 131k prefill from scratch. Every chunk in that
+   row has `pos0 > 0`, which is why it is the cleanest A0 signal in the sweep —
+   but it also means the row's mean attended position is ~3N/4, not N/2, so it is
+   **not comparable** to any single-node number whose protocol we do not know.
+   Use the sweep for A/B against itself, and Run 3b below for anything
+   cross-machine.
 
 ## Run 0 — build and sanity
 
@@ -130,6 +134,24 @@ Target at 131072: **~1.5× over Run 1.** Derivation: the pair executes ~8.9e10
 FLOPs/token of which ~45% duplicates the peer; halving the splittable part
 predicts 1.51×, and the measured TP2-vs-single-node ratio after discounting the
 M2/M3 gap independently gives 1.52.
+
+## Run 3b — cold single-point prefill (do this, it is the honest number)
+
+The sweep rows are incremental suffixes. For a number that means something on
+its own — and for any comparison against a single-node figure — run one **cold**
+point, flag off then flag on:
+
+```
+--ctx-start 131072 --ctx-max 131072      # no --step-mul; one cold prefill
+```
+
+This is the number to quote. The sweep tells you the *shape* of the gain across
+context; this tells you the *size* of it at the context you care about, without
+the 3N/4 mean-position artefact.
+
+| | flag off | flag on | Δ |
+|---|---|---|---|
+| cold 131072 prefill t/s | | | |
 
 ## Run 4 — free diagnostics while the rig is up
 

@@ -30408,6 +30408,22 @@ static bool metal_graph_encode_layer_attention_batch(
                                                                         n_comp,
                                                                         &index_stage_t0);
                     }
+                } else if (tp_row_split_attn) {
+                    /* Unreachable by construction, and loud rather than subtle
+                     * if that ever stops being true.  The pos0 > 0 split
+                     * predicate admits ratio 4 only when pos0 / ratio already
+                     * exceeds top-k, and n_comp here is the post-update
+                     * layer_n_comp -- at least (pos0 + n_tokens) / ratio -- so
+                     * use_indexed_comp must have been taken.  This branch
+                     * passes the full n_tokens/pos0 against the half-height
+                     * q_work/heads_work views, which the row-range bounds
+                     * check would reject with a far less obvious message. */
+                    fprintf(stderr,
+                            "ds4: tp: row-split chunk reached the static-mixed "
+                            "attention path (il=%u pos0=%u n_tokens=%u ratio=%u "
+                            "n_comp=%u); refusing rather than mixing row counts\n",
+                            il, pos0, n_tokens, ratio, n_comp);
+                    ok = false;
                 } else {
                     ok = ds4_gpu_attention_decode_mixed_batch_heads_tensor(heads_work,
                                                                              model->map,
