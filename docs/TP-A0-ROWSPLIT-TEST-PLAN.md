@@ -21,16 +21,35 @@ This doc is the **request** side of a loop: results go into
 | R4 — argsort canon | done + **fixed** | +5.6% @2048, +2.5% @4096 when disabled. Now gated on `n_tokens >= 32` (`6fa977c`). |
 | R5 — indexer split | done | **Bit-identical** (0/129,280 logits differ). score 317.7 → 138.2 ms, topk 10.0 → 5.2, attention unchanged. Sweep 131k 237.44 → **283.64** (+19.5%), cold 281.20 → **322.64**. |
 | R6 — size ratio-128 layers | done | Prize **311.2 ms/layer-chunk × 20 layers**, ~71% of the odd layer. Odd-layer attention is *larger* than a ratio-4 layer's (255.3 vs 182.8 ms) and grows with context. Two of this doc's premises were wrong — see below. |
-| R7 — static-mixed split | **built, requested below** | `DS4_TP_PREFILL_SPLIT_STATIC_MIXED=1`. Needs inertness + correctness + throughput. |
+| R7 — static-mixed split | done | **Bit-identical** (0/129,280). Sweep 131k 284.03 → **342.25** (+20.5%), cold 322.64 → **380.27** (+18.2%). Both inside the pre-recorded projection (~340 / ~380). |
+| R8 — FlashAttention `nsg` | **built, requested below** | `DS4_METAL_FA_NSG=4`. Measured standalone: **1.94–2.20× on the attention kernel, bit-identical**. Needs rig confirmation on M2 Ultra. |
 
-**Arc so far at ctx 131072 (sweep):** 183.4 (old base) → 221.50 (upstream
-indexer stack) → 237.44 (A0) → **283.64** (indexer split). **+55%.**
-Cold single point 259.90 → 322.64. Decode untouched at 28.09.
+**Arc at ctx 131072 (sweep):** 183.4 (old base) → 221.50 (upstream indexer
+stack) → 237.44 (A0) → 283.64 (indexer split) → **342.25** (static-mixed
+split). **+87%** over the old base, **+54.4%** over the flag-off baseline on
+this branch. Cold single point 259.90 → **380.27** (+46.4%). Decode untouched
+throughout (28.28 steady).
 
-Against the only honest scaling baseline available — PP on the same pair, same
-protocol, same model, since a single node cannot hold 145.26 GiB — the prefill
-gap has closed from **PP +51%** to **PP +18%** (334.53 vs 283.64), while TP
-retains its ~39% decode lead.
+**TP sweep prefill now exceeds PP at 131k** (342.25 vs 334.53) for the first
+time, while keeping the ~40% decode lead. PP on the same pair remains the only
+honest scaling reference, since a single node cannot hold 145.26 GiB.
+
+Worth noting what the last three changes have in common: none of them made the
+GPU faster. A0, the indexer split and the static-mixed split each *removed
+replicated work* — the same arithmetic being done on both ranks. That well is
+now nearly dry, which is why R8 targets kernel efficiency instead.
+
+**Pin the PP column before quoting the crossover.** The PP figures in R7c
+(393.90 / 412.78 / 454.20 / 444.70 / 438.98 / 373.38 / 334.53) appear nowhere
+else in `BENCHMARKS-TP-PP.md` and no PP run is recorded for 2026-08-25, yet the
+131072 entry matches the older `pp-rdma-new` table to the cent while every
+other point differs by 10–30%. Either it is a fresh run whose 131k point
+coincidentally lands on 334.53, or that one cell was carried over. It matters
+because the "TP now beats PP" headline rests on exactly that number — and note
+the fresh column trends *below* the old one at 65536 (373.38 vs 426.59,
+−12.5%), so a genuinely re-measured 131k PP point may well be lower, which
+would widen the margin rather than erase it. Please confirm which, and if it is
+a new run, record it as its own table.
 
 **Do not quote `speed-bench/m2_ultra.csv` or the "1.85× PP scaling" figure as
 scaling references.** The former uses a fixed 2048-token increment per frontier
@@ -79,49 +98,139 @@ rows, feeds its own top-k into its own attention rows, and the existing
 
 ## Open requests
 
-### R7 — static-mixed row split (`DS4_TP_PREFILL_SPLIT_STATIC_MIXED=1`)
+### R8 — FlashAttention simdgroup count (`DS4_METAL_FA_NSG=4`)
 
-Built on `upstream-metal-wins`. Opt-in, **requires `DS4_TP_PREFILL_SPLIT_NONZERO=1`**,
-must be set on BOTH ranks (it changes the per-layer gate count — asymmetric
-settings deadlock the big gates, they do not degrade). Builds warning-clean;
-`ds4_test --server`, `ds4_agent_test`, `ds4-eval --self-test-extractors` pass.
+Built on `upstream-metal-wins` (`fa94db7`). **Default is unchanged**, so this
+could not have perturbed R7; set `DS4_METAL_FA_NSG=4` on BOTH ranks to enable.
+Builds warning-clean; all three suites pass.
 
-Extends the `pos0 > 0` row split to the **20 `ratio 128` layers** R6 sized, and
-in passing to `ratio 4` chunks below the top-k threshold. Adds **no gate traffic**
-beyond the `attn_out` swap A0 already does.
+This is the first change in the series that is not about replication. Every
+prior win removed duplicated work between the ranks; this one makes the kernel
+itself faster, and it applies to all four `dk512` call sites.
 
-**R7a — inertness.** Flag unset must reproduce the R5 arm exactly. Cheapest
-failure; do it first.
+**Why.** `nsg=8`, which `head_dim >= 512` has always selected, is the worst
+legal value for this kernel at `C = 64`, on two compounding counts:
 
-**R7b — correctness** (16384 prompt, `DS4_TP_FORCE_DENSE_ATTN_OUT=1` on both
-arms, greedy, `--dump-frontier-logits-dir`), against the A0+indexer arm.
+- `NC = (C/8)/NSG` is the number of 8×8 QK tiles a simdgroup produces per key
+  block. `NSG=8` pins `NC` at its floor of **1** — one tile, then
+  `simdgroup_store` and the barriers — where `NSG=4` does two, halving sync
+  overhead per unit work. A `static_assert((C/8) % NSG == 0)` makes 8 the
+  largest value the kernel admits at all.
+- the QK loop unrolls by `MIN(DK8/2, 4*NSG)`, jumping from 16× to a full 32× at
+  `NSG=8` and doubling live simdgroup matrices. No occupancy is won back:
+  shared memory is `Q*(DK + 2*PV + 2*SH)*2` = 28,672 B against a 32,768 B
+  limit, so **exactly one threadgroup is resident per core** either way. (The
+  same budget is why `nqptg` cannot go to 16 — it would need 57,344 B and
+  simply fails to launch. `head_dim=512` is what caps the query tile at 8.)
 
-Expect **bit-identical**, as R5 was, and for the same reason: the mask is
-rebuilt per call from the origin, so a row sub-range reproduces its own rows
-exactly rather than re-tiling a shared one. If logits differ at all, that is a
-finding — it means something on this path is *not* deriving purely from
-`(attn_pos0, q_work_rows)`, and R7c should not be run until it is explained.
+**Measured standalone** (M1 Max, ds4's own shader extracted and run against the
+real kernel; executed keys counted from the mask, not assumed):
 
-**R7c — throughput**: full sweep + cold 131k, all three flags on, vs the R5
-arm (A0 + indexer).
+| shape | nsg=8 | nsg=4 | speedup | differing floats |
+|---|---|---|---|---|
+| odd ratio-128, late 131k chunk | 852.4 ms | 387.2 ms | **2.20×** | 0 / 134,217,728 |
+| odd ratio-128, mid 64k chunk | 509.4 ms | 236.1 ms | **2.16×** | 0 / 134,217,728 |
+| odd ratio-128, early 8k chunk | 210.0 ms | 97.7 ms | **2.15×** | 0 / 134,217,728 |
+| short chunk (1024 tok) | 203.7 ms | 105.0 ms | **1.94×** | 0 / 33,554,432 |
 
-Projection, from R6's own numbers — worth recording *before* the run so it can
-be scored: saving ≈ half of 311.2 ms × 20 layers ≈ **3.1 s per late chunk**,
-~19% of that chunk. Sweep 131k **283.64 → ~340** (+20%), cold **322.64 → ~380**
-(+18%). Softer than R5's mechanism-level certainty: it extrapolates odd-layer
-attention from two points, so treat ±5 points as within model error. Direction
-and rough size are the claim.
+Context for the size of that: at `nsg=8` the kernel runs at **0.76 TFLOP/s**
+while an equal-FLOP GEMM on the same GPU reaches **5.2–6.0** — a ~7× gap, which
+independently reproduces the ~6× implied by R6 on the M2 Ultra (attention 2.4
+vs `q_path` 14.7 TFLOP/s). `nsg=4` recovers about half of it.
 
-If it lands, TP sweep prefill reaches **approximate parity with PP** (334.53) at
-131k for the first time, while keeping the ~39% decode lead — which would close
-the "why is TP prefill behind" question that started this workstream.
+**R8a — inertness.** Flag unset must reproduce the R7 arm. Should be exact:
+the default path is untouched.
 
-Also worth a line if it is cheap: R6 showed the odd-layer `attention` stage
-includes a **single-threaded CPU fill of a 43 MB f16 mask** (`n_keys × n_tokens`
-= 5248 × 4096, 21.5M scalar stores) plus a fresh transient buffer of the same
-size, per layer per chunk, ×20 layers ×32 chunks. The split halves both. If R7c
-undershoots the projection, that CPU term is the first place to look, because it
-does not parallelise across the two ranks the way GPU work does.
+**R8b — correctness** (16384, `DS4_TP_FORCE_DENSE_ATTN_OUT=1` both arms,
+greedy). Expect **bit-identical**, as it was standalone on 134M output floats
+across four shapes. `nsg` changes only how work is partitioned across
+simdgroups, not accumulation order within a QK tile. If logits differ at all,
+stop and report — that would mean the partitioning is not accumulation-neutral
+on this hardware, which the standalone run says it is.
+
+**R8c — throughput**: full sweep + cold 131k, all four flags on, vs the R7 arm.
+
+Projection, recorded before the run: if the standalone ratio transfers, the
+FlashAttention consumption roughly halves. Post-R7 that stage is ~128 ms on an
+odd layer and ~39 ms on an even one, so the saving is ≈ 1.4 s + 0.4 s per late
+chunk out of ~12.5 s → **sweep 131k 342.25 → ~375–395, cold 380.27 → ~415–440**
+(+10–15%).
+
+Weaker than R7's projection, for a reason worth stating: R7 extrapolated from
+measurements on *this rig*, whereas this extrapolates from a **24-core M1 Max
+to a 60-core M2 Ultra**. The 32 KB threadgroup-memory limit is architectural so
+the occupancy argument carries, but the barrier-vs-register tradeoff that makes
+`nsg=4` win could scale differently with core count. Treat the direction as
+solid and the magnitude as unverified — that is exactly what R8c is for.
+
+If it lands, flip the default in `ds4_gpu_flash_attn_nonvec_nsg()` and drop the
+env knob.
+
+### R7 — static-mixed row split — **DONE, passed**
+
+Bit-identical, and both pre-recorded projections landed (sweep ~340 → 342.25,
+cold ~380 → 380.27). Full results in `BENCHMARKS-TP-PP.md`. Notable: 2048
+came in at ~0%, which is the correct inertness signal — a 2048-token prompt is
+a single `pos0 == 0` chunk, so the flag has nothing to act on.
+
+R6's single-threaded 43 MB mask-fill concern **did not bite**, as the follow-up
+measurement predicted: ported and timed exactly, that loop is 5.25 ms serial,
+2.1% of the `attention` stage and ~0.8% of a full 131k prefill. Parallelising
+it with `dispatch_apply` gives 4.1×, and it is still not worth doing.
+
+### Heterogeneous compute (ANE / CPU) — **evaluated and closed, 2026-08-26**
+
+Asked whether the ANE or the CPU could take some of the prefill matmul load.
+Answer: no for ANE, marginal for CPU. Recorded so it is not re-opened.
+
+**The premise needed adjusting first.** Prefill *is* matmul-bound, but the GPU
+is not bad at matmul. Scoring R6's stages against their FLOP counts: `q_path`
+**14.7 TFLOP/s** (68% of the M2 Ultra's 21.5 TF fp32 peak), `output_proj`
+**8.9**, `attention` **~2.4**. The problem was one kernel at ~6× below what the
+same GPU does on a plain GEMM 30 ms earlier in the same layer — hence R8, not
+more silicon.
+
+**ANE — four independent blockers**, from the ANE guide plus local probing:
+
+- **Bandwidth.** ANE's roof is 24–51 GB/s on M1, ~145 GB/s on M5. It does not
+  see unified-memory bandwidth; the rig's GPU has ~800 GB/s per node.
+- **Ultra does not aggregate.** The driver "steers whole independent
+  submissions to the least-busy engine die and never exchanges tensor data
+  between them," and the collective-enable capability byte reads zero on all 28
+  targets. An M2 Ultra is two independent 16-core ANEs; a single graph cannot
+  span dies.
+- **fp16 numerics fail on our worst case.** The guide names value, **output
+  projection** and down-projection as the projections that break in fp16 e2e.
+  `o_a` is K=32768 — and on M2 (A14-generation ANE) the MAC output stage
+  saturates at 2¹⁵ = 32768; the non-saturating path arrives at A15/M3.
+- **Shape tax.** One compiled program per concrete shape, no dynamic dims
+  without entitlement, 0.23 ms dispatch floor.
+
+Throughput loses anyway: the guide's M1 head-to-head is ANE 3.6 vs GPU 7.3
+TFLOP/s on a K=4096 GEMM, and it classifies large-batch matmul as "GPU regime
+throughout" — which is exactly what 4096-token prefill is.
+
+Probed locally on an M1 Max via CoreML at ds4's real shapes: ANE appears as a
+*candidate* for every op tried (`candidates=CPU|GPU|NeuralEngine`) but CoreML
+never once scheduled it, including for a canonical 3×3 conv stack. That matches
+the guide — under CoreML the device is "a scheduling outcome, not a choice."
+Forcing it means the private `e5rt_*` Espresso API.
+
+On zero-copy: every boundary "charges a tensor repack between the engine
+channel-interleaved fp16 layout and the host layout," IOSurface sharing is
+listed as reachable-but-unexercised, and overlapping streams is called out as
+unsound. Unified memory does not buy a free hand-off here.
+
+**CPU/AMX** measured on the same M1 Max via Accelerate at ds4's shapes:
+**1.32–1.79 TFLOP/s** fp32 (`q_a` 1.75, `q_b` 1.78, `o_a` 1.32, `ffn` 1.79).
+Scaling by P-cluster count an M2 Ultra should reach ~3–3.5 — ~20% more compute
+against a GPU doing 14.7, and not free, since those cores already drive the
+Metal encoder and the RDMA gate service thread. Poor trade against R8.
+
+One incidental cross-check worth keeping: AMX reproduces the GPU's
+`q_b`-vs-`o_a` asymmetry (1.78 vs 1.32, same direction as 14.7 vs 8.9), so the
+K=32768 reduction being slower is a property of the shape on two independent
+engines, not a ds4 defect.
 
 ### R6 — size the ratio-128 layers — **DONE**, and it corrected this doc
 
