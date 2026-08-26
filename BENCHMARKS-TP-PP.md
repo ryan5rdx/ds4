@@ -236,6 +236,43 @@ baseline: sweep 221.50 → 283.64 (**+28.1%**), cold 259.90 → 322.64
 predicts (splittable share grows with `comp`). Decode untouched
 (28.09 steady).
 
+**R6 — sizing the ratio-128 (odd) layers** (`DS4_METAL_LAYER_STAGE_PROFILE`,
+both splits on, cold 131k, 2026-08-25; profile-run throughput not comparable,
+but 322.09/322.07 t/s vs 322.64 clean — per-layer profiling is cheap here.
+Late chunk pos=126976, tokens=4096.)
+
+| stage | odd `il`=3 (ratio 128) | even `il`=4 (ratio 4) |
+|---|---|---|
+| `hc_pre` (attn) | 1.935 | 3.307 |
+| `norm` (attn) | 0.026 | 0.071 |
+| `q_path` | 21.069 | 12.353 |
+| `kv_path` | 0.437 | 0.491 |
+| `compressor` | 3.070 | 5.027 |
+| `indexer_setup` | — (no indexer) | 7.484 |
+| `attention` | **255.293** | **182.807** |
+| `inv_rope` | 1.959 | 1.101 |
+| `output_proj` | **34.857** | 17.190 |
+| `hc_post` (attn) | 2.993 | 16.691 |
+
+FFN part (already TP-sharded by the 50/50 expert split, not row-split):
+routed_moe 52.3/65.0, hc_post 50.2/23.9, shared 4.5/2.4 both layers.
+
+- Odd-layer attention **grows with context** (192.0 ms at pos 81920 → 255.3 ms
+  at pos 126976) and is *larger* than the ratio-4 layer's (255 vs 183 ms):
+  these layers carry the bulk of the replicated attention work, not the
+  indexer layers.
+- **The prize** (`q_path` + `attention` + `output_proj` on one odd layer) =
+  **311.2 ms/layer-chunk → × 20 layers ≈ 6.2 s of every chunk pass**, ~71% of
+  the odd layer's own ~435 ms chunk time. Large — the mask-slicing work on the
+  static-mixed path is justified.
+- **The hard floor** (stages that must stay full-width): `kv_path` +
+  `compressor` ≈ 3.5–5.5 ms/layer. Row-splitting's ceiling on these layers is
+  essentially the whole attention block.
+- Note the two profilers measure different groupings: this `attention` stage
+  (182.8 ms on the even layer) spans the full attention consumption, while R1's
+  indexer-stage `attention` (39.4 ms on the same layer) covers only the
+  top-k-selected rows sub-stage.
+
 **Run 3b — cold single point (the honest number), 2026-08-25**
 
 | | flag off | flag on | Δ |
