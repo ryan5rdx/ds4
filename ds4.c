@@ -29076,6 +29076,13 @@ static bool metal_graph_encode_layer_attention_batch(
     const bool tp_attn_nonzero_prefix =
         !zero_prefix &&
         n_tokens <= g->raw_cap &&
+        /* Even chunks only.  tp_half_rows rounds up, so for odd n_tokens the
+         * peer's row-range view spans [tp_half_rows, 2*tp_half_rows) and its
+         * last row is index n_tokens -- one past the end.  Unreachable before,
+         * because only chunk 0 could split and chunk 0 is always full-size;
+         * A0 makes the final partial chunk splittable, so it becomes live.
+         * Skipping the split there costs at most one short chunk. */
+        (n_tokens % 2u) == 0u &&
         /* Only the two pos0 > 0 paths that carry no comp mask: the raw ubatch
          * path (ratio 0) and the indexed path (ratio 4 with more compressed
          * keys than top-k).  The static-mixed path consumes an n_keys x
