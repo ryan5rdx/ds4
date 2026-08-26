@@ -18641,9 +18641,18 @@ int ds4_gpu_indexer_topk_tensor(
         }
         /* Default (rollback env read per call): canonical (score desc,
          * idx asc) total order — tie order among equal scores is the only
-         * output change; prerequisite for the streaming top-k above. */
-        id<MTLComputePipelineState> sort_pipeline =
-            getenv("DS4_METAL_DISABLE_ARGSORT_CANON") == NULL
+         * output change; prerequisite for the streaming top-k above.
+         *
+         * Gated on the same n_tokens >= 32 as stream512, which is the only
+         * consumer that needs the total order.  Unlike the rest of the
+         * indexer stack this was originally ungated, so it also ran on short
+         * batches where it buys nothing and costs real throughput: measured
+         * on the M2 Ultra pair, disabling it recovered +5.6% prefill at ctx
+         * 2048 and +2.5% at 4096, and was neutral at 8192 where the tiled
+         * path takes over anyway. */
+        const bool use_canon_sort =
+            n_tokens >= 32u && getenv("DS4_METAL_DISABLE_ARGSORT_CANON") == NULL;
+        id<MTLComputePipelineState> sort_pipeline = use_canon_sort
                 ? ds4_gpu_get_pipeline("kernel_argsort_f32_i32_desc_canon")
                 : g_argsort_f32_i32_desc_pipeline;
         if (!sort_pipeline) return 0;
