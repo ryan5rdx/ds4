@@ -186,9 +186,10 @@ ranks, `DS4_TP_FORCE_DENSE_ATTN_OUT` unset, 2026-08-25):
   gain is mechanistic, not noise: A0 splits attention *consumption* (constant
   4.19e7 MACs/token/layer) but not indexer *scoring* (n_comp × 64 × 128, grows
   linearly; 2.68e8 MACs/token/layer at 131k, 6.4× larger). Confirmed by R1
-  below, and fixed by the indexer split (R5) and static-mixed split (R7):
-  cold 131k 259.90 → 380.27 (+46.4% total), sweep 221.50 → 342.25 (+54.4%),
-  **first TP sweep prefill above PP at 131k** with the decode lead intact.
+  below, and fixed by the indexer split (R5) and static-mixed split (R7),
+  then the FlashAttention simdgroup fix (R8): cold 131k 259.90 → 402.64
+  (+54.9% total), sweep 221.50 → 367.29 (+65.8%), **first TP sweep prefill
+  above PP at 131k** with the decode lead intact.
 
 **R5 — indexer split** (`DS4_TP_PREFILL_SPLIT_INDEXER=1` + A0, both ranks;
 `589e93e`, 2026-08-25)
@@ -315,6 +316,53 @@ static-mixed), **+46.4%** over the flag-off baseline; sweep +54.4% (221.50 →
 time**, while keeping the ~40% decode lead (28.28 vs 20.09). Both projections
 landed within model error; no CPU-mask undershoot observed, so R6's
 single-threaded mask-fill concern did not bite at this size.
+
+**R8 — FlashAttention simdgroup count** (`DS4_METAL_FA_NSG=4` + the three
+split flags, both ranks; `fa94db7`, 2026-08-25). First change that speeds the
+kernel itself instead of removing replicated work.
+
+R8a — inertness: R7-flag sweep on the new binary with the knob unset.
+Reproduces the R7 arm at every point (131k: 342.18 vs 342.25, 8k: 484.71 vs
+485.69, 4k: 411.25 vs 405.11). **Pass.**
+
+R8b — correctness (16384, DENSE both arms, greedy): **bit-identical** —
+0/129,280 logits differ, tokens identical, argmax 305 both (control 469.44 /
+candidate 481.12 t/s dense). As the standalone runs predicted: partitioning is
+accumulation-neutral. **Pass.**
+
+R8c — throughput, all four flags, vs the R7 arm (projection recorded before
+the run: sweep 131k ~375–395, cold ~415–440):
+
+| ctx | R7 arm (NSG=8) | NSG=4 | Δ |
+|---|---|---|---|
+| 2048 | 389.99 | 423.03 | +8.5% |
+| 4096 | 411.25 | 417.54 | +1.5% |
+| 8192 | 484.71 | 500.16 | +3.2% |
+| 16384 | 467.50 | 480.79 | +2.8% |
+| 32768 | 443.12 | 461.20 | +4.1% |
+| 65536 | 400.90 | 427.08 | +6.5% |
+| **131072** | **342.18** | **367.29** | **+7.3%** (proj. ~375–395) |
+
+Cold single point: 380.27 → **402.64** (+5.9%; projection ~415–440). Gain is
+positive at every point and grows with context (1.5% @4k → 7.3% @131k), as
+the mechanism predicts, but the magnitude is about half the M1 Max standalone
+2.2× — the M1→M2 extrapolation was the flagged risk, and it is the part that
+came in soft. Decode untouched (28.18 steady).
+
+Full arc, cold 131k: 259.90 → 281.20 (A0) → 322.64 (+indexer) → 380.27
+(+static-mixed) → **402.64** (+NSG4) = **+54.9%**; sweep 221.50 → **367.29**
+= **+65.8%**.
+
+**Power/residency capture (this run, both nodes, powermetrics 5 s × 40):**
+lanfear 86–89% active residency, 54.5–58.1 W; mat 89–91%, 54.1–57.3 W.
+Residency has been flat (~89–91%) at **both 8k and 131k in every arm so far**,
+regardless of stage mix (R3: same flatness at 8k off/on; R7/R8: same at 131k).
+Since attention's share of layer time dropped substantially across R5–R8 while
+residency did not rise, the ceiling is consistent with a fixed per-iteration
+overhead (gates/boundaries), not with any single GPU stage. Recorded for the
+follow-up residency investigation. Suggested follow-up per the plan: if NSG=4
+stays, flip the `ds4_gpu_flash_attn_nonvec_nsg()` default and drop the env
+knob.
 
 **Run 3b — cold single point (the honest number), 2026-08-25**
 
