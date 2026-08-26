@@ -10287,6 +10287,14 @@ static int live_prefix_rewind_target(bool backend_can_rewind,
                                      int old_pos, int prompt_len, int common) {
     if (!backend_can_rewind || prompt_len <= 1 || old_pos <= 0) return -1;
     if (common <= 0) return -1;
+    /* Kill switch.  This path is default-on and it is the one that increases
+     * mirrored REWIND traffic under TP, so it needs to be removable without a
+     * rebuild when bisecting a control-plane fault. */
+    {
+        static int disabled = -1;
+        if (disabled < 0) disabled = getenv("DS4_DISABLE_LIVE_PREFIX_REWIND") != NULL;
+        if (disabled) return -1;
+    }
     /* The whole checkpoint already matches: the plain prefix-match path scores
      * that higher than any rewind. */
     if (common >= old_pos) return -1;
