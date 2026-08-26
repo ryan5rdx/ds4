@@ -4,6 +4,117 @@ Branch: `upstream-metal-wins`
 Rig: 2× M2 Ultra 60-core 128GB, tensor-parallel over Thunderbolt RDMA
 Model: DeepSeek V4 Flash MXFP4, 145.26 GiB (76.73 GiB shard per rank)
 
+## Status (2026-08-25)
+
+This doc is the **request** side of a loop: results go into
+`BENCHMARKS-TP-PP.md`, asks go here.
+
+| run | state | outcome |
+|---|---|---|
+| 1 — inertness / baseline | done | 221.50 t/s @131k prefill, 28.06 decode. Indexer stack +20.8%, LLT decode +10.8% vs old base. Startup hang did not reproduce at `3746eae`. |
+| 2 — correctness | done | **Pass.** 128/128 tokens identical, 305/305 argmax identical, max Δlogit 0.049 vs a 0.0055 control-vs-control baseline (~2 f16 ULP). Criterion rewritten below. |
+| 3 — A0 throughput | done | +7.2% @131k (221.50 → 237.44), peaking +11.1% at 8k. Real, correct, decode untouched — but **not** the predicted ~1.5×. |
+| 3b — cold single point | in progress | |
+| 4 — gate + stage profile | **requested below** | |
+
+**Why Run 3 came in low, and it is not noise.** A0 splits the attention
+*consumption*, which `top_k` caps at a constant `(512 + 128) × 64 × 512 × 2`
+= 4.19e7 MACs/token/layer. It does **not** split the indexer *scoring*, which is
+`n_comp × 64 × 128` and grows linearly with context — 2.68e8 MACs/token/layer at
+131k, i.e. **6.4× larger**. The measured gain falls exactly as that ratio rises
+(8k: 0.4× → +11.1%; 131k: 6.4× → +7.2%), which is the mechanism, not scatter.
+
+Consequence: **A0 structurally cannot fix long-context degradation** — the term
+it splits does not grow with context. The term that does is still replicated on
+both ranks. Splitting the indexer is the actual fix, and unlike A0 it adds **no
+gate traffic**, because score/top-k are per-query-row: each rank scores its own
+rows, feeds its own top-k into its own attention rows, and the existing
+`attn_out` swap already recombines everything downstream.
+
+| | compute removed /token/layer | gates added | GPU idle |
+|---|---|---|---|
+| A0 (landed) | 4.19e7 MACs | +23/chunk (43 → 66) | worse (~90% util observed) |
+| indexer split (next) | 2.68e8 MACs | **0** | unchanged |
+
+## Open requests
+
+Ordered by value. R1 is the one that unblocks the next change.
+
+### R1 — indexer stage breakdown at 131k (highest value)
+
+Sizes the indexer split before it is built. Everything above is arithmetic; this
+is the measurement that replaces it.
+
+```
+DS4_METAL_FAST_SYNC=1 DS4_TP_PREFILL_SPLIT_NONZERO=1 \
+DS4_METAL_INDEXER_STAGE_PROFILE=1 \
+  ./ds4-bench ... --ctx-start 131072 --ctx-max 131072
+```
+
+Emits per layer per chunk:
+```
+ds4: metal indexer stage layer=<il> pos=<pos0> tokens=<n> comp=<n_comp> score=<ms> ms
+                                                                        topk=<ms> ms
+                                                                   attention=<ms> ms
+```
+
+Record the three stage times for **a few even layers ≥ 2** (they carry the
+indexer) at a late chunk, plus `comp=`. Paste a representative handful of lines
+rather than the whole log.
+
+**Caveat:** the boundary helper calls `ds4_gpu_end_commands()` /
+`ds4_gpu_begin_commands()` around each stage, so it forces a command-buffer
+split per stage. Throughput under this flag is **not** comparable to a clean
+run — only the relative score : topk : attention split is meaningful.
+
+What it decides: if `score` dominates `attention` by the predicted ~6×, the
+indexer split is the next change and its ceiling is roughly the `score` share.
+If it does not, the model above is wrong and I want to know before building.
+
+### R2 — gate profile, both arms
+
+Turns "~90% GPU util" into a number, and gives the bandwidth figure that decides
+whether the RDMA workstream is worth anything.
+
+```
+DS4_TP_GATE_PROFILE=1 ...  --ctx-start 131072 --ctx-max 131072
+```
+once with `DS4_TP_PREFILL_SPLIT_NONZERO=1`, once without.
+
+From the **BIG** line record, for each arm:
+
+| | A0 off | A0 on |
+|---|---|---|
+| `gates` (expect 43 → 66 per chunk) | | |
+| avg **gpu wait** µs — the pipeline bubble | | |
+| avg **exchange** µs | | |
+
+Effective per-direction bandwidth = `67,108,864 / avg_exchange_us`.
+
+The gpu-wait delta between arms is the true cost of A0's added gates, and is the
+number I got wrong by estimating wire time only.
+
+### R3 — GPU utilisation shape
+
+Was the ~90% seen with A0 **on**, **off**, or both? And is the idle flat across
+the sweep or growing with context? Flat implicates gate count; growing
+implicates something else. A rough `powermetrics --samplers gpu_power` reading
+at 8k and at 131k in each arm is enough.
+
+### R4 — short-context regression (cheap, low priority)
+
+Run 1 showed −2.2% prefill and −2.0% decode at 4096 vs the old base, above the
+~1% noise floor. Suspect is #832's canonical argsort comparator: unlike the rest
+of the indexer stack it is **not** token-count gated, so it applies where the
+sort is a large fraction.
+
+```
+DS4_METAL_DISABLE_ARGSORT_CANON=1     # 2048 and 4096 points only
+```
+
+If that recovers the 2%, it should be gated on `n_tokens >= 32` like its
+siblings and I will patch it.
+
 ## What is being measured
 
 Two independent changes landed on this branch. **They must be separated**, or the
