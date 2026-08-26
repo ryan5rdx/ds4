@@ -8535,6 +8535,7 @@ struct server {
     bool model_stopping;
     int decode_pending;
     int active_generations;
+    int prefill_quantum;
     int mixed_prefill_quantum;
     int last_prefill_slot;
     pthread_mutex_t mu;
@@ -10728,9 +10729,25 @@ static void server_prefill_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
+/* Tokens handed to the engine per ds4_session_sync() while batched mode owns
+ * the prompt.  This is NOT the engine's prefill chunk: the graph caps chunks at
+ * ds4_prefill_cap_for_prompt() (4096 on Flash), but batched mode rebuilds the
+ * prompt one quantum at a time, so whichever is smaller is what actually runs.
+ * At the 2048 default the engine chunk never binds, and a 131k prompt takes 64
+ * chunk passes instead of 32 -- which doubles the per-layer TP big-gate count,
+ * the dominant fixed overhead measured in the R2 gate profile.  Raising this to
+ * the engine chunk trades scheduler responsiveness for that.  Non-batched mode
+ * does not come through here at all; it hands the whole prompt to the engine.
+ *
+ * The mixed value is deliberately much smaller: while a generation is active
+ * this bounds how long a prefill can stall decode on the shared executor. */
+#define DS4_SERVER_DEFAULT_PREFILL_QUANTUM 2048
+
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    return generation_active ? s->mixed_prefill_quantum : 2048;
+    const int idle = s->prefill_quantum > 0 ? s->prefill_quantum :
+                     DS4_SERVER_DEFAULT_PREFILL_QUANTUM;
+    return generation_active ? s->mixed_prefill_quantum : idle;
 }
 
 static int server_prefill_quantum(server *s) {
@@ -13481,6 +13498,7 @@ typedef struct {
     bool enable_cors;
     int batched_sessions;
     int resident_sessions;
+    int prefill_quantum;
     int mixed_prefill_quantum;
 } server_config;
 
@@ -13633,6 +13651,7 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .prefill_quantum = DS4_SERVER_DEFAULT_PREFILL_QUANTUM,
         .mixed_prefill_quantum = 128,
     };
     c.kv_cache = kv_cache_default_options();
@@ -13726,6 +13745,13 @@ static server_config parse_options(int argc, char **argv) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--resident-sessions")) {
             c.resident_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--prefill-quantum")) {
+            c.prefill_quantum = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.prefill_quantum <= 0) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --prefill-quantum must be positive");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
@@ -14021,6 +14047,7 @@ int main(int argc, char **argv) {
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
+    s.prefill_quantum = cfg.prefill_quantum;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
@@ -14264,6 +14291,27 @@ static void test_batched_prefill_round_robin(void) {
     slots[0].prefill_waiting = false;
     slots[2].prefill_waiting = false;
     TEST_ASSERT(server_next_prefill_slot_locked(&s) == -1);
+}
+
+static void test_prefill_quantum_option(void) {
+    char *default_argv[] = {"ds4-server"};
+    server_config defaults = parse_options(1, default_argv);
+    TEST_ASSERT(defaults.prefill_quantum == DS4_SERVER_DEFAULT_PREFILL_QUANTUM);
+
+    char *custom_argv[] = {"ds4-server", "--prefill-quantum", "4096"};
+    server_config custom = parse_options(3, custom_argv);
+    TEST_ASSERT(custom.prefill_quantum == 4096);
+
+    server s = { .prefill_quantum = custom.prefill_quantum,
+                 .mixed_prefill_quantum = 128 };
+    /* idle uses the new knob; an active generation still uses the mixed one */
+    TEST_ASSERT(server_prefill_quantum_for(&s, false) == 4096);
+    TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+
+    /* unset falls back to the historical literal rather than 0 */
+    server zero = { .prefill_quantum = 0, .mixed_prefill_quantum = 128 };
+    TEST_ASSERT(server_prefill_quantum_for(&zero, false) ==
+                DS4_SERVER_DEFAULT_PREFILL_QUANTUM);
 }
 
 static void test_mixed_prefill_quantum_option(void) {
@@ -19214,6 +19262,7 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
+    test_prefill_quantum_option();
     test_mixed_prefill_quantum_option();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
