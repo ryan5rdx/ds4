@@ -166,7 +166,26 @@ equality does not hold for the unsplit path.
   control-vs-control baseline (baseline 0.0055 vs split 0.049, ~9× — same ULP
   class). Throughput (Run 3) gated on this: proceed.
 
-- A0 throughput (Run 3) sweep: not yet recorded here.
+A0 throughput (Run 3, full sweep, `DS4_TP_PREFILL_SPLIT_NONZERO=1` on both
+ranks, `DS4_TP_FORCE_DENSE_ATTN_OUT` unset, 2026-08-25):
+
+| ctx | Run 1 (off) | Run 3 (on) | Δ |
+|-----|-------------|------------|----|
+| 2048 | 378.94 | 384.72 | +1.5% |
+| 4096 | 346.12 | 353.77 | +2.2% |
+| 8192 | 379.73 | 422.05 | +11.1% |
+| 16384 | 357.48 | 385.54 | +7.9% |
+| 32768 | 328.48 | 363.75 | +10.7% |
+| 65536 | 282.83 | 309.28 | +9.3% |
+| 131072 | 221.50 | 237.44 | +7.2% |
+
+- Gain is real but **not the predicted shape**: expected ~0% at 2048 rising to
+  ~1.5× at 131072; observed a mid-context peak (~+11% at 8k/32k) falling back
+  to +7.2% at 131k. 2048 is ~0% as constructed. Decode untouched.
+- 131072 target was ~1.5× (≈332 t/s); measured 237.4 (+7.2%). Cold single-point
+  (Run 3b) and gate profile (Run 4) pending; the long-context bottleneck is
+  likely not the replicated attention row work A0 removes (indexer replication
+  and/or big-gate bandwidth are the suspects).
 
 ### TP — `tp-multi-slot-batching` (old base, superseded)
 
