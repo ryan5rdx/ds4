@@ -392,6 +392,57 @@ covered, but the HC contribution shrank and the two largest items (`routed_moe`
 4.72 and `attn_inv_rope` 3.63, together 34% of the token) remain without a
 proposal.
 
+### Repack-on-load — makes M3 and §7C the same mechanism, and kills the objection that buried §7C — 2026-08-27
+
+**Both M3 and §7C are pure byte reorganisations of data we already have.**
+Neither changes a value: MXFP4 dequant is `d = e8m0_to_f32(e)` times a 16-entry
+table of exact E2M1 values, so a planar split of `{uchar e; uchar qs[16]}` into
+an aligned payload plane and a scale plane is bit-identical by construction, and
+§7C's intra-expert split is just a different ordering of the same expert bytes.
+
+**So do it in the engine at load, not offline.** The rank already knows at load
+time whether it is in TP mode and which shard it owns. Making the layout a
+runtime property removes, at a stroke, the two things that got §7C struck:
+
+- ~~"costs a conversion tool"~~ — no tool.
+- ~~"a TP-layout-specific model file"~~ — no second artefact, no format
+  versioning, no "which GGUF is this" problem.
+
+**And it makes §7B's blocker disappear too.** §7B was rejected as *"~22k spans —
+blocked"*, because a rank's half of each expert is not contiguous in the mapped
+file and `ffn_down_exps` splits on the inner dim. That is an *addressing*
+problem, and it only exists while you are reading in place. **If the rank builds
+its own contiguous copy — read scattered, write contiguous, once at load — there
+are no spans.** Each rank writes only its own slice, so its destination is
+*half* the routed weights.
+
+**Sizing, from the verified byte model** (`13.37 MB`/expert, matching the T8
+bench exactly): 128 owned experts × 43 layers = **73.6 GB/rank** of routed MoE;
+147.2 GB across both.
+
+| cost | assessment |
+|---|---|
+| **Load time** | 73.6 GB read+write per rank. At a realistic 5–10 GB/s effective that is **~7–15 s** added to startup. Today the loader is mmap-lazy and copies nothing. |
+| **Peak memory** | The destination is ~73.6 GB (half that for the §7C variant). Source pages are clean and file-backed, so `MADV_DONTNEED` as the stream advances keeps steady-state RSS roughly unchanged — **but only if it is written as a stream, not "allocate both, then copy."** |
+| **Wired limit** | 120 GB configured; destination + non-MoE + KV needs checking before committing. |
+| **SSD streaming** | **Incompatible as stated.** `ssd_streaming` pages experts on demand; you cannot pre-repack what is loaded lazily. Either exclude that mode or repack per streamed chunk. |
+| **Existing hook** | None. Weights are strictly mmap-in-place (`newBufferWithBytesNoCopy` over the GGUF); `ds4_layer_pack.c` is layer-to-device placement, unrelated. This is a new loader path. |
+
+**Two independent gates, one shared mechanism.** This makes both items *cheaper
+to try* — it does not make either more likely to pay:
+
+- **M3 is gated on M2.** M1 already falsified the load-shape half of the dequant
+  premise (byte-identical, 734.2 vs 729.2 ms, nothing). **M2 — the byte-indexed
+  `float2` LUT, ~30 lines and no loader work — is the remaining cheap test.** If
+  it is also null there is nothing for a repack to fix, and the loader work
+  would be wasted.
+- **§7C is gated on the per-slot gate profiler** (next run, arm 1), which prices
+  the straggler directly. Its value is load balance and is **independent of M3's
+  premise** — so §7C can survive M2 killing M3, and vice versa.
+
+**Order: run M2 and arm 1 first. Build the loader only for whichever survives.**
+Both surviving is what makes the shared mechanism worth its ~7–15 s of startup.
+
 ### MoE / attention scoping — two different problems, and a correction to T8 — 2026-08-27
 
 Full report: `docs/SCOPE-MOE-ATTN.md`.
