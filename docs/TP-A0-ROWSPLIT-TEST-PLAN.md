@@ -1035,39 +1035,69 @@ right; it is a work-per-threadgroup problem.
 Together they are 9.7 ms, and nobody has priced their achieved bandwidth. Fold
 that into U7's sweep if it is cheap.
 
-#### U7 — batch rows per threadgroup in the indexer score kernel — **the top item**
+#### U7 — the indexer is compute-bound, not bandwidth-bound — **rewritten 2026-08-27, my first version was wrong**
 
-**Prize.** `compressor_indexer` is 10.51 ms of a 36.36 ms token and runs at
-~5% of achievable. Reaching even 40% takes it to ~1.3 ms — **~9 ms, or 25% of
-the token.** Nothing else here is within an order of magnitude.
+**Retracting the premise.** I wrote U7 as "one threadgroup per compressed row —
+batch rows to fix it," taking U2's kernel-config note at face value. Both are
+wrong, and I should have read the dispatch before writing a request on it.
 
-**The change.** Give each threadgroup many compressed rows instead of one:
-hold the query tile in registers/threadgroup memory and stream rows through
-it, amortising both the query load and the reduction across the batch. That
-converts a 512 B load plus a tree reduction into a long run of independent
-coalesced loads — which is exactly what the streaming probe does to reach 760.
+- The decode path is **not** the per-row kernel. `n_head == 64 && head_dim ==
+  128` (`ds4_metal.m:18214`) selects `kernel_dsv4_indexer_scores_llt`
+  (`<NBPTG=8, T_NSG=8>`), dispatching `(n_comp + 63)/64` threadgroups of 256
+  threads — **64 keys per threadgroup**, not one. `DS4_N_INDEXER_HEAD` is a
+  model constant and is **not** TP-split, so both ranks take this path.
+  `kernel_dsv4_indexer_score_one_direct` is the fallback, which U2 appears to
+  have described instead; its "(32,4)" is a threadgroup shape, not a head count.
+- **The row batching I was going to propose is already there.** The kernel
+  stages Q in 8-head tiles and keeps each K row resident across all 64 heads.
 
-**Sweep in `tests/bench_indexer_score` first** — model-free, and it reproduces
-the production stage cost within ~2×. Arms: rows-per-threadgroup {1 (control),
-4, 8, 16, 32} × threadgroup width {128 (control), 256}. Report GPU-busy, GB/s
-and GFLOP/s **against 760, not 400**. Take the best two arms to the rig.
+**And comparing it to a 760 GB/s streaming roof was the wrong roof.** With K
+reused across 64 heads the kernel does 64 × 128 × 2 = 16,384 FLOP per 512-byte
+key — **32 FLOP/byte by construction.** The harness's own two columns confirm
+the reuse is real, at every size:
 
-**Correctness.** Changing the reduction shape changes FP32 association, so this
-is not bit-exact. Hold it to the T2 bar: measurable win, top-1 preserved,
-bounded Δlogit. U2 established the harness's 7.6e-3 disagreement with its CPU
-reference is expected tree-vs-sequential tolerance, so compare **GPU output
-against GPU output** between arms via `BENCH_DUMP`, per that harness's header.
+| n_comp | GFLOP/s | GB/s | ratio |
+|---|---|---|---|
+| 16384 | 731 | 22.9 | **31.9** |
+| 32768 | 1015 | 31.7 | **32.0** |
+| 65536 | 1271 | 39.7 | **32.0** |
 
-**Watch the harness's own warning.** `bench_indexer_score.c`'s header records
-that collapsing per-head barriers measured 6.8× there and delivered +2.7% on
-the real pair. A standalone harness exaggerates latency-bound fixes because
-nothing else is running to hide the stalls. **Treat any sweep number here as an
-upper bound and confirm on the rig before productionising.**
+A kernel at 32 FLOP/byte should never approach streaming bandwidth; 40 GB/s is
+what 1271 GFLOP/s *looks* like here, not an independent symptom. **The
+indexer's "~5% of roof" was an artefact of measuring an arithmetic-dense kernel
+against a bandwidth roof.**
 
-**This supersedes U4 — do not write U4 until U7 lands.** U4 splits a 10.5 ms
-stage across ranks to save ~5 ms. If U7 takes the stage to ~1.3 ms, U4's prize
-falls to ~0.65 ms and stops covering its exchange latency and tie-breaking
-risk. Fix the kernel, re-measure, then decide.
+**The real question, and it is still a big one.** Against FLOPs the kernel runs
+at **1271 GFLOP/s of roughly 21 TFLOP/s FP32 (60-core M2 Ultra) — about 6%.**
+The stage is still 10.51 ms and still the largest; only the diagnosis changes,
+from "make it stream" to "find out why the ALUs are idle." Candidates worth
+pricing, in order:
+
+1. **The f32→half staging.** The kernel comment says "f32 rows staged to half"
+   before the 8×8 simdgroup steps. The compressed cache is F32 on disk *and* in
+   memory (`ds4.c:17373`), so every key is converted on the fly, every layer,
+   every token. **Storing it as F16 would remove the conversion entirely** —
+   note this is T9/U3, which was killed on bandwidth grounds that no longer
+   apply. **U3 should be reconsidered for a completely different reason than it
+   was proposed.**
+2. **Occupancy.** 256 threads and `sharedf` threadgroup memory per threadgroup;
+   report threadgroups-in-flight per core and whether shared memory or
+   registers are the limiter.
+3. **The simdgroup step over depth 128** in 8×8 tiles — 16 sequential matrix
+   steps per key tile, each dependent on the last.
+
+**What to actually run.** There is no rows-per-threadgroup knob to sweep, and
+adding one would be pointless. The only existing variants are
+`kernel_dsv4_indexer_scores_llt16` / `llt32` (`NBPTG` = 16/32), which vary the
+**token** axis and are therefore **inert at decode** (`n_tokens = 1`), and
+`llt_nsg4` (`T_NSG=4`), already measured as a wash. A real sweep needs **new
+template instantiations varying `T_NSG`** — `<8,2>` and `<8,16>` — which is a
+two-line change in `metal/dsv4_misc.metal` plus pipeline names. That is the
+first cheap experiment; the F16 staging is the first substantive one.
+
+**Sequencing unchanged in one respect:** this still supersedes U4. A 10.51 ms
+stage split across ranks saves ~5 ms, but fixing 6% ALU utilisation is worth
+more and makes the split worth proportionally less. Fix the kernel first.
 
 #### U8 — diagnose the MoE matvec's 54% — re-opened by U6
 
