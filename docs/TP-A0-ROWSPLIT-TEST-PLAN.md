@@ -797,11 +797,42 @@ fixing it pays twice.
 
 ### Restructuring options, ranked by leverage
 
-1. **Enable the concurrent encoder for decode under TP2.** The code exists and
-   ships. Independent dispatches within a layer — the compressor projection does
-   not depend on the q path — could overlap instead of serializing. Blocked
-   today only by an unrelated fusion's `tp_world < 2` guard. **Cheapest
-   structural change with the largest reach; start here.**
+1. **Concurrent encoder — I mis-sized this, twice over. Corrected 2026-08-27.**
+
+   I called it "blocked only by an unrelated fusion's `tp_world < 2` guard" and
+   "the cheapest structural change". Both wrong.
+
+   **It is deliberate, and the code says so.** `parallel_ffn_route_eligible`
+   carries `g->tp_world < 2` *itself* (`ds4.c:~22180`), not via some other
+   fusion, and the comment directly above it reads: *"A concurrent compute
+   encoder removes all of the generic routed-MoE function's implicit dispatch
+   ordering. **Keep admission deliberately narrower than the normal decode
+   path**: fixed resident IQ2 pair-SwiGLU, direct Q2 top-6 sum, no
+   readback/profiling/TP detours."* It also excludes SSD streaming, every
+   `cuda_tp_*` mode, profiling, directional steering and debug prefixes.
+
+   **The reason is sound.** Under `MTLDispatchTypeConcurrent` dispatches may
+   overlap unless separated by an explicit barrier, and the decode graph relies
+   on the serial encoder for *implicit* ordering throughout. Enabling it broadly
+   means converting ~24 dispatches per layer from implicit to explicit
+   dependency ordering. Miss one and the result is silent corruption — the same
+   failure mode as the C2 regression, which shipped a wrong-output kernel that
+   looked like a 1.7% win because a throughput sweep cannot see garbage.
+
+   **And the prize is smaller than I implied, and lands at the wrong end.**
+   Overlap is bounded by the *smaller* of the two independent branches. The q
+   path (`q_a_kv_proj` + `q_lora_norm` + `q_path` = 5.17 ms) and the
+   compressor/kv path both start from `attn_norm`, so they are genuinely
+   independent — but the compressor branch is ~0.5 ms at 2k and ~9.7 ms at 131k:
+
+   | | bound on the saving |
+   |---|---|
+   | 2k | **~0.5 ms (2.1%)** — there is almost nothing to overlap with |
+   | 131k | ~5.2 ms (15.1%) |
+
+   **So it does not serve the 50 t/s short-context goal at all** — at 2k the
+   compressor branch is nearly empty. It is a long-context lever, and an
+   expensive, corruption-prone one. **Demoted from first to last.**
 2. **Collapse a layer's ~24 dispatches toward 1–3.** The precedent is in-tree:
    `kernel_dsv4_comp_row_finalize_f32` already folds seven tiny per-layer
    dispatches into one, bit-exactly. Every additional fusion removes an exposed
