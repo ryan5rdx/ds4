@@ -189,7 +189,12 @@ two are minutes and one of them can invalidate three completed runs.
 | 5 | ~~R12a~~ split-schedule sweep + **R12b** reduced ballast arm + **encoder-boundary instrument** — **R12b and encoder-boundary MOOT** (probe stall; stage profile shows no stall). R12a split-schedule still valid if wanted. | ~1.5 h | R12b is now a confirmation, not a discovery; the encoder-boundary half is the genuinely unmeasured one. |
 | 6 | **R13 n-gram rig arms** (inertness / correctness / decode A/B on repetitive vs novel text) | ~1 h | Independent of the above; run whenever convenient. |
 | 7 | ~~T1~~ — **done 2026-08-26: dead.** `DS4_TP_GATE_FASTPATH` is a wash (±0.6% decode, no gate-exchange change) and is **not bit-identical** (logits shift up to 2.3, top-1 preserved). Stay default-off. ~~T8 port~~ — dead, see row 3. | — | Both are code, both are gated on a measurement above. |
-| 8 | Cleanup batch: T6, T9, T10, T13 | — | Small, low-risk, individually sub-1%. |
+| 8 | Cleanup batch: T6, T10, T13 (**T9 removed — promoted to U3**) | — | Small, low-risk, individually sub-1%. |
+| **9** | **U1 — streaming-read ceiling on the rig**, one rank, no TP | ~15 min | **Run first.** Decides whether ~400 GB/s is the platform or our kernels, and therefore how to read every number below. Also re-scores T8. |
+| **10** | **U2 — indexer-score roofline + working-set sweep** | ~30 min | The largest stage sits at ~4% of *both* roofs. Says whether it is addressable by configuration or needs a restructure — **and U3's prize depends on the answer.** |
+| **11** | **U3 — T9 re-sized: indexer cache F32→F16** | ~1 h | 352 MB/token at 131k, halved. Was filed sub-1% at "0.2–0.4 ms"; the stage is 10.5 ms. **Gated on U2.** |
+| **12** | **U4 — TP row-split the decode indexer** | ~3 h | The biggest stage is computed *twice* today, once per rank. ~5 ms of 36 ms. Largest single item in this document. |
+| **13** | **U5 — R13 n-gram arms, re-prioritised** | ~1 h | Raises arithmetic intensity without requiring any kernel to get faster — the structural answer to a latency-bound decode. |
 
 Steps 0–3 are about four hours of rig time and settle whether the last three
 campaigns are valid, whether the largest sized item is real, and whether the
@@ -728,6 +733,160 @@ between them, and the floor is ~13 ms. Order:
    cannot be the 13 ms.
 3. **T2 follow-up** (28/31) — see below. Cheap, but a loose end, not a lever.
    Still the only remaining queued measurement.
+
+### U-series — requests — 2026-08-27
+
+Five items from the throughput reopening. **U1 first**: it decides how to read
+the other four, and it is fifteen minutes.
+
+#### U1 — is ~400 GB/s the platform or our kernels? — **run first**
+
+**Where:** the rig (M2 Ultra, 800 GB/s spec). **Not** the M1 Max — its peak
+*is* 400 GB/s, so it cannot discriminate. One rank, no TP, no model, matching
+T8's conditions exactly.
+
+**Method.** Push the working set well past any cache with the existing
+model-free harness and watch whether achieved bandwidth ever exceeds 400 GB/s:
+
+```
+tests/bench_moe_mxfp4_decode 256 256 6     # T8's original point, the ~400 GB/s reading
+tests/bench_moe_mxfp4_decode 512 512 6
+tests/bench_moe_mxfp4_decode 512 512 12    # more distinct experts streamed per iter
+tests/bench_moe_mxfp4_decode 1024 1024 12
+```
+Report MB/iter and GB/s for each. Three runs per arm; these are small and
+noisy.
+
+**Decision.**
+- **Any arm > ~450 GB/s** → 400 was a working-set or kernel artifact, the
+  "near the M2 Ultra ceiling" claim at `BENCHMARKS-TP-PP.md:226` is retracted,
+  and matvec tuning re-opens across the board (including, separately from its
+  dead specialisation ladder, the MoE stage at 5.4 ms).
+- **Nothing exceeds ~410 GB/s at any size** → we are pinned at exactly one
+  M2 Max die's worth of bandwidth. That points at placement/interleave across
+  UltraFusion rather than at any kernel, which would be a **platform-wide ~2×**
+  and by far the largest thing in this document. Escalate; do not tune kernels
+  until it is understood.
+
+**Note for the benchmark doc:** `BENCHMARKS-TP-PP.md:226` currently reads
+"bandwidth-bound at ~400 GB/s — near the M2 Ultra ceiling". The Ultra ceiling
+is 800; 400 is one M2 Max die. That sentence should be corrected whatever U1
+returns, because T8's "specializations cannot buy what is not there" rests on
+it.
+
+#### U2 — indexer-score roofline and working-set sweep — **gates U3**
+
+**Where:** model-free, so the dev box works, but **also run it on the rig** —
+the ratio between the two is itself informative and the 0.63 transfer factor
+applies to any projection from the M1 Max.
+
+**Baseline already taken (M1 Max, 2026-08-27):** `bench_indexer_score 32768`
+gives 460 GFLOP/s (**4.4%** of ~10.4 TFLOP/s) and 14.4 GB/s of K-cache traffic
+(**3.6%** of 400 GB/s), GPU-busy 1.01 ms/dispatch → 21.2 ms across 21 layers,
+about 2× the rig's measured 10.5 ms. Three kernel arms
+(`DS4_METAL_DISABLE_INDEXER_LLT=1`, `DS4_METAL_INDEXER_LLT_NSG4=1`, default)
+landed within 0.7% of each other.
+
+**Method.** Sweep the working set and watch how time scales:
+
+```
+for n in 4096 8192 16384 32768 65536 ; do
+    DS4_METAL_GPU_BUSY_PROFILE=1 tests/bench_indexer_score $n 300
+done
+```
+
+**Decision — this is the fork that matters.**
+- **GPU-busy roughly linear in `n_comp`, GB/s flat and low** → genuinely
+  latency-bound per byte, and **U3 will not pay**: halving the bytes of a
+  kernel that is at 4% of bandwidth buys little time. Go instead to a
+  restructure (below).
+- **GPU-busy sublinear / GB/s rising with `n_comp`** → the small-working-set
+  arms are overhead-dominated and the kernel does stream at larger sizes.
+  **U3 then pays roughly its byte reduction**, and is the cheap win.
+- **Flat GPU-busy across sizes** → fixed per-dispatch cost dominates and the
+  answer is neither U3 nor a restructure but batching layers per dispatch.
+
+**The restructure to price if the first branch holds.** 64 heads score against
+one K-cache: **16.78 MB/dispatch with perfect reuse, 1.07 GB without.** The
+distance between those is the whole optimisation. Report, for the current
+kernel, threadgroup count, threads/threadgroup and per-thread row count so we
+can see how far it is from the ~2,060-threadgroup configuration ds4 uses for a
+comparable Q4_K shape (`ds4_metal.m:19628`).
+
+**Also resolve, while here:** the harness fails its own correctness gate —
+`8459/32768 bit-exact, 24127 within 1e-5, worst rel 7.567e-03`, over its 1e-3
+threshold, printing "kernel looks wrong". Probably benign for a ranking use,
+but it must not stay unexplained on the stage we are about to spend three days
+optimising. Say whether it is an expected FP32-vs-reference tolerance or a
+real defect.
+
+#### U3 — T9 re-sized: indexer compressed cache F32 → F16 — **gated on U2**
+
+**Why it moved tier.** The cache is allocated F32 at `ds4.c:17373`
+(`layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float)`): at 131k that
+is 32768 × 128 × 4 B = **16.78 MB/layer**, **352 MB/token** across the 21
+ratio-4 layers. T9 halves it. The plan filed this at "~0.2–0.4 ms" in the
+sub-1% bucket — a figure written before the stage profile priced the stage at
+**10.5 ms**.
+
+**Do not start until U2 reports.** If the kernel is latency-bound rather than
+bandwidth-bound, halving the bytes does not halve the time, and the honest
+prize could be near zero. U2 is thirty minutes and decides whether this is a
+~2–4 ms item or a null.
+
+**Correctness.** The e2m1 losslessness argument in the original T9 note still
+needs stating explicitly against the *decode* path, not just prefill. Gate on
+top-1 preserved plus bounded Δlogit, per the T2 bar. Memory: ~176 MB freed.
+
+#### U4 — TP row-split the decode indexer — the largest single item here
+
+**The finding.** `metal_graph_tp_split_indexer()` is gated on
+`DS4_TP_PREFILL_SPLIT_INDEXER` and is **prefill-only** (`ds4.c:29056-29062`).
+The decode call site passes the full `g->layer_n_index_comp[il]` with **no rank
+and no world argument** (`ds4.c:23241`). Both ranks therefore compute the
+identical full indexer score every decode token, on the single largest stage in
+the profile (10.5 ms at 131k).
+
+**Design.** Split the compressed-row range by rank; each rank scores its half
+and takes a **local top-k**; exchange the two candidate lists; merge to the
+global top-k.
+
+- **Exactness:** top-k of the union of two local top-ks *is* the global top-k,
+  provided each side contributes k candidates. This is exact, not approximate.
+- **Tie-breaking is the one correctness risk.** Equal scores must break
+  deterministically and identically on both ranks — break by global row index,
+  not by local position, or the two ranks can select different key sets and
+  diverge. Call this out in the implementation and test it directly with a
+  synthetic tied-score case.
+- **Wire cost is negligible:** k = 512 candidates × (score + index) = ~4 KB per
+  layer, ~86 KB/token across 21 layers, ~20 µs at the measured 4.4 GB/s link
+  ceiling — against a ~5 ms saving.
+- **Latency is the real cost, not bytes.** 21 additional exchanges per token at
+  ~25 µs each is ~0.5 ms if they serialise. **Ride the existing per-layer gate
+  exchange rather than adding a new one**; if that is not possible, report the
+  serialised cost so the net is honest.
+
+**Prize:** ~5 ms of a 36 ms token, ~14%. Report t/s at 2k/32k/131k against the
+M0 baseline, top-1 preservation over ≥7 steps, and the measured exchange cost
+separately from the stage saving.
+
+**Prerequisite:** U1, so we know whether the halved per-rank work actually
+converts to time or just moves us along a flat part of the curve.
+
+#### U5 — n-gram speculation on the rig (R13 arms, re-prioritised)
+
+Unchanged in content from R13, promoted in priority. `DS4_NGRAM_SPEC` is
+implemented and has **never run on the rig**. It is the one queued item that
+raises arithmetic intensity without requiring any kernel to get faster: verify
+steps run `n_tokens > 1`, turning decode matvecs into small matmuls, which is
+the textbook response to a latency-bound decode.
+
+Run the existing R13 arms (inertness, correctness, decode A/B on repetitive vs
+novel text, using `speed-bench/promessi_sposi.txt`). **Report acceptance rate
+alongside t/s** — the t/s delta is meaningless without it. Note the known
+interaction: with speculation on, `decode_splits = 1` (`ds4_metal.m:30001`), so
+**T2 is inert on verify steps** and the two must not be productionised
+independently without re-checking the combination.
 
 ### Correction — "99% busy" is a time measurement, not a throughput one — 2026-08-27
 
