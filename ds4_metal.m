@@ -1139,14 +1139,29 @@ static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
     const double spt = (cb_s > 0.0) ? cb_s / (double)(hi - lo) : 1e-9;
     const double cal = (cb_s > 0.0) ? (spt / 1e-9) : 1.0;
 
+    /* Spans overlap -- confirmed ~197% on the rig once the slot-reuse bug was
+     * fixed, i.e. the GPU pipelines each encoder against roughly one neighbour.
+     * A raw span is therefore an UPPER BOUND, and the raw column summing to ~2x
+     * the wall clock is useless as a budget.  Normalising by cb/sum distributes
+     * the overlap proportionally and yields a column that sums to the command
+     * buffer, which is what a per-stage budget needs.  It assumes overlap is
+     * uniform across encoders; where it is not, the error is redistributed
+     * rather than removed.  Both columns are printed so the assumption stays
+     * visible. */
     double total_us = 0.0;
+    for (uint32_t i = 0; i < g_ts_n; i++) {
+        const uint64_t a = t[i * 2].timestamp, b = t[i * 2 + 1].timestamp;
+        if (b > a) total_us += (double)(b - a) * spt * 1e6;
+    }
+    const double cb_us_pre = (cb_s > 0.0) ? cb_s * 1e6 : 0.0;
+    const double norm = (total_us > 0.0 && cb_us_pre > 0.0) ? cb_us_pre / total_us : 1.0;
     for (uint32_t i = 0; i < g_ts_n; i++) {
         const uint64_t a = t[i * 2].timestamp, b = t[i * 2 + 1].timestamp;
         if (b <= a) continue;
         const double us = (double)(b - a) * spt * 1e6;
-        total_us += us;
-        fprintf(stderr, "ds4: enc-ts %-28s %8.1f us\n",
-                g_ts_labels[i] ? g_ts_labels[i] : "(unlabelled)", us);
+        fprintf(stderr, "ds4: enc-ts %-28s raw %8.1f us   norm %8.1f us  %5.1f%%\n",
+                g_ts_labels[i] ? g_ts_labels[i] : "(unlabelled)", us, us * norm,
+                cb_us_pre > 0.0 ? us * norm / cb_us_pre * 100.0 : 0.0);
     }
     const double cb_us = cb_s * 1e6;
     fprintf(stderr,

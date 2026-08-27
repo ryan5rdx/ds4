@@ -1153,6 +1153,45 @@ fixing it pays twice.
 They are not wrong, but they are not the path to 50 t/s. Item 1 is a day's work
 against a defect worth several milliseconds, and item 3 costs nothing but a run.
 
+### Falsifier resolved: slot reuse it was — and the confirmed overlap is the bigger finding — 2026-08-27
+
+On the fixed build the inferred tick **pins at exactly 1.000 ns at 2k**, against
+0.632–0.642 before. The pre-registered falsifier said a tick that stopped
+varying with context meant slot reuse, and it did. **The counter is 1.0 ns on
+both parts; the sub-nanosecond readings were corruption.**
+
+**Coverage stays at ~197%, and for the first time that number means something.**
+With the corruption gone it is a genuine measurement: **the encoder spans really
+do overlap about 2×.**
+
+**That is worth more than the calibration fix, because it explains three
+standing nulls at once.** 175 encoders in a 23.8 ms token would average 136 µs
+if they did not overlap; measured they average 268 µs, so each span extends
+~132 µs past its own work — about one neighbour. A fixed per-encoder offset
+would have to be 132 µs to explain that, which is not plausible; a pipelining
+depth of ~2 is. **The GPU already overlaps adjacent encoders.** Therefore:
+
+| null | why it was a null |
+|---|---|
+| R12a split schedule, flat within 0.9% | boundaries already overlap, so moving them changes nothing |
+| ballast marginal dispatch, 3.74 µs | an added dispatch hides inside the pipeline |
+| dispatch-count reduction, dead | the count was never the constraint |
+
+Three independent results, one mechanism. **Stop treating the decode graph as
+"1021 strictly serialised dispatches" — it is not, and I asserted that for most
+of today.** What survives is that the *work* is latency-bound within each
+kernel; what does not is that the *scheduling* is the problem.
+
+**Instrument change: a normalised column.** Raw spans sum to ~2× the wall clock
+and are useless as a budget, so the report now prints raw, normalised
+(`× cb/sum`) and share-of-cb side by side. The normalised column sums to the
+command buffer, which is what a per-stage budget needs. It assumes overlap is
+uniform across encoders — where it is not, the error is redistributed rather
+than removed — and both columns are printed so that assumption stays visible.
+
+**Arm B is now usable.** Re-run on a build ≥ this commit and take the
+**normalised** column as the budget; treat raw as an upper bound.
+
 ### Arm B re-run — one bug, not two, and the data says which — 2026-08-27
 
 The calibrated re-run reported **tick 0.632–0.642 ns and coverage ~198%
