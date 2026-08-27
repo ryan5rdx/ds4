@@ -23854,6 +23854,10 @@ static bool metal_graph_encode_decode_layer_phase(
          * bit-exact. */
         const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN;
         ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_ATTN) != 0;
+        /* Mirrors the ffn_tp_gate marker.  The ATTN gate carries no routed
+         * straggler, so pricing the two separately isolates the imbalance from
+         * the fabric latency that both pay. */
+        DS4_METAL_PROFILE_DECODE_STAGE("attn_tp_gate");
         if (ok) {
             ds4_gpu_tensor *first = g->tp_rank == 0 ? g->tp_out[slot] : g->tp_in[slot];
             if (metal_graph_directional_steering_attn_enabled(g)) {

@@ -9992,6 +9992,15 @@ enum {
     DS4_TP_STAT_KIND_COUNT = 3,
 };
 static uint64_t g_tp_stat_kind_gates[DS4_TP_STAT_KIND_COUNT];
+/* Per-gate-slot split (ATTN vs FFN).  The two gates exchange the same payload
+ * over the same fabric, but only the FFN gate sits behind the routed-expert
+ * shard, so it alone absorbs the straggler.  With every other term identical,
+ * exchange_FFN - exchange_ATTN is the straggler's per-layer cost directly --
+ * no cross-epoch subtraction, and it bounds U14 and the section 7 designs.
+ * If the two measure equal, the imbalance is zero and all of them are dead. */
+static uint64_t g_tp_stat_slot_gates[2];
+static double   g_tp_stat_slot_gpu_wait_ms[2];
+static double   g_tp_stat_slot_exchange_ms[2];
 static double g_tp_stat_kind_gpu_wait_ms[DS4_TP_STAT_KIND_COUNT];
 static double g_tp_stat_kind_exchange_ms[DS4_TP_STAT_KIND_COUNT];
 
@@ -10179,12 +10188,29 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
             g_tp_stat_kind_gates[kind]++;
             g_tp_stat_kind_gpu_wait_ms[kind] += wait_ms;
             g_tp_stat_kind_exchange_ms[kind] += exchange_ms;
+            if (kind == DS4_TP_STAT_ROW && req.gate < 2u) {  /* 0=ATTN, 1=FFN per ds4_tp.h */
+                g_tp_stat_slot_gates[req.gate]++;
+                g_tp_stat_slot_gpu_wait_ms[req.gate] += wait_ms;
+                g_tp_stat_slot_exchange_ms[req.gate] += exchange_ms;
+            }
             if (++g_tp_stat_gates % 860 == 0) {
                 fprintf(stderr,
                         "ds4: TP gates %llu: avg gpu-wait %.1f us, avg exchange %.1f us\n",
                         (unsigned long long)g_tp_stat_gates,
                         g_tp_stat_gpu_wait_ms / (double)g_tp_stat_gates * 1000.0,
                         g_tp_stat_exchange_ms / (double)g_tp_stat_gates * 1000.0);
+                {
+                    /* ds4_tp.h is not visible here: 0 = ATTN, 1 = FFN. */
+                    const double a_n = (double)g_tp_stat_slot_gates[0];
+                    const double f_n = (double)g_tp_stat_slot_gates[1];
+                    const double a_x = a_n ? g_tp_stat_slot_exchange_ms[0] / a_n * 1000.0 : 0.0;
+                    const double f_x = f_n ? g_tp_stat_slot_exchange_ms[1] / f_n * 1000.0 : 0.0;
+                    fprintf(stderr,
+                            "ds4: TP row gates by slot: attn %.0f x %.1f us, ffn %.0f x %.1f us, "
+                            "exchange delta %+.1f us -> straggler <= %.2f ms/token\n",
+                            a_n, a_x, f_n, f_x, f_x - a_x,
+                            (f_x - a_x) * 2.0 * 43.0 / 1000.0);
+                }
                 fprintf(stderr,
                         "ds4: TP gate kinds: row %llu %.1f/%.1f us, "
                         "verify %llu %.1f/%.1f us, big %llu %.1f/%.1f us "
