@@ -243,6 +243,36 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### Arm B — encoder-timestamp re-baseline — 2026-08-27
+
+Build `fba4ef0` (with `df0037e` `DS4_METAL_GPU_ENCODER_TIMESTAMPS`), rig,
+gen 128. The low-distortion instrument (GPU timestamp counter at encoder
+boundaries, one command buffer, ~1-3% distortion vs the 13-18% of
+`DS4_METAL_GPU_STAGE_TIMESTAMPS`).
+
+| ctx | gen_steady t/s | encoders/token |
+|---|---|---|
+| 2k | 42.08 | 175 |
+| 131k | 29.71 | 174 |
+
+**Throughput at baseline** — confirms the instrument's ~1-3% distortion
+claim (no round-trip-per-marker inflation; the run is not distorted).
+
+**Labeled `reduce` span** (the FA decode phase, the only non-unlabelled span):
+
+| ctx | calls/token | µs/call |
+|---|---|---|
+| 2k | 41 | 313.1 |
+| 131k | 20 | 339.0 |
+
+**Caveat to flag (not yet interpreted):** the per-report "N encoders, X ms of
+GPU time" summary sums ~44 ms @2k / ~64-69 ms @131k per report, which
+**exceeds the per-token wall clock** (23.8 ms @2k / 33.7 ms @131k). The
+individual encoder spans are in µs and labelled spans (reduce) reconcile
+sensibly; the summary sum likely includes timestamp-unit or span-overlap
+effects. Recorded raw for the fan-out to interpret against the hand-corrected
+table.
+
 ### Iteration 3 — TP crash-fix validation, clean re-baseline, R12a split-schedule sweep — 2026-08-27
 
 Build `06c2c6b` (post-C2-revert, with TP crash fix `69a3b86`), rig
