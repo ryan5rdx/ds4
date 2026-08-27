@@ -392,40 +392,46 @@ covered, but the HC contribution shrank and the two largest items (`routed_moe`
 4.72 and `attn_inv_rope` 3.63, together 34% of the token) remain without a
 proposal.
 
-### Next run — 2026-08-27
+### Next run — updated 2026-08-27 after U15
 
-**Rig: U15, the three zero-code HC arms above, and the Q8_0 shape sweep**
-(`make tests/bench_q8_attn_shapes && ./tests/bench_q8_attn_shapes 760` — the
-build rule was missing until `b95e7ff`, so this could not have been rebuilt
-there before). The sweep re-establishes the rig's k-curve on the current build
-and is the falsifier for C1 and C3. U15 is the sole
-*queued* item that is zero-code and rig-blocked; the HC arms are new and cost
-minutes. Everything else is now implementation-gated, not measurement-gated.
+**Rig — four arms, all zero-code now:**
 
-```
-DS4_METAL_GPU_STAGE_TIMESTAMPS=1    # ctx 2048, gen 128
-```
-**Report every marker**, not a top-12 — U12's table left ~9% of the token in
-unreported stages, and at 2k that residue outweighs several of the stages being
-chased. It now also includes the two `q_path` sub-stages from `863e8fa`.
+1. **Q8_0 shape sweep.** `make tests/bench_q8_attn_shapes && ./tests/bench_q8_attn_shapes 760`.
+   Model-free. **The build rule did not exist until `b95e7ff`** — the committed
+   binary dated 2026-08-24 and any rebuild failed on `ds4_gpu.h`, so this could
+   not have been reproduced on the rig before. Re-establishes the rig's k-curve
+   on the current build; it is the falsifier for **C1** and **C3**.
+2. **`DS4_METAL_ATTN_OUT_LOW_NSG` ∈ {1,2,4,8}** at 2k and 131k. `out_a` carried a
+   literal `nsg=4` that `DS4_METAL_Q8_MV_NSG` could not reach, so **T4 never
+   swept it** — and 4 is the value T4 measured as ~3% worse than TP's nsg=2
+   everywhere it *could* reach. Default unchanged at 4. This is **C2**, ~1% of
+   the token, and it is now one env var.
+3. **Stage profile with the new `ffn_tp_gate` marker** at 2k and 131k. Turns the
+   1.351 ms gate figure from a two-stage difference into a directly measured
+   row. Also picks up the `q_path` sub-stages.
+4. **U5 / R13 n-gram arms** — implemented, never run, independent of everything
+   else. Report acceptance rate alongside t/s; the delta is meaningless without
+   it.
 
-It answers three things at once: whether the context-invariant model inferred
-from 32k/131k actually holds at 2k; what the four HC stages and `attn_output`
-really cost at the target context; and where the ~9% residue lives.
+**Closed by U15, do not re-run:** the `hcpre` ablation (resolved the 2.7×
+disagreement — the chain covers only ~43% of the span) and the pre-norm fusion
+disable (**+0.58 ms, the fusion is a net win**).
 
-**Not rig-blocked — these need code, and the code is mine to write:**
+**Implementation queue — mine to write, in this order:**
 
-| item | state |
-|---|---|
-| **U16** `q_lora_norm` | **diagnosed** — 2 threadgroups on 60 cores, 43×/token. Fusion target identified. Up to 1.68 ms. |
-| **U17** `q_a_kv_proj` | 2.14 ms at 17% of roof; needs a roofline pass like U16's before writing anything. |
-| **U4** decode indexer TP split | **un-deferred** — U9 failed, so the ~4 ms at 131k is intact. Largest long-context item. |
-| **U5** n-gram arms | implemented, never run; independent of everything above. |
+| item | ms | why this order |
+|---|---|---|
+| **U16** `q_lora_norm` fusion | ≤1.50 | Diagnosed to 2 threadgroups. Largest item with a known mechanism. |
+| **C1** Q8_0 k-curve | 1.13–1.40 | **Program-wide** — one kernel, many stages. Gated on arm 1. |
+| **U14** shared-shift | 0.82 | Now has a measured mechanism (gate spin), no memory cost, fixed work. |
+| **C3** row-split `shared_down` | ~0.25 | Falls out of C1's mechanism. |
+| **U4** decode indexer TP split | ~4 at 131k | Long-context only; ~0 at 2k. Largest long-context item. |
 
-**Blocked on the two scoping agents** (`docs/SCOPE-HC-STAGES.md`,
-`docs/SCOPE-ATTNOUT-ROUTER-SHARED.md`): the HC stages (4.56 ms) and
-`attn_output` / `router` / shared (6.50 ms). Together 11.06 ms — **45% of the
-2k token** — and the reason not to commit to an implementation order yet.
+**Blocked on the three running scoping agents** — `routed_moe_folded` (4.72 ms)
+and `attn_inv_rope` (3.63 ms), together **34% of the 2k token with no proposal
+against either**, and the gate-overlap question (~2.7 ms, 11%). Those three are
+**45% of the token** and are why the implementation order above is not yet
+committed past U16.
 
 ### Sequencing — run in this order
 

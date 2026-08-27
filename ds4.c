@@ -25333,6 +25333,14 @@ static bool metal_graph_encode_decode_layer_phase(
                                     DS4_N_EMBD) != 0;
         }
         if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
+        /* The FFN TP gate's release fence is a 1-thread spin
+         * (`kernel_dsv4_tp_fence_wait`, metal/dsv4_misc.metal:7333) that blocks
+         * the command buffer for the whole RDMA round trip while counting as
+         * GPU-busy.  Two scoping passes priced it at 1.351 ms/token by
+         * differencing ffn_hc_post against the gate-free attn_hc_post, which
+         * runs the identical kernel at the identical grid.  This boundary makes
+         * that a measured row instead of an inference. */
+        DS4_METAL_PROFILE_DECODE_STAGE("ffn_tp_gate");
         if (ok) {
             ds4_gpu_tensor *first = g->tp_rank == 0 ? g->tp_out[tp_slot] : g->tp_in[tp_slot];
             ds4_gpu_tensor *second = g->tp_rank == 0 ? g->tp_in[tp_slot] : g->tp_out[tp_slot];

@@ -26395,8 +26395,21 @@ int ds4_gpu_attention_output_q8_tp_tensor(
             .nb1 = (uint64_t)rank * sizeof(float),
             .nr0 = 2,
         };
+        /* C2: this nsg was a literal 4, unreachable by DS4_METAL_Q8_MV_NSG, so
+         * T4's sweep never touched it -- and 4 is the value T4 measured as ~3%
+         * worse than TP's nsg=2 everywhere else it could reach.  Route it
+         * through the same knob so the arm can actually be run; the default is
+         * unchanged at 4 until the rig says otherwise. */
+        int16_t out_low_nsg = 4;
+        {
+            const char *e = getenv("DS4_METAL_ATTN_OUT_LOW_NSG");
+            if (e && e[0]) {
+                const int v = atoi(e);
+                if (v == 1 || v == 2 || v == 4 || v == 8) out_low_nsg = (int16_t)v;
+            }
+        }
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
+            ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", out_low_nsg);
         int ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                 pipeline,
                 &args,
