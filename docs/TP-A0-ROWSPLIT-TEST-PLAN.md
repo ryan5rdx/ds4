@@ -205,6 +205,7 @@ two are minutes and one of them can invalidate three completed runs.
 | ~~20~~ | ~~U11 — confirm U10 does not regress prefill~~ — **done 2026-08-27: neutral.** Prefill 393.03 vs 393.37 t/s @131k; first-token 36.5 vs 35.5 ms. No nsg4-style spike. **U10 stays default-on.** | — | One arm, closed. |
 | **21** | **U12 — price `q_path` (5.47 ms) and `attn_inv_rope` (4.27 ms)** | ~1 h | **26.8% of the token, never looked at.** Larger than anything ever queued here. Roofline them as U7/U8 did. |
 | **22** | **U13 — arm the inverse-RoPE fuse on the indexed branch (was T10)** | ~1 d | The fuse exists but is armed only on the gathered branch, so all 21 ratio-4 layers pay a standalone dispatch. Filed at 0.04–0.09 ms against a 4.27 ms stage. **Gated on U12.** |
+| **23** | **U14 — MoE expert straggler (recovered from `tp_decode_investigation.md` §7)** | ~2 d (design C) | ~1.29 ms / 3.5% at 131k. Contiguous 128/128 sharding gives `E[max(k,6−k)] = 3.9375` vs an ideal 3.0, and it does not average out. Three designs already scoped; throughput derisked by the shared expert. **Never queued here.** |
 
 Steps 0–3 are about four hours of rig time and settle whether the last three
 campaigns are valid, whether the largest sized item is real, and whether the
@@ -1377,6 +1378,78 @@ blocks of 1024 at `n_comp` 32768. Nothing has tested whether that is the right
 point, and U10 just demonstrated this kernel family is residency-sensitive, so
 smaller blocks are worth one arm. Zero code if `nth` is made env-overridable.
 
+### Recovered prior work — `speed-bench/tp_decode_investigation.md` — 2026-08-27
+
+The dispatch-reduction dead end is documented, and reading it back turns up two
+corrections to this plan and one queued target we had lost.
+
+**The dispatch campaign was abandoned on arithmetic, not on threads.** §6:
+*"Dispatch removal is not a productive strategy here. 1021 dispatches × 1.9 µs
+= 1.94 ms, and a realistic fusion campaign was scoped at 185 dispatches =
+0.35 ms = +0.6 t/s."* That is the same conclusion U6/U7 reached independently,
+so nothing to re-tread — **and it retroactively explains why U9 was a bad bet**:
+it was a dispatch-shaped idea in a tree that had already priced dispatch-shaped
+ideas at +0.6 t/s.
+
+**The "not enough threads" memory is a different entry**, §8: *"packed32 flash
+reduce at 32 heads — correct but **1.35 t/s slower**; tuned for the 64-head
+grid, halving it **underfills 60 cores**. Reverted (`fe4674f`)."* Same family as
+T2's turnover at 112 threadgroups and U7's smem-capped residency. Three
+independent observations of one constraint.
+
+**Correction 1 — §4's "the kernels are fine" was measured against the wrong
+roof.** Its key table:
+
+| stage | GB/token | ms | achieved | isolated bench | ratio |
+|---|---|---|---|---|---|
+| attn output | 1.533 | 2.880 | 532 GB/s | 517–581 | ~100% |
+| `q_b` | 0.767 | 1.559 | 492 GB/s | ~413–541 | ~100% |
+| routed MoE | 2.264 | 6.170 | 367 GB/s | ~400 | 92% |
+
+Those ratios compare **in-engine achieved against the same kernel measured in
+isolation** — they show the engine loses nothing versus standalone. They do
+**not** show the kernels are near the hardware. U6 put the streaming roof at
+**760 GB/s**, so 532 GB/s is **70%** and the isolated bench itself is 68–76%.
+*"Conclusion: the kernels are fine"* should read *"the engine is not the
+problem; the kernels are at ~70% of what the part can stream."* That is exactly
+the error U6 corrected for the MoE, and it was sitting in this file for the
+attention path too.
+
+**Correction 2 — U12 must not repeat the `attnout` phantom.** §8: *"`attnout` /
+`out_b` restructuring — **phantom target**. Believed to be 2× its rate; it runs
+at ~100%. The error was a 3×-low byte estimate and a wrong k (512 vs the actual
+4096)."* And §14.6, in the file's own words: **"Before quoting any byte figure,
+reconcile it against the 60.17 MB/layer in §3. Three wrong conclusions in this
+investigation came from skipping that check."** Fold that into U12 as a
+prerequisite, not advice.
+
+Also §14.1, which we re-learned the hard way in U9: *"treat changes below about
+1% as noise until interleaved."* It was already written down.
+
+#### U14 — the MoE expert straggler (recovered from §7) — fully scoped, never queued here
+
+**Worth ~1.29 ms at 131k (3.5% of the token); §7 measured it at 1.47 ms /
++2.7 t/s at its own baseline.** Routed experts are sharded contiguously
+128/128, so with 6 experts selected uniformly the per-layer critical path is
+`E[max(k, 6−k)] = 3.9375` against an ideal 3.0 — **and because each layer gates
+independently the imbalance does not average out.**
+
+Three designs were already scoped (§7): **A** partial replication (E[max]≈3.16,
+**+27 GiB**, drops usable context ~1M → ~650k); **B** in-place intra-expert
+split (**blocked** — ~22k spans, and `ffn_down_exps` splits on the inner dim so
+it is not expressible as spans at all); **C** repacked GGUF (perfect 3.0, one
+span per tensor, no extra memory, and incidentally makes the `down` read
+contiguous — cleanest end state, costs a conversion tool and a TP-specific
+model file).
+
+**Throughput is already derisked:** the shared expert *already* uses exactly
+this decomposition (`ds4.c:23922`) and hits its predicted rate. **The obstacle
+is mapping, not throughput.**
+
+This is larger than U10 delivered (+1.6%) and comparable to U10c, it is fully
+analysed, and it is the only item here that attacks a *load-balance* rather
+than a kernel. It was not in this plan's queue at all. Slot it after U12.
+
 #### U11 — confirm U10 does not regress prefill — **run first — DONE 2026-08-27: neutral, U10 stays default-on**
 
 **Outcome.** Prefill A/B on the rig (mat worker / lanfear coord, build
@@ -1392,9 +1465,12 @@ with `promessi_sposi.txt`:
 | 131k | TIGHT on | 393.03 | 36.5 | 29.15 |
 | 131k | TIGHT=0 | 393.37 | 35.5 | 28.42 |
 
-*\*The 272.9 ms at 32k TIGHT-on is a cold-start/warm-up artifact (first
-frontier of the first arm includes model load + shader compile); the same
-arm's 65k/131k first-token is 32.8/36.5 ms — normal. Not a regression.*
+*\*The 272.9 ms at 32k TIGHT-on is a cold-start/warm-up artifact — the first
+frontier of the first arm includes model load and shader compile, and the same
+arm's 65k/131k first-token is 32.8/36.5 ms. **Treat the whole 32k row as void
+rather than as −3%**: the warm-up contaminates that arm's prefill t/s as well,
+so it is not evidence either way. The 65k and 131k rows are clean and are what
+answers the question.*
 
 **Prefill is neutral:** 501.92 vs 517.19 (−3% at 32k, warm-up), 460.94 vs
 461.72 (−0.2%), 393.03 vs 393.37 (−0.1% at 131k). First-token at 131k 36.5 vs
@@ -1441,6 +1517,18 @@ already named by the stage profile, so this is measurement, not archaeology.
   attributed.
 - **`attn_inv_rope`, 4.27 ms, 11.7%** (`ds4.c:23568`) — a standalone
   64-threadgroup inverse-RoPE dispatch applied to the attention output heads.
+
+**Prerequisite, per §14.6 of `tp_decode_investigation.md`:** reconcile every
+byte figure against the verified 60.17 MB/layer model in its §3 **before**
+quoting a rate. Three wrong conclusions in that investigation came from skipping
+this, including the `attnout` phantom target — believed 2× off, actually at
+~100%, from a 3×-low byte estimate and a wrong k. `q_path` is the same family of
+kernel, so the same trap is live.
+
+**Note what §4 already priced:** `q_b` at 492 GB/s and attn output at 532 GB/s,
+both ~100% of their *isolated bench* — but only ~70% of U6's 760 GB/s roof. So
+the open question for `q_path` is not "does the engine lose against standalone"
+(answered: no) but "why is the standalone kernel at 70%".
 
 **Method, mirroring U7/U8:** stage-profile at 32k and 131k with per-kernel
 attribution; compute achieved GB/s and GFLOP/s for each and place them against
