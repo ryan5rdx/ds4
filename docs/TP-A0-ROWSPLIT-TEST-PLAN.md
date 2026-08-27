@@ -1157,6 +1157,87 @@ for bandwidth — is back on **two** independent grounds: it removes a per-key
 format conversion, and it unlocks the NK the sweep says we want. Re-open it
 after the scaling question is settled.
 
+#### U7b — the scaling puzzle is probably an artefact, and U2 measured the wrong kernel
+
+Fresh build on the M1 Max, same `n_comp=32768`:
+
+| path | GFLOP/s |
+|---|---|
+| `kernel_dsv4_indexer_score_one_direct` (fallback) | 456.5 |
+| `kernel_dsv4_indexer_scores_llt` (**production default**) | 1075.9 |
+
+**U2's 1015 on the rig is almost certainly the *direct* path**, not LLT — its
+own note describes `kernel_dsv4_indexer_score_one_direct` and its `(32,4)`
+threadgroup shape. Against direct-on-M1-Max (456.5) that is **2.22×**, right in
+line with core count × clock (60/32 × 1398/1296 ≈ 2.02). **So the kernel scales
+fine and there is no non-scaling mystery** — I was comparing my LLT number
+against U2's direct number.
+
+Two consequences. **U2's roofline is about a kernel production does not run**,
+so its "~5% of roof" should not be carried forward. And the rig's real LLT rate
+is likely ~2100 GFLOP/s, which puts the *scoring* half of the stage at roughly
+0.26 ms/layer × 21 ≈ **5.4 ms** — leaving the other ~5 ms of the 10.51 ms stage
+somewhere else. M2 already said where: **`indexer topk` was 5.32 ms against
+`indexer score` 3.84 ms.** Selection costs more than scoring.
+
+**Still confirm on the rig with a freshly built binary** — this is inference
+from a dev-box A/B, not a measurement.
+
+#### U9 — decode sorts 32,768 scores to take 512 — **the largest untouched item**
+
+**What decode actually does.** `ds4_gpu_indexer_topk_tensor` has a purpose-built
+streaming selector, `kernel_dsv4_indexer_topk_stream512`, gated on:
+
+```c
+if (top_k == 512u && n_tokens >= 32u && ...)     // ds4_metal.m:18658
+```
+
+**Decode is `n_tokens == 1`, so it never qualifies.** It falls through to a full
+`kernel_argsort_f32_i32_desc` block sort plus merge — **a complete bitonic sort
+of 32,768 scores per layer to extract the top 512**, 21 layers per token. That
+is O(n log²n) to select 1.5% of the input, and it explains why M2 measured
+top-k (5.32 ms) as *more expensive than the scoring it selects from* (3.84 ms).
+
+**Why the gate exists — and why removing it is not the fix.** `stream512`
+dispatches `MTLSizeMake(n_tokens, 1, 1)` threadgroups of 512 threads: **one
+threadgroup per token.** At decode that is a single threadgroup on a 60-core
+GPU, i.e. 1/60th of the machine. Naively enabling it for `n_tokens == 1` would
+be algorithmically better and wall-clock worse. **This is the same "cannot run
+enough threads at once" constraint seen before** — the T2 sweep put the useful
+oversubscription ceiling at ~96 threadgroups on 60 cores (1.6/core, turnover at
+112), and the U7 NSG ladder is capped at one threadgroup per core by
+threadgroup memory.
+
+**So the fix is a genuine restructure, and it is the right kind.** Single-token
+selection has to be spread across threadgroups rather than compressed into one:
+
+1. **Two-pass radix / histogram select.** Histogram the score exponents across
+   many threadgroups, prefix-sum to find the 512th-largest threshold, then one
+   filtering pass. **O(n) with full grid occupancy**, versus O(n log²n) on one
+   threadgroup.
+2. **Per-block partial top-512 then merge.** Simpler, reuses `stream512`'s body
+   per block, needs a small merge over `ceil(n_comp/block)` candidate lists.
+
+Option 1 is the better ceiling; option 2 is the cheaper first experiment and
+can reuse an existing kernel body.
+
+**Prize.** 5.32 ms of a 36.36 ms token at 131k — **the largest single
+sub-component of the largest stage**, and it is algorithmic rather than a
+constant-factor tune, which is why it is worth more than any knob swept so far.
+
+**T6 already spotted the gate and mis-sized it.** It is filed in "Lower tier …
+individually sub-1%" as *"`stream512` top-k at `n_tokens == 1` — decode never
+takes it; 0.16–0.46 ms"*. That figure predates M2 and the stage profile. **T6 is
+withdrawn from the cleanup batch and superseded by U9** — the same mistake T9
+made, and for the same reason: sized before the stage was priced.
+
+**Correctness.** Top-k selection is exact if ties break deterministically. A
+threshold/histogram select must handle the case where more than 512 scores tie
+at the threshold value — break by ascending row index, matching whatever the
+argsort currently produces, and test it directly with a synthetic all-equal
+score vector. Compare selected-index sets against the argsort path with
+`BENCH_DUMP`-style GPU-vs-GPU diffing, not against a CPU reference.
+
 #### U8 — diagnose the MoE matvec's 54% — re-opened by U6
 
 **Prize.** `routed_moe_folded` is 5.40 ms at 131k streaming at ~410 of 760
