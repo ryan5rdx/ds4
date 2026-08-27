@@ -719,6 +719,47 @@ suggested — but only the ones that block. Identifying *which* dispatches are
 barriers with nothing alongside is now a first-class question, and
 `bench_qkv_norm` is the instrument for pricing any of them in isolation.
 
+### U5 / n-gram speculation is UNREACHABLE, not merely unrun — 2026-08-27
+
+Found while running the arm: `DS4_NGRAM_SPEC=1` on the plain bench decode loop
+returned **42.00 t/s with zero draft, verify or spec activity**. That is the
+baseline. **The arm never engaged the feature.** Traced and confirmed:
+
+- `ds4_session_eval` routes straight to `ds4_session_eval_probe_tp`
+  (`ds4.c:64765`). No speculation, no n-gram.
+- The n-gram dispatch lives at `ds4.c:69996`, inside
+  `ds4_session_eval_speculative_argmax_impl` (`:69923`).
+- That impl has exactly two public entries, `ds4_session_eval_speculative_argmax`
+  and `..._excluding` (`:70745`, `:70755`).
+- **The only caller of either, anywhere, is `ds4_bench.c:866`** — gated on
+  `cfg.dspark && !cfg.dspark_strict`, and `--dspark` **requires `--mtp FILE`**
+  (`ds4_bench.c:398`).
+- **`ds4_server.c` never calls either entry.** It parses `--dspark` and sets
+  `c.engine.dspark`, but in the engine that flag only selects DSpark weight
+  loading and prints a warning at open (`ds4.c:59879`); the server's generation
+  loop has no speculative path at all.
+
+**So there is no speculation in the production serving path, and n-gram in
+particular can only be reached from the bench with an MTP file loaded** — a
+draft-model mechanism entirely separate from n-gram drafting.
+
+**Three consequences.**
+
+1. **Every previous framing of U5 as "implemented, never run" was wrong.** It is
+   implemented and *not wired up*. Running it needs a call site, not a rig slot.
+2. **The recorded DSpark negative does not transfer.** "Forced Promessi runs
+   remain 19–21 t/s" was measured through `--dspark --mtp`, i.e. an MTP draft
+   model. It says nothing about n-gram drafting, whose draft is nearly free.
+   Those two were being treated as one datum.
+3. **This raises speculation's cost and lowers its risk simultaneously** —
+   more work than an env flag, but the reason it has never shown a benefit is
+   now known to be "it never ran", not "it does not work".
+
+**Correction owed to the running 50 t/s workflow:** its speculation lens was
+briefed with "implemented and never run on the rig", which is materially
+incomplete. Whatever it concludes about acceptance rates must be re-read against
+the fact that wiring is a prerequisite. Amend the synthesis when it lands.
+
 ## Why decode is at 41 t/s, why the GPU draws 30 W, and why TP2 is only ~1.6× — 2026-08-27
 
 These are one question. Answering it properly says the remaining 1% items
