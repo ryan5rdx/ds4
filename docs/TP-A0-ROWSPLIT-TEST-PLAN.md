@@ -1632,6 +1632,87 @@ Same underfill family as packed32-at-32-heads (−1.35 t/s), T2's turnover at
 between `q_a`, `q_b` and the norm/RoPE tail: three lines, and it splits 5.47 ms
 into three numbers that are all from one run.
 
+## The short-context program — 2026-08-27
+
+**Target: 50 t/s at low context, from ~41 today.** The reason to pursue this
+ahead of more long-context kernel work is structural, and it is the most useful
+thing the stage profile has told us.
+
+### 88% of the short-context token is context-invariant
+
+Separating U12's 32k and 131k columns by whether a stage moves:
+
+| stage | ms | % of the 2k token | priced? |
+|---|---|---|---|
+| `q_path` | 5.47 | **22.5%** | 170 GB/s = **22% of roof** |
+| `routed_moe_folded` | 4.99 | **20.5%** | ~410 GB/s = **54% of roof** |
+| `attn_output` | 3.75 | **15.4%** | only in an older epoch, and once a phantom target |
+| `ffn_hc_post` | 1.83 | 7.5% | **never** |
+| `attn_hc_pre` | 1.14 | 4.7% | **never** |
+| `ffn_hc_pre` | 1.12 | 4.6% | **never** |
+| `router` | 1.11 | 4.6% | **never** |
+| `shared_gate_up` | 0.98 | 4.0% | **never** |
+| `shared_down` | 0.66 | 2.7% | **never** |
+| `attn_hc_post` | 0.47 | 1.9% | **never** |
+| **fixed subtotal** | **21.53** | **88.5%** | |
+
+Only `compressor_indexer` and `attn_inv_rope` grow with context. **Everything
+else is paid identically at 2k and at 131k.**
+
+**34% of the 2k token has never been priced against any roof** — the four HC
+stages (4.56 ms) and `attn_output` (3.75 ms). That is a larger unexamined
+fraction than long context ever had, and it is why this is the better place to
+spend effort now: the long-context queue is picked-over ground, this is not.
+
+### Fixed-work savings propagate, additively
+
+A saving in fixed work is the *same number of milliseconds* at every context —
+so it is a smaller *percentage* at long context, but free there:
+
+| fixed work cut | 2k | 131k |
+|---|---|---|
+| — | 41.1 t/s | 29.1 t/s |
+| 2.0 ms | 44.8 | 31.0 |
+| 3.0 ms | 46.9 | 31.9 |
+| **4.34 ms** | **50.0** | **33.4** |
+| 6.0 ms | 54.5 | 35.3 |
+
+**So hitting 50 t/s at 2k lands ~33.4 t/s at 131k** — a +15% long-context gain
+for work aimed at short context. Reaching 35 at 131k needs 5.73 ms, more than
+the fixed pool realistically holds, so that additionally requires attacking
+`compressor_indexer`. Note the effect is **additive, not ratio-preserving**:
+removing shared fixed cost slightly *worsens* the 2k→131k ratio even as both
+improve.
+
+### U15 — stage-profile at 2k — **we have never run one**
+
+Everything above is inferred from 32k/131k invariance. Sound, but indirect, and
+the two largest unexamined blocks deserve a direct measurement at the context
+they are being justified by.
+
+```
+DS4_METAL_GPU_STAGE_TIMESTAMPS=1   # ctx 2048, gen 128, same procedure as U12
+```
+
+**Report every stage, not a top-12.** U12's table listed 12 rows summing to
+29.88 ms against a reported 32.70 ms total at 32k — so **~2.8 ms (9%) sat in
+stages that exist as markers but were not reported**: `attn_norm`, `kv_path`,
+`compressor_proj`, `compressor_update`, `compressor_quantize`,
+`compressor_commit`, `indexer_compressor_*`. At 2k that residue is a larger
+share than several of the stages we are chasing. It also now includes the two
+new `q_path` sub-stages from `863e8fa`.
+
+### Scoping agents dispatched 2026-08-27
+
+Two agents are scoping the unpriced blocks against the 760 GB/s / ~21 TFLOP/s
+roofs, with the byte-reconciliation and epoch rules as hard constraints:
+
+- `docs/SCOPE-HC-STAGES.md` — the four HC stages, 4.56 ms / 18.7%.
+- `docs/SCOPE-ATTNOUT-ROUTER-SHARED.md` — `attn_output`, `router`, shared
+  expert; 6.50 ms / 26.7%. Briefed explicitly on the `attnout` phantom-target
+  history and on why §4's "~100% of isolated bench" does not answer the
+  roofline question.
+
 ### U12b — the two arms that turn 26.8% from "priced" into "explained"
 
 **Both are built and committed. Neither needs code on the rig side.**
