@@ -305,7 +305,7 @@ Net of the ~0.18 ms/marker profiler tax, and with both scoping reports in:
 | **gate spin** (ATTN + FFN) | ~2.7 | 11.1% | measured twice, independently |
 | ~~U16~~ | — | **Diagnosed, not implemented.** The kernel is ~22 µs of pure dispatch latency, flat across a 64× work range, so a fusion buys nothing. Same fix as the gate spin: concurrent scheduling. **Held behind the gate agent.** |
 | **C1** Q8_0 k-curve, program-wide | 1.13–1.40 | 4.6–5.8% | 2.9× spread confirmed model-free |
-| **U14** shared-shift | 0.82 | 3.4% | now has a measured mechanism |
+| **U14** shared-shift | ≤0.74 | **re-sized down** from 0.82, which exceeded the whole imbalance. Design changes from "shift all" to "shift to equalise", which reaches zero FFN-gate imbalance in the δ<S regime. Gated on the per-slot gate measurement. |
 | **HC pool** (H4/H6/H2) | 0.6–1.0 | 2.5–4.1% | scoped; grid-widening already negative |
 | **C3** row-split `shared_down` | ~0.25 | 0.8–1.1% | k-curve consequence |
 | **C2** `out_a` nsg (unswept) | ~0.25 | 0.8–1.2% | one literal to change |
@@ -382,7 +382,7 @@ correct*.
 | **gate spin** (ATTN + FFN) | 1.75–2.7 | **7–11%** | confirmed at 2k; largest, least understood |
 | **C1** Q8_0 k-curve, program-wide | 1.13–1.40 | 4.6–5.8% | 2.9× spread confirmed model-free |
 | ~~U16~~ | — | **Diagnosed, not implemented.** The kernel is ~22 µs of pure dispatch latency, flat across a 64× work range, so a fusion buys nothing. Same fix as the gate spin: concurrent scheduling. **Held behind the gate agent.** |
-| **U14** shared-shift | 0.82 | 3.4% | measured mechanism |
+| **U14** shared-shift | ≤0.74 | **re-sized down** from 0.82, which exceeded the whole imbalance. Design changes from "shift all" to "shift to equalise", which reaches zero FFN-gate imbalance in the δ<S regime. Gated on the per-slot gate measurement. |
 | **C3** row-split `shared_down` | ~0.25 | ~1.0% | k-curve consequence; `shared_down` is only 0.49 ms net |
 | **C2** `out_a` nsg (unswept) | ~0.25 | ~1.0% | one literal |
 | **HC pool** | **~0.5** | ~2% | **downgraded** — ablation says 0.76 ms exists at all |
@@ -391,6 +391,74 @@ Non-gate sum **≈4.0–5.2 ms** against the **4.34 ms** needed for 50 t/s. Stil
 covered, but the HC contribution shrank and the two largest items (`routed_moe`
 4.72 and `attn_inv_rope` 3.63, together 34% of the token) remain without a
 proposal.
+
+### Gate-overlap scoping — mostly irreducible, and four corrections — 2026-08-27
+
+Full report: `docs/SCOPE-TP-GATE-OVERLAP.md`.
+
+**Verdict: ~1.3 ms of the 1.75–2.70 ms is hardware one-way latency** for a 16 KB
+exchange that must happen 86 times. That line has four levers only: fewer gates
+(structurally impossible), a smaller payload (not bit-exact), a faster fabric,
+or more tokens per gate. **Overlap does not exist to be found — it has to be
+manufactured.**
+
+**Correction 1 — I was wrong that the gate spin explains the 30 W.** I asserted
+that twice. 8–11% of the token at zero power predicts **~53 W, not 30 W**. The
+"GPU busy ⇒ useful work" correction stands, but the power gap is mostly
+latency-bound matvec versus prefill GEMM. Retracted.
+
+**Correction 2 — M0's "exchange is 6–7% of gate time" divides by the wrong
+denominator.** `DS4_TP_GATE_PROFILE`'s `gpu-wait` leg is encode-to-execute lead
+*plus all inter-gate compute*, because `ds4_gpu_tp_gate_encode` enqueues at
+**encode** time (`ds4_metal.m:10513-10525`), not execute time. The GPU's actual
+stall is the **exchange** leg (24.8 µs), not `gpu-wait` (375 µs). 24.8 µs + two
+dispatches + two forced encoder breaks ≈ 30 µs, which reconciles with the
+31.4 µs differential. **Exchange is ~65–80% of the gate; wire is ~60% of that.**
+T1's post-mortem reason ("dominated by local GPU completion") is wrong — its
+null result stands, but not for the reason recorded.
+
+**Correction 3 — §8's concurrent-encoder dismissal is factually wrong.** A
+`MTLDispatchTypeConcurrent` path **exists and ships** (`ds4_metal.m:1028-1030`,
+`:9526-9733`, live at `ds4.c:24985`). The single `memoryBarrierWithResources` is
+the one level break inside the one concurrent region, not evidence that overlap
+is impossible. It is disabled under TP2 only because `fuse_shared_down_hc`
+requires `tp_world < 2` (`ds4.c:24182-24187`). Also relevant: `ds4_gpu_tp_big_gate_kick`/`_wait`
+already implements a kick/wait split for prefill, explicitly "to interleave more
+GPU work with the wire exchange" — and its comment records a **measured
+stale-payload failure** when arrival used a flag word with no fence behind it.
+**That is the go/no-go risk for any overlap work.** `MTLSharedEvent` release is
+closed by measurement (~186 µs/gate); a wider fence is closed (21% vs 4%).
+
+**Correction 4 — U14 is over-sized and, as specified, unachievable.** Since the
+ATTN gate is symmetric and carries no straggler,
+`exchange_FFN − exchange_ATTN = E|s|/2` exactly. The measured 23.6 µs pooled
+exchange bounds **E|s| ≤ 34.4 µs, so the straggler is ≤ 0.74 ms/token
+(est. ~0.3 ms)**. U14's uniform `E[max] = 3.9375` model implies 1.29 ms of
+excess — **incompatible at any non-negative software cost**, so its 0.82 ms win
+exceeds the entire imbalance. But we are in the `δ < S` regime, where the
+*correct* design is "shift the shared expert to **equalise**", not "shift all" —
+and that drives FFN-gate imbalance to **zero** rather than partway. **Re-size
+U14 to ≤0.74 ms and change its design.**
+
+*(One thing in the report I do not follow: it lists C3 as dying with the
+straggler. C3 is the `shared_down` row-split, which is a k-curve consequence —
+k=1024 sits below the kernel's peak — and is independent of load balance. Left
+in the queue.)*
+
+### Instrument built for the next run — `a861150`
+
+The report's recommended measurement, implemented rather than queued:
+
+- **Per-slot gate profiler.** `DS4_TP_GATE_PROFILE` now splits row gates by
+  ATTN/FFN and prints both averages, their delta, and the implied per-token
+  straggler bound. `req.gate` was already in the queue struct, so this perturbs
+  nothing on the GPU.
+- **`attn_tp_gate` stage marker**, mirroring `ffn_tp_gate`.
+
+**This is a decisive arm: if the two gates measure equal, the straggler is zero
+and U14 plus all three §7 designs are dead in one run.** Also queued from the
+report, zero engine change: re-run M3's `uc_pingpong` with 4×4 KB chained
+against 1×16 KB — minutes, worth ≤0.34 ms.
 
 ### U16 — measured before implementing, and the fix changed — 2026-08-27
 
@@ -474,7 +542,7 @@ disable (**+0.58 ms, the fusion is a net win**).
 |---|---|---|
 | ~~U16~~ | — | **Diagnosed, not implemented.** The kernel is ~22 µs of pure dispatch latency, flat across a 64× work range, so a fusion buys nothing. Same fix as the gate spin: concurrent scheduling. **Held behind the gate agent.** |
 | **C1** Q8_0 k-curve | 1.13–1.40 | **Program-wide** — one kernel, many stages. Gated on arm 1. |
-| **U14** shared-shift | 0.82 | Now has a measured mechanism (gate spin), no memory cost, fixed work. |
+| **U14** shared-shift | ≤0.74 | **re-sized down** from 0.82, which exceeded the whole imbalance. Design changes from "shift all" to "shift to equalise", which reaches zero FFN-gate imbalance in the δ<S regime. Gated on the per-slot gate measurement. |
 | **C3** row-split `shared_down` | ~0.25 | Falls out of C1's mechanism. |
 | **U4** decode indexer TP split | ~4 at 131k | Long-context only; ~0 at 2k. Largest long-context item. |
 
