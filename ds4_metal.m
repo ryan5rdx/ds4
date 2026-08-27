@@ -1094,22 +1094,55 @@ static void ds4_gpu_ts_name_last(const char *label) {
     if (label && g_ts_enabled > 0 && g_ts_n > 0) g_ts_labels[g_ts_n - 1] = label;
 }
 
-static void ds4_gpu_ts_report(const char *tag) {
+/* Counter timestamps are in a GPU tick unit that is NOT guaranteed to be
+ * nanoseconds, and it differs by part: assuming ns validated on an M1 Max
+ * (encoder sum within 4% of the command-buffer span) and over-reported by ~1.85x
+ * on an M2 Ultra.  So calibrate every report against the command buffer's own
+ * GPUStartTime/GPUEndTime, which are documented seconds, instead of trusting the
+ * unit.
+ *
+ * Reporting coverage (span sum / cb span) alongside is deliberate: encoder spans
+ * can overlap where the GPU pipelines encoder setup against the previous
+ * encoder's drain, and a sum that quietly exceeds the wall clock is exactly the
+ * kind of silent error this project keeps getting caught by.  Over 100% means
+ * the spans overlap and per-encoder figures are upper bounds. */
+static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
     if (!ds4_gpu_ts_active() || g_ts_n == 0) return;
     NSData *rd = [g_ts_buffer resolveCounterRange:NSMakeRange(0, g_ts_n * 2u)];
     if (!rd) { g_ts_n = 0; return; }
     const MTLCounterResultTimestamp *t = (const MTLCounterResultTimestamp *)rd.bytes;
-    double total = 0.0;
+
+    uint64_t lo = UINT64_MAX, hi = 0;
     for (uint32_t i = 0; i < g_ts_n; i++) {
         const uint64_t a = t[i * 2].timestamp, b = t[i * 2 + 1].timestamp;
-        if (b <= a) continue;   /* an unresolved sample reads as zero */
-        const double us = (double)(b - a) / 1000.0;
-        total += us;
+        if (b <= a) continue;
+        if (a < lo) lo = a;
+        if (b > hi) hi = b;
+    }
+    if (hi <= lo) { g_ts_n = 0; return; }
+
+    const double cb_s = cb ? (cb.GPUEndTime - cb.GPUStartTime) : 0.0;
+    /* seconds per tick, from this command buffer's own clock */
+    const double spt = (cb_s > 0.0) ? cb_s / (double)(hi - lo) : 1e-9;
+    const double cal = (cb_s > 0.0) ? (spt / 1e-9) : 1.0;
+
+    double total_us = 0.0;
+    for (uint32_t i = 0; i < g_ts_n; i++) {
+        const uint64_t a = t[i * 2].timestamp, b = t[i * 2 + 1].timestamp;
+        if (b <= a) continue;
+        const double us = (double)(b - a) * spt * 1e6;
+        total_us += us;
         fprintf(stderr, "ds4: enc-ts %-28s %8.1f us\n",
                 g_ts_labels[i] ? g_ts_labels[i] : "(unlabelled)", us);
     }
-    fprintf(stderr, "ds4: enc-ts %s: %u encoders, %.3f ms of GPU time\n",
-            tag ? tag : "", g_ts_n, total / 1000.0);
+    const double cb_us = cb_s * 1e6;
+    fprintf(stderr,
+            "ds4: enc-ts %s: %u encoders, %.3f ms spans over a %.3f ms cb "
+            "(coverage %.0f%%%s, tick=%.3f ns)\n",
+            tag ? tag : "", g_ts_n, total_us / 1000.0, cb_us / 1000.0,
+            cb_us > 0.0 ? total_us / cb_us * 100.0 : 0.0,
+            (cb_us > 0.0 && total_us > cb_us * 1.05) ? " OVERLAPPING" : "",
+            cal);
     g_ts_n = 0;
 }
 
@@ -1418,7 +1451,7 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
         ds4_gpu_invalidate_zero_prefix_prefill_block_maps();
     }
     ds4_gpu_stream_expert_cache_note_owned_completed();
-    ds4_gpu_ts_report(label);
+    ds4_gpu_ts_report(cb, label);
     [g_transient_buffers removeAllObjects];
     ds4_gpu_model_buffer_cache_maybe_evict(label);
     return ok;
@@ -11078,14 +11111,11 @@ static int ds4_gpu_flash_attn_stage_profile_boundary(
 int ds4_gpu_synchronize(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) {
-        const int rc = ds4_gpu_end_commands();
-        ds4_gpu_ts_report("batch");
-        return rc;
+        return ds4_gpu_end_commands();
     }
     ds4_gpu_parallel_ffn_reset_state(YES);
     if ([g_pending_cbs count] != 0) {
         int ok = ds4_gpu_wait_pending_command_buffers("synchronize");
-        ds4_gpu_ts_report("pending");
         [g_transient_buffers removeAllObjects];
         ds4_gpu_model_buffer_cache_maybe_evict("synchronize");
         return ok;

@@ -1153,6 +1153,49 @@ fixing it pays twice.
 They are not wrong, but they are not the path to 50 t/s. Item 1 is a day's work
 against a defect worth several milliseconds, and item 3 costs nothing but a run.
 
+### Arm B — the instrument runs clean but reports wrong; fixed, needs a re-run — 2026-08-27
+
+**What worked.** 42.08 t/s at 2k and 29.71 at 131k — **baseline throughput**, so
+the 1–3% distortion claim holds and the run is undistorted. 175 encoders per
+token, against 14 stage markers. The mechanism is sound.
+
+**What did not.** The reported spans are too large. The per-report sum is
+~44 ms at 2k against a 23.8 ms token, and the labelled `reduce` span reads
+313 µs/call × 41 calls = 12.8 ms against `attn_inv_rope`'s 3.64 ms. **Do not use
+arm B's absolute numbers.**
+
+**Diagnosis.** `MTLCounterResultTimestamp.timestamp` is a GPU *tick*, not
+guaranteed nanoseconds, and I divided by 1000 assuming it was. That assumption
+validated on the M1 Max — re-checked just now, it infers **exactly 1.000 ns/tick
+with 93–96% coverage and no overlap** — so it is plausibly a different timebase
+on M2 Ultra. The other candidate is genuine span overlap, where the GPU
+pipelines one encoder's setup against the previous encoder's drain.
+
+**Fix: stop assuming, calibrate.** Each report now derives seconds-per-tick from
+the command buffer's own `GPUStartTime`/`GPUEndTime` — documented seconds — and
+prints, on the same line: total span, the cb span, **coverage %**, an
+`OVERLAPPING` marker past 105%, and the **inferred ns/tick**. So the next run
+distinguishes the two causes by itself:
+
+- `tick ≈ 0.54 ns` → it was a unit difference and the calibrated figures are now
+  correct outright.
+- `tick ≈ 1.0 ns` with coverage > 100% → real overlap, and per-encoder figures
+  are **upper bounds**.
+
+Putting the cb span on the same line also fixes an interpretation trap: a report
+fires **per command buffer**, and decode issues 3 per token, so comparing a
+per-report sum against a per-*token* wall clock is not a like-for-like
+comparison. The line is now self-contained.
+
+**Two limits worth stating.** With a single encoder the calibration is
+degenerate — coverage is forced to 100% and tells you nothing. And because the
+tick scale is derived from `hi − lo` across the encoders, any command-buffer
+overhead outside them inflates the inferred tick slightly, so coverage is a mild
+over-estimate.
+
+**Re-run arm B** on a build carrying this fix before any of its numbers enter the
+budget. Everything else in Phase 0 is unaffected.
+
 ### Iteration 3 results — crash fix holds, baseline restored, R12a dead — 2026-08-27
 
 Build `06c2c6b`, i.e. **before** the encoder-timestamp work, so three of the
