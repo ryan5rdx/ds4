@@ -205,7 +205,7 @@ two are minutes and one of them can invalidate three completed runs.
 | ~~20~~ | ~~U11 — confirm U10 does not regress prefill~~ — **done 2026-08-27: neutral.** Prefill 393.03 vs 393.37 t/s @131k; first-token 36.5 vs 35.5 ms. No nsg4-style spike. **U10 stays default-on.** | — | One arm, closed. |
 | **21** | **U12 — price `q_path` (5.47 ms) and `attn_inv_rope` (4.27 ms)** | ~1 h | **26.8% of the token, never looked at.** Larger than anything ever queued here. Roofline them as U7/U8 did. |
 | **22** | **U13 — arm the inverse-RoPE fuse on the indexed branch (was T10)** | ~1 d | The fuse exists but is armed only on the gathered branch, so all 21 ratio-4 layers pay a standalone dispatch. Filed at 0.04–0.09 ms against a 4.27 ms stage. **Gated on U12.** |
-| **23** | **U14 — MoE expert straggler (recovered from `tp_decode_investigation.md` §7)** | ~2 d (design C) | ~1.29 ms / 3.5% at 131k. Contiguous 128/128 sharding gives `E[max(k,6−k)] = 3.9375` vs an ideal 3.0, and it does not average out. Three designs already scoped; throughput derisked by the shared expert. **Never queued here.** |
+| ~~23~~ | ~~U14 — MoE expert straggler~~ — **deprioritised 2026-08-27.** Design C is a repacked TP-specific model file for 3.5%; B blocked; A costs 27 GiB. Recorded that whole-expert reassignment provably cannot help (variance, not mean), and that §7 missed a cheaper option — shifting the shared expert to the routed-light rank, 2.3% for no memory and no repack. | — | Poor return against U12/U13; kept so it is not re-derived. |
 
 Steps 0–3 are about four hours of rig time and settle whether the last three
 campaigns are valid, whether the largest sized item is real, and whether the
@@ -1446,9 +1446,46 @@ model file).
 this decomposition (`ds4.c:23922`) and hits its predicted rate. **The obstacle
 is mapping, not throughput.**
 
-This is larger than U10 delivered (+1.6%) and comparable to U10c, it is fully
-analysed, and it is the only item here that attacks a *load-balance* rather
-than a kernel. It was not in this plan's queue at all. Slot it after U12.
+**Deprioritised 2026-08-27 — recorded so it is not re-derived, not queued.**
+Design C is a repacked TP-layout-specific model file plus a conversion tool for
+3.5%, and B is blocked, and A costs 27 GiB and a third of the usable context.
+That is poor return against U12/U13. Two things are worth writing down first.
+
+**Whole-expert reassignment cannot fix this, so C really is the only route to
+perfect balance.** The imbalance is *per-token variance*, not mean load: even
+with every expert equally popular, `E[max(k, 6−k)] = 3.9375`. No permutation of
+which experts live on which rank changes that, and popularity-balancing the
+partition fixes the mean while leaving the variance untouched. Splitting every
+expert's intermediate dimension is the only static scheme that makes both ranks
+do exactly half of *whatever* is selected.
+
+**But §7 missed a fourth option, and it is much cheaper.** `router`,
+`shared_gate_up`, `routed_moe` and `shared_down` all run **before the FFN
+gate**, so the gate waits on `max_over_ranks(shared_share + routed_share)` —
+and the shared expert is split by a fixed 50/50 `shared_tp_local = shared_dim/2`
+(`ds4.c:23922`). Give the routed-*light* rank more of the shared expert and the
+max drops:
+
+| per layer @131k | heavy rank | light rank | max |
+|---|---|---|---|
+| today (shared 50/50) | 0.1256 + 0.0191 | 0.0658 + 0.0191 | **0.1447** |
+| all shared → light rank | 0.1256 + 0 | 0.0658 + 0.0381 | **0.1256** |
+
+**0.82 ms/token — 2.3% of the token, 64% of design C's prize** — with no extra
+memory, no repacked GGUF, and reusing a decomposition that already exists and
+already hits its predicted rate. Note the ceiling: even handing the light rank
+*all* of the shared expert does not fully balance (it would need 128% of it),
+so the win is exactly the heavy rank's shared share and no more.
+
+**The real obstacle is dispatch shape, not mapping.** `k` is only known after
+the router kernel runs *on the GPU*, and the host encodes dispatches ahead of
+time; reading `k` back would add a sync that costs more than the win. It needs
+either an indirect command buffer or — simpler — both ranks dispatching the
+full shared grid with each threadgroup predicated on `k` from a device buffer,
+so the unassigned side early-outs. Not bit-exact (it repartitions the shared
+expert's sums), so T2 bar.
+
+**If this is ever revisited, do the shared-shift, not the repack.**
 
 #### U11 — confirm U10 does not regress prefill — **run first — DONE 2026-08-27: neutral, U10 stays default-on**
 
