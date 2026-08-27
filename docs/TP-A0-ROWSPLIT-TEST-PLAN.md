@@ -974,7 +974,11 @@ until re-taken.**
 | **2** | **Clean re-baseline.** `DS4_METAL_GPU_STAGE_TIMESTAMPS=1` and `DS4_TP_GATE_PROFILE=1`, 2k and 131k, on the post-revert build. Report **every** marker. | yes | Both recent profiles are compromised — one by the C2 artifact, the earlier one by the `attn_tp_gate` mislabel. **Everything downstream compares against this**, and two corrected figures need confirming: `attn_out_proj` ≈ 2.73 ms (not 2.38) and the straggler ≈ 0.50 ms (not 0.66). |
 | **3** | **R12a — command-buffer split schedule.** Arms 4/0, 2/8, 2/16, 2/32, 3/12, 4/12. **Hard prerequisite: `DS4_METAL_FAST_SYNC=1` on both ranks**, or `ds4_gpu_tp_split_safe()` returns 0 and every arm collapses to one buffer — a flat null for the wrong reason. | yes | **Revived, and worth more than when it was filed.** We now know a command-buffer round trip costs ~0.25–0.4 ms host-observed, and decode uses 3 buffers per token at `pos ≥ 128`. This sweeps that schedule **bit-identically**. Nothing else on the list attacks the round-trip cost, and it is free. |
 
-**Not runnable — these are mine, not rig work:**
+**Not yet runnable — these need code written before there is anything to run.**
+They are *not* rig arms today; they become rig arms once the instrument exists.
+(Division of labour: the dev box is an M1 Max with no model weights, one die and
+no TP, so it can only run the model-free harnesses and source analysis.
+Anything touching the model, TP2, real contexts or t/s is rig work.)
 
 - **Arm 2 (flash-attn split) is dead as designed.** The boundary takes a host
   wall clock either side of `end_commands()`/`begin_commands()`, so it measures a
