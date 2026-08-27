@@ -243,6 +243,81 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### Next-run battery (arms 1-5) — gate profiler, flash-attn split, stage profile, q8 shapes, attn_out nsg — 2026-08-27
+
+Build `345de30`, gen 128, rig (lanfear coord / mat worker). Zero-code arms.
+
+**Arm 1 — per-slot TP gate profiler (`DS4_TP_GATE_PROFILE=1`) — DECISIVE.**
+ATTN vs FFN exchange are **NOT equal**:
+
+| ctx | ATTN exchange | FFN exchange | delta | straggler bound |
+|---|---|---|---|---|
+| 2k | 17.8-17.9 µs | 29.4-29.6 µs | **+11.6 µs** | **≤ 1.0 ms/token** |
+| 131k | 19.0-19.1 µs | 27.1-27.2 µs | **+8.1 µs** | **≤ 0.69-0.70 ms/token** |
+
+The plan's decision rule: "if they measure equal, U14 and all three §7
+designs die." They are **not** equal — the FFN gate (which sits behind the
+routed shard) trails the ATTN gate by ~8-12 µs. **U14 and the §7 designs
+SURVIVE.** The straggler is real but modest (~0.7-1.0 ms/token upper bound,
+smaller at long context).
+
+**Arm 2 — flash-attn stage split (`DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1`).**
+Batch-context profile (inert on owned command buffer by design). Per-call
+`decode_gathered`: fa_core ~0.31-0.33 ms, reduce ~0.40-0.49 ms @2k. NOTE:
+per-call sums do **not** reconcile to the 3.8 ms `attn_inv_rope` stage marker
+(~30 ms summed @2k) — the profile is a different (batch-context) epoch, and
+its t/s is not comparable (13 t/s @2k vs 41 t/s unprofiled). Recorded raw
+for the A2 sizing; the honest decomposition of the 3.63 ms still needs a
+non-batch measurement.
+
+**Arm 3 — stage profile (`DS4_METAL_GPU_STAGE_TIMESTAMPS=1`) with new gate
+rows.** The gate is now a measured row, not a two-stage difference:
+
+| stage | 2k ms/token | 131k ms/token |
+|---|---|---|
+| **attn_tp_gate** | 3.719 | 3.750 |
+| **ffn_tp_gate** | 1.581 | 1.494 |
+| compressor_indexer | 0.199 | 9.712 |
+| routed_moe_folded | 4.911 | 4.963 |
+| attn_inv_rope | 3.813 | 4.220 |
+| q_a_kv_proj | 2.152 | 2.140 |
+| q_path | 1.874 | 1.869 |
+| q_lora_norm | 1.673 | 1.678 |
+| **total gpu_busy** | **28.657** | **38.402** |
+
+Note: `attn_output` now reads ~0.000 at 2k (its timing is absorbed by the
+new `attn_tp_gate` marker). `attn_tp_gate` (3.72 ms, ctx-invariant) is now
+visible as a top-5 stage — worth the plan's attention.
+
+**Arm 4 — Q8_0 shape sweep (`tests/bench_q8_attn_shapes 760`, mat).** Rig
+curve is **NOT monotonic** (M1 Max climbs monotonically):
+
+| k | GB/s | % peak |
+|---|---|---|
+| 512 | 224-227 | 29.5-29.8 |
+| 1024 | 279-280 | 36.8-36.9 |
+| 2048 | 410-413 | 54.1-54.4 |
+| 4096 | 445-458 | 58.6-60.3 |
+| 8192 | 421-441 | 55.4-58.1 |
+
+The curve **humps at k=2048 then recovers** — C1's shape (monotonic climb)
+**must be re-established on the rig**; the M1 Max shape does not transfer.
+
+**Arm 5 — `DS4_METAL_ATTN_OUT_LOW_NSG` sweep {1,2,4,8}.** Default is 4, so the
+nsg4 arm is the baseline. **Monotonic improvement with higher nsg:**
+
+| nsg | 2k t/s | 131k t/s |
+|---|---|---|
+| 1 | 38.86 | 28.02 |
+| 2 | 40.66 | 28.79 |
+| 4 (default) | 41.15 | 29.20 |
+| **8** | **41.85** | **29.61** |
+
+**nsg=8 beats default by ~+1.5-1.7%** at both contexts; nsg=2 slightly
+worse; nsg=1 worst. T4's "nsg=4 ~3% worse everywhere else" finding does
+**NOT reproduce** on the rig — higher nsg is monotonically better here.
+C2 candidate: raise attn_out_low_nsg to 8.
+
 ### U15 — stage profile at 2k (first ever) + HC arms — 2026-08-27
 
 `DS4_METAL_GPU_STAGE_TIMESTAMPS=1` on the rig (build `c13e3bb`), gen 128,

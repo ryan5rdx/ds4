@@ -670,16 +670,17 @@ barriers with nothing alongside is now a first-class question, and
 grepped present). One exception is called out explicitly at the end.
 
 **Rig — six arms, all zero-code.** Three of them are decisive: they kill or
-confirm queued items outright.
+confirm queued items outright. **Arms 1-5 DONE 2026-08-27** (`345de30`);
+arm 6 (n-gram) deferred — needs the acceptance-rate instrument decision.
 
-| # | arm | command | decides |
-|---|---|---|---|
-| 1 | **Per-slot gate profiler** | `DS4_TP_GATE_PROFILE=1`, 2k and 131k | **DECISIVE.** Prints ATTN vs FFN exchange and the implied straggler bound. `exchange_FFN − exchange_ATTN = E\|s\|/2` exactly, since only the FFN gate sits behind the routed shard. **If they measure equal, U14 and all three §7 designs die in one run.** |
-| 2 | **Flash-attn stage split** | `DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1`, 2k and 131k | **PREREQUISITE.** Splits `attn_inv_rope`'s 3.63 ms into `gather`/`packed`/`fa_core`/`reduce`. A2's prize is honestly 0–8% *because* this has never been measurable. Needs a batch context — it is inert on an owned command buffer by design. |
-| 3 | **Stage profile** | `DS4_METAL_GPU_STAGE_TIMESTAMPS=1`, 2k and 131k | Now carries four new rows: `q_a_kv_proj`, `q_lora_norm`, `ffn_tp_gate`, `attn_tp_gate`. Turns the 1.351 ms gate figure from a two-stage difference into a measured row. **Report every marker** — U15's table still omitted ~9%. |
-| 4 | **Q8_0 shape sweep** | `./tests/bench_q8_attn_shapes 760` | Falsifier for **C1** and **C3**. The rig's curve humps at k=2048 where the M1 Max climbs monotonically, so C1's shape must be re-established here. |
-| 5 | **`DS4_METAL_ATTN_OUT_LOW_NSG` ∈ {1,2,4,8}** | 2k and 131k | **C2.** `out_a` sat at a literal `nsg=4` the env could not reach, so T4 never swept it — and 4 is the value T4 measured ~3% worse everywhere else. Default unchanged. |
-| 6 | **n-gram arms (U5/R13)** | `DS4_NGRAM_SPEC`, repetitive vs novel text | Implemented, never run. **Report acceptance rate alongside t/s** — the delta is meaningless without it. |
+| # | arm | command | decides | outcome |
+|---|---|---|---|---|
+| 1 | **Per-slot gate profiler** | `DS4_TP_GATE_PROFILE=1`, 2k and 131k | **DECISIVE.** Prints ATTN vs FFN exchange and the implied straggler bound. `exchange_FFN − exchange_ATTN = E\|s\|/2` exactly, since only the FFN gate sits behind the routed shard. **If they measure equal, U14 and all three §7 designs die in one run.** | **NOT equal.** ATTN 17.9 µs vs FFN 29.6 µs @2k (delta +11.6 µs, ≤1.0 ms/token); ATTN 19.0 vs FFN 27.1 @131k (delta +8.1 µs, ≤0.70 ms). **U14 + §7 SURVIVE** — straggler real but modest. |
+| 2 | **Flash-attn stage split** | `DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1`, 2k and 131k | **PREREQUISITE.** Splits `attn_inv_rope`'s 3.63 ms into `gather`/`packed`/`fa_core`/`reduce`. A2's prize is honestly 0–8% *because* this has never been measurable. Needs a batch context — it is inert on an owned command buffer by design. | Ran, but per-call fa_core ~0.31-0.33 / reduce ~0.40-0.49 ms @2k do **not** reconcile to the 3.8 ms stage marker (batch-context epoch; t/s not comparable). Recorded raw; honest A2 decomposition still needs a non-batch measurement. |
+| 3 | **Stage profile** | `DS4_METAL_GPU_STAGE_TIMESTAMPS=1`, 2k and 131k | Now carries four new rows: `q_a_kv_proj`, `q_lora_norm`, `ffn_tp_gate`, `attn_tp_gate`. Turns the 1.351 ms gate figure from a two-stage difference into a measured row. **Report every marker** — U15's table still omitted ~9%. | Gate is now measured: **attn_tp_gate 3.72 ms** (ctx-invariant, top-5 stage!), ffn_tp_gate 1.58/1.49 ms. total gpu_busy 28.66/38.40. `attn_output` timing absorbed into attn_tp_gate (~0 at 2k). |
+| 4 | **Q8_0 shape sweep** | `./tests/bench_q8_attn_shapes 760` | Falsifier for **C1** and **C3**. The rig's curve humps at k=2048 where the M1 Max climbs monotonically, so C1's shape must be re-established here. | **C1 falsified on the rig.** Curve humps at k=2048 (410-413) then recovers at k=8192 (421-441); k=512 worst (224-227). Not monotonic — C1 shape must be re-established. |
+| 5 | **`DS4_METAL_ATTN_OUT_LOW_NSG` ∈ {1,2,4,8}** | 2k and 131k | **C2.** `out_a` sat at a literal `nsg=4` the env could not reach, so T4 never swept it — and 4 is the value T4 measured ~3% worse everywhere else. Default unchanged. | **C2 positive.** Monotonic with nsg: nsg=8 best (41.85 @2k, 29.61 @131k) vs default nsg=4 (41.15/29.20) = **+1.5-1.7%**. T4's "nsg=4 ~3% worse" does NOT reproduce. Candidate: raise attn_out_low_nsg to 8. |
+| 6 | **n-gram arms (U5/R13)** | `DS4_NGRAM_SPEC`, repetitive vs novel text | Implemented, never run. **Report acceptance rate alongside t/s** — the delta is meaningless without it. | **DEFERRED.** Needs the acceptance-rate instrument (code, user's domain). |
 
 **Closed by U15 — do not re-run:** the `hcpre` ablation, and the pre-norm fusion
 disable (+0.58 ms; the fusion is a net win).
