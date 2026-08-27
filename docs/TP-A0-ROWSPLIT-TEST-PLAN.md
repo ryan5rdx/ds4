@@ -719,6 +719,70 @@ suggested — but only the ones that block. Identifying *which* dispatches are
 barriers with nothing alongside is now a first-class question, and
 `bench_qkv_norm` is the instrument for pricing any of them in isolation.
 
+### Iteration 2 ran on the C2-broken build — what survives — 2026-08-27
+
+Build `6b962db` had `out_low_nsg = 8` live, so `kernel_dsv4_attn_out_low_q8_0_f32`
+was compiled for 8 simdgroups and dispatched with 4. Each simdgroup covered
+1/8 of k instead of 1/4, so the threadgroup read **half the k range** — faster
+and wrong. The previous 5-arm battery (build `345de30`) predates C2 and is
+**clean**; that gives a clean control for the same procedure on the same rig.
+
+**The contamination is narrow and quantifiable.** Every unrelated stage matches
+between the two runs within 0.03 ms:
+
+| stage @2k | clean | broken | Δ |
+|---|---|---|---|
+| routed_moe | 4.911 | 4.927 | +0.016 |
+| q_a_kv_proj | 2.152 | 2.141 | −0.011 |
+| q_path | 1.874 | 1.876 | +0.002 |
+| q_lora_norm | 1.673 | 1.675 | +0.002 |
+| attn_inv_rope | 3.813 | 3.784 | −0.029 |
+
+So the runs are comparable and the artifact is localised. In the attention
+region: clean 3.719 (the mislabelled combined figure) against broken
+2.383 + 0.994 = 3.377 — **+0.342 ms of C2 artifact**.
+
+**Arm 1 survives with one correction.** `attn_out_proj` is real and
+context-invariant, but its clean value is **~2.73 ms, not 2.38**. The headline
+finding stands and is important: **the 3.72 ms was a mislabel, and the actual
+ATTN gate is only ~0.99 ms.**
+
+**The gate is now directly measured rather than differenced:** `ffn_tp_gate`
+1.643 + `attn_tp_gate` 0.994 = **2.64 ms**, against my earlier ~2.7 ms estimate
+from differencing `ffn_hc_post` against `attn_hc_post`. Two independent methods
+agreeing. And the split is informative — **the FFN gate costs 1.65× the ATTN
+gate, which is the straggler, since only the FFN gate sits behind the routed
+shard.**
+
+**Arm 3 must use the CLEAN number.** Garbage attention output feeds the router,
+so expert selection under C2 is not the model's real distribution — and it
+shows: the delta grew from **+11.6 µs (clean) to +15.4 µs (broken)**, consistent
+with degenerate routing concentrating experts. **The straggler is ~0.50 ms, not
+0.66.** U14 and §7 survive at **0.50 ms, 2.1% of the token** — the third
+successive downward revision of that item (0.82 → 0.74 → 0.66 → 0.50).
+
+### Arm 2 cannot work as built, and the sampling fix did not address the real defect
+
+Per-call `fa_core` 0.25–0.41 ms and `reduce` 0.27–0.35 ms, against a 3.78 ms
+stage for all 43 layers. Sampling cut the calls from 10,496 to 123 as intended,
+and the reconciliation is **still 6× out**.
+
+**The reason is the boundary mechanism itself, not the call count.**
+`ds4_gpu_flash_attn_stage_profile_boundary` takes `ds4_gpu_now_ms()` — a **host
+wall clock** — either side of `ds4_gpu_end_commands()` / `begin_commands()`. It
+therefore measures a **command-buffer round trip**, not kernel time. The
+0.25–0.41 ms figures are exactly the round-trip cost `bench_qkv_norm` measured
+independently (423 µs wall, 110 µs GPU-busy per cb at one dispatch per buffer).
+
+This works for prefill, where a stage is milliseconds and the round trip is
+noise. **At decode, where stages are microseconds, the round trip is the entire
+measurement.** A0 as designed can never decompose the decode attention.
+
+**What it needs instead:** GPU timestamps sampled *within one command buffer*
+(`MTLCounterSampleBuffer` at dispatch boundaries), not encoder splits. That is a
+different instrument, not a parameter change. **A2 stays unsized, and I should
+stop reporting A0 as built.**
+
 ### U5 / n-gram speculation is UNREACHABLE, not merely unrun — 2026-08-27
 
 Found while running the arm: `DS4_NGRAM_SPEC=1` on the plain bench decode loop
