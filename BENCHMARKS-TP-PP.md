@@ -202,6 +202,70 @@ Cold 131k prefill (TP): 402.64 — +54.9% over the pre-workstream flag-off cold
 baseline (259.90); sweep +65.8% (221.50 → 367.29). TP wins prefill at
 ≤16k and decode at every point; PP wins prefill from 32k up.
 
+### T8 — MoE decode specialization pricing (standalone harness) — 2026-08-26
+
+`tests/bench_moe_mxfp4_decode 256 256 6` on lanfear (M2 Ultra 60-core, same
+GPU as mat), no model, no TP. 256 routed experts, 6 distinct streamed per
+iter, 80.22 MB/iter, 43-layer projection. Cumulative-disable ladder prices
+each of the five MXFP4 routed-MoE decode specializations
+(`ds4_metal.m:39358`+): static_trip → sum6_full_rows → fixed_route_sum6 →
+fixed_route_pair → tg_multiple.
+
+| arm | disabled | wall ms/iter | GB/s | 43L ms/token |
+|---|---|---|---|---|
+| t8_full | none | 0.2076 / 0.2143 / 0.2057 | ~383 | 9.08 |
+| t8_no_trip | static_trip | 0.2033 | 394.5 | 8.74 |
+| t8_no_fullrows | +sum6_full_rows | 0.2086 | 384.6 | 8.97 |
+| t8_no_sum6 | +fixed_route_sum6 | 0.1932 | 415.2 | 8.31 |
+| t8_no_pair | +fixed_route_pair | 0.1970 | 407.1 | 8.47 |
+| t8_no_tgmult | +tg_multiple (all generic) | 0.1988 / 0.2046 / 0.1929 | ~403 | 8.54 |
+
+**Conclusion: the specialization ladder is worth nothing to −5%; the generic
+path is consistently slightly faster** (fully-disabled mean 0.1988 ms/iter vs
+full-ladder 0.2092, ~403 vs ~383 GB/s, non-overlapping across 3 runs each).
+The routed MoE matvec is **bandwidth-bound at ~400 GB/s** — near the M2 Ultra
+ceiling — so kernel specializations cannot buy what is not there. **T8 pricing
+argues against a MoE specialization port.**
+
+### Env battery — T2 + T3 + T4 at 32k/65k/131k — 2026-08-26
+
+One rig session, `DS4_NGRAM_SPEC` off, sweep `32768→131072 --step-mul 2`
+(covers 32k/65k/131k decode rows), gen 128, control = in-session `t2_12`
+(= the decode-split default, also tracking M0). Decode steady t/s:
+
+| arm | 32k | 65k | 131k | vs control @131k |
+|---|---|---|---|---|
+| **t2_12** (split=12, control) | 33.79 | 31.71 | 28.43 | — |
+| t2_8 | 33.49 | 31.40 | 28.08 | −1.2% |
+| t2_15 | 34.01 | 31.78 | 28.40 | −0.1% |
+| t2_16 | 33.93 | 31.85 | 28.49 | +0.2% |
+| t2_20 | 34.22 | 31.93 | 28.59 | +0.6% |
+| **t2_24** | 34.24 | 31.99 | 28.68 | **+0.9%** |
+| t3_1 (LLT nsg4) | 34.27 | 31.11 | 28.26 | −0.6% |
+| t4_1 (nsg=1) | 33.68 | 31.18 | 28.17 | −0.9% |
+| **t4_2** (nsg=2) | 33.89 | 31.65 | 28.40 | −0.1% |
+| t4_3 (nsg=3) | 33.33 | 31.12 | 27.98 | −1.6% |
+| t4_4 (nsg=4) | 32.64 | 30.66 | 27.58 | −3.0% |
+| t4_6 (nsg=6) | 32.32 | 30.17 | 27.25 | −4.1% |
+
+Prefill was flat across every arm (393.5–393.7 @131k; 461.6–462.0 @65k;
+495–518 @32k) — none of these knobs touch prefill.
+
+**T2 — decode split-K: monotonic gain from 12→24, default is not optimal.**
++0.9% @131k / +1.3% @32k at split=24 vs the default 12. Larger splits win
+(24 is the top of the tested range; the code allows 2..31).
+
+**T3 — indexer LLT nsg4 (presence flag): context-dependent, roughly neutral.**
+Helps 32k steady (+1.4%), hurts 65k/131k (−1.7%/−0.6%). First-token latency
+spikes to 189 ms @32k vs 31 ms control — the nsg4 LLT scorer is slower on the
+first decode step but faster in steady state. Mixed; not a clear win.
+
+**T4 — Q8_MV_NSG: default 2 is optimal; higher is monotonically worse.**
+n=1 −0.9%, n=3 −1.6%, n=4 −3.0%, n=6 −4.1% @131k. The `parallel_full_ffn`
+confound (setting the env var disables it, `ds4.c:22199`) is isolated by t4_2
+(nsg=2, env set) vs control: −0.1% — negligible, that path is not on this
+model anyway (it is IQ2_XXS/Q2_K only).
+
 ### M0 — re-baseline decode on a pinned shard — `upstream-metal-wins` @ `5866100` tree build, 2026-08-26
 
 Step 0 came back positive: `iogpu.wired_limit_mb` was `0` on both hosts for
