@@ -18248,13 +18248,23 @@ int ds4_gpu_indexer_score_one_tensor(
             } else if (getenv("DS4_METAL_INDEXER_LLT_NSG4") != NULL) {
                 score_nsg = 4;
             }
-            /* U10: sq/sw/sqk aliased over the dead sk staging buffer -- same
-             * NK=64, 16384 B instead of 20512, so 2 threadgroups resident per
-             * 32 KiB core instead of 1.  U10a showed NSG=4 beating the default
-             * by +5-13% on the Ultra, but NSG=4 buys that residency by halving
-             * NK; this buys it for free.  Opt-in until the rig prices it. */
+            /* U10, DEFAULT ON: sq/sw/sqk aliased over the dead sk staging
+             * buffer -- same NK=64, 16384 B instead of 20512, so 2
+             * threadgroups resident per 32 KiB core instead of 1.  U10a showed
+             * NSG=4 beating the default by +5-13% on the Ultra, but NSG=4 buys
+             * that residency by halving NK; this buys it for free.
+             *
+             * Measured +19.3% on an M1 Max (4 alternating rounds) and +17.4%
+             * on the rig (3 runs, 1717.2 -> 2015.6 GFLOP/s), where it also
+             * beats NSG=4 by 14.6%.  Byte-identical output at n_comp 32768 and
+             * 65536, and it does not change the grid -- only the threadgroup
+             * memory allocation -- so it carries none of the T3 nsg4 risk,
+             * which came from doubling the threadgroup count.
+             *
+             * DS4_METAL_INDEXER_LLT_TIGHT=0 rolls it back. */
+            const char *tight_env = getenv("DS4_METAL_INDEXER_LLT_TIGHT");
             const bool score_tight =
-                score_nsg == 8 && getenv("DS4_METAL_INDEXER_LLT_TIGHT") != NULL;
+                score_nsg == 8 && !(tight_env && tight_env[0] == '0');
             id<MTLComputePipelineState> direct_pipeline = score_llt
                 ? ds4_gpu_get_pipeline(score_tight
                         ? "kernel_dsv4_indexer_scores_llt_tight"
