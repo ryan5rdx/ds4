@@ -620,8 +620,8 @@ Three things follow.
    inflating it across 36 additional layers. This is now the single most
    important constraint on the kernel design, and `docs/QWEN38-GDN-KERNEL-DESIGN.md`
    §3 should be judged primarily on it.
-3. **The floor may be worth more than the port — but that is not yet
-   established.** ~13 ms/token sits on the model we already run, against
+3. **~~The floor may be worth more than the port.~~ Settled 2026-08-26 — see
+   the update below.** ~13 ms/token sits on the model we already run, against
    ~7 ms/token of long-context gain from a ~62,000-line port. The caution is
    that the 13 ms is *unattributed*, not *recoverable*: M2 skipped `router`,
    `shared` and `kv` because they do not ablate cleanly, so the residual
@@ -636,3 +636,42 @@ is per-layer or per-token. Per-layer cost scales with `n_layer` and Qwen is
 worse on it; per-token fixed cost does not scale and Qwen keeps the full ~13 ms
 floor, landing nearer ~48 t/s. That is a measurement, not an argument, and it
 should be made on DS4 before any Qwen code is written.
+
+### Update, 2026-08-26 — the stage profile lands and inverts the dispatch argument
+
+The ~20-minute measurement recommended above was run
+(`DS4_METAL_GPU_STAGE_TIMESTAMPS` at 32k/131k, after a one-line instrument fix
+in `28ecec4`). The result removes the ambiguity and changes what this port
+should optimise for.
+
+**Decode gpu_busy is 30.43 ms @32k / 36.36 @131k with a gap of ~0.31 ms at
+both — the GPU is ~99% busy, and the stage sum equals busy exactly.** The
+13 ms residual is real compute from stages M2's ablation set could not cover
+(`q_path` remainder, `compressor_indexer`, `attn_inv_rope`, `router`, `shared`,
+`ffn`/`attn` HC). There is no stall.
+
+Three revisions follow, and the third is the important one.
+
+1. **The floor is not recoverable overhead, so it is no longer an argument
+   against the port.** It is the cost of running the model. Point 3 above is
+   withdrawn: there is no 13 ms of stall sitting on DS4 that beats a port.
+2. **The long-context term is finer than M2 could see.** It is
+   `compressor_indexer` — the compressed-KV index lookup, **not** the scoring
+   or top-k selection — at +5.06 of the +5.93 ms growth and 10.51 ms at 131k,
+   the single largest decode stage. Qwen runs that lookup on 12 layers instead
+   of 21, which is still the port's strongest decode argument and is now
+   attributed to a specific kernel rather than to "the indexer."
+3. **The dispatch-count objective I gave the GDN kernel design is aimed at the
+   wrong target.** That brief said "one dispatch per layer is load-bearing,"
+   reasoning from a floor presumed to be dispatch and synchronisation latency.
+   The GPU is 99% busy: dispatch count is not the constraint, **stage compute
+   is**. This inverts the design's central trade-off — and it converts the
+   review's D1 occupancy finding from a defect into a decisive one, since
+   narrowing the dominant kernel's grid from ~2,060 threadgroups to 64 in order
+   to save two dispatches is exactly the wrong direction on a compute-bound,
+   fully-busy GPU. **§3 of `QWEN38-GDN-KERNEL-DESIGN.md` should be re-derived
+   with occupancy as the objective and dispatch count as a tiebreak.**
+
+Sequencing consequence for DS4 itself: R12b and the encoder-boundary instrument
+are moot, and the remaining levers are stage costs — `compressor_indexer`
+(10.5 ms), `q_path` (5.5), `routed_moe` (5.4), `attn_inv_rope` (4.3).

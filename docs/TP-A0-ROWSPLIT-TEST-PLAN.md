@@ -184,8 +184,9 @@ two are minutes and one of them can invalidate three completed runs.
 | 1 | **M3** — **done 2026-08-26** (`uc_lat2`, byte-verified, n=2000/arm): half-RTT **8.0 µs (4 KB)** / **14.5–15.5 µs p50 (16 KB, single WR)** — both ≪20 µs → **T1 open** (~30 µs/gate ≈ 2.5 ms/token at 131k). Single 16 KB UC WR confirmed working on this stack. One transient first-ping UC drop seen; T1 needs a re-arm/retry path. Recorded in `BENCHMARKS-TP-PP.md`. | — | Decides T1, the largest sized item, before any code is written. ≲20 µs half-RTT → ~2.5 ms/token available; ~45 µs → T1 closes. |
 | 2 | ~~Env battery T2 + T3 + T4~~ — **done 2026-08-26. T2 +0.9% @131k and monotonic to the top of the tested range (not peaked); T3 mixed; T4 default already optimal.** Follow-up: sweep T2 at 28/31. | — | One small real win, two nulls. |
 | 3 | ~~T8 pricing~~ — **done 2026-08-26. The specialisation ladder is worth nothing to −5%; the generic path is faster. T8 is dead.** The routed MoE matvec is bandwidth-bound at ~400 GB/s. | — | 30 minutes of pricing saved five kernel patches for a negative. |
-| 4 | ~~M2~~ — **done 2026-08-26.** Ablation at 32k/65k/131k. **Routed MoE is the dominant decode stage (~22–25%)**; **the indexer is the long-context story** (score +5.9→12.2%, topk +7.9→17.7% as ctx 32k→131k — the largest attributed slice of the 11.1 ms); attnout ~9–10%, qb/attncore ~5%, hcpre ~2%. | ~2 h | The 11.1 ms/token of unattributed long-context decode growth — the largest unknown in the document. |
-| 5 | **R12a** split-schedule sweep + **R12b** reduced ballast arm + the encoder-boundary instrument | ~1.5 h | R12b is now a confirmation, not a discovery; the encoder-boundary half is the genuinely unmeasured one. |
+| 4 | ~~M2~~ — **done 2026-08-26.** Ablation at 32k/65k/131k. **Routed MoE is the dominant decode stage (~22–25%)**; **the indexer is the long-context story** (score +5.9→12.2%, topk +7.9→17.7% as ctx 32k→131k — the largest attributed slice of the 11.1 ms); attnout ~9–10%, qb/attncore ~5%, hcpre ~2%. **Refined by the stage profile (done below): the indexer cost is `compressor_indexer` (+5.06 of +5.93 ms growth), and the ~13 ms residual is real compute, not stall.** | ~2 h | The 11.1 ms/token of unattributed long-context decode growth — the largest unknown in the document. |
+| 4b | ~~Stage profile at 32k/131k~~ — **done 2026-08-26.** Decode gpu_busy 30.43/36.36 ms, **gap ~0.31 ms (1%) — decode is ~99% GPU-busy, no stall.** Stage sum = busy exactly (100% attribution). compressor_indexer = the long-context term (+5.06 ms). **The ~13 ms M2 residual is real compute (unablated stages), not idle.** | ~20 min | Bounds router/shared/kv/compressor and decomposes the ~13 ms floor without ablation. |
+| 5 | ~~R12a~~ split-schedule sweep + **R12b** reduced ballast arm + **encoder-boundary instrument** — **R12b and encoder-boundary MOOT** (probe stall; stage profile shows no stall). R12a split-schedule still valid if wanted. | ~1.5 h | R12b is now a confirmation, not a discovery; the encoder-boundary half is the genuinely unmeasured one. |
 | 6 | **R13 n-gram rig arms** (inertness / correctness / decode A/B on repetitive vs novel text) | ~1 h | Independent of the above; run whenever convenient. |
 | 7 | ~~T1~~ — **done 2026-08-26: dead.** `DS4_TP_GATE_FASTPATH` is a wash (±0.6% decode, no gate-exchange change) and is **not bit-identical** (logits shift up to 2.3, top-1 preserved). Stay default-off. ~~T8 port~~ — dead, see row 3. | — | Both are code, both are gated on a measurement above. |
 | 8 | Cleanup batch: T6, T9, T10, T13 | — | Small, low-risk, individually sub-1%. |
@@ -690,17 +691,11 @@ count accounts for at most 1.94 ms of it, which is consistent with this
 document already concluding that "dispatch removal is not a productive
 strategy here."
 
-That leaves exactly two candidates, and they are separately measurable:
-
-- **unablated compute** — `router`, `shared`, `kv`, compressor, q_a/kv, HC
-  post, embedding/logits/sampling;
-- **encoder close/reopen boundaries and gate waits** — **172 boundaries per
-  token** (`:796`), which ballast is blind to because it fires *inside* an open
-  encoder. If boundaries carried the whole non-compute remainder they would be
-  ~75 µs each, in the range upstream #590 reports.
-
-**So the floor closes with two instruments, not one**, and neither is
-expensive.
+That left two candidates — unablated compute, or encoder boundaries and gate
+waits. **The stage profile has since resolved it: unablated compute, with a
+0.31 ms gap and no stall.** The reasoning below is kept because the conclusion
+it reached — that dispatch removal cannot be the lever — was right, and it is
+now measured rather than inferred.
 
 **Decomposing the compute half does not need ablation, and that is the
 unlock.** The
@@ -716,34 +711,57 @@ document into a table.** It should run before anything else.
 **Consequence for sequencing.** The remaining stage-level items are worth ~1%
 between them, and the floor is ~13 ms. Order:
 
-1. **Stage-profile run at 32k/131k** (above) — bounds `router`/`shared`/`kv`/
-   compressor and tells us how much of the 13 ms is real compute. ~20 min.
-2. **The encoder-boundary instrument** (`:736-740`, ~20 lines) — worth running,
-   but **not for the reason given in the first draft of this list.** See the
-   correction below. Steps 1 and 2 are independent.
+1. **Stage-profile run at 32k/131k** (above) — **DONE 2026-08-26. The floor is
+   real compute, not stall.** `DS4_METAL_GPU_STAGE_TIMESTAMPS` reports decode
+   gpu_busy 30.43 ms @32k / 36.36 @131k with a **gap of only ~0.31 ms at both**
+   — the decode GPU is ~99% busy, and the stage sum equals busy exactly, so
+   there is no hidden idle time. The 13 ms M2 residual is the sum of stages
+   the ablation set did not cover (q_path remainder, compressor_indexer,
+   attn_inv_rope, router, shared, ffn/attn hc), all real compute.
+   **compressor_indexer is the long-context term**: +5.06 of the +5.93 ms
+   growth 32k→131k. (Note: a one-line instrument fix was needed — the decode
+   stage report was only wired on the speculative `_top` decode variant, not
+   the main TP decode loop; added in `28ecec4`.)
+2. **R12b reduced-ballast arm + the encoder-boundary instrument** — **MOOT.
+   They probe stall, and the stage profile shows there is no stall (gap
+   ~0.31 ms, 1%).** Do not run. The floor is compute; per-layer dispatch
+   cannot be the 13 ms.
 3. **T2 follow-up** (28/31) — see below. Cheap, but a loose end, not a lever.
+   Still the only remaining queued measurement.
 
-**Correction — "per-layer versus per-token" is not a useful discriminator, and
-I proposed it as one.** Encoder boundaries are themselves per-layer: gates per
-token are `DS4_N_LAYER * DS4_TP_GATES_PER_LAYER` (`ds4.c:60435`), so 86 gates =
-43 × 2 and the 172 close/reopen events = 86 × 2. But so are `router`, `shared`,
-`kv` and the compressor. **Nearly everything in a decode token is per-layer**,
-so that axis separates almost nothing, and both branches of the question make
-the *same* Qwen prediction: +5 layers is +1.51 ms either way (20 extra
-boundaries × 75.6 µs, or 13/43 × 5).
+**The real lever is now the stage costs.** compressor_indexer (10.5 ms @131k,
+the entire long-context growth), q_path (5.5), routed_moe (5.4), attn_inv_rope
+(4.3). Any future decode work must target these stages, not stall.
 
-Two things follow, one reassuring and one narrowing.
+**Post-mortem on how the floor was mis-framed, kept because it cost two wrong
+turns.** The residual was first described here as "not compute at all," then as
+splitting between unablated compute and stall, with "per-layer versus
+per-token" offered as the discriminator. All three were wrong, and the stage
+profile settled it in twenty minutes: **the gap is 0.31 ms. There was never any
+stall to find.**
 
-- **The Qwen extrapolation is more robust than §10 claims, not less.** Because
-  the residual is dominated by per-layer terms of *both* kinds, the 48/43
-  scaling applies to most of it regardless of the compute/stall split. ~14.5 ms
-  is the right number and it does not depend on resolving the split.
-- **The discriminator that matters is compute versus stall, not per-layer
-  versus per-token.** The stage profiler answers it directly by pricing
-  `router`/`shared`/`kv`/compressor. The boundary instrument then prices the
-  *attackable* fraction of what is left — that is its actual job, and it is
-  still worth doing, but it decides how much of the floor we could recover, not
-  how the floor scales.
+Two observations from that detour still hold and are worth keeping.
+
+- **Nearly everything in a decode token is per-layer**, so that axis was never
+  going to discriminate anything. Encoder boundaries are per-layer — gates per
+  token are `DS4_N_LAYER * DS4_TP_GATES_PER_LAYER` (`ds4.c:60435`), so 86 gates
+  = 43 × 2 and the 172 close/reopen events = 86 × 2 — but so are `router`,
+  `shared`, `kv` and the compressor.
+- **That makes the Qwen extrapolation more robust, not less.** Because the
+  token is per-layer nearly end to end, the 48/43 scaling applies to
+  essentially all of it, and it no longer depends on a compute/stall split that
+  turns out not to exist. ~14.5 ms stands (see
+  `docs/QWEN38-FLASH-NEXT-PORT-PLAN.md` §10) — and it is now a *compute* floor,
+  which means the GDN design's dispatch-count objective is aimed at the wrong
+  target.
+
+**Method note.** Ablation and stage profiling answer different questions, and
+reaching for ablation first cost the detour above. Ablation prices *what a
+chain contributes in situ* but can only cover chains that ablate cleanly — M2
+had to skip `router`, `shared` and `kv` for exactly that reason, and the
+skipped set was the residual. Stage timestamps price *everything*, need no
+semantically-wrong output, and sum to the measured busy time so the attribution
+is closed by construction. **Profile first, ablate second.**
 
 The ablation method (re-run `DS4_TP_ABLATE` chains at 32k and 131k, plus
 `DS4_METAL_ABLATE_INDEXER_SCORE`/`_TOPK`, which are already wired into decode
