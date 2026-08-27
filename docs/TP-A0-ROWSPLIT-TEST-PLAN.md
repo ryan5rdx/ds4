@@ -171,10 +171,82 @@ baseline means explicitly setting the three to `0`.
 
 ## Open requests
 
+### HC scoping result — 2026-08-27 — three corrections, and one finding bigger than the stages themselves
+
+Full report: `docs/SCOPE-HC-STAGES.md`. **The 4.56 ms is not 4.56 ms of HC
+work**, and the credible headroom is **~0.6–1.0 ms (2.5–4.1% of the 2k token)**,
+not 18.7%. Three things it establishes matter beyond the HC stages.
+
+**1. The TP gate is a 1-thread GPU spin loop, and it is inside these stages.**
+`ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN)` sits inside the `ffn_hc_post`
+span (`ds4.c:25335`, marker at `:25377`), and its release fence is
+`kernel_dsv4_tp_fence_wait` (`metal/dsv4_misc.metal:7333`) — a bounded spin that
+blocks the command buffer for the whole RDMA round trip. `attn_hc_post` runs the
+**identical kernel at the identical grid with no gate, in the same run**, so the
+difference prices the gate directly:
+
+> **1.812 − 0.461 = 1.351 ms = 43 × 31.4 µs/gate**, against an independently
+> measured ~38 µs/gate.
+
+**This is what the 30 W is.** A 1-thread spin keeps the GPU "busy" at
+essentially zero power, which is why the stage profile reports 99% busy with a
+0.31 ms gap while the part draws a quarter of its envelope. The "there is no
+stall" conclusion was correct about *idle* and wrong about *useful work* — the
+stall is inside the busy time, wearing a kernel's clothes.
+
+With the ATTN gate inside `attn_output` too, **~2.7 ms/token — 11% at 2k — is
+gate spin.**
+
+**2. `attn_output` is not a target.** Net of the ATTN gate it prices at ~640
+GB/s = **84% of roof**. §8's "phantom target" warning holds; the sibling agent's
+largest item is pre-empted.
+
+**3. Every stage number in this document is inflated ~13%.**
+`DS4_METAL_GPU_STAGE_TIMESTAMPS` makes each stage its own command buffer (~900
+per token against 3), and U12's 32k sum is **32.70 ms profiled vs 28.91
+unprofiled on the same build `b99dfa3`** — 3.79 ms over ~903 boundaries =
+**4.2 µs each, ≈0.18 ms per marker**. Net of their own boundary:
+
+| stage | profiled | net |
+|---|---|---|
+| `q_a_kv_proj` | 2.137 | 1.957 |
+| `q_lora_norm` | 1.680 | **1.500** |
+| `ffn_hc_post` | 1.812 | 1.632 |
+| `attn_hc_post` | 0.461 | 0.281 |
+
+U16 survives this comfortably — 1.50 ms on 2 threadgroups is still the worst
+ratio in the engine — but **quote net numbers from here on.**
+
+### What this does to the queue
+
+**U14's shared-shift comes back up, with a measured mechanism.** I deprioritised
+it as an abstract load-balance argument worth 0.82 ms. It is now visible as
+**1.351 ms of measured spin in `ffn_hc_post`**, and the reason the peer is late
+is precisely the `E[max(k, 6−k)] = 3.9375` imbalance §7 describes. Shifting the
+shared expert to the routed-light rank attacks exactly this, costs no memory and
+no repack, and is **fixed work — it pays at every context**. That puts it level
+with U16 and above the entire HC candidate pool.
+
+**Grid widening on the HC producers is already a recorded negative.** `d81a28f`
+on branch `pr-778` (not in this branch) implements the obvious 6→10 threadgroup
+spread, bit-identical, for **+0.12% on an M5 Max** — because TG0 alone carries
+four matvec rows *plus* the whole 4096-wide collapse+RMS epilogue, and spreading
+does not touch it. Do not re-propose it; H2 (unloading TG0) is the version with
+a mechanism, and it is not bit-exact.
+
+**Three zero-code arms to fold into the next rig run**, all from the report:
+`DS4_TP_ABLATE=hcpre` (resolves an unexplained 2.7× disagreement between the
+ablation's 0.85 ms and the profile's 2.276 ms);
+`DS4_METAL_DISABLE_PRE_M5_HC_PRODUCER_PRE_NORM_FUSE=1` (tests whether the
+fusion's three device-scope `seq_cst` fences cost more than the dispatch they
+removed — a possible free default flip); and a three-line marker after
+`ds4.c:25335` that turns finding 1 from inference into a measured row.
+
 ### Next run — 2026-08-27
 
-**Rig: U15 only.** It is the sole queued item that is zero-code and
-rig-blocked. Everything else is now implementation-gated, not measurement-gated.
+**Rig: U15, plus the three zero-code HC arms above.** U15 is the sole
+*queued* item that is zero-code and rig-blocked; the HC arms are new and cost
+minutes. Everything else is now implementation-gated, not measurement-gated.
 
 ```
 DS4_METAL_GPU_STAGE_TIMESTAMPS=1    # ctx 2048, gen 128
