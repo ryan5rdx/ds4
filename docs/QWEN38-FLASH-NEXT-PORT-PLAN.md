@@ -561,3 +561,58 @@ kernel number will be born on the M1 Max), and **build any GDN harness at world
 2 with the head split and a non-null addend from day one**, because R13b showed
 a world-1 harness measured a more specialised kernel than production runs and
 made a "92%, the kernels are fine" conclusion worthless.
+
+## 10. M2 lands — the decode case, re-grounded on measurement (2026-08-27)
+
+M2 was the measurement gating this decision. It is in, and it changes both
+halves of the decode argument — one for the better, one for the worse.
+
+**The context term is the indexer, and Qwen deletes most of it.** M2 attributes
+essentially the whole of DS4's 11.1 ms long-context penalty to the sparse
+indexer: converted to time, the two indexer chains supply **+5.36 ms of the
++5.87 ms measured growth** from 32k to 131k (`docs/TP-A0-ROWSPLIT-TEST-PLAN.md`,
+M2 section). DS4 pays that on its **21 ratio-4 layers of 43 (49%)**. Qwen has
+**12 QSA layers of 48 (25%)**, and the other 36 are GDN — O(1) state, no cache
+to score, no growth with context at all. The "36 of 48 layers that do not
+degrade with context" claim in §1 now has a measured mechanism and a measured
+magnitude behind it, rather than being an architectural assertion.
+
+**But the floor does not improve, and probably worsens.** M2's other finding is
+a **~13 ms/token residual that no stage ablation touches and that does not move
+with context** — 46% of the token at 32k, 35% at 131k, larger than the routed
+MoE. If that floor is per-layer dispatch and synchronisation cost, Qwen
+inherits it scaled by layer count: **13 × 48/43 ≈ 14.5 ms before GDN adds a
+single dispatch of its own.**
+
+Re-estimating decode on that basis, with the §8 figure of ~3.1 GB/token/rank at
+the ~400 GB/s effective bandwidth T8 measured:
+
+| | DS4 measured | Qwen estimated |
+|---|---|---|
+| 2k | 41.1 t/s | ~45 t/s (+10%) |
+| 131k | 28.3 t/s | ~45 t/s (**+59%**) |
+
+≈ 7.8 ms of memory time on a ≈ 14.5 ms floor, roughly flat in context.
+
+Three things follow.
+
+1. **Qwen's decode win is a long-context win, not a general one.** At short
+   context it is within noise of what we already have. Anyone expecting a
+   uniform speedup from a 6 B-active model should be corrected by this table:
+   the floor, not the parameter count, sets short-context decode.
+2. **"One dispatch per layer" in the GDN decode kernel is load-bearing, not a
+   nice-to-have.** It is the difference between inheriting the floor and
+   inflating it across 36 additional layers. This is now the single most
+   important constraint on the kernel design, and `docs/QWEN38-GDN-KERNEL-DESIGN.md`
+   §3 should be judged primarily on it.
+3. **The floor is worth more than the port.** ~13 ms/token on the model we
+   already run, versus ~7 ms/token of long-context gain from a ~62,000-line
+   port. Whatever the floor turns out to be, attacking it is the better trade —
+   and it is unmeasured. R12b's reduced-ballast arm and the encoder-boundary
+   instrument are the queued items that probe it.
+
+**The open question that decides how the table above reads:** whether the floor
+is per-layer or per-token. Per-layer cost scales with `n_layer` and Qwen is
+worse on it; per-token fixed cost does not scale and Qwen keeps the full ~13 ms
+floor, landing nearer ~48 t/s. That is a measurement, not an argument, and it
+should be made on DS4 before any Qwen code is written.
