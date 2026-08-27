@@ -175,9 +175,9 @@ two are minutes and one of them can invalidate three completed runs.
 
 | # | Do | Time | Why first |
 |---|---|---|---|
-| 0 | **`sysctl iogpu.wired_limit_mb` on both hosts**, and grep every saved log for `wired_limit_mb is 0` | 2 min | If it was 0 after the 2026-08-26 reboot, the shard was paging lazily and **R10d, R10e and R11 are all suspect**. Set it to `120000` on both and note it in the prerequisites (done — `BENCHMARKS-TP-PP.md`). |
+| 0 | **`sysctl iogpu.wired_limit_mb` on both hosts** — **done 2026-08-26**: it **was** `0` on both hosts; all 27 surviving R10/R11 coordinator logs carry the `wired_limit_mb is 0` warning, so **R10d/R10e/R11 decode numbers are suspect** (flat, stall-shaped, neither-bound profile = lazy paging). Set to `120000` on both; prerequisite added to `BENCHMARKS-TP-PP.md`. | — | If it was 0 after the 2026-08-26 reboot, the shard was paging lazily and **R10d, R10e and R11 are all suspect**. Set it to `120000` on both and note it in the prerequisites (done — `BENCHMARKS-TP-PP.md`). |
 | 0b | Confirm `DS4_METAL_FAST_SYNC=1` is in the **`ds4-server`** launch path | 2 min | Bench always sets it; production may not. Worth ~186 µs of a 508 µs gate, and without it the decode command-buffer split is a no-op under TP. |
-| 1 | **M3** — `uc_pingpong` at 4 KB and 16 KB | 10 min | Decides T1, the largest sized item, before any code is written. ≲20 µs half-RTT → ~2.5 ms/token available; ~45 µs → T1 closes. |
+| 1 | **M3** — **done 2026-08-26** (`uc_lat2`, byte-verified, n=2000/arm): half-RTT **8.0 µs (4 KB)** / **14.5–15.5 µs p50 (16 KB, single WR)** — both ≪20 µs → **T1 open** (~30 µs/gate ≈ 2.5 ms/token at 131k). Single 16 KB UC WR confirmed working on this stack. One transient first-ping UC drop seen; T1 needs a re-arm/retry path. Recorded in `BENCHMARKS-TP-PP.md`. | — | Decides T1, the largest sized item, before any code is written. ≲20 µs half-RTT → ~2.5 ms/token available; ~45 µs → T1 closes. |
 | 2 | **Env battery: T2 + T3 + T4** at 32k and 131k, `DS4_NGRAM_SPEC` **off** | ~1.5 h | Three knobs, no code, no correctness arm needed beyond top-1 + bounded Δlogit. T3 pre-screens free on the dev box with `tests/bench_indexer_score`. |
 | 3 | **T8 pricing** — `tests/bench_moe_mxfp4_decode 256` with the five disable envs, **on the rig** | 30 min | Prices four layers of MoE specialisation before writing the port. Model-free harness. |
 | 4 | **M2** — ablation battery at 32k and 131k, incl. the never-run indexer ablations | ~2 h | The 11.1 ms/token of unattributed long-context decode growth — the largest unknown in the document. |
@@ -410,6 +410,13 @@ Three ordered changes in `tp_rdma_gate_exchange()` (`ds4_tp.c:1011-1073`):
 **Gate it on M3 first:** `uc_pingpong` at 4 KB and 16 KB. Half-RTT ≲20 µs means
 ~30 µs/gate is recoverable — **2.5 ms/token, +8% at 131k**. ~45 µs means T1 is
 closed and we have documented a hard floor. Minutes to find out.
+
+**M3 result (2026-08-26):** half-RTT **8.0 µs (4 KB)** and **14.5–15.5 µs p50
+(16 KB, single WR — the gate shape)**, both under the threshold. **T1 is open.**
+A single 16,384 B UC SEND WR is confirmed working on this stack (byte-verified
+×2000 per arm), and one transient first-ping UC drop across the whole battery
+means the implementation needs a re-arm/retry path. Full table in
+`BENCHMARKS-TP-PP.md` (M3 section).
 
 #### The env battery — one rig session, `DS4_NGRAM_SPEC` off
 

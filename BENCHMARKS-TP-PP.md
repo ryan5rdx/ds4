@@ -194,6 +194,52 @@ Cold 131k prefill (TP): 402.64 — +54.9% over the pre-workstream flag-off cold
 baseline (259.90); sweep +65.8% (221.50 → 367.29). TP wins prefill at
 ≤16k and decode at every point; PP wins prefill from 32k up.
 
+### M3 — RDMA ping-pong latency, the T1 gate — probe battery, 2026-08-26
+
+**Question (plan step 1):** is T1 (reclaim the per-gate software cost) viable?
+Threshold: half-RTT ≲20 µs → viable (~30 µs/gate ≈ 2.5 ms/token at 131k, ~+8%);
+~45 µs → T1 closes as a documented hard floor.
+
+**Probe.** `uc_lat2`, built on `uc_bench`'s proven skeleton (OOB metadata over
+TCP with the socket kept open and a `barrier()` before the first ping — closing
+it early is a documented UC first-packet race; targeted CQE polling; negotiated
+QP depth; GID-table scan exactly as `ds4_tp.c` does). Payload is a per-byte
+pattern, re-rotated each iteration, and **verified byte-by-byte on every reply
+in both directions** (server echo), because `uc_pingpong`'s 16 KB check is a
+documented false positive (it only checked the first 64 B). n = 2000/arm.
+`uc_pingpong` itself was unusable here: it hardcodes GID index 1, and after
+the TB-net reset mat's IPv4-mapped GID sits at index 2 (index 1 is a stale
+hole) — the scan makes the probe immune, as `ds4` is.
+
+| arm | RTT min/p50/mean/p99/max (µs) | one-way p50 (µs) | bad bytes |
+|---|---|---|---|
+| 4 KB mat→lanfear | 11.0 / 16.0 / 16.4 / 25.0 / 789 | 8.0 | 0 |
+| 4 KB lanfear→mat | 14.0 / 16.0 / 16.0 / 19.0 / 93 | 8.0 | 0 |
+| 16 KB mat→lanfear | 19.0 / 29.0 / 40.6 / 113 / 1608 | 14.5 | 0 |
+| 16 KB lanfear→mat | 20.0 / 31.0 / 38.1 / 115 / 120 | 15.5 | 0 |
+
+Raw (unverified) `uc_bench` 4 KB: 11.55 / 10.93 µs RTT per direction — the
+verified numbers carry a few µs of per-byte check overhead on both sides.
+
+**Findings.**
+
+- **Both sizes clear the threshold with ~2.5× margin. T1 is open.** 4 KB
+  half-RTT ~8 µs; 16 KB (the gate's actual payload) ~14.5–15.5 µs p50 one-way.
+- **A single 16,384 B UC SEND WR works on this stack** — the ds4 gate shape
+  (`DS4_TP_RDMA_MAX_MSG = 16384`, one WR, no chunking): no EPERM at post, all
+  2000 × 16 KB deliveries byte-verified. The `uc_bench` note ("UC SEND >4096 B
+  EPERMs at post") does not apply here; ds4's all-day R10e runs are
+  independent proof.
+- 16 KB p50 RTT (29–31 µs) ≈ 4 KB (16 µs) + ~14 µs: consistent with
+  per-TB-frame processing (~3–4 µs × 3 extra frames) plus ~2.7 µs of pure wire
+  at the R10b ceiling (4.4 GB/s). Payload size is not what makes the gate
+  slow — hardware one-way is ~15 µs against ds4's observed 49.7 µs wire
+  (R9→R10e), corroborating T1's ~35 µs/gate software estimate.
+- One transient first-ping UC drop occurred across the whole battery (4 KB
+  lanfear→mat; retry clean). UC has no retransmit: a T1 implementation needs a
+  re-arm/retry path for a dropped gate (`timeout_sec` covers correctness, not
+  latency).
+
 ### R11 — decode gate count halved via replicated attention — `upstream-metal-wins` @ `a0cf853` build, 2026-08-26 — **NEGATIVE: decode −8.5 to −11.8%, avenue closed**
 
 Flag: `DS4_TP_DECODE_REPLICATE_ATTN=1` on both ranks (`a0cf853`). Replicates
