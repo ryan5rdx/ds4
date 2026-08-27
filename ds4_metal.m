@@ -1000,7 +1000,9 @@ static void ds4_gpu_trace_label_encoder(id<MTLComputeCommandEncoder> enc) {
     enc.label = [NSString stringWithUTF8String:g_trace_tag];
 }
 
+static void ds4_gpu_ts_label(const char *label);
 static void ds4_gpu_trace_push(id<MTLComputeCommandEncoder> enc, const char *name) {
+    if (name) ds4_gpu_ts_label(name);
     if (!ds4_gpu_trace_labels() || !enc || !name) return;
     [enc pushDebugGroup:[NSString stringWithUTF8String:name]];
 }
@@ -1021,18 +1023,129 @@ static uint64_t g_dispatch_cbs;
 
 #define DS4_DISP(enc) (g_dispatch_count++, (enc))
 
+/* ---- GPU timestamp profiler (DS4_METAL_GPU_ENCODER_TIMESTAMPS=1) ----------
+ *
+ * The existing DS4_METAL_GPU_STAGE_TIMESTAMPS path prices a stage by ENDING the
+ * command buffer at each boundary and reading cb.GPUStartTime/GPUEndTime.  That
+ * costs a full submit round trip per boundary -- measured at ~0.18 ms per marker,
+ * inflating the token 13% at 32k and 18% at 2k -- and at decode, where stages
+ * are microseconds, the round trip IS the measurement.  It is why the flash-attn
+ * split reported per-call figures 6x larger than the stage they belonged to.
+ *
+ * This samples the GPU timestamp counter at encoder boundaries instead, inside
+ * ONE command buffer.  Probed on this hardware: atStageBoundary is supported,
+ * atDispatchBoundary is not, so per-encoder is the finest granularity available
+ * -- which is enough, since the engine already creates encoder boundaries where
+ * it needs them.  Validated against known workloads: 4x work measured 3.82x,
+ * 2x measured 1.92x, and the encoder sum tracked the command-buffer span to 4%.
+ */
+#define DS4_GPU_TS_MAX_ENCODERS 512
+
+static id<MTLCounterSampleBuffer> g_ts_buffer;
+static const char *g_ts_labels[DS4_GPU_TS_MAX_ENCODERS];
+static uint32_t g_ts_n;
+static int g_ts_enabled = -1;
+static const char *g_ts_pending_label;
+
+static int ds4_gpu_ts_active(void) {
+    if (g_ts_enabled < 0) {
+        g_ts_enabled = getenv("DS4_METAL_GPU_ENCODER_TIMESTAMPS") != NULL;
+        if (g_ts_enabled) {
+            id<MTLCounterSet> set = nil;
+            for (id<MTLCounterSet> c in g_device.counterSets) {
+                if ([c.name isEqualToString:MTLCommonCounterSetTimestamp]) { set = c; break; }
+            }
+            if (!set || ![g_device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+                fprintf(stderr, "ds4: encoder timestamps unavailable on this device\n");
+                g_ts_enabled = 0;
+            } else {
+                MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
+                d.counterSet = set;
+                d.sampleCount = DS4_GPU_TS_MAX_ENCODERS * 2u;
+                d.storageMode = MTLStorageModeShared;
+                NSError *err = nil;
+                g_ts_buffer = [g_device newCounterSampleBufferWithDescriptor:d error:&err];
+                if (!g_ts_buffer) {
+                    fprintf(stderr, "ds4: counter sample buffer failed: %s\n",
+                            err ? [[err localizedDescription] UTF8String] : "?");
+                    g_ts_enabled = 0;
+                }
+            }
+        }
+    }
+    return g_ts_enabled > 0;
+}
+
+/* Name the encoder currently being timestamped.  Call sites open the encoder
+ * first and label it immediately after, so back-filling the most recent sample
+ * slot is equivalent to pre-labelling and touches no call site. */
+static void ds4_gpu_ts_label(const char *label) {
+    if (!label) return;
+    if (g_ts_enabled > 0 && g_ts_n > 0 && !g_ts_labels[g_ts_n - 1]) {
+        g_ts_labels[g_ts_n - 1] = label;
+    } else {
+        g_ts_pending_label = label;
+    }
+}
+
+static void ds4_gpu_ts_report(const char *tag) {
+    if (!ds4_gpu_ts_active() || g_ts_n == 0) return;
+    NSData *rd = [g_ts_buffer resolveCounterRange:NSMakeRange(0, g_ts_n * 2u)];
+    if (!rd) { g_ts_n = 0; return; }
+    const MTLCounterResultTimestamp *t = (const MTLCounterResultTimestamp *)rd.bytes;
+    double total = 0.0;
+    for (uint32_t i = 0; i < g_ts_n; i++) {
+        const uint64_t a = t[i * 2].timestamp, b = t[i * 2 + 1].timestamp;
+        if (b <= a) continue;   /* an unresolved sample reads as zero */
+        const double us = (double)(b - a) / 1000.0;
+        total += us;
+        fprintf(stderr, "ds4: enc-ts %-28s %8.1f us\n",
+                g_ts_labels[i] ? g_ts_labels[i] : "(unlabelled)", us);
+    }
+    fprintf(stderr, "ds4: enc-ts %s: %u encoders, %.3f ms of GPU time\n",
+            tag ? tag : "", g_ts_n, total / 1000.0);
+    g_ts_n = 0;
+}
+
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
         if (!g_batch_enc) {
-            g_batch_enc = g_batch_encoder_concurrent
-                ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
-                : [cb computeCommandEncoder];
+            /* The batch reuses one encoder until something ends it, so each
+             * recreation is one timestamped span -- which lands exactly on the
+             * encoder boundaries the engine already creates (~172 per token). */
+            if (!g_batch_encoder_concurrent && ds4_gpu_ts_active() &&
+                g_ts_n < DS4_GPU_TS_MAX_ENCODERS) {
+                MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
+                pd.sampleBufferAttachments[0].sampleBuffer = g_ts_buffer;
+                pd.sampleBufferAttachments[0].startOfEncoderSampleIndex = g_ts_n * 2u;
+                pd.sampleBufferAttachments[0].endOfEncoderSampleIndex = g_ts_n * 2u + 1u;
+                g_ts_labels[g_ts_n] = g_ts_pending_label;
+                g_ts_pending_label = NULL;
+                g_ts_n++;
+                g_batch_enc = [cb computeCommandEncoderWithDescriptor:pd];
+            }
+            if (!g_batch_enc) {
+                g_batch_enc = g_batch_encoder_concurrent
+                    ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
+                    : [cb computeCommandEncoder];
+            }
             ds4_gpu_trace_label_encoder(g_batch_enc);
         }
         return g_batch_enc;
     }
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc = nil;
+    if (ds4_gpu_ts_active() && g_ts_n < DS4_GPU_TS_MAX_ENCODERS) {
+        MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
+        pd.sampleBufferAttachments[0].sampleBuffer = g_ts_buffer;
+        pd.sampleBufferAttachments[0].startOfEncoderSampleIndex = g_ts_n * 2u;
+        pd.sampleBufferAttachments[0].endOfEncoderSampleIndex = g_ts_n * 2u + 1u;
+        g_ts_labels[g_ts_n] = g_ts_pending_label;
+        g_ts_pending_label = NULL;
+        g_ts_n++;
+        enc = [cb computeCommandEncoderWithDescriptor:pd];
+    }
+    if (!enc) enc = [cb computeCommandEncoder];
     ds4_gpu_trace_label_encoder(enc);
     return enc;
 }
@@ -1299,6 +1412,7 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
         ds4_gpu_invalidate_zero_prefix_prefill_block_maps();
     }
     ds4_gpu_stream_expert_cache_note_owned_completed();
+    ds4_gpu_ts_report(label);
     [g_transient_buffers removeAllObjects];
     ds4_gpu_model_buffer_cache_maybe_evict(label);
     return ok;
@@ -10957,10 +11071,15 @@ static int ds4_gpu_flash_attn_stage_profile_boundary(
 
 int ds4_gpu_synchronize(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (g_batch_cb) return ds4_gpu_end_commands();
+    if (g_batch_cb) {
+        const int rc = ds4_gpu_end_commands();
+        ds4_gpu_ts_report("batch");
+        return rc;
+    }
     ds4_gpu_parallel_ffn_reset_state(YES);
     if ([g_pending_cbs count] != 0) {
         int ok = ds4_gpu_wait_pending_command_buffers("synchronize");
+        ds4_gpu_ts_report("pending");
         [g_transient_buffers removeAllObjects];
         ds4_gpu_model_buffer_cache_maybe_evict("synchronize");
         return ok;
