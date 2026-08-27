@@ -201,7 +201,7 @@ two are minutes and one of them can invalidate three completed runs.
 | **17** | **U10a — NSG sweep {8,4,2} on the rig** | **~10 min, zero code** | **Run this next.** The knob is built, committed and bit-identical; the rig ran only the default. It is the direct test of whether residency is the Ultra's deficit, and it decides whether U10 gets written at all. |
 | ~~18~~ | ~~U9~~ — **built and measured 2026-08-27: negative, default off.** 0.77× on the M1 Max. The premise was wrong — the argsort fallback is *already* a 32-block hierarchy, so the parallelism U9 added already existed. Exact vs CPU ground truth; the argsort path is the one that deviates under ties. | — | Cost a day; caught by interleaved A/B before it shipped. |
 | ~~17~~ | ~~U10a~~ — **done 2026-08-27. NSG=4 beats the default by +5–13% on the Ultra; NSG=2 −12%. Residency beats NK there — U10 is ON.** | — | The M1 Max ranking did not transfer, which was the question. |
-| **19** | **U10 — alias `sq`/`sw`/`sqk` over the dead `sk` buffer** — **built, +19.3% on M1 Max, bit-identical, opt-in.** Rig A/B requested against default and `NSG=4`. **U10c** (F16 cache, 2 → 7 resident) gated on it. | ~1 d | Residency 1 → 2 at *unchanged* NK — the distinction U10a could not isolate. |
+| **19** | **U10 — alias `sq`/`sw`/`sqk` over the dead `sk` buffer** — **built, +19.3% on M1 Max, bit-identical, opt-in. Rig A/B DONE 2026-08-27: +17.4% (mean 2015.6 vs 1717.2 GFLOP/s), beats NSG=4, bit-identical.** End-to-end ~2–4% of the token (see U10b). **U10c** (F16 cache, 2 → 7 resident) gated on it. | ~1 d | Residency 1 → 2 at *unchanged* NK — the distinction U10a could not isolate. |
 
 Steps 0–3 are about four hours of rig time and settle whether the last three
 campaigns are valid, whether the largest sized item is real, and whether the
@@ -1322,7 +1322,15 @@ mis-*ranked* because I priced the kernel and not the token. **Every future item
 in this document should carry its end-to-end share, not just its kernel-level
 multiple.**
 
-#### U10 — drop the `sk` staging buffer: 1 → 7 threadgroups resident per core
+#### U10 — drop the `sk` staging buffer: 1 → 7 threadgroups resident per core — **cheap half DONE on the rig 2026-08-27**
+
+**Rig A/B (mat, M2 Ultra, 2026-08-27): `DS4_METAL_INDEXER_LLT_TIGHT` wins at
++17.4%** (mean 2015.6 vs 1717.2 GFLOP/s at n_comp=32768, 3 runs), and beats
+NSG=4 (+2.4% there) too. **Bit-identical** to default (32750/32768 exact, same
+worst-rel row 22878). The implemented cheap half (alias `sq`/`sw`/`sqk` over
+`sk`, residency 1 → 2 at unchanged NK) is confirmed at Ultra scale; end-to-end
+it is a ~2–4% token item (see U10b). **U10c** (F16 cache, 2 → 7 resident) is
+gated on.
 
 This is where U7c points, and it is the strongest structural lever found so far.
 

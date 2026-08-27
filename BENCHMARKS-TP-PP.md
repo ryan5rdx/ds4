@@ -243,6 +243,31 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### U10 — TIGHT alias confirmed on the rig: +17.4%, bit-identical — 2026-08-27
+
+`DS4_METAL_INDEXER_LLT_TIGHT=1` (opt-in, NSG=8) on mat (M2 Ultra),
+n_comp=32768, `DS4_METAL_GPU_BUSY_PROFILE=1 tests/bench_indexer_score 32768
+300`, 3 runs per arm. The implemented U10 is the cheap intermediate — alias
+`sq`/`sw`/`sqk` over the under-used `sk` buffer for residency 1 → 2 at
+unchanged NK — not the full F16-cache drop (that is U10c).
+
+| arm | GFLOP/s (3 runs) | mean | vs default |
+|---|---|---|---|
+| default NSG=8 | 1646.8 / 1715.2 / 1789.6 | 1717.2 | — |
+| **U10 TIGHT** | **1924.3 / 2089.0 / 2033.6** | **2015.6** | **+17.4%** |
+| NSG=4 | 1877.2 / 1677.7 / 1720.7 | 1758.5 | +2.4% |
+
+**U10 TIGHT is the clear winner on the rig (+17.4% vs default), and it also
+beats NSG=4 (+14.6%).** It is **bit-identical** to default (32750/32768 exact,
+same worst-rel row 22878), so no correctness gate is needed. This confirms the
+dev-box +19.3% and is the cheap half of the residency hypothesis confirmed at
+Ultra scale. End-to-end against the token this is a ~2–4% item (score kernel =
+3.84 ms of 36.36 ms = 10.9%; see plan U10b).
+
+**Consequence:** U10 confirmed → **U10c** (F16 index cache, 2 → 7 resident) is
+gated on, per the sequencing table. Note per U10b the honest end-to-end ceiling
+is ~2.5–5.4%, worth doing but not before U9's larger algorithmic prize.
+
 ### U10a — NSG sweep on the rig: residency beats NK — U10 is ON — 2026-08-27
 
 `DS4_METAL_INDEXER_LLT_NSG` ∈ {8, 4, 2} with `DS4_METAL_GPU_BUSY_PROFILE=1
