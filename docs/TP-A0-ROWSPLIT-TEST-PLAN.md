@@ -1582,7 +1582,66 @@ win here.
 
 **Report the end-to-end share alongside any kernel multiple** (U10b).
 
-#### U13 — arm the inverse-RoPE fuse on the indexed branch — **T10, mis-sized by ~50×**
+#### U12 — **partially done 2026-08-27.** Times landed; the roofline did not — and `attn_inv_rope` is mis-named
+
+**Delivered:** per-stage times at 32k/131k. `q_path` **5.474 → 5.472 ms —
+context-invariant**; `attn_inv_rope` **3.389 → 4.258 ms, +26% with context**.
+Together 26.8% of the token, as expected.
+
+**Not delivered:** the roofline. No GB/s, no GFLOP/s, and no reconciliation
+against the 60.17 MB/layer model — which was the *prerequisite*, and the whole
+point. We now know what these stages cost; we still do not know why.
+
+**Correction 1 — `attn_inv_rope` is mostly FlashAttention, not RoPE.** Stage
+spans run marker-to-marker, and this one begins at `compressor_indexer`
+(`ds4.c:23316`) and ends at `ds4.c:23568`. `ds4_gpu_attention_decode_heads_tensor`
+— the decode FlashAttention call — sits at `ds4.c:23539`, **inside that span.**
+Confirming: there is **no separate attention stage anywhere in the profile's
+twelve entries**, so the attention core has to be here. The +26% growth with
+context is attention behaving normally, not a RoPE tail getting slower.
+
+**This invalidates U13's sizing.** U13 was written against "a 4.27 ms standalone
+inverse-RoPE dispatch". Most of that 4.258 ms is attention. The RoPE tail's real
+share is unmeasured and could be a small fraction of it. **Do not write U13
+until it is isolated** — and do not reuse M2's `attncore` (1.91 ms) to subtract,
+because that is a different measurement epoch and mixing epochs is exactly the
+error §14.6 warns about.
+
+**Isolating it is free.** `DS4_METAL_DISABLE_PRE_M5_ATTN_INV_ROPE_FUSE=1`
+(`ds4.c:22094`) forces the *gathered* branch onto the standalone RoPE as well.
+Default vs that arm prices the standalone dispatch across the 20 gathered
+layers, which scales directly to the 21 indexed layers that pay it today. **Zero
+code, one arm, and it is the number U13 actually needs.**
+
+**Correction 2 — `q_path` roofline, computed here since U12 did not.** From the
+shapes: `q_a` is 4096 × 1024 and `q_b` is 1024 × 16384 per rank, Q8_0 at ~1.031
+B/weight → **21.6 MB/layer/rank, 0.930 GB/token**. Reconciliation check per
+§14.6: `q_b` alone is 0.744 GB against §4's measured **0.767 GB** — agrees, so
+the byte model is sound.
+
+**0.930 GB over 5.472 ms = 170 GB/s = 22% of the 760 GB/s roof.** That is the
+number U12 was asked for, and it says `q_path` is *not* bandwidth-limited —
+consistent with it being context-invariant.
+
+**Where to look next in `q_path`.** The fused head-norm + RoPE-tail kernel
+dispatches `MTLSizeMake(n_head, n_tok, 1)` (`ds4_metal.m:22589`) — at decode
+that is **32 threadgroups on 60 cores**, one per head, for 512 floats each.
+Same underfill family as packed32-at-32-heads (−1.35 t/s), T2's turnover at
+112, and U7's smem-capped residency. But **do not size this by subtracting §4's
+`q_b` from U12's `q_path`** — different epochs. Get it by adding stage markers
+between `q_a`, `q_b` and the norm/RoPE tail: three lines, and it splits 5.47 ms
+into three numbers that are all from one run.
+
+**Revised request — two cheap arms, then decide:**
+1. `DS4_METAL_DISABLE_PRE_M5_ATTN_INV_ROPE_FUSE=1` A/B → prices the standalone
+   RoPE, and therefore U13.
+2. Stage markers inside `q_path` → splits the largest context-invariant stage
+   into its three parts.
+
+Both are same-run, same-epoch, and together they turn 26.8% of the token from
+"priced" into "explained".
+
+#### U13 — arm the inverse-RoPE fuse on the indexed branch — **T10 — SIZING INVALIDATED, see U12 correction 1**
 
 **T10 is filed in the row-8 cleanup batch at "~0.04–0.09 ms" and the stage it
 targets is 4.27 ms.** That is the fourth item mis-sized the same way — T9, T6,
