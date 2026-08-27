@@ -783,6 +783,69 @@ measurement.** A0 as designed can never decompose the decode attention.
 different instrument, not a parameter change. **A2 stays unsized, and I should
 stop reporting A0 as built.**
 
+### Speculation is structurally excluded under TP2 — the wiring task is not a wiring task — 2026-08-27
+
+Before writing an n-gram call site I checked whether one would help. It would
+not. The exclusion is architectural, not a missing caller.
+
+1. **TP requires a distributed role.** `--tensor-parallel requires --role
+   coordinator or --role worker` (`ds4_tp.c:531-534`). TP is expressed *through*
+   the distributed machinery; there is no TP without it.
+2. **A coordinator session therefore gets a distributed handle.**
+   `if (e->distributed.role == DS4_DISTRIBUTED_COORDINATOR)` →
+   `ds4_dist_session_create(&s->distributed, ...)` (`ds4.c:60993`, `:61153`).
+3. **And the speculative entry bails on exactly that**, first thing
+   (`ds4.c:69931`):
+
+```c
+    if (s->distributed) {
+        if (!accepted) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+```
+
+**So under TP2, speculation of any kind — n-gram or DSpark — falls straight
+through to a plain single-token eval and returns 1.** Adding a bench call site
+would have measured baseline throughput a second time, which is precisely the
+failure the last arm already produced.
+
+**Why this matters more than the earlier finding.** "Unreachable from the bench"
+implied a call site would fix it. It would not: on this rig, in the
+configuration we actually run, the feature cannot engage at all.
+
+**It also resolves the DSpark number.** "Forced Promessi runs remain 19–21 t/s"
+cannot have come from a TP coordinator, or it would have read 41 (the
+fall-through). It was single-node — so that figure says nothing about
+speculation under TP, in either direction. Note `speed-bench/tp_mtp_hunt.md` and
+the `tp-mtp-hunt` branch exist precisely because someone already attempted the
+structural TP work; **read that before re-attempting it.**
+
+**Re-sizing the prize, because it is still the largest one available.** Weights
+are read once per *pass* regardless of row count, so a verify pass with N draft
+rows costs about what a 1-row decode costs. Throughput is then `L / 24.34 ms`
+for acceptance length L:
+
+| L | t/s |
+|---|---|
+| 1.00 (today) | 41.1 |
+| **1.22** | **50.1** |
+| 1.50 | 61.6 |
+
+**50 t/s needs only L = 1.22** — one extra token accepted on 22% of steps — *if*
+verify is near-free. The production workload is tool-calling and structured
+output, which is where n-gram drafting is strongest; Promessi prose is its worst
+case. **But if verify costs 2× a decode step, break-even moves to L = 2.00 and
+50 t/s needs L = 2.43.** Both unknowns fall out of one run, once it can run.
+
+**Cost: this is days, not hours.** It needs the batched verify to work across
+the pair — draft is deterministic from token history so both ranks can derive it
+independently, and multi-row batches already cross the gates during prefill, so
+the machinery exists. What does not exist is checkpoint/rewind on rejection under
+the mirrored-session protocol. **Do not start it without reading
+`tp_mtp_hunt.md` first.**
+
 ### U5 / n-gram speculation is UNREACHABLE, not merely unrun — 2026-08-27
 
 Found while running the arm: `DS4_NGRAM_SPEC=1` on the plain bench decode loop
