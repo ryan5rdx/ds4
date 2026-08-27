@@ -322,10 +322,23 @@ Three consequences, most likely first:
 3. The DSpark batch verifier's projections differ from decode's regardless of
    the GDN scan.
 
-Open question worth checking on the current model, independent of any port:
-whether DS4's decode-time compressor updates are already slot-count-dependent
-under multi-slot batching. The prefill path is canonicalised by the
-rebuild-from-4-tokens; the decode path may not be.
+**Checked on the current model: DS4 is clean today, and structurally so.**
+The decode compressor projection passes a literal `1` for the row count
+(`ds4.c:22951` and `:22957`), so it is a single-row matvec no matter how many
+sessions are co-batched. And both native cross-session row-fusing paths bail
+out under TP — `metal_graph_native_session_batch_qkv_supported` (`ds4.c:64831`)
+and `..._shared_supported` (`ds4.c:64784`) each test `e->tp.active` and return
+false — so on this rig sessions batch at the outer level only and every
+projection still runs at `n_tok == 1`. Neither path touches the compressor in
+any case.
+
+The exposure is therefore *prospective*, and it is worth naming because it
+points straight at this branch's own goal: the outer TP session batching is
+already on by default (`DS4_METAL_TP_SESSION_BATCH` only disables it when
+explicitly `0`, `ds4.c:64747`), so the natural next step is to let the native
+row-fusing paths run under TP. The moment they do, projection reduction trees
+become slot-count-dependent. For DS4 that is bounded — a shifted attention
+weight. For GDN it would be permanent.
 
 ### The mitigation package
 
