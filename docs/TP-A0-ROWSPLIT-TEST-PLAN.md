@@ -428,6 +428,51 @@ bench exactly): 128 owned experts × 43 layers = **73.6 GB/rank** of routed MoE;
 | **SSD streaming** | **Incompatible as stated.** `ssd_streaming` pages experts on demand; you cannot pre-repack what is loaded lazily. Either exclude that mode or repack per streamed chunk. |
 | **Existing hook** | None. Weights are strictly mmap-in-place (`newBufferWithBytesNoCopy` over the GGUF); `ds4_layer_pack.c` is layer-to-device placement, unrelated. This is a new loader path. |
 
+**It is not a cache-locality change, and getting that right shrinks M3.** Both
+layouts are read strictly sequentially — a matvec walks blocks in order — so
+cache lines are equally well used and the same bytes come out of DRAM either
+way. What planar actually changes is **alignment**: at a 17-byte stride the
+16-byte payload is never naturally aligned, so it cannot be fetched as one
+aligned vector load and ~6% of accesses straddle a cache line.
+
+**Both halves of that mechanism are already measured, and they are small.**
+
+| measurement | result |
+|---|---|
+| **U8** — stride 17 vs stride 16, same 16-byte payload, on the rig | 713.2 vs 758.0 GB/s = **5.9%** |
+| **M1** — 8 scalar byte loads → 2 alignment-1 `packed_uchar4` loads | **null** (734.2 vs 729.2 ms, byte-identical) |
+
+5.9% of `routed_moe`'s 4.72 ms is **0.28 ms — 1.1% of the 2k token**, against
+M3's estimated 2.30–2.45 ms. **An 8× gap between the estimate and the mechanism
+we have already measured.** M1 says the instruction-count half is worth nothing;
+U8 says the straddle half is worth ~6%. Neither supports 9.7%.
+
+**So M3's estimate is not credible on the evidence, and the residual 48%→100% is
+probably not layout at all** — more likely nibble unpacking and LUT traffic (M2),
+or simply that a 4-bit format cannot reach the rate of one that does no
+unpacking. Worth remembering MXFP4 is already the faster format *per weight*:
+365 GB/s × 1.88 weights/byte ≈ 687 Gweights/s against Q8_0's ~547.
+
+**Consequence: justify repack-on-load on §7C alone.** §7C is a load-balance
+change whose value does not depend on any of this, and it is measured directly
+by the per-slot gate profiler. If M3 rides along for free once the loader
+exists, fine — but it should not be the reason to build it.
+
+**Both ranks must repack, and it is not symmetric work.** The worker has to run
+the same conversion when it sees TP, and for §7C the two ranks write *different*
+slices, so this is not a case where "both run the same binary" is sufficient
+reassurance. Three specific hazards, all with precedent in this tree:
+the decision must derive only from inputs both ranks share (TP active, world
+size, rank index) and never from a one-sided env — `DS4_TP_ABLATE` already
+carries a "same value on both ranks" warning, and `DS4_METAL_FAST_SYNC` silently
+collapses the decode split when set on only one; the ~7–15 s cost is paid by
+both, and the coordinator will block on the worker; and a rank that skips the
+repack while its peer performs it produces silently wrong output rather than an
+error, so the layout choice needs to be part of the handshake, not an
+assumption.
+
+*(SSD streaming is not a constraint — confirmed out of scope.)*
+
 **Two independent gates, one shared mechanism.** This makes both items *cheaper
 to try* — it does not make either more likely to pay:
 
