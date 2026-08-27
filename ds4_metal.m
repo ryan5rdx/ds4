@@ -1046,6 +1046,14 @@ static const char *g_ts_labels[DS4_GPU_TS_MAX_ENCODERS];
 static uint32_t g_ts_n;
 static int g_ts_enabled = -1;
 static const char *g_ts_pending_label;
+/* Which command buffer currently owns slots [0, g_ts_n).  Compared only, never
+ * dereferenced or retained.  Slots were previously global, so encoders from a
+ * second in-flight command buffer appended to the first one's range: hi-lo then
+ * spanned two buffers while the report divided by one buffer's wall clock,
+ * producing a bogus sub-nanosecond "tick" and ~200% coverage together.  A
+ * hardware tick cannot vary with context length, and the first arm-B run read
+ * 0.63 ns at 2k against 1.00 at 131k -- which is what gave the artefact away. */
+static void *g_ts_cb;
 
 static int ds4_gpu_ts_active(void) {
     if (g_ts_enabled < 0) {
@@ -1108,6 +1116,11 @@ static void ds4_gpu_ts_name_last(const char *label) {
  * the spans overlap and per-encoder figures are upper bounds. */
 static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
     if (!ds4_gpu_ts_active() || g_ts_n == 0) return;
+    if (cb && (__bridge void *)cb != g_ts_cb) {
+        /* These slots belong to a different command buffer; reporting them
+         * against this one's clock is what produced the sub-nanosecond tick. */
+        return;
+    }
     NSData *rd = [g_ts_buffer resolveCounterRange:NSMakeRange(0, g_ts_n * 2u)];
     if (!rd) { g_ts_n = 0; return; }
     const MTLCounterResultTimestamp *t = (const MTLCounterResultTimestamp *)rd.bytes;
@@ -1144,6 +1157,11 @@ static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
             (cb_us > 0.0 && total_us > cb_us * 1.05) ? " OVERLAPPING" : "",
             cal);
     g_ts_n = 0;
+    /* Command-buffer addresses get recycled -- observed directly while
+     * debugging this -- so pointer identity alone would let a NEW buffer that
+     * happens to reuse a freed address append to a stale range.  Disowning here
+     * means the next encoder always starts a fresh range. */
+    g_ts_cb = NULL;
 }
 
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
@@ -1153,6 +1171,10 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
             /* The batch reuses one encoder until something ends it, so each
              * recreation is one timestamped span -- which lands exactly on the
              * encoder boundaries the engine already creates (~172 per token). */
+            if (ds4_gpu_ts_active() && (__bridge void *)cb != g_ts_cb) {
+                g_ts_cb = (__bridge void *)cb;
+                g_ts_n = 0;
+            }
             if (!g_batch_encoder_concurrent && ds4_gpu_ts_active() &&
                 g_ts_n < DS4_GPU_TS_MAX_ENCODERS) {
                 MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
@@ -1172,6 +1194,10 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
             ds4_gpu_trace_label_encoder(g_batch_enc);
         }
         return g_batch_enc;
+    }
+    if (ds4_gpu_ts_active() && (__bridge void *)cb != g_ts_cb) {
+        g_ts_cb = (__bridge void *)cb;
+        g_ts_n = 0;
     }
     id<MTLComputeCommandEncoder> enc = nil;
     if (ds4_gpu_ts_active() && g_ts_n < DS4_GPU_TS_MAX_ENCODERS) {

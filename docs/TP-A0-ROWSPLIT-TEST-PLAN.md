@@ -1153,6 +1153,47 @@ fixing it pays twice.
 They are not wrong, but they are not the path to 50 t/s. Item 1 is a day's work
 against a defect worth several milliseconds, and item 3 costs nothing but a run.
 
+### Arm B re-run — one bug, not two, and the data says which — 2026-08-27
+
+The calibrated re-run reported **tick 0.632–0.642 ns and coverage ~198%
+OVERLAPPING at 2k**, and **tick ~1.000 ns with ~198% coverage at 131k**. The
+bench read that as two independent causes: an M2 Ultra tick of ~0.63 ns *plus*
+genuine 2× encoder overlap. **I think it is one cause, and the data rules the
+other reading out.**
+
+**A hardware tick period cannot vary with context length.** 0.632 ns at 2k
+against 1.000 ns at 131k is not a property of the counter. And overlap cannot
+move the inferred tick: the scale is `cb_seconds / (hi − lo)`, and overlap
+changes the *sum* of spans, not their extent. A tick of 0.63 requires `hi − lo`
+in ticks to exceed the command buffer's duration in nanoseconds by **1.57×** —
+impossible for encoders inside one buffer.
+
+**One bug explains both numbers: the sample slots were global, not per command
+buffer.** Encoders from a second in-flight buffer appended to the first one's
+range, so `hi − lo` spanned ~2 buffers (inferred tick ~0.5–0.65) while the
+report divided the span sum by *one* buffer's wall clock (coverage ~200%). That
+1.000 ns at 131k is the M1 Max value exactly, which is the tell: **the true tick
+is 1.0 ns on both parts**, and the 2k reading was corruption.
+
+**Fixed:** slots are now owned by a command buffer, the range resets when a
+different buffer starts filling it, and a report against a foreign buffer is
+refused rather than mis-scaled. While debugging I observed **command-buffer
+addresses being recycled**, so pointer identity alone would let a new buffer
+reuse a freed address and append to a stale range — the report therefore
+disowns the range when it completes.
+
+**The falsifier, stated in advance.** If the next run still shows the inferred
+tick varying with context, my explanation is wrong and the bench's two-cause
+reading stands. If the tick pins at ~1.000 ns at both contexts, it was slot
+reuse and **coverage becomes a real overlap measurement for the first time** —
+at which point a coverage figure meaningfully above 100% would mean the
+per-encoder spans genuinely overlap and are upper bounds.
+
+**Until then, treat both arm-B runs' absolute numbers as void** — including the
+calibrated `reduce` figures of 199 µs/call at 2k and 311 at 131k. The
+instrument's *distortion* claim is unaffected and still holds: throughput came
+back at baseline (42.04 / 29.70 t/s) on both runs.
+
 ### Arm B — the instrument runs clean but reports wrong; fixed, needs a re-run — 2026-08-27
 
 **What worked.** 42.08 t/s at 2k and 29.71 at 131k — **baseline throughput**, so
