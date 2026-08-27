@@ -718,17 +718,32 @@ between them, and the floor is ~13 ms. Order:
 
 1. **Stage-profile run at 32k/131k** (above) — bounds `router`/`shared`/`kv`/
    compressor and tells us how much of the 13 ms is real compute. ~20 min.
-2. **The encoder-boundary instrument** (`:736-740`, ~20 lines) — the other half
-   of the floor, and now the *more* likely half given that dispatch cost is
-   capped at 1.94 ms. Promote it above R12b's ballast arm, which is a
-   confirmation of a number we already have. Steps 1 and 2 are independent and
-   can run in either order or together.
+2. **The encoder-boundary instrument** (`:736-740`, ~20 lines) — worth running,
+   but **not for the reason given in the first draft of this list.** See the
+   correction below. Steps 1 and 2 are independent.
 3. **T2 follow-up** (28/31) — see below. Cheap, but a loose end, not a lever.
 
-The floor's composition — per-layer dispatch versus per-token fixed cost — is
-answerable and matters beyond DS4: per-layer cost scales with `n_layer`, so it
-directly prices the Qwen port's 48-vs-43 layers (see
-`docs/QWEN38-FLASH-NEXT-PORT-PLAN.md` §10).
+**Correction — "per-layer versus per-token" is not a useful discriminator, and
+I proposed it as one.** Encoder boundaries are themselves per-layer: gates per
+token are `DS4_N_LAYER * DS4_TP_GATES_PER_LAYER` (`ds4.c:60435`), so 86 gates =
+43 × 2 and the 172 close/reopen events = 86 × 2. But so are `router`, `shared`,
+`kv` and the compressor. **Nearly everything in a decode token is per-layer**,
+so that axis separates almost nothing, and both branches of the question make
+the *same* Qwen prediction: +5 layers is +1.51 ms either way (20 extra
+boundaries × 75.6 µs, or 13/43 × 5).
+
+Two things follow, one reassuring and one narrowing.
+
+- **The Qwen extrapolation is more robust than §10 claims, not less.** Because
+  the residual is dominated by per-layer terms of *both* kinds, the 48/43
+  scaling applies to most of it regardless of the compute/stall split. ~14.5 ms
+  is the right number and it does not depend on resolving the split.
+- **The discriminator that matters is compute versus stall, not per-layer
+  versus per-token.** The stage profiler answers it directly by pricing
+  `router`/`shared`/`kv`/compressor. The boundary instrument then prices the
+  *attackable* fraction of what is left — that is its actual job, and it is
+  still worth doing, but it decides how much of the floor we could recover, not
+  how the floor scales.
 
 The ablation method (re-run `DS4_TP_ABLATE` chains at 32k and 131k, plus
 `DS4_METAL_ABLATE_INDEXER_SCORE`/`_TOPK`, which are already wired into decode
