@@ -22602,6 +22602,14 @@ static bool metal_graph_encode_decode_layer_phase(
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", metal_graph_qr(g), q_rank, il, pos);
     }
+    /* U12: split the q_path stage into its three parts.  At 131k the whole
+     * stage is 5.47 ms and context-invariant -- 15% of the token and the
+     * largest non-indexer stage -- but 0.930 GB/token over 5.472 ms is only
+     * 170 GB/s, 22% of the 760 GB/s roof, so it is not bandwidth-bound and the
+     * cost is somewhere inside.  These two extra boundaries attribute it
+     * within a single run, which matters because the obvious decomposition
+     * (subtract section 4's q_b from this stage) mixes measurement epochs. */
+    DS4_METAL_PROFILE_DECODE_STAGE("q_a_kv_proj");
     const bool kvnorm_dump = metal_graph_debug_wants("KVnorm", il, pos);
     bool kv_rope_fused = false;
     if (qkv_rms_fused) {
@@ -22716,6 +22724,12 @@ static bool metal_graph_encode_decode_layer_phase(
     if (qkv_rms_fused && ok && !kv_rope_fused) {
         metal_graph_debug_dump_tensor("KVnorm", metal_graph_kv(g), DS4_N_HEAD_DIM, il, pos);
     }
+    /* U12: everything after this boundary is Phase B -- the q_b projection
+     * plus the per-head RMS norm and RoPE tail.  The remaining `q_path` stage
+     * therefore measures exactly that, and the suspect is the fused
+     * head-norm/RoPE kernel, which dispatches n_head x n_tok threadgroups
+     * (`ds4_metal.m:22589`) -- 32 on 60 cores at decode. */
+    DS4_METAL_PROFILE_DECODE_STAGE("q_lora_norm");
     /* Phase B head slice: under the real TP split this rank computes only
      * its heads [tp_head0, tp_head0 + tp_heads) end to end — q_b rows, the
      * per-head norm/rope, the attention core and its owned output groups.
