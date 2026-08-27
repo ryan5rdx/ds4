@@ -1233,6 +1233,79 @@ calibrated `reduce` figures of 199 µs/call at 2k and 311 at 131k. The
 instrument's *distortion* claim is unaffected and still holds: throughput came
 back at baseline (42.04 / 29.70 t/s) on both runs.
 
+### Arm B4 — the tick is settled, the *call count* is not; one more run — 2026-08-27
+
+Run 3 closed the falsifier: **tick = 1.000 ns at both contexts**, so the counter
+unit question is finished and the ~197% coverage is a real 2× overlap. Two things
+in run 3 are still not usable, and one of them is arithmetically impossible.
+
+**The impossibility.** `reduce` is a sub-phase *of* `attn_inv_rope` — the decode
+flash-attn call sits between the `compressor_indexer` marker (`ds4.c:23330`) and
+the `attn_inv_rope` marker (`ds4.c:23582`) — so it cannot cost more than the
+stage that contains it. Run 3 says it does:
+
+| ctx | calls/token | norm µs/call | product | `attn_inv_rope` | ratio |
+|---|---|---|---|---|---|
+| 2k | 27 | 159.7 | **4.31 ms** | 3.64 ms | **1.18× — impossible** |
+| 131k | 19 | 171.3 | 3.25 ms | 4.24 ms | 0.77× — plausible |
+
+**`calls/token` was measuring the instrument, not the graph.** It read 41 at 2k
+before slot-scoping and 27 after, and slot-scoping changed only *which ranges get
+reported* — never how many encoders the engine builds. Two silent-loss paths in
+the old code:
+
+1. `ds4_gpu_ts_report` returned without printing for a foreign cb, and the next
+   cb to encode zeroed the range. Any buffer committed to `g_pending_cbs`
+   (`ds4_metal.m:9595`, `:9618`) is never reported at all, so its whole range
+   vanished with no trace.
+2. Slots were reserved at **encode** time but written at **GPU execution** time,
+   and committed buffers keep executing while later ones encode. A single
+   512-slot arena therefore let an in-flight buffer scribble into the range being
+   measured — the same class as the original global-slot bug, only narrower, and
+   **context-dependent**: 2k runs many short buffers, 131k runs few long ones,
+   which is the right shape to explain why only 2k fails to reconcile.
+
+**Fixed in this build.** Ranges are banked (4 × 512 slots, `g_ts_base` advances
+past a dropped range so in-flight writes cannot alias), and every report now
+prints a cumulative loss line:
+
+```
+ds4: enc-ts LOSS (cumulative): N of M ranges never reported (K encoders), J encoders unsampled at the 512-slot range cap
+```
+
+**Third candidate, not yet excluded.** Normalisation divides every span by the
+same coverage factor, i.e. it assumes overlap is uniform. If the big FA `reduce`
+encoder pipelines with its neighbour more than the small encoders do, a uniform
+divide over-states it — which would also produce a 2k overshoot. Banking and the
+loss counter do not test this; the residual after them does.
+
+**What to run.** Same two contexts, same build flags as run 3, plus nothing new:
+
+```
+DS4_METAL_GPU_ENCODER_TIMESTAMPS=1   # 2k and 131k, as run 3
+```
+
+**Read in this order:**
+
+1. **The LOSS line.** If `N/M` is ~0, loss is not the cause and cause 3 is what
+   remains. If `N/M` is ~1/3 at 2k, the 41→27 drift is explained and the real
+   `calls/token` is the reported count scaled by `M/(M−N)`.
+2. **Recompute the product** with the corrected count. It must come in **under**
+   `attn_inv_rope` (3.64 ms @2k, 4.24 @131k). If it still exceeds it, the
+   uniform-overlap assumption is broken and the normalised column is not a budget
+   — in which case treat *raw* as the upper bound and stop quoting `norm`.
+3. **Throughput** — must still read ~42 t/s @2k / ~29.7 @131k, else the
+   instrument has started distorting.
+
+**Pre-registered falsifier.** If the LOSS line reads ~0 dropped ranges at *both*
+contexts, then loss was never the mechanism, and the 2k overshoot is either
+slot aliasing (now fixed, so the product should have moved) or non-uniform
+overlap (so it will not have). Whichever it is, run 4 separates them, because
+banking is already in and only cause 3 can survive it.
+
+**Until this reconciles, `norm µs/call` stays out of the token budget.** The
+per-call figure may well be right; the count it gets multiplied by is not.
+
 ### Arm B — the instrument runs clean but reports wrong; fixed, needs a re-run — 2026-08-27
 
 **What worked.** 42.08 t/s at 2k and 29.71 at 131k — **baseline throughput**, so

@@ -1040,10 +1040,31 @@ static uint64_t g_dispatch_cbs;
  * 2x measured 1.92x, and the encoder sum tracked the command-buffer span to 4%.
  */
 #define DS4_GPU_TS_MAX_ENCODERS 512
+/* Slot capacity is several ranges deep so a range starting now does not reuse
+ * slots that a still-executing command buffer will write into.  Reserving the
+ * range happens at ENCODE time but the counter writes happen at GPU EXECUTION
+ * time, and committed buffers sit in g_pending_cbs while later ones encode, so
+ * a single 512-slot arena let an in-flight buffer scribble over the range being
+ * measured.  That is the same class of corruption as the global-slot bug, just
+ * narrower, and it is context-dependent: at 2k the buffers are short and many,
+ * so overlap is likeliest exactly where the budget failed to reconcile. */
+#define DS4_GPU_TS_CAPACITY (DS4_GPU_TS_MAX_ENCODERS * 4u)
 
 static id<MTLCounterSampleBuffer> g_ts_buffer;
 static const char *g_ts_labels[DS4_GPU_TS_MAX_ENCODERS];
 static uint32_t g_ts_n;
+/* First slot of the range owned by g_ts_cb; labels stay range-local. */
+static uint32_t g_ts_base;
+/* Ranges that were reserved and sampled but never reported, because their
+ * command buffer never reached ds4_gpu_ts_report before another one started
+ * encoding.  This loss used to be silent, which is how `calls/token` became a
+ * property of the instrument rather than of the graph: the figure read 41 at 2k
+ * before slot-scoping and 27 after, for an engine that builds exactly the same
+ * encoders either way.  A budget multiplies that count, so it has to be known. */
+static uint64_t g_ts_dropped_ranges;
+static uint64_t g_ts_dropped_encoders;
+static uint64_t g_ts_capped;          /* encoders left unsampled at the range cap */
+static uint64_t g_ts_reported_ranges;
 static int g_ts_enabled = -1;
 static const char *g_ts_pending_label;
 /* Which command buffer currently owns slots [0, g_ts_n).  Compared only, never
@@ -1069,7 +1090,7 @@ static int ds4_gpu_ts_active(void) {
             } else {
                 MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
                 d.counterSet = set;
-                d.sampleCount = DS4_GPU_TS_MAX_ENCODERS * 2u;
+                d.sampleCount = DS4_GPU_TS_CAPACITY * 2u;
                 d.storageMode = MTLStorageModeShared;
                 NSError *err = nil;
                 g_ts_buffer = [g_device newCounterSampleBufferWithDescriptor:d error:&err];
@@ -1121,7 +1142,7 @@ static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
          * against this one's clock is what produced the sub-nanosecond tick. */
         return;
     }
-    NSData *rd = [g_ts_buffer resolveCounterRange:NSMakeRange(0, g_ts_n * 2u)];
+    NSData *rd = [g_ts_buffer resolveCounterRange:NSMakeRange(g_ts_base * 2u, g_ts_n * 2u)];
     if (!rd) { g_ts_n = 0; return; }
     const MTLCounterResultTimestamp *t = (const MTLCounterResultTimestamp *)rd.bytes;
 
@@ -1171,12 +1192,52 @@ static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
             cb_us > 0.0 ? total_us / cb_us * 100.0 : 0.0,
             (cb_us > 0.0 && total_us > cb_us * 1.05) ? " OVERLAPPING" : "",
             cal);
+    g_ts_reported_ranges++;
+    /* Multiplying a per-call figure by a calls/token count read off this log is
+     * only sound if the log covers every range.  Print what it does not. */
+    if (g_ts_dropped_ranges || g_ts_capped) {
+        fprintf(stderr,
+                "ds4: enc-ts LOSS (cumulative): %llu of %llu ranges never reported "
+                "(%llu encoders), %llu encoders unsampled at the %u-slot range cap\n",
+                (unsigned long long)g_ts_dropped_ranges,
+                (unsigned long long)(g_ts_dropped_ranges + g_ts_reported_ranges),
+                (unsigned long long)g_ts_dropped_encoders,
+                (unsigned long long)g_ts_capped, DS4_GPU_TS_MAX_ENCODERS);
+    }
     g_ts_n = 0;
     /* Command-buffer addresses get recycled -- observed directly while
      * debugging this -- so pointer identity alone would let a NEW buffer that
      * happens to reuse a freed address append to a stale range.  Disowning here
      * means the next encoder always starts a fresh range. */
     g_ts_cb = NULL;
+}
+
+/* Hand slots [g_ts_base, g_ts_base + g_ts_n) to `cb`, advancing past whatever
+ * the previous range used so an in-flight buffer's counter writes cannot land
+ * in them.  Whatever the previous owner left unreported is counted, not
+ * silently forgotten. */
+static void ds4_gpu_ts_begin_range(id<MTLCommandBuffer> cb) {
+    if ((__bridge void *)cb == g_ts_cb) return;
+    if (g_ts_n > 0) { g_ts_dropped_ranges++; g_ts_dropped_encoders += g_ts_n; }
+    g_ts_base += g_ts_n;
+    if (g_ts_base + DS4_GPU_TS_MAX_ENCODERS > DS4_GPU_TS_CAPACITY) g_ts_base = 0;
+    g_ts_cb = (__bridge void *)cb;
+    g_ts_n = 0;
+}
+
+/* Reserve one slot pair for the encoder about to be created, or count the
+ * overflow.  Returns nil when sampling is off or the range is full, so the
+ * caller falls back to an untimestamped encoder. */
+static MTLComputePassDescriptor *ds4_gpu_ts_pass_descriptor(void) {
+    if (g_ts_n >= DS4_GPU_TS_MAX_ENCODERS) { g_ts_capped++; return nil; }
+    MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
+    pd.sampleBufferAttachments[0].sampleBuffer = g_ts_buffer;
+    pd.sampleBufferAttachments[0].startOfEncoderSampleIndex = (g_ts_base + g_ts_n) * 2u;
+    pd.sampleBufferAttachments[0].endOfEncoderSampleIndex = (g_ts_base + g_ts_n) * 2u + 1u;
+    g_ts_labels[g_ts_n] = g_ts_pending_label;
+    g_ts_pending_label = NULL;
+    g_ts_n++;
+    return pd;
 }
 
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
@@ -1186,20 +1247,10 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
             /* The batch reuses one encoder until something ends it, so each
              * recreation is one timestamped span -- which lands exactly on the
              * encoder boundaries the engine already creates (~172 per token). */
-            if (ds4_gpu_ts_active() && (__bridge void *)cb != g_ts_cb) {
-                g_ts_cb = (__bridge void *)cb;
-                g_ts_n = 0;
-            }
-            if (!g_batch_encoder_concurrent && ds4_gpu_ts_active() &&
-                g_ts_n < DS4_GPU_TS_MAX_ENCODERS) {
-                MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
-                pd.sampleBufferAttachments[0].sampleBuffer = g_ts_buffer;
-                pd.sampleBufferAttachments[0].startOfEncoderSampleIndex = g_ts_n * 2u;
-                pd.sampleBufferAttachments[0].endOfEncoderSampleIndex = g_ts_n * 2u + 1u;
-                g_ts_labels[g_ts_n] = g_ts_pending_label;
-                g_ts_pending_label = NULL;
-                g_ts_n++;
-                g_batch_enc = [cb computeCommandEncoderWithDescriptor:pd];
+            if (ds4_gpu_ts_active()) ds4_gpu_ts_begin_range(cb);
+            if (!g_batch_encoder_concurrent && ds4_gpu_ts_active()) {
+                MTLComputePassDescriptor *pd = ds4_gpu_ts_pass_descriptor();
+                if (pd) g_batch_enc = [cb computeCommandEncoderWithDescriptor:pd];
             }
             if (!g_batch_enc) {
                 g_batch_enc = g_batch_encoder_concurrent
@@ -1210,20 +1261,11 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
         }
         return g_batch_enc;
     }
-    if (ds4_gpu_ts_active() && (__bridge void *)cb != g_ts_cb) {
-        g_ts_cb = (__bridge void *)cb;
-        g_ts_n = 0;
-    }
     id<MTLComputeCommandEncoder> enc = nil;
-    if (ds4_gpu_ts_active() && g_ts_n < DS4_GPU_TS_MAX_ENCODERS) {
-        MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
-        pd.sampleBufferAttachments[0].sampleBuffer = g_ts_buffer;
-        pd.sampleBufferAttachments[0].startOfEncoderSampleIndex = g_ts_n * 2u;
-        pd.sampleBufferAttachments[0].endOfEncoderSampleIndex = g_ts_n * 2u + 1u;
-        g_ts_labels[g_ts_n] = g_ts_pending_label;
-        g_ts_pending_label = NULL;
-        g_ts_n++;
-        enc = [cb computeCommandEncoderWithDescriptor:pd];
+    if (ds4_gpu_ts_active()) {
+        ds4_gpu_ts_begin_range(cb);
+        MTLComputePassDescriptor *pd = ds4_gpu_ts_pass_descriptor();
+        if (pd) enc = [cb computeCommandEncoderWithDescriptor:pd];
     }
     if (!enc) enc = [cb computeCommandEncoder];
     ds4_gpu_trace_label_encoder(enc);
