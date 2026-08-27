@@ -243,7 +243,10 @@ argument holds verbatim and it should come back bit-identical.
 6. **`dedc830` half-generalises, and the useful half is the half that does.**
    The *rebuild* does not — it needs a bounded window. But the **alignment**
    does, and `ds4_session_rewind_align()` already snaps to `lcm(non-zero
-   ratios)` = **128, a multiple of 64**. It is already the right shape. What
+   ratios)` = **128, a multiple of 64**. The *mechanism* is already the right
+   shape — but note the *value* is not portable: Qwen's only non-zero ratio is
+   4, so the same function returns **4** where GDN needs **64**. The alignment
+   hook generalises; its input does not. What
    that code is really doing is canonicalising the carried state — making it a
    function of a fixed grid rather than of the chunk schedule — and GDN's state
    at a 64-aligned position is a *complete* object, so it gets that

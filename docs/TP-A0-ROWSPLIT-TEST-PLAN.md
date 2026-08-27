@@ -681,7 +681,29 @@ What does survive is the negative pattern: T1 (wire latency, wash), T8 (MoE
 kernel specialisation, negative) and R11 (gate count, negative) all attacked
 chains *inside* the attributed 16–23 ms, and none of them moved the needle.
 
-**Decomposing the floor does not need ablation, and that is the unlock.** The
+**Per-dispatch cost cannot be the floor — our own ballast numbers rule it
+out.** The marginal dispatch cost measured in-situ is **~1.9 µs**, and decode
+issues **1021 dispatches/token**, so the entire dispatch budget is **1.94 ms**
+(`:781`). To reach 13 ms the marginal cost would have to be 12.7 µs — **6.7×**
+what we measured. Whatever the recoverable part of the residual is, dispatch
+count accounts for at most 1.94 ms of it, which is consistent with this
+document already concluding that "dispatch removal is not a productive
+strategy here."
+
+That leaves exactly two candidates, and they are separately measurable:
+
+- **unablated compute** — `router`, `shared`, `kv`, compressor, q_a/kv, HC
+  post, embedding/logits/sampling;
+- **encoder close/reopen boundaries and gate waits** — **172 boundaries per
+  token** (`:796`), which ballast is blind to because it fires *inside* an open
+  encoder. If boundaries carried the whole non-compute remainder they would be
+  ~75 µs each, in the range upstream #590 reports.
+
+**So the floor closes with two instruments, not one**, and neither is
+expensive.
+
+**Decomposing the compute half does not need ablation, and that is the
+unlock.** The
 three chains M2 skipped are precisely the ones that cannot be ablated cleanly —
 but they are all already instrumented in the decode stage profiler
 (`DS4_METAL_PROFILE_DECODE_STAGE("router")` at `ds4.c:24123`, and the same for
@@ -696,9 +718,11 @@ between them, and the floor is ~13 ms. Order:
 
 1. **Stage-profile run at 32k/131k** (above) — bounds `router`/`shared`/`kv`/
    compressor and tells us how much of the 13 ms is real compute. ~20 min.
-2. **R12b reduced-ballast arm + the encoder-boundary instrument** — these probe
-   stall rather than stage, and are the right follow-up once step 1 says how
-   much stall there is to find.
+2. **The encoder-boundary instrument** (`:736-740`, ~20 lines) — the other half
+   of the floor, and now the *more* likely half given that dispatch cost is
+   capped at 1.94 ms. Promote it above R12b's ballast arm, which is a
+   confirmation of a number we already have. Steps 1 and 2 are independent and
+   can run in either order or together.
 3. **T2 follow-up** (28/31) — see below. Cheap, but a loose end, not a lever.
 
 The floor's composition — per-layer dispatch versus per-token fixed cost — is
