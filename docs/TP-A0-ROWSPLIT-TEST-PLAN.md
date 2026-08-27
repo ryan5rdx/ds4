@@ -1217,6 +1217,38 @@ numbers by ~1.9 before projecting engine impact**, alongside the ~0.63
 standalone-to-rig factor already in this document. Note the in-situ numbers are
 the trustworthy ones, and they still put top-k (5.32 ms) above scoring (3.84).
 
+#### U10a — run the NSG sweep on the rig — **zero code, and it decides U10**
+
+**This is the gap in the U7 rig run.** The rig measured only the default
+(NSG=8, 1565 GFLOP/s). The `DS4_METAL_INDEXER_LLT_NSG` knob is built, committed
+and bit-identical across arms — **the sweep just has not been run there**, and
+it is the free test of U10's entire premise.
+
+```
+for n in 8 4 2 ; do
+  DS4_METAL_INDEXER_LLT_NSG=$n DS4_METAL_GPU_BUSY_PROFILE=1 \
+    tests/bench_indexer_score 32768 300
+done
+```
+
+**Why it decides U10.** On the M1 Max more residency was *worse* — NSG=4
+−1.4%, NSG=2 −25% — because shrinking NK loses more on Q-staging amortisation
+than residency gains. But U7c's whole argument is that **the Ultra is short of
+latency hiding specifically**, at 72% scaling efficiency and 7.3% of ALU peak
+against the M1 Max's 10.1%. If that is right, the residency/NK trade should sit
+at a **different point on the Ultra than on the M1 Max**.
+
+| rig outcome | reading | consequence |
+|---|---|---|
+| NSG=4 ≥ NSG=8 | residency is worth more than NK on the Ultra — the M1 Max ranking does **not** transfer | **U10 is on**: dropping `sk` buys 7× residency at *unchanged* NK, strictly better than what NSG=4 trades for |
+| NSG=4 ≈ −1.4% as on M1 Max | the trade behaves the same on both parts | U10 weakens sharply — residency is not the deficit, and the 72% is something else |
+| NSG=4 clearly worse | NK dominates even harder at scale | **U10 is off.** Look at the 8×8 simdgroup step chain instead |
+
+Note NSG=4 confounds two changes (NK halved *and* residency doubled), so it can
+only ever be suggestive — but a **win** there is strong evidence for U10 because
+U10 gets the residency without paying the NK. Run this before writing any U10
+code.
+
 #### U10 — drop the `sk` staging buffer: 1 → 7 threadgroups resident per core
 
 This is where U7c points, and it is the strongest structural lever found so far.
@@ -1238,7 +1270,14 @@ threadgroup memory drops to 4,128 B and residency goes from 1 to 7 threadgroups
 per core — at unchanged NK.**
 
 That is the occupancy the kernel has never had, and U7c says occupancy is
-exactly what the Ultra is short of. It also removes a per-key format conversion
+exactly what the Ultra is short of.
+
+*(Aside from U6's second-host run: on lanfear the Metal-allocated arms reach
+791 GB/s against the mmap arms' 758–764 — a repeatable **~4%** placement
+effect that mat does not show. So "allocation path costs nothing" is very
+slightly too strong: it costs 0–4% depending on host, and the true roof is
+~790. Real, but two orders of magnitude below what the placement hypothesis
+predicted, and not worth a loader change.)* It also removes a per-key format conversion
 and halves the cache's 352 MB/token of reads, though on the evidence neither of
 those is the main prize.
 
