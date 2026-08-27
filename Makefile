@@ -164,6 +164,33 @@ tests/bench_q8_attn_shapes: tests/bench_q8_attn_shapes.o ds4_metal.o
 bench-q8-attn-shapes: tests/bench_q8_attn_shapes
 	./tests/bench_q8_attn_shapes
 
+tests/bench_encode_shape.o: tests/bench_encode_shape.m
+	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
+
+tests/bench_encode_shape: tests/bench_encode_shape.o
+	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
+
+bench-encode-shape: tests/bench_encode_shape
+	./tests/bench_encode_shape
+
+tests/bench_mv_concurrency.o: tests/bench_mv_concurrency.m
+	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
+
+tests/bench_mv_concurrency: tests/bench_mv_concurrency.o
+	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
+
+bench-mv-concurrency: tests/bench_mv_concurrency
+	./tests/bench_mv_concurrency
+
+tests/bench_decode_rows.o: tests/bench_decode_rows.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/bench_decode_rows: tests/bench_decode_rows.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+bench-decode-rows: tests/bench_decode_rows
+	./tests/bench_decode_rows
+
 tests/bench_membw.o: tests/bench_membw.m
 	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
 

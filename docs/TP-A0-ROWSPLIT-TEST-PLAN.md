@@ -957,34 +957,49 @@ fixing it pays twice.
 They are not wrong, but they are not the path to 50 t/s. Item 1 is a day's work
 against a defect worth several milliseconds, and item 3 costs nothing but a run.
 
-### Next run — iteration 2, rebuilt 2026-08-27
+### Next run — iteration 3, rebuilt 2026-08-27 after the C2 revert
 
-**DONE 2026-08-27 (`6b962db`):** arms 1-3 measured, arm 4 (n-gram) did not
-engage (see below). Full data in `BENCHMARKS-TP-PP.md` §Iteration 2.
+**Honest state: the measurement programme is nearly exhausted.** Of iteration
+2's four arms, two are compromised and two were never runnable. What remains is
+three items, and only one of them is a new question.
 
-| # | arm | outcome |
-|---|---|---|
-| 1 | **Stage profile** | **`attn_out_proj` is a real 2.38 ms top-4 stage** (ctx-invariant) that the last run's `attn_tp_gate` marker had swallowed; the true `attn_tp_gate` is only **0.91-0.99 ms**. The 3.72 ms figure was a mislabel, not a gate cost. |
-| 2 | **Flash-attn split** | Sampling fixed (123 vs 10496 calls). fa_core 0.251 / reduce 0.274 ms/token @2k, but per-layer × 43 ≈ 22.6 ms still does **not** reconcile to the 3.78 ms stage. Honest A2 decomposition still open. |
-| 3 | **Per-slot gate profiler** | Corrected formula: **straggler 0.66 ms @2k / 0.70 @131k** (was 1.00/0.70, double-counted). U14 + §7 survive at ~0.7 ms, not 1.0. |
-| 4 | **n-gram arms** | **DID NOT ENGAGE.** Plain bench decode (`ds4_session_eval` → `ds4_session_eval_probe_tp`, `ds4_bench.c:883`) never reaches the n-gram dispatch (`ds4.c:69923`, only via `..._speculative_argmax_excluding` when `cfg.dspark`, which requires `--mtp FILE`). 0 spec-stat lines, baseline throughput at 2k/131k. **Needs a dspark invocation to exercise — implementation-side, mine.** |
+**Rebuild first.** The last run used `6b962db`, which had the C2 defect
+(`out_low_nsg = 8` against a 4-simdgroup dispatch → garbage output that measured
+as a win). Reverted in `da63283`. **Every number from that build is suspect
+until re-taken.**
 
-**Do not re-run:** the Q8_0 shape sweep (C1 falsified — the rig peaks at k=4096,
-a different shape from both the M1 Max and §5, and **§5's curve should not be
-quoted again**), the `attn_out_low_nsg` sweep (**C2 banked, default now 8**), the
-`hcpre` ablation, and the pre-norm fusion disable.
+| # | arm | zero-code? | why |
+|---|---|---|---|
+| **1** | **Validate the TP crash fix.** Prefill a prompt of **4095 tokens**, checkpoint, then continue. Watch the worker for "Metal model range … is not covered by mapped model views". | yes | **Highest priority — it gates a shipped fix.** `69a3b86` corrects a double expert-offset rebase that put rank 1 one whole expert blob out of range. It fires only when a chunk is exactly one token, which is why it took a `cached = 4096×22 − 1` resume to surface. A single-box variant is documented in `docs/BUG-TP-WORKER-MODEL-VIEW-2026-08-27.md`. |
+| **2** | **Clean re-baseline.** `DS4_METAL_GPU_STAGE_TIMESTAMPS=1` and `DS4_TP_GATE_PROFILE=1`, 2k and 131k, on the post-revert build. Report **every** marker. | yes | Both recent profiles are compromised — one by the C2 artifact, the earlier one by the `attn_tp_gate` mislabel. **Everything downstream compares against this**, and two corrected figures need confirming: `attn_out_proj` ≈ 2.73 ms (not 2.38) and the straggler ≈ 0.50 ms (not 0.66). |
+| **3** | **R12a — command-buffer split schedule.** Arms 4/0, 2/8, 2/16, 2/32, 3/12, 4/12. **Hard prerequisite: `DS4_METAL_FAST_SYNC=1` on both ranks**, or `ds4_gpu_tp_split_safe()` returns 0 and every arm collapses to one buffer — a flat null for the wrong reason. | yes | **Revived, and worth more than when it was filed.** We now know a command-buffer round trip costs ~0.25–0.4 ms host-observed, and decode uses 3 buffers per token at `pos ≥ 128`. This sweeps that schedule **bit-identically**. Nothing else on the list attacks the round-trip cost, and it is free. |
 
-### Implementation queue after iteration 2
+**Not runnable — these are mine, not rig work:**
 
-| item | ms | state |
-|---|---|---|
-| **C3** row-split `shared_down` | 0.16 | **Measured, unblocked, implementable now.** k=1024→2048 is 279→410 GB/s = 1.47× on the current rig. |
-| **§7C** intra-expert split via repack-on-load | ≤0.50 @2k | Straggler confirmed real but **halved by the formula fix**. Justify the loader on this alone — **not** on M3. |
-| **A2** head-batched vec | 0–2.0 | **Gated on arm 2**, which should finally size it. |
-| **A1** split the reduce over DV | 0.1–0.3 | Independent, low cost. |
-| ~~C1~~, ~~M3~~, ~~U16~~, ~~M1~~ | — | C1 falsified by arm 4; M3's mechanism bounded at ~1.1% by U8+M1 against a 9.7% estimate; U16 is dispatch latency; M1 measured null. |
+- **Arm 2 (flash-attn split) is dead as designed.** The boundary takes a host
+  wall clock either side of `end_commands()`/`begin_commands()`, so it measures a
+  command-buffer round trip, not kernel time — which is why per-call figures
+  (0.25–0.41 ms) match the round trip exactly and miss the stage by 6×. Needs
+  `MTLCounterSampleBuffer` timestamps **inside one command buffer**. A2 stays
+  unsized until then.
+- **Arm 4 (n-gram) needs a call site, not a rig slot.** There is no speculation
+  in the production path at all: `ds4_session_eval` → `..._probe_tp`, and the
+  only caller of the speculative entry anywhere is `ds4_bench.c:866` behind
+  `--dspark --mtp FILE`.
 
-**Banked so far: U10 (+1.6%), T2 (+0.9%), C2 (+1.5–1.7%).**
+**Live implementation queue, and it is thin.** C3 row-split `shared_down`
+(0.16 ms, measured mechanism, unblocked), U14/§7C shared-shift (**0.50 ms** after
+three downward revisions), A1 reduce split over DV (0.1–0.3 ms). **That is
+~1 ms against the 4.34 ms needed.**
+
+**The honest position: this plan no longer contains a path to 50 t/s.** It
+contains a re-baseline, a correctness gate, one free sweep, and ~1 ms of
+implementation. The 15 ms gap between the 9.5 ms bandwidth floor and the 24.34 ms
+actual is not addressed by anything on this list. A fan-out is running against
+exactly that question (eight lenses, adversarially refuted, `docs/PATH-TO-50TPS.md`
+when it lands) — **hold further implementation until it reports**, because
+committing days to a 0.16 ms item while a 15 ms question is open is the wrong
+trade.
 
 ### Sequencing — run in this order
 
