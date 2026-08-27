@@ -195,6 +195,7 @@ two are minutes and one of them can invalidate three completed runs.
 | **11** | **U3 — T9 re-sized: indexer cache F32→F16** | ~1 h | **gated off by U2 2026-08-26.** U2 reported latency-bound, so per its own gate the honest prize is near zero — do not start the F32→F16 code work; go to the restructure. 352 MB/token at 131k, halved. Was filed sub-1% at "0.2–0.4 ms"; the stage is 10.5 ms. **Gated on U2.** |
 | **12** | **U4 — TP row-split the decode indexer** | ~3 h | The biggest stage is computed *twice* today, once per rank. ~5 ms of 36 ms. Largest single item in this document. |
 | **13** | **U5 — R13 n-gram arms, re-prioritised** | ~1 h | Raises arithmetic intensity without requiring any kernel to get faster — the structural answer to a latency-bound decode. |
+| **14** | **U6 — why ~400 GB/s on an 800 GB/s part** — allocation-path + concurrency arms | ~1 h + harness | **Now the largest open question.** U1 ruled out working-set size but never varied allocation path or kernel. Our weights are an `mmap` wrapped with `newBufferWithBytesNoCopy`, so Metal never places them — if they sit on one die, that is exactly 400 GB/s. Decides whether the roof is 400 or 800, and therefore how every other item here is sized. **Ahead of U3/U4/U5.** |
 
 Steps 0–3 are about four hours of rig time and settle whether the last three
 campaigns are valid, whether the largest sized item is real, and whether the
@@ -904,6 +905,82 @@ separately from the stage saving.
 
 **Prerequisite:** U1, so we know whether the halved per-rank work actually
 converts to time or just moves us along a flat part of the curve.
+
+#### U6 — why ~400 GB/s on an 800 GB/s part — **the largest open question**
+
+**U1's conclusion is right about kernels and wrong about "platform."** It swept
+the *working set* 8× (3.19 → 25.50 GiB) and found a hard 408–410 GB/s plateau.
+That rules out cache effects and working-set size. It does **not** establish a
+platform ceiling, because all four arms shared the same two things it never
+varied: **one kernel** (the MoE matvec) and **one allocation path**. The
+finding is "not working-set size," not "not our kernels."
+
+**The mechanism I believe is responsible.** The M2 Ultra is two M2 Max dies
+joined by UltraFusion, each with its own memory controllers and **400 GB/s** of
+LPDDR5. Reaching 800 requires accesses spread across *both* dies' controllers.
+Our weights are not placed by Metal at all:
+
+- the GGUF is `mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0)` — file-backed
+  (`ds4.c:2544-2545`);
+- those host pages are then wrapped with **`newBufferWithBytesNoCopy`**
+  (`ds4_metal.m:2023`) as `MTLResourceStorageModeShared`
+  (`ds4_metal.m:1377-1383`).
+
+So physical placement is decided by the VM's page-fault path for a file-backed
+mapping, **not by the GPU driver**. If those pages land predominantly on one
+die's memory, all 60 GPU cores contend for that die's 400 GB/s and the other
+half of the memory system sits idle. **That predicts exactly the number we
+measure**, and it independently explains the power reading: ~30 W GPU during
+decode against ~60 W in prefill is consistent with half the memory subsystem
+doing nothing.
+
+This is a hypothesis with a clean falsifier, not a conclusion. Two rival
+explanations make different predictions and the test below separates all three:
+
+1. **Placement** — pages on one die. Metal-allocated `Private` memory should
+   then be substantially faster than the wrapped mmap.
+2. **Per-dispatch concurrency** — a single kernel cannot generate enough
+   outstanding requests to saturate both dies regardless of placement. Then two
+   concurrent kernels on separate queues should exceed 410 in aggregate while
+   each alone does not.
+3. **Genuine architectural limit** — nothing exceeds ~410 under any condition.
+
+**The instrument does not exist yet and must be written.** `bench_moe_mxfp4_decode`
+is a matvec, not a bandwidth probe, and it only exercises the mmap path. What
+U6 needs is a purpose-built streaming-read harness: a grid-stride kernel doing
+wide (`uint4`) loads with no dependent chains, thousands of threadgroups,
+summing into a sink so nothing is optimised away, over a buffer of ≥8 GiB.
+Arms, all with the identical kernel and size:
+
+| arm | allocation | tests |
+|---|---|---|
+| A | `newBufferWithBytesNoCopy` over `MAP_SHARED` file mmap | **the current model path** |
+| B | `newBufferWithBytesNoCopy` over `MAP_PRIVATE\|MAP_ANONYMOUS` mmap | file-backed vs anonymous |
+| C | `newBufferWithLength:` + `StorageModeShared` | Metal-placed, CPU-visible |
+| D | `newBufferWithLength:` + `StorageModePrivate` | Metal-placed, GPU-local |
+| E | arm A plus `MTLResourceHazardTrackingModeUntracked` | the existing `DS4_METAL_MODEL_UNTRACKED` knob |
+| F | two concurrent dispatches on two command queues, arm D | per-dispatch concurrency limit |
+
+**Decision.**
+- **D (or F) ≫ A** → placement or concurrency, and it is *ours to fix*. At
+  ~1.7–2× on every weight read this would be worth more than every other item
+  in this document combined, and it would re-open T8 and the whole matvec
+  queue. The fix would be a loader change — stage weights into Metal-allocated
+  memory, or fault the mapping in from several threads so first-touch spreads
+  the pages — not a kernel change.
+- **All arms ~410** → genuine architectural ceiling for GPU reads on this part.
+  Then 400 GB/s is the real roof, U2's 39.7 GB/s is 10% of a *correct* roof,
+  and the kernel-level work stands as planned.
+
+**Run on the rig only.** The M1 Max is a single 400 GB/s die and cannot
+discriminate any of this. One useful pre-screen *is* available on the dev box
+though: if A and D differ materially even on a single-die part, the penalty is
+paging or hazard tracking rather than die locality, which is worth knowing
+before the rig time is spent.
+
+**Sequencing: this goes ahead of U3, U4 and U5.** Every one of them is sized in
+milliseconds saved against an assumed bandwidth roof, and U6 decides whether
+that roof is 400 or 800.
 
 #### U5 — n-gram speculation on the rig (R13 arms, re-prioritised)
 
