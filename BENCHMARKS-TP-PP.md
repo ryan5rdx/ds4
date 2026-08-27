@@ -243,6 +243,37 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### Arm B — encoder-timestamp re-baseline (re-run 3, slot-scoped + normalised build `05f402d`) — 2026-08-27
+
+**Falsifier resolved.** The pre-registered falsifier said: if the inferred
+tick pins at ~1.000 ns at both contexts on the slot-scoped build, slot reuse
+was the single cause. It does:
+
+| ctx | gen_steady t/s | tick | coverage |
+|---|---|---|---|
+| 2k | 42.25 | **1.000 ns** | ~197% OVERLAPPING |
+| 131k | 29.75 | **1.000 ns** | ~198% OVERLAPPING |
+
+**The counter is 1.0 ns on both parts; the 0.632 ns readings were slot-reuse
+corruption** (global sample slots let a second in-flight buffer's encoders
+append to the first's range). **Coverage ~197% is now a genuine measurement**
+for the first time: encoder spans really do overlap ~2×, so the GPU already
+pipelines adjacent encoders (pipelining depth ~2, ~132 µs of overlap per span).
+This independently explains three standing nulls — R12a flat split schedule,
+marginal ballast dispatch, dead dispatch-count reduction.
+
+**Normalised budget** (the column that sums to the command buffer, per the
+plan's instruction to take normalised as the budget; raw is an upper bound):
+
+| ctx | calls/token | raw µs/call | **norm µs/call** |
+|---|---|---|---|
+| 2k | 27 (41 pre-slot-scope) | 314.0 | **159.7** |
+| 131k | 19 (20 pre-slot-scope) | 339.3 | **171.3** |
+
+Normalised `reduce` ≈ **160-171 µs/call**, vs the hand-corrected table's
+`attn_inv_rope` 3.64 ms stage. Throughput at baseline (42.25 / 29.75 t/s)
+confirms the instrument's ~1-3% distortion claim once more.
+
 ### Arm B — encoder-timestamp re-baseline (re-run, tick-calibrated build `0b987e5`) — 2026-08-27
 
 Re-run because the first arm-B run (build `fba4ef0`) predated the tick
