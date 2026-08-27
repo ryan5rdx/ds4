@@ -181,6 +181,30 @@ Format: one table per (branch, commit, date). Newest first. Every table should
 name the branch + HEAD commit + date + the exact env flags that differ from
 defaults; the sweep semantics above apply to all rows.
 
+### U1 — streaming-read ceiling: ~400 GB/s is the platform, not our kernels — 2026-08-26
+
+`tests/bench_moe_mxfp4_decode` on lanfear (M2 Ultra, 800 GB/s spec), one
+rank, no TP, no model — T8's conditions with the working set pushed 8× via
+`n_total_expert` (harness caps `n_sel=6`). Every arm streams 80.22 MB/iter;
+3 runs each.
+
+| n_experts | model map | GB/s (3 runs) | mean |
+|---|---|---|---|
+| 256 | 3.19 GiB | 374.5 / 387.2 / 383.5 | ~382 |
+| 512 | 6.38 GiB | 409.1 / 407.7 / 410.4 | ~409 |
+| 1024 | 12.75 GiB | 408.6 / 406.6 / 410.2 | ~408 |
+| 2048 | 25.50 GiB | 410.8 / 406.8 / 412.0 | ~410 |
+
+**Verdict: nothing exceeds ~410 GB/s even with the working set pushed 8×.**
+The ~408–410 plateau is exactly one M2 Max die's worth of the 800 GB/s
+Ultra spec (400/die). So ~400 GB/s is a platform/placement characteristic
+(single-die UltraFusion locality), not a kernel limit. **Escalate; do not
+tune kernels.**
+
+**Correction to T8:** T8's "bandwidth-bound at ~400 GB/s — near the M2
+Ultra ceiling" is wrong — the ceiling is 800 GB/s; ~400 GB/s is one die's
+worth, not the chip's ceiling.
+
 ### Current state — `upstream-metal-wins` @ `f3668a1`/`627ccc1`, 2026-08-25
 
 Consolidated, from the two full sweeps above (TP = all three splits + nsg4

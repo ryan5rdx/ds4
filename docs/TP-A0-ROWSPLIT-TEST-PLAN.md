@@ -190,7 +190,7 @@ two are minutes and one of them can invalidate three completed runs.
 | 6 | **R13 n-gram rig arms** (inertness / correctness / decode A/B on repetitive vs novel text) | ~1 h | Independent of the above; run whenever convenient. |
 | 7 | ~~T1~~ — **done 2026-08-26: dead.** `DS4_TP_GATE_FASTPATH` is a wash (±0.6% decode, no gate-exchange change) and is **not bit-identical** (logits shift up to 2.3, top-1 preserved). Stay default-off. ~~T8 port~~ — dead, see row 3. | — | Both are code, both are gated on a measurement above. |
 | 8 | Cleanup batch: T6, T10, T13 (**T9 removed — promoted to U3**) | — | Small, low-risk, individually sub-1%. |
-| **9** | **U1 — streaming-read ceiling on the rig**, one rank, no TP | ~15 min | **Run first.** Decides whether ~400 GB/s is the platform or our kernels, and therefore how to read every number below. Also re-scores T8. |
+| **9** | **U1 — streaming-read ceiling on the rig**, one rank, no TP | ~15 min | **done 2026-08-26** — pinned at ~408–410 GB/s across maps 3.19–25.5 GiB = one M2 Max die; platform/placement (UltraFusion), not kernels; escalate, do not tune kernels. **Run first.** Decides whether ~400 GB/s is the platform or our kernels, and therefore how to read every number below. Also re-scores T8. |
 | **10** | **U2 — indexer-score roofline + working-set sweep** | ~30 min | The largest stage sits at ~4% of *both* roofs. Says whether it is addressable by configuration or needs a restructure — **and U3's prize depends on the answer.** |
 | **11** | **U3 — T9 re-sized: indexer cache F32→F16** | ~1 h | 352 MB/token at 131k, halved. Was filed sub-1% at "0.2–0.4 ms"; the stage is 10.5 ms. **Gated on U2.** |
 | **12** | **U4 — TP row-split the decode indexer** | ~3 h | The biggest stage is computed *twice* today, once per rank. ~5 ms of 36 ms. Largest single item in this document. |
@@ -755,7 +755,11 @@ between them, and the floor is ~13 ms. Order:
 Five items from the throughput reopening. **U1 first**: it decides how to read
 the other four, and it is fifteen minutes.
 
-#### U1 — is ~400 GB/s the platform or our kernels? — **run first**
+#### U1 — is ~400 GB/s the platform or our kernels? — **DONE 2026-08-26**
+
+**Outcome.** Pinned at ~408–410 GB/s across maps 3.19–25.5 GiB = one M2 Max
+die; platform/placement (UltraFusion), not kernels; escalate, do not tune
+kernels.
 
 **Where:** the rig (M2 Ultra, 800 GB/s spec). **Not** the M1 Max — its peak
 *is* 400 GB/s, so it cannot discriminate. One rank, no TP, no model, matching
