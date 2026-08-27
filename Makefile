@@ -137,6 +137,15 @@ tests/test_topk_ab: tests/test_topk_ab.o ds4_metal.o
 test-topk-ab: tests/test_topk_ab
 	./tests/test_topk_ab
 
+tests/bench_q8_attn_shapes.o: tests/bench_q8_attn_shapes.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/bench_q8_attn_shapes: tests/bench_q8_attn_shapes.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+bench-q8-attn-shapes: tests/bench_q8_attn_shapes
+	./tests/bench_q8_attn_shapes
+
 tests/bench_membw.o: tests/bench_membw.m
 	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
 

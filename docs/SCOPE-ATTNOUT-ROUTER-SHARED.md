@@ -1,6 +1,25 @@
 # Scoping: attn_output / router / shared-expert decode stages
 
-Branch `upstream-metal-wins`. **Analysis only — no source changed.**
+Branch `upstream-metal-wins`. **Analysis only — no source changed.** Complete.
+
+**Headline.** Across the three stages there is roughly **1.3-1.9 ms of recoverable time
+(5.5-7.8% of the 2k token)**, of which only **~0.6-1.0 ms is stage-local** — the rest is
+these stages' share of one program-wide Q8_0 matvec change. Three findings drive that:
+
+1. **`attn_output` is over-credited.** Its span contains the ATTN TP gate's 1-thread GPU
+   fence spin, not just the projection pair — **~0.4-1.35 ms** of it, bounded by E3's own
+   `ffn_hc_post − attn_hc_post = 1.351 ms = 43 x 31.4 us/gate`. The kernel target is
+   ~2.5-2.9 ms, not 3.804. One marker line pins it.
+2. **The projection pair is at 69-70% of the roof by two independent ablation epochs, not
+   the ~100% §4 claimed** — but that 30% is the Q8_0 dequant matvec's gap everywhere in
+   the engine, not an `attn_output` property, and is worth more attacked program-wide
+   (3.16 GB/token). If C0 shows the gate at the top of its range the projection is
+   nearer 83% and even that shrinks.
+3. **`router` has no kernel headroom at all** — 11% of the memory roof, 0.4% of the ALU
+   roof. It is latency, dispatch and (16-20%) profiler. Only dispatch removal can move it.
+
+The one clean stage-local mechanism found is `shared_down`: the TP k-split put a k=2048
+matvec at k=1024, one step down from the peak of its own kernel's measured shape curve.
 
 Roofs used throughout:
 - streaming memory **760 GB/s measured** (`BENCHMARKS-TP-PP.md:195-207`, both hosts) — not 800, not 400
@@ -84,11 +103,26 @@ until the host service thread publishes the peer's release word. That spin is
 `GPUEndTime - GPUStartTime` time and is therefore **inside the reported 3.804 ms.**
 
 This is the single most important structural fact about this stage, and it was not
-visible from the stage name. Corroboration from the sibling stage: the FFN gate
-(`ds4.c:25335`) lands the same way inside `ffn_hc_post`, and `ffn_hc_post` measures
-1.812 ms against `attn_hc_post`'s 0.461 ms for comparable HC work — a ~1.35 ms
-difference in the same run and the same direction. (This is a consistency check across
-two stages of *one* run, not a cross-epoch subtraction.)
+visible from the stage name.
+
+**Corroboration from the sibling stage, inside one run — and independently reached.** The
+FFN gate (`ds4.c:25335`) lands the same way inside `ffn_hc_post`. Both HC-post spans
+contain exactly **one** HC-expand dispatch — `ds4_gpu_hc_expand_add_tensor` at
+`ds4.c:23882` for `attn_hc_post`, `ds4_gpu_hc_expand_add_split_tensor` at `ds4.c:25368`
+for `ffn_hc_post` — and `ffn_hc_post` additionally contains the FFN gate's two dispatches.
+In E3 they measure **1.812 ms** and **0.461 ms**: **1.351 ms = 43 x 31.4 us/gate**,
+against an independently measured ~38 us/gate. This is a within-one-run subtraction of two
+stages that run the identical kernel at the identical grid, not a cross-epoch subtraction.
+The concurrent HC scoping reached the same conclusion by the same route
+(`docs/SCOPE-HC-STAGES.md`, commit `c13e3bb`).
+
+**How much of `attn_output` that implies — bounded, not pinned.** 31.4 us/gate is an
+*upper* bound for the ATTN gate, because the FFN gate additionally absorbs the routed-MoE
+straggler (§7: `E[max(k, 6-k)] = 3.9375` vs 3.0, ~1.47 ms/token of imbalance) while the
+ATTN gate follows work both ranks perform identically. So the gate share of
+`attn_output`'s 3.804 ms is somewhere in **~0.4 to ~1.35 ms**, and the projection pair is
+correspondingly 2.45-3.4 ms. That range is too wide to size a candidate against, which is
+exactly why C0 (one marker line) is the first thing to do.
 
 Notes:
 - `ds4.c:23802`'s comment "**2560 threadgroups**" is **stale**. The pair dispatches
@@ -158,9 +192,10 @@ stride is `NSG * NQ = 16`, so **each thread runs exactly 2 loop iterations**.
 
 ### 2.1 Bytes and FLOPs per token per rank
 
-Shape at the decode call site (`ds4.c:23804-23815`, values from `DS4_SHAPE_FLASH`):
-`group_dim = n_head_dim * (n_head / n_out_group) = 512 * 8 = 4096`; `rank = n_lora_o = 1024`;
-`n_groups_total = 8`; `group_cnt = 4` (this rank's half); `out_dim = n_embd = 4096`.
+Shape read from `ds4.c:22113-22116` (call site `ds4.c:23804-23815`):
+`n_groups = DS4_N_OUT_GROUP = 8`, `group_heads = 64/8 = 8`,
+`group_dim = n_head_dim * group_heads = 512 * 8 = 4096`, `rank = DS4_N_LORA_O = 1024`,
+`group_cnt = n_groups / 2 = 4` (this rank's half, `ds4.c:23800`), `out_dim = n_embd = 4096`.
 
 Q8_0 row bytes = `(k / 32) * 34`.
 
@@ -208,12 +243,15 @@ the *isolated bench* (517-581 GB/s for the same kernel family), which only prove
 engine costs nothing over standalone. Against the hardware it is 70%. The remaining 30%
 is ~0.9 ms/token, **3.7% of the 2k token** if fully recovered.
 
-**(b) ~0.9 ms of the stage span is not the projection pair at all.** 3.804 (E3 span) vs
-2.93 (E2 projection-only) is a cross-epoch comparison and must not be quoted as a
-difference — but the span provably contains the ATTN gate fence spin, which is the only
-other GPU work in it, and the `ffn_hc_post` / `attn_hc_post` contrast inside E3 puts a
-same-run gate-sized quantity in the same range. **`attn_output` is being over-credited as
-a kernel target by roughly a quarter of its headline number.**
+**(b) A large minority of the stage span is not the projection pair at all.** 3.804 (E3
+span) vs 2.93 (E2 projection-only) is a cross-epoch comparison and must not be quoted as a
+difference — but the span provably contains the ATTN gate fence spin, the only other GPU
+work in it, and E3's own `ffn_hc_post − attn_hc_post = 1.351 ms = 43 x 31.4 us/gate`
+measures the sibling gate within a single run. Bounded above by that and below by the fact
+that the ATTN gate does not absorb the MoE straggler, the gate share here is
+**~0.4-1.35 ms**. **`attn_output` is over-credited as a kernel target by somewhere between
+a tenth and a third of its headline number, and the roofline conclusion in (a) depends on
+which** — at 2.93 ms it is 69% of roof, at 2.45 ms it would be 83%.
 
 ### 2.3 Why the kernel is at 70% — and what the shape data already rules out
 
@@ -491,8 +529,166 @@ reducing the number of serialized FFN front-end dispatches, not speeding any one
 
 ## 5. Ranked candidates
 
-TBD
+Ranked by **end-to-end share of the 2k token (24.34 ms, 41.08 t/s)**, not by kernel
+multiple. Anything under ~0.24 ms is under 1% and should be treated as such.
 
-## 6. Instrumentation that would settle the open questions
+### C0 (do first, it is not a win) — split the `attn_output` marker
 
-TBD
+**Mechanism.** One line: a `DS4_METAL_PROFILE_DECODE_STAGE("attn_out_proj")` between
+`ds4.c:23849` and `ds4.c:23850`, i.e. after the projection pair and before
+`ds4_gpu_tp_gate_encode`. In **one run** this separates the out_a/out_b projections from
+the ATTN TP gate fence spin, which today are reported as a single 3.804 ms number.
+
+**Value.** Zero ms directly; it re-sizes the largest of the three targets, whose gate
+share is currently only bounded to **0.4-1.35 ms** (1.6-5.5% of the token). At the top of
+that range the projection pair is already at 83% of roof and C1's share of it nearly
+vanishes; at the bottom, 69% stands. Nothing else in section 2 can be sized until this is
+one number. Whatever the gate portion is, it moves into the TP-gate workstream (T1), where
+entirely different levers apply. Also record the
+`buffers=` field that `ds4_gpu_stage_report` already prints (`ds4_metal.m:10870-10873`) and
+that U12's table dropped — it calibrates the ~4.6 ms instrument tax per stage.
+
+**Cost.** One line, inert unless profiling is on. **Falsified if** the gate portion comes
+back under ~0.2 ms — which would mean the projections run at ~425 GB/s in situ, contradicting
+both the E1 and E2 ablations, and would itself be the finding.
+
+### C1 — widen the Q8_0 decode matvec's per-thread memory-level parallelism — **~1.1-1.4 ms, 4.6-5.8% of the token**
+
+**This is the largest item found, and it is not stage-local — it is the reason two of the
+three stages scoped here sit where they do.**
+
+**Mechanism.** `kernel_mul_mv_q8_0_f32_impl` (`metal/dense.metal:115-183`) uses `NQ = 8`:
+each thread issues one 8-byte weight load and 32 bytes of activation per row per iteration,
+in a non-unrolled loop with a carried accumulator. The evidence that this is the binding
+constraint is §5's shape sweep — a hump in k at constant bytes (283 / 413 / **581** / 541 /
+517 GB/s for k = 512 / 1024 / 2048 / 4096 / 8192), which is a latency/MLP signature, not a
+bandwidth one. Two concrete edits: **`NQ = 16`** (16-byte weight loads, half the
+iterations, `yl[16]` register cost) and/or **unrolling the `ib` loop by 2** so two blocks'
+loads are in flight.
+
+**Size.** Q8_0 decode traffic per rank per layer is `out_a 17.83 + out_b 17.83 + q_b 17.83 +
+shared 13.37 + q_a 4.46 + kv 2.23 = 73.55 MB` -> **3.16 GB/token**, currently moving at
+roughly 400-530 GB/s. 70% -> 85% of the 760 roof is **1.13 ms**; -> 90% is **1.40 ms**.
+At 2k that is **41.08 -> 43.1 t/s**; at 131k, 29.15 -> 30.1 t/s.
+
+**Cost.** A shader edit to one template, plus every consumer that binds `N_R0_Q8_0`
+(`metal/dense.metal:221,468,671`, `metal/dsv4_hc.metal:726,846,955`,
+`metal/moe.metal:3320-3397`). **Register pressure is the risk** and it is the same family
+as the underfill constraint: doubling `yl` may cut residency and lose more than it gains.
+
+**Falsified for free, before any rig time.** `tests/bench_q8_attn_shapes` with
+`DS4_BENCH_MAP_GB=16` sweeps exactly these shapes model-free, and `./ds4_test
+--metal-kernels` is byte-exact without the model. §9 records that changes with a
+model-free byte-exact test held 3/3 while read-only-validated changes held 0/2. If the
+bench does not move k=4096 above ~600 GB/s, drop it.
+
+### C2 — `attn_out_low`'s NSG is pinned at 4 and has never been swept — **~0.2-0.3 ms, 0.8-1.2%**
+
+**Mechanism.** `out_a` uses `ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32",
+4)` with a **literal 4** (`ds4_metal.m:26399`, and the same 4 to the encoder at `26410`).
+`ds4_gpu_get_mul_mv_pipeline` has no env override (`ds4_metal.m:2960-2993`), so
+`DS4_METAL_Q8_MV_NSG` never reaches it — contrary to
+`docs/TP-A0-ROWSPLIT-TEST-PLAN.md:648`. T4 measured nsg=4 as **-3.0% at 131k** across every
+Q8_0 stage the env *does* reach. `out_a` carries 17.83 MB of the ~55.7 MB/layer that T4
+swept, so the same effect on `out_a` scales to roughly 0.2-0.3 ms.
+
+**Cost.** Route the literal through `ds4_gpu_make_q8_0_mv_dispatch().nsg`, or hardcode 2 for
+an A/B arm. Two lines. The grid is `ne01/nr0 x pairs` and does not depend on nsg, so
+nothing else changes.
+
+**Falsified if** the A/B is flat or negative — plausible, because this kernel's grid carries
+the 4 output groups in `tgpig.z` and its residency profile differs from the plain matvec.
+Cheap enough that measuring beats arguing.
+
+### C3 — row-split `shared_down` instead of k-splitting it — **~0.20-0.26 ms, 0.8-1.1%**
+
+Full argument in 4.3. Same bytes, k per row 1024 -> 2048 (the peak of the §5 curve),
+per-thread iterations 2 -> 4, grid 2048 -> 1024 threadgroups, one-time zero of the unowned
+half of `shared_out` rather than a per-layer memset, and the existing summing FFN gate
+composes unchanged.
+
+**Falsified if** `tests/bench_q8_attn_shapes` at (k=2048, N=2048) — 1024 threadgroups, the
+proposed shape — does not clear ~420 GB/s. The sweep's nearest neighbours bracket it
+(k=2048/4096 TGs at 581; k=8192/1024 TGs at 517), so this is a genuine open question and
+the bench answers it model-free before any rig time. **Not bit-identical to today**
+(one full-k dot vs two half-k partials summed), though identical between ranks.
+
+### C4 — enable the router + shared-gate/up fusion under TP — **~0.15-0.40 ms, 0.6-1.6%**
+
+**Mechanism.** `kernel_dsv4_router_shared_gate_up_q8_0` already exists
+(`ds4_metal.m:20254-20351`) and the surrounding control flow already handles the resulting
+order via `router_shared_done`. Lifting `g->tp_world < 2` (`ds4.c:24042`) and threading the
+lane offset (`gate_offset + tp_lane_off`, `out_dim = tp_half`) removes one dispatch and one
+full-GPU barrier per layer, raises the dispatch from 512 to 640 threadgroups, and lets the
+router's 2.1 MB ride behind the shared expert's 8.9 MB stream instead of paying its own
+launch and memory latency.
+
+**Cost and risk.** Moderate. §8's exactness objection is real and must be decided, not
+ignored: the fused kernel dispatches `(32, 8, 1)` (`ds4_metal.m:20342`) where TP runs the
+standalone shared gate/up at `nsg = 2`, so the reduction order changes and the output is
+**not bit-identical to today's TP output** (it is identical between ranks). Also verify the
+fused kernel's `shared_tgs = (out_dim/2 + 1)/2` row mapping is correct for a
+half-width `out_dim`.
+
+**Falsified if** the C0 marker split shows the router matvec is a small part of the router
+stage — in which case the fusion only recovers the dispatch (0.08-0.19 ms) and drops below
+1%.
+
+### Not worth doing / already closed
+
+| item | why |
+|---|---|
+| Any `attn_output` **underfill** work | 4096 threadgroups per layer on 60 cores. This stage is the opposite end of the constraint from packed32 / the 32-TG RoPE kernel / the LLT scorer. |
+| Global `DS4_METAL_Q8_MV_NSG` retune | Swept (T4): TP default 2 optimal, monotonically worse above. |
+| Making the **router kernel** faster | 82 GB/s and 0.38% of the FLOP roof. Its weights would take 0.12 ms/token at the roof; it costs 1.108 ms. There is no rate to improve — only dispatches to remove. |
+| `kernel_dsv4_router_project_select_fused` under TP | Tried, **broke output** with repetition loops, reverted (`2b04539`, §8); also M5-gated at `ds4.c:24058`, so dead on M2 Ultra. A grid-wide `atomic_uint` spin barrier is unsafe when the grid can exceed residency. |
+| Dropping the shared-expert TP split (both ranks compute it whole) | Arithmetic rejects it: 26.74 MB/layer/rank x 43 = 1.150 GB at even 550 GB/s is **2.09 ms** against 1.622 ms today. |
+| `attn_output` byte-model restructuring | §8's phantom. The byte model in 2.1 reconciles to §3 to 0.3%. |
+
+### Summary table
+
+| # | candidate | ms saved | % of 2k token | t/s at 2k | cost | confidence |
+|---|---|---:|---:|---|---|---|
+| C0 | split the `attn_output` marker | 0 (re-sizes 0.9 ms) | — | — | 1 line | certain |
+| C1 | Q8_0 matvec `NQ`/unroll (program-wide) | 1.13-1.40 | **4.6-5.8%** | 41.1 -> 43.1 | shader, wide blast radius | medium; free to falsify; **shrinks if C0 puts the gate at the top of its range** |
+| C2 | `attn_out_low` nsg 4 -> 2 | 0.20-0.30 | 0.8-1.2% | +0.3-0.5 | 2 lines | medium |
+| C3 | row-split `shared_down` | 0.20-0.26 | 0.8-1.1% | +0.3-0.4 | small, not bit-exact | medium-high |
+| C4 | router + shared gate/up fusion under TP | 0.15-0.40 | 0.6-1.6% | +0.3-0.7 | moderate, not bit-exact | low-medium |
+
+**If C1, C2, C3 and C4 all land at mid-estimate: ~1.9 ms = 7.8% of the 2k token, 41.1 ->
+44.6 t/s, and ~30.8 t/s at 131k.** That is a meaningful fraction of the 4.34 ms the
+short-context program needs for 50 t/s, but it is not on its own the answer, and **more
+than half of it comes from one program-wide kernel change (C1), not from the three stages
+as such.**
+
+---
+
+## 6. Honest answer to the roofline question, per stage
+
+| stage | roof it is near | headroom |
+|---|---|---|
+| `attn_output` | **memory, 69-70% of 760** (projection pair, two independent ablation epochs). **10-35% of the reported span is the ATTN TP gate spin, not the kernel** (bounded, C0 pins it). | The 30% gap is the Q8_0 dequant matvec's program-wide gap (C1), not an `attn_output` property. **No stage-local headroom beyond C2.** |
+| `router` | **neither.** 82 GB/s = 11% of memory; 0.38% of ALU. Latency, dispatch and (16-20%) instrument. | **No kernel headroom exists.** Only dispatch removal (C4) and a corrected measurement. |
+| `shared_gate_up` | **memory, 52% of 760** | Program-wide C1; grid halved to 512 TGs by the TP split, best addressed by giving the dispatch more work (C4) rather than reshaping it. |
+| `shared_down` | **memory, 39% of 760** | **Stage-local and mechanistic: the TP k-split put it at k=1024, one step down from the k=2048 peak of its own kernel's shape curve.** C3. |
+
+## 7. Instrumentation that would settle what is still open, each in one run
+
+1. **`attn_out_proj` marker** between `ds4.c:23849` and `23850` — separates the projection
+   pair from the ATTN gate spin. One line. (C0.)
+2. **`router_proj` marker** between `ds4.c:24112` and `24113` — separates the F16 router
+   matvec from the bitonic select. One line. Section 3.3's decomposition is currently an
+   inference; this makes it a measurement, and it is the only way to price the router at
+   all given that §9 rules the `router` ablation unusable.
+3. **Record `buffers=` per stage.** Already printed (`ds4_metal.m:10870-10873`), already
+   emitted by the U12 command, simply not transcribed. Combined with the known 37.99 ms
+   instrumented vs ~33.4 ms real GPU busy, it converts the instrument tax from an estimate
+   into a per-stage subtraction inside one run — and it matters most for exactly the small
+   stages scoped here (~16-33% of `router`, `shared_gate_up`, `shared_down`).
+4. **`tests/bench_q8_attn_shapes` at (k=2048, N=2048) and (k=4096, N=4096) with `NQ=16`.**
+   Model-free, byte-exact-checkable, runs on the dev box for correctness and needs the rig
+   only for timing. Decides C1 and C3 before either touches the engine.
+
+All four are additive to a single `DS4_METAL_GPU_STAGE_TIMESTAMPS=1` run at 2k — which,
+per `docs/TP-A0-ROWSPLIT-TEST-PLAN.md:1687` (U15), **has never been run**, and every
+percentage in this document is a 131k measurement asserted to be context-invariant.
