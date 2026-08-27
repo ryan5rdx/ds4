@@ -1,17 +1,31 @@
-# Inventory: benchmark & test harnesses (ds4)
+# Inventory: benchmark and test harnesses
 
-STATUS: IN PROGRESS (skeleton written first; sections filled as extraction proceeds)
+STATUS: in progress (skeleton written first, filled as extraction proceeds).
 
-Extractor assignment: "harnesses". Source of truth = the harness source files
-themselves (`tests/bench_*.c`, `tests/bench_*.m`, `tests/test_*.c`,
-`speed-bench/*.c`) plus `Makefile` and any caveats recorded in the campaign docs.
+Scope: every `tests/bench_*.c`, `tests/bench_*.m`, `tests/test_*.c`,
+`tests/*.cu`, `speed-bench/*.c` harness in the ds4 tree, plus the shell/python
+harnesses that sit alongside them.
 
-Sections:
-1. Master table
-2. Makefile rule coverage / build status
-3. Per-harness detail
-4. Caveats index
-5. Harnesses with no Makefile rule
-6. Provenance notes
+## 1. Build-status matrix
+(TBD)
 
-(placeholder -- being filled)
+## 2. Metal micro-harnesses (model-free)
+(TBD)
+
+## 3. Metal harnesses that link ds4_metal.o
+(TBD)
+
+## 4. Whole-engine harnesses (need a GGUF)
+(TBD)
+
+## 5. CUDA / ROCm harnesses
+(TBD)
+
+## 6. Pure-CPU unit tests
+(TBD)
+
+## 7. Script harnesses
+(TBD)
+
+## 8. Cross-cutting caveats
+(TBD)

@@ -1153,6 +1153,63 @@ fixing it pays twice.
 They are not wrong, but they are not the path to 50 t/s. Item 1 is a day's work
 against a defect worth several milliseconds, and item 3 costs nothing but a run.
 
+### Iteration 3 results — crash fix holds, baseline restored, R12a dead — 2026-08-27
+
+Build `06c2c6b`, i.e. **before** the encoder-timestamp work, so three of the
+seven Phase 0 arms ran and the rest still need a build ≥ `225c884`.
+
+**Arm A — the TP crash fix holds. PASS.** Prefilled 4095 fresh (493.64 t/s),
+resumed 4095→4099 so the first chunk was exactly **one token** — the precise
+trigger. **Zero** "not covered by mapped model views", no resumed-prefill
+failure, no GPU timeout, no transport failure. `69a3b86` is validated against
+the shape that produced the original crash. **Close this.**
+
+**Arm B — clean re-baseline, and both hand-corrections were close.**
+
+| | predicted | measured | error |
+|---|---|---|---|
+| `attn_out_proj` | 2.73 | **2.867** | 5% |
+| straggler @2k | 0.50 | **0.545** | 8% |
+
+So the C2-contamination analysis was sound: iteration 2's 2.38 was the broken
+build's artefact, and differencing against the clean control recovered the right
+answer to within 5%. **U14 / §7C stand at ~0.52–0.55 ms.**
+
+Net of the ~18% profiler tax, the 2k budget now reads:
+
+| stage | net ms | share of the 24.44 ms token |
+|---|---|---|
+| `routed_moe_folded` | 4.72 | 19.3% |
+| `attn_inv_rope` | 3.64 | **14.9%** |
+| `attn_out_proj` | 2.69 | 11.0% |
+| `q_a_kv_proj` | 1.96 | 8.0% |
+| `q_path` | 1.69 | 6.9% |
+| `q_lora_norm` | 1.49 | 6.1% |
+| `ffn_tp_gate` | 1.38 | 5.6% |
+| `attn_tp_gate` | 0.76 | 3.1% |
+| `compressor_indexer` | 0.02 | 0.1% |
+| **sum** | **18.33** | **75.0%** |
+
+**Treat these as the last numbers from the old instrument.** Arm B of the new
+Phase 0 list re-takes all of it at 1–3% distortion instead of 18%, and the
+standing gate applies: where the two disagree by more than 0.3 ms, believe the
+new one.
+
+**Arm G — R12a is a flat null and the avenue is dead.** Six split schedules at
+131k: 29.31 / 29.21 / 29.24 / 29.38 / 29.19 / 29.12 t/s — **all within 0.9%**.
+
+**And that is worth more than the null.** If command-buffer boundaries carried
+real cost, moving from 4/0 to 2/32 would have shown it. They do not. **This is a
+second, independent refutation of the round-trip framing I retracted an hour
+ago** — the ballast said the marginal dispatch is cheap, the `kv_n` sweep said
+the kernel is 80% work, and now the split schedule says command-buffer count
+does not matter either. Three instruments, one answer. **Remove R12a from the
+queue and stop proposing command-buffer or dispatch-count reductions.**
+
+**Still to run, on a build ≥ `225c884`:** the encoder-timestamp re-baseline, the
+flash-attn shape fields, the ballast arm, `powermetrics`, and the
+compressor-accounting arm.
+
 ### Next run — iteration 3, rebuilt after the 50 t/s fan-out — 2026-08-27
 
 **Read `docs/PATH-TO-50TPS.md` first.** Its verdict is that 50 t/s is **not
@@ -1174,7 +1231,7 @@ is 1.85× off it, not 2.6×**.
 | **D** | **`DS4_METAL_DISPATCH_BALLAST` ∈ {0,2}** at 2k | The dispatch price **in the live graph**. Settles an 11.6× spread that four candidates live or die on — and my retracted 22 µs claim came from getting this wrong in isolation. | **Not yet run.** Queued. |
 | **E** | **`powermetrics --samplers gpu_power`** during decode vs `tests/bench_membw` | Retires the "30 W / 20% utilised" premise either way. The fan-out believes it dissolves. | **Not yet run.** Queued. |
 | **F** | **`DS4_METAL_DISABLE_PRE_M5_QKV_PAIR_QUAD_FUSE=1`** + stage profiler | Confirms the 608 MB compressor accounting the corrected byte model rests on. | **Not yet run.** Queued. |
-| **G** | **R12a command-buffer split schedule** — arms 4/0, 2/8, 2/16, 2/32, 3/12, 4/12. **`DS4_METAL_FAST_SYNC=1` on both ranks** or every arm collapses to one buffer and reads as a false null. | Bit-identical, free, and the only queued item that attacks command-buffer round-trip cost. | **FLAT NULL 2026-08-27** (build `06c2c6b`, 131k, `DS4_METAL_FAST_SYNC=1`). All arms within 0.9%: 4/0 29.31, 2/8 29.21, 2/16 29.24, 2/32 29.38, 3/12 29.19, 4/12 29.12 t/s. Split schedule makes no measurable difference at 131k. |
+| ~~G~~ | ~~R12a command-buffer split schedule~~ — **done 2026-08-27: flat null, all six arms within 0.9%. Avenue dead.** — arms 4/0, 2/8, 2/16, 2/32, 3/12, 4/12. **`DS4_METAL_FAST_SYNC=1` on both ranks** or every arm collapses to one buffer and reads as a false null. | Bit-identical, free, and the only queued item that attacks command-buffer round-trip cost. | **FLAT NULL 2026-08-27** (build `06c2c6b`, 131k, `DS4_METAL_FAST_SYNC=1`). All arms within 0.9%: 4/0 29.31, 2/8 29.21, 2/16 29.24, 2/32 29.38, 3/12 29.19, 4/12 29.12 t/s. Split schedule makes no measurable difference at 131k. |
 
 **Also recorded 2026-08-27** (clean re-baseline on `06c2c6b`, pre-encoder-timestamp build): `attn_out_proj` = **2.867 ms** ctx-invariant (confirming ~2.73, not the C2-broken 2.38); `attn_tp_gate` 0.935 ms; total gpu_busy 28.83 / 38.37 ms; straggler **~0.52-0.55 ms/token** (gate delta +12.2-12.7 µs). Full data in `BENCHMARKS-TP-PP.md` §Iteration 3. Note: arms B/C/D/E/F supersede/re-baseline these figures with the low-distortion encoder-timestamp instrument, so treat the above as the last pre-instrument numbers. |
 
