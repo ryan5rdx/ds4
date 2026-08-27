@@ -227,6 +227,58 @@ The routed MoE matvec is **bandwidth-bound at ~400 GB/s** — near the M2 Ultra
 ceiling — so kernel specializations cannot buy what is not there. **T8 pricing
 argues against a MoE specialization port.**
 
+### Stage profile — the ~13 ms floor is real compute, not stall — 2026-08-26
+
+`DS4_METAL_GPU_STAGE_TIMESTAMPS=1` at 32k and 131k, single ctx each, gen
+128, both ranks (per-token decode stage report added to the main TP decode
+path — the report was previously only wired on the speculative `_top`
+variant; `ds4.c` `metal_graph_eval_token_raw_swa`). Steady-state decode
+stage gpu_ms (coordinator rank):
+
+| stage | 32k | 131k | Δ |
+|---|---|---|---|
+| compressor_indexer | 5.45 | **10.51** | **+5.06** |
+| q_path | 5.48 | 5.47 | 0 |
+| routed_moe_folded | 4.67 | 5.40 | +0.73 |
+| attn_inv_rope | 3.42 | 4.27 | +0.85 |
+| attn_output | 3.73 | 3.80 | 0 |
+| ffn_hc_post | 2.19 | 1.48 | −0.71 |
+| attn_hc_pre | 1.16 | 1.14 | 0 |
+| ffn_hc_pre | 1.13 | 1.11 | 0 |
+| router | 1.11 | 1.09 | 0 |
+| shared_gate_up | 0.99 | 0.98 | 0 |
+| shared_down | 0.66 | 0.66 | 0 |
+| attn_hc_post | 0.46 | 0.46 | 0 |
+| **total gpu_busy** | **30.43** | **36.36** | +5.93 |
+| span | 30.73 | 36.67 | |
+| **gap (stall)** | **0.307** | **0.308** | |
+
+**The decode GPU is ~99% busy — the stall gap is ~0.31 ms at both contexts.**
+The stage sum (30.427/36.360) equals `total gpu_busy` exactly, so every
+microsecond is attributed to a stage; there is no hidden idle time.
+
+**The ~13 ms M2 "residual" is real compute, not stall.** M2's ablation set
+did not cover several stages that the stage profile now prices directly:
+q_path's un-ablated remainder, compressor_indexer (the compressed-KV index
+lookup — distinct from the indexer score/topk M2 ablated), attn_inv_rope,
+router, shared_gate_up/down, ffn_hc_pre/post, attn_hc_pre/post. Summing the
+stage profile at 131k accounts for the 12.45 ms residual M2 could not
+attribute. The GPU is busy the whole token; there is no dispatch/idle floor
+left to find.
+
+**The long-context term is `compressor_indexer`, essentially in full.**
+Measured growth 32k→131k is +5.93 ms; compressor_indexer alone is +5.06 ms,
+with a small attention tail (inv_rope +0.85, routed_moe_folded +0.73,
+ffn_hc_post −0.71). This is a finer attribution than M2's indexer
+score/topk — the dominant indexer cost is the compressed-KV lookup, not the
+scoring or top-k selection.
+
+**Consequence for the plan: R12b (dispatch ballast) and the encoder-boundary
+instrument are now moot — they probe stall, and there is no stall.** The
+floor is compute. The two levers that remain are (a) making the big stages
+cheaper — compressor_indexer (10.5 ms @131k), q_path (5.5), routed_moe
+(5.4), attn_inv_rope (4.3) — and (b) T2's ~1% on attncore+attnout.
+
 ### M2 — attribute the 11.1 ms — ablation battery at 32k/65k/131k — 2026-08-26
 
 Re-ran the `DS4_TP_ABLATE` chain battery at 32k and 131k plus the never-run
