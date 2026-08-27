@@ -392,6 +392,62 @@ covered, but the HC contribution shrank and the two largest items (`routed_moe`
 4.72 and `attn_inv_rope` 3.63, together 34% of the token) remain without a
 proposal.
 
+### MoE / attention scoping — two different problems, and a correction to T8 — 2026-08-27
+
+Full report: `docs/SCOPE-MOE-ATTN.md`.
+
+**Correction — `routed_moe_folded` is 365 GB/s, not the ~410 this plan has been
+quoting, and T8 priced kernels production cannot run.** The 410 is U1's
+*isolated world-1 harness*. **All five MXFP4 specialisations are gated on
+`add_in == NULL && tp_world == 1`, so none of them can ever fire on the folded
+TP path.** T8's "the ladder is worth nothing" conclusion survives — but for a
+stronger reason than it recorded: those kernels are unreachable under TP, not
+merely unprofitable. Live rate is **365 GB/s = 48% of roof**; bytes reconcile
+exactly against §3 (3.0 owned experts × 13.369 MB × 43 = 1.7246 GB).
+
+**The k-curve does not explain the MoE — clean negative.** gate/up run at
+k=4096 and down at k=2048, the rig's *two best* Q8_0 points (541 and 581 GB/s).
+Unlike `shared_down`, there is no bad geometry here.
+
+**What is left is per-byte work.** `block_mxfp4` is `{uchar e; uchar qs[16]}` at
+**alignment 1**, so the payload reads as 8 scalar byte loads
+(`metal/moe.metal:4501`) and dequant is 16 threadgroup LUT lookups per 8 bytes —
+~2.9 memory instructions per weight byte against ~1.5 for the Q8_0 matvec.
+
+**M1 tested and reverted — the instruction-count model did not predict.**
+Rewriting all nine sites to alignment-1 `packed_uchar4` loads was
+**byte-identical** (FNV-1a fingerprint unchanged) and **measured nothing**:
+interleaved GPU-time A/B gave 734.2/734.2 ms patched against 729.2/734.5
+baseline, a gap inside the baseline's own spread. Not shipped. **M2 (byte-indexed
+`float2` LUT) is untested and now doubtful** — and it would add ~1.9 KB of
+threadgroup memory, which U7/U10 showed is the binding constraint on residency.
+
+**`attn_inv_rope` is a parallelism problem, near neither roof by 1.5 orders of
+magnitude** — 6–28 GB/s (0.8–3.7%), 305 GFLOP/s (1.4%), ~35× its own
+instruction-issue floor. Four causes, all structural: the flash reduce is
+hard-wired to exactly **32 threadgroups on 60 cores** every layer
+(`ds4_metal.m:29334`); the vec kernel is one simdgroup per threadgroup, capped
+at ~9 resident/core by 3,328 B of shared memory; **22 of 43 layers dispatch only
+128–160 threadgroups**; and KV is re-read **64×** (32 heads × K-then-V on the
+same buffer). This is the sixth sighting of the underfill constraint and by far
+the worst.
+
+**A0 built (`8943015`).** The decode attention could not be decomposed at all —
+`ds4_gpu_flash_attn_stage_profile_boundary` existed but was wired only into the
+four *prefill* encoders, which is why the restructuring estimate honestly spans
+0–8%. `ds4_gpu_encode_flash_attention_gathered_heads` now takes the command
+buffer by pointer and carries four boundaries — `gather`, `packed`, `fa_core`,
+`reduce` — so `DS4_METAL_FLASH_ATTN_STAGE_PROFILE` splits the 3.63 ms in one
+run. Inert unless the env is set.
+
+**The one large item, and it now has a partner.** M3 — repack MXFP4 planar (an
+aligned `qs` plane plus a separate scale plane) — is **2.30–2.45 ms, 9.5–10.1%
+of the token**, high cost, and **shares its conversion tool with §7 option C**
+(the intra-expert repack for the straggler). Together those are **~15% of the
+token for one offline tool and one TP-specific model file.** That is a
+materially different proposition from either alone, and it is the first thing in
+this document that could move decode by more than a few percent.
+
 ### Gate-overlap scoping — mostly irreducible, and four corrections — 2026-08-27
 
 Full report: `docs/SCOPE-TP-GATE-OVERLAP.md`.
