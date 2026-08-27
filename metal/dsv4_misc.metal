@@ -6849,7 +6849,7 @@ kernel void kernel_dsv4_indexer_scores_tiled(
  * matrix steps over depth 128 in ascending order, relu then w*scale per
  * head in ascending head order, and ds4's causal (-inf) epilogue for
  * multi-token (prefill) calls / all-rows pass-through for decode. */
-template <int NBPTG, int T_NSG>
+template <int NBPTG, int T_NSG, bool TIGHT_SMEM = false>
 kernel void kernel_dsv4_indexer_scores_llt_impl(
         constant ds4_metal_args_dsv4_indexer_scores_fused & args,
         device const char *q,
@@ -6873,9 +6873,19 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
     if (args.n_head != NH || args.head_dim != DK) return;
     const bool causal = args.n_tokens > 1u;
 
+    /* U10: sk is written once and read once -- every simdgroup transposes its
+     * 8 keys into the mk registers immediately below, after which the buffer is
+     * dead for the rest of the kernel.  Under TIGHT_SMEM sq/sw/sqk are aliased
+     * back over it, so the allocation is max(sk, sq+sw+sqk) = 16384 B instead
+     * of their sum, 20512.  On a 32 KiB core that is 2 threadgroups resident
+     * instead of 1, at *unchanged* NK -- which is what separates this from the
+     * NSG=4 arm, where the extra residency was paid for by halving NK.
+     * Requires the barrier after the mk load, below. */
     threadgroup half  *sk  = (threadgroup half *)sharedf;        // [NK][DK]
-    threadgroup half  *sq  = sk + NK*DK;                         // [NHPTG][DK]
-    threadgroup float *sw  = sharedf + (NK*DK + NHPTG*DK)/2;     // [NHPTG]
+    threadgroup half  *sq  = TIGHT_SMEM ? (threadgroup half *)sharedf
+                                        : sk + NK*DK;            // [NHPTG][DK]
+    threadgroup float *sw  = TIGHT_SMEM ? (threadgroup float *)(sharedf + (NHPTG*DK)/2)
+                                        : sharedf + (NK*DK + NHPTG*DK)/2;  // [NHPTG]
     threadgroup float *sqk = sw + NHPTG;                         // [NSG*NHPTG*NKPSG]
 
     const uint i_kv_0 = tgpig.x * NK;
@@ -6900,6 +6910,12 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
     simdgroup_half8x8 mk[DK8];
     for (uint i = 0; i < DK8; i++) {
         simdgroup_load(mk[i], sk + (uint)sgitg*NKPSG*DK + 8*i, DK, 0, true);
+    }
+
+    /* sk is dead from here.  Under TIGHT_SMEM sq/sw/sqk overlap it, so every
+     * simdgroup must have finished reading before the first sq write below. */
+    if (TIGHT_SMEM) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     const uint i_kv = i_kv_0 + (uint)sgitg*NKPSG;   // first key of this simdgroup
@@ -6974,6 +6990,9 @@ template [[host_name("kernel_dsv4_indexer_scores_llt32")]] kernel kernel_dsv4_ll
  * does not fit at all.  Select with DS4_METAL_INDEXER_LLT_NSG. */
 template [[host_name("kernel_dsv4_indexer_scores_llt_nsg4")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 4>;
 template [[host_name("kernel_dsv4_indexer_scores_llt_nsg2")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 2>;
+/* U10: same NK=64 shape, sq/sw/sqk aliased over the dead sk staging buffer.
+ * 16384 B instead of 20512 -> 2 threadgroups resident per 32 KiB core. */
+template [[host_name("kernel_dsv4_indexer_scores_llt_tight")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 8, true>;
 
 #ifdef DS4_METAL_HAS_TENSOR
 // Retained full-512 prefill indexer score path.  This is the part of sparse

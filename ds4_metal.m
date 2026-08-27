@@ -18248,12 +18248,21 @@ int ds4_gpu_indexer_score_one_tensor(
             } else if (getenv("DS4_METAL_INDEXER_LLT_NSG4") != NULL) {
                 score_nsg = 4;
             }
+            /* U10: sq/sw/sqk aliased over the dead sk staging buffer -- same
+             * NK=64, 16384 B instead of 20512, so 2 threadgroups resident per
+             * 32 KiB core instead of 1.  U10a showed NSG=4 beating the default
+             * by +5-13% on the Ultra, but NSG=4 buys that residency by halving
+             * NK; this buys it for free.  Opt-in until the rig prices it. */
+            const bool score_tight =
+                score_nsg == 8 && getenv("DS4_METAL_INDEXER_LLT_TIGHT") != NULL;
             id<MTLComputePipelineState> direct_pipeline = score_llt
-                ? ds4_gpu_get_pipeline(score_nsg == 2
-                        ? "kernel_dsv4_indexer_scores_llt_nsg2"
-                        : (score_nsg == 4
-                                ? "kernel_dsv4_indexer_scores_llt_nsg4"
-                                : "kernel_dsv4_indexer_scores_llt"))
+                ? ds4_gpu_get_pipeline(score_tight
+                        ? "kernel_dsv4_indexer_scores_llt_tight"
+                        : (score_nsg == 2
+                                ? "kernel_dsv4_indexer_scores_llt_nsg2"
+                                : (score_nsg == 4
+                                        ? "kernel_dsv4_indexer_scores_llt_nsg4"
+                                        : "kernel_dsv4_indexer_scores_llt")))
                 : ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_direct_pipeline,
                                         "kernel_dsv4_indexer_score_one_direct");
             if (!direct_pipeline) return 0;
@@ -18288,8 +18297,14 @@ int ds4_gpu_indexer_score_one_tensor(
                  * NK = 8*NSG.  Reproduces the previous constants exactly at
                  * NSG=8 (20512 B) and NSG=4 (11296 B). */
                 const NSUInteger nk = 8u * (NSUInteger)score_nsg;
-                [enc setThreadgroupMemoryLength:(nk*128u + 8u*128u) * sizeof(uint16_t) +
-                                                (8u + nk*8u) * sizeof(float) atIndex:0];
+                const NSUInteger sk_b  = nk * 128u * sizeof(uint16_t);
+                const NSUInteger rest_b = 8u * 128u * sizeof(uint16_t) +
+                                          (8u + nk * 8u) * sizeof(float);
+                /* Aliased: the allocation is the max of the two lifetimes,
+                 * not their sum. */
+                [enc setThreadgroupMemoryLength:(score_tight
+                        ? (sk_b > rest_b ? sk_b : rest_b)
+                        : sk_b + rest_b) atIndex:0];
                 ds4_gpu_trace_push(enc, score_nsg == 2 ? "indexer_score_llt_nsg2"
                                         : (score_nsg == 4 ? "indexer_score_llt_nsg4"
                                                           : "indexer_score_llt"));
