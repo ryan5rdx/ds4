@@ -26431,12 +26431,19 @@ int ds4_gpu_attention_output_q8_tp_tensor(
          * worse than TP's nsg=2 everywhere else it could reach.  Route it
          * through the same knob so the arm can actually be run; the default is
          * unchanged at 4 until the rig says otherwise. */
-        /* C2, measured on the rig 2026-08-27: nsg 1/2/4/8 gave 38.86/40.66/
-         * 41.15/41.85 t/s at 2k and 28.02/28.79/29.20/29.61 at 131k --
-         * monotonically better with width, so the default moves 4 -> 8 for
-         * +1.5-1.7%.  T4's "nsg=4 is ~3% worse everywhere else" does not
-         * reproduce here. */
-        int16_t out_low_nsg = 8;
+        /* C2 REVERTED to 4 -- the sweep that "won" at 8 was measuring broken
+         * output.  `nsg` here is baked into the pipeline as a function
+         * constant (ds4_metal.m:2980), but the dispatch below passes a
+         * hardcoded 4 for threadsPerThreadgroup and sizes threadgroup memory
+         * for 4.  Raising only the pipeline's nsg compiles a kernel that
+         * cross-simdgroup-reduces over 8 simdgroups while only 4 are launched,
+         * so it reads uninitialised threadgroup memory -- garbage output, and
+         * *faster*, which is exactly why a throughput-only sweep preferred it.
+         *
+         * Re-opening this means changing the pipeline nsg, the
+         * threadsPerThreadgroup and the threadgroup_bytes together, and gating
+         * on top-1 preserved rather than on t/s. */
+        int16_t out_low_nsg = 4;
         {
             const char *e = getenv("DS4_METAL_ATTN_OUT_LOW_NSG");
             if (e && e[0]) {
