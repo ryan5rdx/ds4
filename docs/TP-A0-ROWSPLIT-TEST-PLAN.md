@@ -945,21 +945,46 @@ explanations make different predictions and the test below separates all three:
    each alone does not.
 3. **Genuine architectural limit** — nothing exceeds ~410 under any condition.
 
-**The instrument does not exist yet and must be written.** `bench_moe_mxfp4_decode`
-is a matvec, not a bandwidth probe, and it only exercises the mmap path. What
-U6 needs is a purpose-built streaming-read harness: a grid-stride kernel doing
-wide (`uint4`) loads with no dependent chains, thousands of threadgroups,
-summing into a sink so nothing is optimised away, over a buffer of ≥8 GiB.
-Arms, all with the identical kernel and size:
+**The instrument now exists: `tests/bench_membw`.** `bench_moe_mxfp4_decode` is
+a matvec, not a bandwidth probe, and only exercises the mmap path. The new
+harness is self-contained (Metal + Foundation only, no `ds4_metal.o`) and runs
+one grid-stride `uint4` streaming kernel — no dependent chains, 2M threads,
+with a host-supplied `store` flag the compiler cannot fold so the loads cannot
+be sunk — across seven allocation arms of identical size:
 
 | arm | allocation | tests |
 |---|---|---|
-| A | `newBufferWithBytesNoCopy` over `MAP_SHARED` file mmap | **the current model path** |
-| B | `newBufferWithBytesNoCopy` over `MAP_PRIVATE\|MAP_ANONYMOUS` mmap | file-backed vs anonymous |
-| C | `newBufferWithLength:` + `StorageModeShared` | Metal-placed, CPU-visible |
-| D | `newBufferWithLength:` + `StorageModePrivate` | Metal-placed, GPU-local |
-| E | arm A plus `MTLResourceHazardTrackingModeUntracked` | the existing `DS4_METAL_MODEL_UNTRACKED` knob |
-| F | two concurrent dispatches on two command queues, arm D | per-dispatch concurrency limit |
+| `metal-shared` | `newBufferWithLength:` + `StorageModeShared` | Metal-placed, CPU-visible |
+| `mmap-anon` | `NoCopy` over `MAP_PRIVATE\|MAP_ANON` | file-backed vs anonymous |
+| `mmap-file` | `NoCopy` over `MAP_SHARED` file mmap | **the current model path** |
+| `mmap-untracked` | as above + `HazardTrackingModeUntracked` | the `DS4_METAL_MODEL_UNTRACKED` knob |
+| `mmap-parallel` | as `mmap-file`, faulted in by 16 threads | **first-touch placement — the cheap fix** |
+| `metal-private` | `newBufferWithLength:` + `StorageModePrivate` | Metal-placed, GPU-local |
+| `two-queue` | 2× Private on two queues, overlapped | per-dispatch concurrency limit |
+
+```
+make tests/bench_membw
+BENCH_MEMBW_FILE=/path/to/model.gguf ./tests/bench_membw 16 20
+```
+
+`BENCH_MEMBW_FILE` points the file arms at a real file — **use the GGUF on the
+rig**, which makes `mmap-file` literally the engine's own load path. Arms are
+freed as they finish so peak footprint is ~2× the arm size; 16 GiB/arm wants
+~32 GiB free.
+
+**Pre-screened on the M1 Max (single 400 GB/s die), 2026-08-27:** every arm
+lands at **357–365 GB/s — 89–91% of that part's spec**, and all seven are
+within 2% of each other. Two things follow, and both are what make the rig run
+decisive. The kernel is a *valid* probe: it saturates a single-die part, so a
+low number on the Ultra cannot be blamed on a weak kernel. And allocation path
+costs nothing on one die — no paging or hazard-tracking penalty — so if the
+arms *do* separate on the Ultra, die locality is the only thing left that
+distinguishes them.
+
+**Expect on the rig:** the same kernel at 89–91% of an 800 GB/s part would be
+~710–730 GB/s. If `mmap-file` instead lands near the 408–410 GB/s U1 measured,
+that is one die exactly, and the spread across the other six arms says which
+fix applies.
 
 **Decision.**
 - **D (or F) ≫ A** → placement or concurrency, and it is *ours to fix*. At

@@ -127,6 +127,15 @@ tests/bench_indexer_score: tests/bench_indexer_score.o ds4_metal.o
 
 bench-indexer-score: tests/bench_indexer_score
 	./tests/bench_indexer_score
+
+tests/bench_membw.o: tests/bench_membw.m
+	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
+
+tests/bench_membw: tests/bench_membw.o
+	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
+
+bench-membw: tests/bench_membw
+	./tests/bench_membw
 speed-bench/metal_decode_schedule_bench.o: speed-bench/metal_decode_schedule_bench.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
