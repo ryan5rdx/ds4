@@ -1632,6 +1632,69 @@ Same underfill family as packed32-at-32-heads (−1.35 t/s), T2's turnover at
 between `q_a`, `q_b` and the norm/RoPE tail: three lines, and it splits 5.47 ms
 into three numbers that are all from one run.
 
+### U12b outcome — my hypothesis is dead, and a better target fell out — 2026-08-27
+
+**Arm 2 — `q_path` split three ways** (context-invariant at both 32k and 131k):
+
+| sub-stage | ms | bytes/token | achieved | of 760 roof |
+|---|---|---|---|---|
+| `q_a_kv_proj` | 2.137 | 0.279 GB | 131 GB/s | **17%** |
+| `q_lora_norm` | 1.680 | **~0.55 MB** | **0.33 GB/s** | **0.04%** |
+| `q_path` (q_b + per-head norm/RoPE) | 1.862 | ~0.744 GB | ~400 GB/s | 53% |
+
+**The per-head norm/RoPE underfill hypothesis is dead.** Phase B is 1.862 ms
+against a ~1.5 ms `q_b`-alone estimate, so the tail is **~0.36 ms** — not the
+1.5–2.5 ms I put in the sizing table. The U12b decision table called this
+correctly ("remaining `q_path` ≈ 1.5 ms → the cost is in `q_a_kv_proj`, look
+there"), which is the first time the pre-registered prediction has paid off.
+The 32-threadgroup grid at `ds4_metal.m:22589` is real but it is not costing us
+anything worth chasing.
+
+**`q_lora_norm` is the find: 1.68 ms — 6.9% of the 2k token — moving ~0.55 MB.**
+That is **0.33 GB/s, 0.04% of roof**, and **39 µs per layer to normalise a
+1024-element vector**. Twenty times the 1.9 µs marginal dispatch cost, so it is
+not dispatch count either. Nothing else measured in this project is this far
+from its roof — the indexer at 5% of ALU peak was the previous record and this
+is two orders of magnitude below that.
+
+The span (`ds4.c:22612`–`:22732`) is the q-LoRA RMS norm plus the fused KV RoPE
+and, on some paths, an FP8 KV-cache store — `dsv4_qkv_rms_norm_rows_kv_rope`,
+`dsv4_qkv_rms_norm_kv_rope_fp8_store`, `dsv4_qkv_rms_norm_rows`, and
+`rms_norm_weight`. **Which of those actually fires at decode has not been
+established**, and that is the first question: four variants exist and the
+selection is conditional.
+
+`q_a_kv_proj` at 17% of roof is the second target — 2.14 ms, 8.8% of the 2k
+token, and a plain Q8_0 pair projection that ought to run near where `q_b`
+does (53%). If it reached `q_b`'s rate it would be ~0.7 ms, saving **~1.4 ms**.
+
+**Together these two are 3.82 ms — 15.7% of the 2k token — and both are far
+enough from their roofs that this is now the best-supported headroom in the
+document.**
+
+### U13 — **effectively dead, and dead outright for the short-context program**
+
+**Arm 1** forced the gathered branch onto the standalone RoPE:
+
+| ctx | default | norope | delta |
+|---|---|---|---|
+| 32k | 3.393 | 3.526 | **+0.133 ms** |
+| 131k | 4.252 | 4.764 | **+0.512 ms** |
+
+Scaling by 21/20 for the indexed layers puts U13's prize at **~0.14 ms at 32k
+and ~0.54 ms at 131k**. Against the plan's gate (under ~0.3 ms → dead) it is
+marginal at 131k and **clearly under at 32k**, so for the short-context program
+it is worth essentially nothing.
+
+**And treat the 0.512 ms as an upper bound.** A fixed-size rotate cannot grow
+with context, so the delta is not purely the RoPE dispatch — disabling the fuse
+also switches the attention reduce between its fused and unfused variants, and
+that difference scales with the reduce's size. Some unknown fraction of the
+0.512 ms is the reduce, not the RoPE.
+
+**Verdict: deprioritise U13** below `q_lora_norm` and `q_a_kv_proj`. It is a day
+of not-bit-exact work for ~1.6% at long context only.
+
 ## The short-context program — 2026-08-27
 
 **Target: 50 t/s at low context, from ~41 today.** The reason to pursue this
