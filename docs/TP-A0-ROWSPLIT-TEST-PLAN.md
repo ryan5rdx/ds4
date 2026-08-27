@@ -921,42 +921,24 @@ both rivals are falsified together; the loader is exonerated and the headroom
 is in the matvec's access pattern (MXFP4 17-byte blocks, gather/scatter,
 dequant interleave). See `BENCHMARKS-TP-PP.md` §U6.
 
-**U1's conclusion is right about kernels and wrong about "platform."** It swept
-the *working set* 8× (3.19 → 25.50 GiB) and found a hard 408–410 GB/s plateau.
-That rules out cache effects and working-set size. It does **not** establish a
-platform ceiling, because all four arms shared the same two things it never
-varied: **one kernel** (the MoE matvec) and **one allocation path**. The
-finding is "not working-set size," not "not our kernels."
+**The die-placement hypothesis was mine, and it is dead.** I argued that
+file-backed `mmap` pages wrapped with `newBufferWithBytesNoCopy`
+(`ds4.c:2544`, `ds4_metal.m:2023`) were landing on one die, that all 60 cores
+were therefore contending for one controller's 400 GB/s, and that this
+"predicts exactly the number we measure." It predicted a number that does not
+exist. `mmap-file` is 756.7–759.9 GB/s — indistinguishable from
+`metal-private`. Both rival explanations died with it: concurrency costs
+nothing, and there is no architectural ceiling at 400.
 
-**The mechanism I believe is responsible.** The M2 Ultra is two M2 Max dies
-joined by UltraFusion, each with its own memory controllers and **400 GB/s** of
-LPDDR5. Reaching 800 requires accesses spread across *both* dies' controllers.
-Our weights are not placed by Metal at all:
+What survives is the narrower half of the argument, which was the useful half:
+**U1 established "not working-set size," not "not our kernels."** All four of
+its arms shared one kernel and one allocation path. That gap was real, and
+closing it is what produced the roof.
 
-- the GGUF is `mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0)` — file-backed
-  (`ds4.c:2544-2545`);
-- those host pages are then wrapped with **`newBufferWithBytesNoCopy`**
-  (`ds4_metal.m:2023`) as `MTLResourceStorageModeShared`
-  (`ds4_metal.m:1377-1383`).
+The M1 Max pre-screen is what makes this decisive rather than arguable. It
+established the probe saturates a single die, so 760 on the Ultra cannot be
+explained away as a weak kernel, and the hypothesis dies outright.
 
-So physical placement is decided by the VM's page-fault path for a file-backed
-mapping, **not by the GPU driver**. If those pages land predominantly on one
-die's memory, all 60 GPU cores contend for that die's 400 GB/s and the other
-half of the memory system sits idle. **That predicts exactly the number we
-measure**, and it independently explains the power reading: ~30 W GPU during
-decode against ~60 W in prefill is consistent with half the memory subsystem
-doing nothing.
-
-This is a hypothesis with a clean falsifier, not a conclusion. Two rival
-explanations make different predictions and the test below separates all three:
-
-1. **Placement** — pages on one die. Metal-allocated `Private` memory should
-   then be substantially faster than the wrapped mmap.
-2. **Per-dispatch concurrency** — a single kernel cannot generate enough
-   outstanding requests to saturate both dies regardless of placement. Then two
-   concurrent kernels on separate queues should exceed 410 in aggregate while
-   each alone does not.
-3. **Genuine architectural limit** — nothing exceeds ~410 under any condition.
 
 **The instrument now exists: `tests/bench_membw`.** `bench_moe_mxfp4_decode` is
 a matvec, not a bandwidth probe, and only exercises the mmap path. The new
@@ -1027,6 +1009,84 @@ before the rig time is spent.
 **Sequencing: this goes ahead of U3, U4 and U5.** Every one of them is sized in
 milliseconds saved against an assumed bandwidth roof, and U6 decides whether
 that roof is 400 or 800.
+
+#### Re-scoring the decode queue against a measured 760 GB/s roof
+
+Every stage in this document was being scored against an *assumed* roof. It is
+now measured, and it is 760 — not the 400 U1 inferred and T8 asserted.
+
+| stage (131k) | time | achieved | of 760 roof |
+|---|---|---|---|
+| `compressor_indexer` | 10.51 ms | ~40 GB/s (U2) | **~5%** |
+| `routed_moe_folded` | 5.40 ms | ~410 GB/s (U1) | **~54%** |
+| `q_path` | 5.47 ms | not measured | — |
+| `attn_inv_rope` | 4.27 ms | not measured | — |
+| streaming probe | — | 760 GB/s | 95% |
+
+**The indexer is ~16× off the roof and it is the largest stage.** At
+`n_comp=32768` the score kernel moves 16.78 MB in 0.352 ms; at the measured
+streaming rate that transfer is ~0.022 ms. U2 already named the cause — **one
+threadgroup per compressed row, per-thread row count 1** — so each threadgroup
+loads 512 B, runs a full `simd_sum` tree, and exits, reloading the query for
+every row. This is not a byte-count problem, which is why killing U3 was
+right; it is a work-per-threadgroup problem.
+
+**Two stages remain unmeasured** (`q_path` 5.47 ms, `attn_inv_rope` 4.27 ms).
+Together they are 9.7 ms, and nobody has priced their achieved bandwidth. Fold
+that into U7's sweep if it is cheap.
+
+#### U7 — batch rows per threadgroup in the indexer score kernel — **the top item**
+
+**Prize.** `compressor_indexer` is 10.51 ms of a 36.36 ms token and runs at
+~5% of achievable. Reaching even 40% takes it to ~1.3 ms — **~9 ms, or 25% of
+the token.** Nothing else here is within an order of magnitude.
+
+**The change.** Give each threadgroup many compressed rows instead of one:
+hold the query tile in registers/threadgroup memory and stream rows through
+it, amortising both the query load and the reduction across the batch. That
+converts a 512 B load plus a tree reduction into a long run of independent
+coalesced loads — which is exactly what the streaming probe does to reach 760.
+
+**Sweep in `tests/bench_indexer_score` first** — model-free, and it reproduces
+the production stage cost within ~2×. Arms: rows-per-threadgroup {1 (control),
+4, 8, 16, 32} × threadgroup width {128 (control), 256}. Report GPU-busy, GB/s
+and GFLOP/s **against 760, not 400**. Take the best two arms to the rig.
+
+**Correctness.** Changing the reduction shape changes FP32 association, so this
+is not bit-exact. Hold it to the T2 bar: measurable win, top-1 preserved,
+bounded Δlogit. U2 established the harness's 7.6e-3 disagreement with its CPU
+reference is expected tree-vs-sequential tolerance, so compare **GPU output
+against GPU output** between arms via `BENCH_DUMP`, per that harness's header.
+
+**Watch the harness's own warning.** `bench_indexer_score.c`'s header records
+that collapsing per-head barriers measured 6.8× there and delivered +2.7% on
+the real pair. A standalone harness exaggerates latency-bound fixes because
+nothing else is running to hide the stalls. **Treat any sweep number here as an
+upper bound and confirm on the rig before productionising.**
+
+**This supersedes U4 — do not write U4 until U7 lands.** U4 splits a 10.5 ms
+stage across ranks to save ~5 ms. If U7 takes the stage to ~1.3 ms, U4's prize
+falls to ~0.65 ms and stops covering its exchange latency and tie-breaking
+risk. Fix the kernel, re-measure, then decide.
+
+#### U8 — diagnose the MoE matvec's 54% — re-opened by U6
+
+**Prize.** `routed_moe_folded` is 5.40 ms at 131k streaming at ~410 of 760
+GB/s. Closing that gap is ~2.5 ms.
+
+**This is not a T8 re-run.** T8 priced five specialisations *within* the
+existing access pattern and found them worth nothing to −5%; that result stands
+and those patches stay dead. What T8's wrong ceiling foreclosed is the
+different question: **why does this kernel stream at 410 when the part does
+760?** Deliverable is a diagnosis, not a patch — apportion the shortfall
+between the 17-byte MXFP4 block granularity (unaligned against any natural
+vector width), the expert gather/scatter, and the dequant interleave.
+
+**Cheapest first step:** add a pure-read arm to `tests/bench_moe_mxfp4_decode`
+that streams the same expert buffers with no dequant and no accumulation. That
+brackets the answer — if the raw gather already caps near 410, the block
+granularity and scatter are the problem; if it reaches ~700, the dequant path
+is.
 
 #### U5 — n-gram speculation on the rig (R13 arms, re-prioritised)
 
