@@ -227,6 +227,70 @@ The routed MoE matvec is **bandwidth-bound at ~400 GB/s** — near the M2 Ultra
 ceiling — so kernel specializations cannot buy what is not there. **T8 pricing
 argues against a MoE specialization port.**
 
+### M2 — attribute the 11.1 ms — ablation battery at 32k/65k/131k — 2026-08-26
+
+Re-ran the `DS4_TP_ABLATE` chain battery at 32k and 131k plus the never-run
+indexer ablations (`DS4_METAL_ABLATE_INDEXER_SCORE`/`_TOPK`), sweep
+`32768→131072 --step-mul 2`, gen 128, in-session control `m2_ctrl` (tracks
+M0 within 0.4%). Deltas are decode steady t/s gain from *removing* each chain
+(semantically-wrong output, t/s delta = in-situ cost; both ranks agree).
+
+| chain | 32k | 65k | 131k |
+|---|---|---|---|
+| control t/s | 33.92 | 31.69 | 28.29 |
+| hcpre | +2.6% | +2.8% | +2.2% |
+| qb | +5.5% | +5.3% | +5.3% |
+| attnout | +10.5% | +9.7% | +9.0% |
+| moe | +25% | +25% | +22% |
+| attncore | +4.5% | +5.5% | +5.7% |
+| indexer score | +5.9% | +8.1% | +12.2% |
+| indexer topk | +7.9% | +10.9% | +17.7% |
+
+**The routed MoE is the dominant decode stage (~22–25%)** — larger than T8's
+isolated ~12% because production carries the 128/128 shard exchange plus the
+real stage shape. Consistent with `DS4_TP_ABLATE=moe` removing ~1/4 of the
+token.
+
+**The indexer is the long-context story.** Both indexer ablations grow with
+context: score +5.9% → +12.2%, topk +7.9% → +17.7% as ctx goes 32k→131k. The
+indexer path is inactive at ctx 512 (per M2's framing) and becomes a
+**17.7% / ~6 ms of the 35.5 ms token** cost at 131k — this is the largest
+single attributed slice of the 11.1 ms long-context growth. (Caveat: ablating
+the indexer also removes its contribution to the routed-MoE top-6 selection,
+so some of that delta may be double-counted with `moe`; the two are not
+disjoint.)
+
+**attnout ~9–10%** is the largest single attention stage; qb/attncore ~5% each;
+hcpre ~2%. No chain is free — every one shows a positive in-situ cost.
+
+### T1 — row-gate fastpath A/B — 2026-08-26
+
+`DS4_TP_GATE_FASTPATH=1` (recv re-arm hoisted before the gate wait,
+signal-every-16th-send), built default-off, A/B against the M0 baseline and
+m0_gate profiles.
+
+| ctx | m0 baseline | t1 fastpath | Δ |
+|---|---|---|---|
+| 2048 | 41.09 | 41.32 | +0.6% |
+| 4096 | 36.58 | 36.55 | −0.1% |
+| 8192 | 36.04 | 36.06 | +0.1% |
+| 16384 | 35.39 | 35.52 | +0.4% |
+| 32768 | 33.71 | 33.72 | +0.0% |
+| 65536 | 31.56 | 31.63 | +0.2% |
+| 131072 | 28.34 | 28.26 | −0.3% |
+
+**T1 is a wash** — all deltas within ±0.6%, no consistent direction. The gate
+profile confirms why: fastpath does not change the row-gate exchange at all
+(23.0 vs 23.6 µs @2k; 24.2 vs 24.8 @131k vs m0_gate). The recv re-arm hoist
+cannot help a wait that is dominated by local GPU completion, not wire
+exchange. Consistent with M0's finding that exchange is 6–7% of gate time.
+
+**Correctness: top-1 preserved (7/7 steps) but NOT bit-identical** — 2/7 steps
+differ, logits shift up to 2.3 (mean 0.27–0.35). The reorder perturbs float
+accumulation order enough to matter for sampling, though greedy argmax is
+unchanged. Since the perf is a wash and the logits are perturbed, **the
+fastpath should stay default-off; do not enable.**
+
 ### Env battery — T2 + T3 + T4 at 32k/65k/131k — 2026-08-26
 
 One rig session, `DS4_NGRAM_SPEC` off, sweep `32768→131072 --step-mul 2`

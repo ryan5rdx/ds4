@@ -184,10 +184,10 @@ two are minutes and one of them can invalidate three completed runs.
 | 1 | **M3** — **done 2026-08-26** (`uc_lat2`, byte-verified, n=2000/arm): half-RTT **8.0 µs (4 KB)** / **14.5–15.5 µs p50 (16 KB, single WR)** — both ≪20 µs → **T1 open** (~30 µs/gate ≈ 2.5 ms/token at 131k). Single 16 KB UC WR confirmed working on this stack. One transient first-ping UC drop seen; T1 needs a re-arm/retry path. Recorded in `BENCHMARKS-TP-PP.md`. | — | Decides T1, the largest sized item, before any code is written. ≲20 µs half-RTT → ~2.5 ms/token available; ~45 µs → T1 closes. |
 | 2 | ~~Env battery T2 + T3 + T4~~ — **done 2026-08-26. T2 +0.9% @131k and monotonic to the top of the tested range (not peaked); T3 mixed; T4 default already optimal.** Follow-up: sweep T2 at 28/31. | — | One small real win, two nulls. |
 | 3 | ~~T8 pricing~~ — **done 2026-08-26. The specialisation ladder is worth nothing to −5%; the generic path is faster. T8 is dead.** The routed MoE matvec is bandwidth-bound at ~400 GB/s. | — | 30 minutes of pricing saved five kernel patches for a negative. |
-| 4 | **M2** — ablation battery at 32k and 131k, incl. the never-run indexer ablations | ~2 h | The 11.1 ms/token of unattributed long-context decode growth — the largest unknown in the document. |
+| 4 | ~~M2~~ — **done 2026-08-26.** Ablation at 32k/65k/131k. **Routed MoE is the dominant decode stage (~22–25%)**; **the indexer is the long-context story** (score +5.9→12.2%, topk +7.9→17.7% as ctx 32k→131k — the largest attributed slice of the 11.1 ms); attnout ~9–10%, qb/attncore ~5%, hcpre ~2%. | ~2 h | The 11.1 ms/token of unattributed long-context decode growth — the largest unknown in the document. |
 | 5 | **R12a** split-schedule sweep + **R12b** reduced ballast arm + the encoder-boundary instrument | ~1.5 h | R12b is now a confirmation, not a discovery; the encoder-boundary half is the genuinely unmeasured one. |
 | 6 | **R13 n-gram rig arms** (inertness / correctness / decode A/B on repetitive vs novel text) | ~1 h | Independent of the above; run whenever convenient. |
-| 7 | T1 implementation if step 1 says yes; T8 port if step 3 says yes | — | Both are code, both are gated on a measurement above. |
+| 7 | ~~T1~~ — **done 2026-08-26: dead.** `DS4_TP_GATE_FASTPATH` is a wash (±0.6% decode, no gate-exchange change) and is **not bit-identical** (logits shift up to 2.3, top-1 preserved). Stay default-off. ~~T8 port~~ — dead, see row 3. | — | Both are code, both are gated on a measurement above. |
 | 8 | Cleanup batch: T6, T9, T10, T13 | — | Small, low-risk, individually sub-1%. |
 
 Steps 0–3 are about four hours of rig time and settle whether the last three
@@ -584,16 +584,24 @@ Carries `q_a`, `kv`, `q_b`, shared gate/up/down, attention-output low. Sweep
 `n_tokens > 1`, which sets `decode_splits = 1` (`ds4_metal.m:30001`) and makes
 **T2 inert on those steps**. Measure the battery with n-gram off.
 
-#### M2 — attribute the 11.1 ms — the largest unknown
+#### M2 — attribute the 11.1 ms — the largest unknown — **DONE 2026-08-26**
 
 Every decode stage number in this tree is from **ctx 512, where the indexer
 path is entirely inactive**. That token is 24.06 ms; ours at 131k is 35.55.
 **11.1 ms/token — 31% of the long-context token — has never been attributed**,
 and code reading accounts for maybe 3–4 ms of it.
 
-Re-run the ablation battery at 32k and 131k (`DS4_TP_ABLATE` chains, plus
+**Outcome.** Full tables in `BENCHMARKS-TP-PP.md`. The routed MoE is the
+dominant decode stage (~22–25%, larger than T8's isolated ~12% because
+production carries the shard exchange). The indexer is the long-context
+story — score +5.9→12.2%, topk +7.9→17.7% as ctx goes 32k→131k, making the
+indexer the largest attributed slice of the 11.1 ms (caveat: ablating it also
+removes its contribution to MoE top-6 selection, so `indexer` and `moe` are
+not disjoint). attnout ~9–10%, qb/attncore ~5%, hcpre ~2%. No chain is free.
+
+The ablation method (re-run `DS4_TP_ABLATE` chains at 32k and 131k, plus
 `DS4_METAL_ABLATE_INDEXER_SCORE`/`_TOPK`, which are already wired into decode
-at `ds4.c:23240`/`:23257` and have never been run at long context). Caveats
+at `ds4.c:23240`/`:23257` and had never been run at long context). Caveats
 from `tp_decode_investigation.md:454-466`: `router` is unusable (ran 0.574 ms
 *slower* while removing 92 dispatches), `kv`/`shared` are fusion rollbacks that
 *add* dispatches, `compidx` has no call site and reports 0.
