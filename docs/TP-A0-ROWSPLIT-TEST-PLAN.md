@@ -719,6 +719,108 @@ suggested — but only the ones that block. Identifying *which* dispatches are
 barriers with nothing alongside is now a first-class question, and
 `bench_qkv_norm` is the instrument for pricing any of them in isolation.
 
+## Why decode is at 41 t/s, why the GPU draws 30 W, and why TP2 is only ~1.6× — 2026-08-27
+
+These are one question. Answering it properly says the remaining 1% items
+cannot reach 50 t/s and points at what could.
+
+### The token is 2.6× off its own realistic floor
+
+Bytes per token per rank, from the stages whose byte models reconcile against
+§3 (routed MoE 1.725 GB, q_a+kv 0.279, q_b 0.744, attn out_a/out_b 1.538):
+**4.29 GB**, excluding shared/router/HC/indexer.
+
+| at | ms | t/s |
+|---|---|---|
+| 760 GB/s (streaming roof) | 5.6 | 177 |
+| **450 GB/s (best real Q8_0 kernel on this rig)** | **9.5** | **105** |
+| **actual** | **24.34** | **41.1** |
+
+**Even against a rate we have actually observed from a production kernel, decode
+is 2.6× slow.** The gap is ~15 ms — not the 4.34 ms that separates us from
+50 t/s. No combination of the queued 1% items closes it, and that is the honest
+reason 50 t/s has stayed out of reach.
+
+### The mechanism: exposed memory latency on a serial dependency chain
+
+**The decode graph is 1021 dispatches and they are fully serialized.** Metal's
+default encoder is `MTLDispatchTypeSerial`. A concurrent path exists and ships
+(`g_batch_encoder_concurrent`, `ds4_metal.m:1028`) but is armed in exactly one
+place — `ds4_gpu_parallel_ffn_start` — and the fusion it belongs to,
+`fuse_shared_down_hc`, requires **`g->tp_world < 2`** (`ds4.c:24191`). **Under
+TP2 nothing in decode runs concurrently.**
+
+So every dispatch waits for its predecessor whether or not it depends on it, and
+most are far too small to hide a DRAM round trip. Direct measurement
+(`tests/bench_qkv_norm`): a dependency-barrier dispatch costs **~22 µs and is
+flat across a 64× range of work** — it is pure exposed latency.
+
+**Six independent sightings of the same underfill, none of them looked for:**
+
+| | |
+|---|---|
+| `q_lora_norm` | **2 threadgroups** on 60 cores, 43×/token |
+| head-norm/RoPE | 32 threadgroups |
+| flash reduce | 32 threadgroups, every layer |
+| 22 of 43 layers | dispatch only 128–160 threadgroups |
+| indexer LLT | **1 threadgroup resident/core**, smem-capped |
+| `packed32` at 32 heads | correct but −1.35 t/s — underfills |
+
+**That is the 30 W.** The GPU is 99% *busy* and ~20% *utilised*: few threads
+resident, ALUs waiting on memory, memory at a fifth of its rate. Prefill has the
+same kernels with thousands of rows in flight, so it fills the machine and draws
+60 W. **Busy ≠ occupied**, and the stage profiler only ever measured busy.
+
+*Bound on this theory, stated honestly:* the dispatch ballast measures **3.74 µs**
+per added no-op, not 22 µs. Those no-ops touch no memory, so they have no DRAM
+latency to expose. **The floor is not "22 µs per dispatch" — it is "~20 µs for a
+dispatch that must reach DRAM before it can start and has nothing to overlap
+with."** The engine has many of those; it does not have 1021 of them.
+
+### Which is also why TP2 is only ~1.6×
+
+Splitting across two nodes halves the *bytes* per dispatch. It does not change
+the *number* of dispatches, and it adds 86 gate exchanges. Only the work-bound
+part scales:
+
+| | ms |
+|---|---|
+| work (scales with bytes) | 17.0 |
+| latency (does not) | 4.9 |
+| gate (TP-only, does not) | 2.7 |
+
+Single node = 2 × 17.0 + 4.9 = **39.0 ms (25.7 t/s)** against TP2's 24.34 —
+**1.60×, not 2×.** The shortfall is exactly the **31%** of the token that does
+not scale, and that 31% is precisely the latency-bound part. **TP2's scaling
+deficit and the single-node inefficiency are the same defect**, which is why
+fixing it pays twice.
+
+### Restructuring options, ranked by leverage
+
+1. **Enable the concurrent encoder for decode under TP2.** The code exists and
+   ships. Independent dispatches within a layer — the compressor projection does
+   not depend on the q path — could overlap instead of serializing. Blocked
+   today only by an unrelated fusion's `tp_world < 2` guard. **Cheapest
+   structural change with the largest reach; start here.**
+2. **Collapse a layer's ~24 dispatches toward 1–3.** The precedent is in-tree:
+   `kernel_dsv4_comp_row_finalize_f32` already folds seven tiny per-layer
+   dispatches into one, bit-exactly. Every additional fusion removes an exposed
+   round trip, and U16 showed the dispatch *is* the cost.
+3. **Speculation, reframed.** Not "raises arithmetic intensity" — **it amortises
+   the fixed latency over N tokens.** The same 1021 serialized dispatches
+   produce N tokens instead of 1, so the non-scaling 31% is divided by the
+   acceptance length. This is the only lever that attacks the floor without
+   touching a single kernel, and `DS4_NGRAM_SPEC` is implemented and still
+   unrun.
+4. **Raise occupancy where a grid is provably too small** — the six sightings
+   above. But note two attempts already failed (`packed32` −1.35 t/s, the
+   `pr-778` HC spread +0.12%), so treat per-kernel widening as the *low*-leverage
+   option, not the obvious one.
+
+**What this reprices.** The queued items sum to 1–3 ms against a ~15 ms gap.
+They are not wrong, but they are not the path to 50 t/s. Item 1 is a day's work
+against a defect worth several milliseconds, and item 3 costs nothing but a run.
+
 ### Next run — iteration 2, rebuilt 2026-08-27
 
 **Verified: `make ds4` plus all six benches clean, every knob and marker grepped
