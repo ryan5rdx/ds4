@@ -171,6 +171,36 @@ baseline means explicitly setting the three to `0`.
 
 ## Open requests
 
+### Next run — 2026-08-27
+
+**Rig: U15 only.** It is the sole queued item that is zero-code and
+rig-blocked. Everything else is now implementation-gated, not measurement-gated.
+
+```
+DS4_METAL_GPU_STAGE_TIMESTAMPS=1    # ctx 2048, gen 128
+```
+**Report every marker**, not a top-12 — U12's table left ~9% of the token in
+unreported stages, and at 2k that residue outweighs several of the stages being
+chased. It now also includes the two `q_path` sub-stages from `863e8fa`.
+
+It answers three things at once: whether the context-invariant model inferred
+from 32k/131k actually holds at 2k; what the four HC stages and `attn_output`
+really cost at the target context; and where the ~9% residue lives.
+
+**Not rig-blocked — these need code, and the code is mine to write:**
+
+| item | state |
+|---|---|
+| **U16** `q_lora_norm` | **diagnosed** — 2 threadgroups on 60 cores, 43×/token. Fusion target identified. Up to 1.68 ms. |
+| **U17** `q_a_kv_proj` | 2.14 ms at 17% of roof; needs a roofline pass like U16's before writing anything. |
+| **U4** decode indexer TP split | **un-deferred** — U9 failed, so the ~4 ms at 131k is intact. Largest long-context item. |
+| **U5** n-gram arms | implemented, never run; independent of everything above. |
+
+**Blocked on the two scoping agents** (`docs/SCOPE-HC-STAGES.md`,
+`docs/SCOPE-ATTNOUT-ROUTER-SHARED.md`): the HC stages (4.56 ms) and
+`attn_output` / `router` / shared (6.50 ms). Together 11.06 ms — **45% of the
+2k token** — and the reason not to commit to an implementation order yet.
+
 ### Sequencing — run in this order
 
 Ordered by (information gained) / (rig time), not by expected gain. The first
@@ -187,21 +217,21 @@ two are minutes and one of them can invalidate three completed runs.
 | 4 | ~~M2~~ — **done 2026-08-26.** Ablation at 32k/65k/131k. **Routed MoE is the dominant decode stage (~22–25%)**; **the indexer is the long-context story** (score +5.9→12.2%, topk +7.9→17.7% as ctx 32k→131k — the largest attributed slice of the 11.1 ms); attnout ~9–10%, qb/attncore ~5%, hcpre ~2%. **Refined by the stage profile (done below): the indexer cost is `compressor_indexer` (+5.06 of +5.93 ms growth), and the ~13 ms residual is real compute, not stall.** | ~2 h | The 11.1 ms/token of unattributed long-context decode growth — the largest unknown in the document. |
 | 4b | ~~Stage profile at 32k/131k~~ — **done 2026-08-26.** Decode gpu_busy 30.43/36.36 ms, **gap ~0.31 ms (1%) — decode is ~99% GPU-busy, no stall.** Stage sum = busy exactly (100% attribution). compressor_indexer = the long-context term (+5.06 ms). **The ~13 ms M2 residual is real compute (unablated stages), not idle.** | ~20 min | Bounds router/shared/kv/compressor and decomposes the ~13 ms floor without ablation. |
 | 5 | ~~R12a~~ split-schedule sweep + **R12b** reduced ballast arm + **encoder-boundary instrument** — **R12b and encoder-boundary MOOT** (probe stall; stage profile shows no stall). R12a split-schedule still valid if wanted. | ~1.5 h | R12b is now a confirmation, not a discovery; the encoder-boundary half is the genuinely unmeasured one. |
-| 6 | **R13 n-gram rig arms** (inertness / correctness / decode A/B on repetitive vs novel text) | ~1 h | Independent of the above; run whenever convenient. |
+| 6 | ~~R13~~ — **merged into U5 (row 13)**, same arms. | — | Deduplicated. |
 | 7 | ~~T1~~ — **done 2026-08-26: dead.** `DS4_TP_GATE_FASTPATH` is a wash (±0.6% decode, no gate-exchange change) and is **not bit-identical** (logits shift up to 2.3, top-1 preserved). Stay default-off. ~~T8 port~~ — dead, see row 3. | — | Both are code, both are gated on a measurement above. |
 | 8 | Cleanup batch: T13, and the unreachable `llt16`/`llt32` instantiations (**T9 → U3/U10; T6 → U9; T10 → U13** — all sized before the stage profile) | — | Small, low-risk, individually sub-1%. |
-| **9** | **U1 — streaming-read ceiling on the rig**, one rank, no TP | ~15 min | **done 2026-08-26** — pinned at ~408–410 GB/s across maps 3.19–25.5 GiB. Initially read as one M2 Max die / platform; **superseded by U6 2026-08-27** — the part streams at ~760 GB/s on the same `mmap` path, so U1's plateau is the MoE matvec kernel's access pattern, not the platform. Kernel headroom re-opens. **Run first.** Decides whether ~400 GB/s is the platform or our kernels, and therefore how to read every number below. Also re-scores T8. |
-| **10** | **U2 — indexer-score roofline + working-set sweep** | ~30 min | **done 2026-08-26.** Latency-bound per byte — 39.7 GB/s at 65536 = ~10% of the 400 GB/s platform, one threadgroup per row; GPU-busy ~linear in `n_comp`. **U3 will not pay** (honest prize near zero); go to the restructure. Correctness flag (worst rel 7.6e-3, row 17391) = expected FP32 tree-vs-sequential tolerance, benign. The largest stage sits at ~4% of *both* roofs. |
+| ~~9~~ | ~~U1~~ — **done 2026-08-26; verdict superseded by U6.** The ~408–410 GB/s plateau is the MoE matvec's access pattern, not the platform. | — | Reversed by U6. |
+| ~~10~~ | ~~U2~~ — **done 2026-08-26; measured the *direct* fallback, not production's LLT kernel** (see U7b), so its roofline does not describe the shipped path. | — | Right method, wrong kernel. |
 | **11** | ~~U3~~ — **folded into U10.** U2 gated it off as "latency-bound, halving bytes will not pay" — correct on bandwidth, but U2 measured the *direct* fallback, not production's LLT kernel, and the real argument for F16 was never bandwidth. It is that `sk` is 80% of the threadgroup-memory budget. See U10. | — | Killed for the right reason on the wrong kernel; returns with a different mechanism. |
-| **12** | **U4 — TP row-split the decode indexer** | ~3 h | The biggest stage is computed *twice* today, once per rank. ~5 ms of 36 ms. Largest single item in this document. |
+| **12** | **U4 — TP row-split the decode indexer** — **UN-DEFERRED 2026-08-27: U9 failed, so its prize is intact** | ~3 h | `compressor_indexer` is **9.67 ms at 131k**, the largest stage, and *both halves* (score and top-k) are computed identically on both ranks — neither `ds4_gpu_indexer_score_one_tensor` nor `ds4_gpu_indexer_topk_tensor` takes a rank or world argument. Row-split with local top-k and a merge is exact. **~4 ms net at 131k (11.7%); ~0 at 2k.** Largest single long-context item left. |
 | **13** | **U5 — R13 n-gram arms, re-prioritised** | ~1 h | Raises arithmetic intensity without requiring any kernel to get faster — the structural answer to a latency-bound decode. |
-| **14** | **U6 — why ~400 GB/s on an 800 GB/s part** — allocation-path + concurrency arms | ~1 h + harness | **done 2026-08-27 — roof is ~760 GB/s, not 400.** `bench_membw` on mat: all seven arms 752–762 GB/s (94–95% of 800), within 1%. Allocation path costs nothing; concurrency costs nothing. The part saturates both dies on ds4's own `mmap` path. **U1's ~408–410 is the MoE matvec kernel (~54% of achievable), not the platform** — kernel headroom re-opens, loader exonerated. |
+| ~~14~~ | ~~U6~~ — **done 2026-08-27. Roof is ~760 GB/s (94–95% of spec), all seven arms within 1%.** Allocation path and concurrency cost nothing; the loader is exonerated. **Reverses U1, voids T8's ceiling claim.** | — | Every stage had been scored against an assumed roof. |
 | ~~15~~ | ~~U7 — indexer LLT scoring on the rig~~ — **done 2026-08-27. 1565 GFLOP/s, 72% core scaling, 7.3% of ALU peak.** U2's 1015 was the *direct* fallback, so the non-scaling worry was an artefact. Deficit is latency hiding: one threadgroup resident per core. | — | Sized the largest stage against the right kernel for the first time. |
 | ~~16~~ | ~~U8 — MoE block granularity~~ — **done 2026-08-27. 17-byte stride costs 5.9%, not 46%.** `blk-16` hits 758 GB/s ≈ roof, so it is not load granularity in any form. **Dequant/accumulate are what remain.** | — | Eliminated one of three suspects for the matvec's 54%. |
-| **17** | **U10a — NSG sweep {8,4,2} on the rig** | **~10 min, zero code** | **Run this next.** The knob is built, committed and bit-identical; the rig ran only the default. It is the direct test of whether residency is the Ultra's deficit, and it decides whether U10 gets written at all. |
+| ~~17~~ | ~~U10a~~ — **done 2026-08-27. NSG=4 beats the default +5–13% on the Ultra; NSG=2 −12%.** Residency beats NK there — U10 confirmed ON. | — | The M1 Max ranking did not transfer, which was the question. |
 | ~~18~~ | ~~U9~~ — **built and measured 2026-08-27: negative, default off.** 0.77× on the M1 Max. The premise was wrong — the argsort fallback is *already* a 32-block hierarchy, so the parallelism U9 added already existed. Exact vs CPU ground truth; the argsort path is the one that deviates under ties. | — | Cost a day; caught by interleaved A/B before it shipped. |
 | ~~17~~ | ~~U10a~~ — **done 2026-08-27. NSG=4 beats the default by +5–13% on the Ultra; NSG=2 −12%. Residency beats NK there — U10 is ON.** | — | The M1 Max ranking did not transfer, which was the question. |
-| **19** | **U10 — alias `sq`/`sw`/`sqk` over the dead `sk` buffer** — **built, +19.3% on M1 Max, bit-identical, opt-in. Rig A/B DONE 2026-08-27: +17.4% (mean 2015.6 vs 1717.2 GFLOP/s), beats NSG=4, bit-identical.** End-to-end ~2–4% of the token (see U10b). **U10c** (F16 cache, 2 → 7 resident) gated on it. | ~1 d | Residency 1 → 2 at *unchanged* NK — the distinction U10a could not isolate. |
+| ~~19~~ | ~~U10~~ — **done and productionised 2026-08-27. +17.4% on the rig, bit-identical, default-on**, prefill neutral (U11). Delivered ~+1.6% end-to-end. | — | Banked. |
 | ~~20~~ | ~~U11 — confirm U10 does not regress prefill~~ — **done 2026-08-27: neutral.** Prefill 393.03 vs 393.37 t/s @131k; first-token 36.5 vs 35.5 ms. No nsg4-style spike. **U10 stays default-on.** | — | One arm, closed. |
 | ~~21~~ | ~~U12 — price `q_path` (5.47 ms) and `attn_inv_rope` (4.27 ms)~~ — **done 2026-08-27.** q_path 5.474/5.472 ms/token (ctx-invariant, 15%); attn_inv_rope 3.389→4.258 ms (grows +26%, 11.7%). 26.8% of token priced. | — | 26.8% of the token, now attributed. |
 | ~~22~~ | ~~U13 — arm the inverse-RoPE fuse on the indexed branch (was T10)~~ — **sizing invalidated by U12 correction 1; U12b arm 1 DONE 2026-08-27: standalone RoPE is +0.133 ms @32k / +0.512 ms @131k — U13's prize is ~0.5 ms at 131k, marginal.** | ~1 d | The 4.27 ms stage is mostly attention; the RoPE tail is ~0.5 ms at 131k. |
