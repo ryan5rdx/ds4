@@ -91,29 +91,84 @@ and the HC expand consumes n_embd partials after the gate.
 computes an unchecked slab address from the schedule, a wrong table is a silent
 out-of-bounds write. **Head-split GDN even if the compute case were marginal.**
 
-## 4. Memory and the deployment fork
+## 4. Weights, metadata, and memory
 
-At ds4's quant mix (MXFP4 routed experts, BF16 elsewhere):
+**We are using `unsloth/Qwen3.8-Flash-Next-GGUF`.** That closes the conversion
+question entirely — no converter to write, no metadata namespace to invent.
 
-| config | GPU-resident | n-gram table | total |
+### The GGUF metadata namespace (read from the real file, 2026-08-27)
+
+`general.architecture = "qwen4exp"` — one arch string to add at
+`config_validate_model` (`ds4.c`), which today accepts exactly `"glm-dsa"` and
+silently falls through to the DeepSeek validator for anything else.
+
+The `qwen4exp.*` namespace maps cleanly onto `ds4_shape`:
+
+| key | value | key | value |
 |---|---|---|---|
-| single node, table in RAM at FP8 | 73.5 GiB | 47.7 | **121 GiB ✗** (>119 available) |
-| single node, table requantised ~4-bit | 73.5 | 25.3 | 99 GiB ✓ |
-| single node, table SSD-streamed | 73.5 | page cache | ✓ |
-| **TP2, table split 8/8 by hash head** | 29.9 + 13.6 | 23.9 | **67 GiB/rank ✓** |
+| `block_count` | 48 | `expert_count` | 512 |
+| `embedding_length` | 2560 | `expert_used_count` | 10 |
+| `attention.head_count` | 24 | `expert_feed_forward_length` | 640 |
+| `attention.head_count_kv` | **2** | `expert_shared_feed_forward_length` | 640 |
+| `attention.key_length` / `value_length` | 256 / 256 | `hyper_connection.count` | 4 |
+| `attention.indexer.head_count` | 4 | `hyper_connection.low_rank` | 320 |
+| `attention.indexer.key_length` | 128 | `full_attention_interval` | 4 |
+| `attention.indexer.top_k` | 2048 | `context_length` | 262144 |
+| `rope.dimension_count` | 64 | `rope.freq_base` | 1e7 |
+| `rope.dimension_sections` | [11,11,10,0] | `embedding_length_per_layer_input` | 160 |
+| `ssm.state_size` | 128 | `ssm.inner_size` | 6144 |
+| `ssm.group_count` | 16 | `ssm.time_step_rank` | 48 |
+| `ssm.conv_kernel` | 4 | | |
 
-The official FP8 release quantises **the 512 routed experts (block-wise
-`[128,128]`) and the n-gram table (per-tensor)**; everything else stays BF16.
+**Two findings that materially reduce the port:**
 
-**TP2 is the comfortable configuration**, and it is the one matching both the
-rig and our existing investment. Single-node is possible but requires either
-SSD-streaming the table or requantising it below FP8 — and
-`ds4_tp_validate_engine_options` refuses SSD streaming under TP, so the two
-paths are mutually exclusive as the code stands.
+**`qwen4exp.attention.compress_ratios = [0,0,0,4, 0,0,0,4, …]`** — the GGUF
+uses **ds4's own per-layer convention**, with `4` on the QSA layers
+(`idx % 4 == 3`) and `0` on the GDN layers. `g_ds4_compress_ratios[]` can read
+it directly; what changes is only the *interpretation* of `ratio == 0`, which
+means "SWA-only" for DeepSeek and "GDN layer" for Qwen. That is a
+family-dependent reinterpretation of an existing array rather than the parallel
+layer-kind enum the audit assumed we would need.
 
-TP2 is also fine for the *released* FP8 weights via a refined block scale
-(`moe_intermediate_size = 640 = 5×128`; TP2 → 320 → gcd 64). It is TP8 that is
-rejected, not TP2.
+**The whole n-gram hash specification is in the metadata as first-class keys** —
+`ple.layer_multipliers` `[23703573157769, 20109073645365, 8052911324071]`,
+`ple.head_vocab_sizes` (16 primes just above 2e7), `ple.head_offsets`,
+`ple.heads_per_ngram` 8, `ple.ngram_size` 3, `ple.conv_kernel` 4,
+`ple.layers [1]`. The multipliers match what was independently read out of the
+safetensors, and `ple.layers = [1]` settles the report-says-2 /
+weights-say-1 discrepancy. Only the *composition rule* still has to be read out
+of llama.cpp's reader — but since the GGUF carries exactly these keys, that
+reader is the specification.
+
+**And it confirms a latent defect with a real file:** `tokenizer.ggml.pre =
+"qwen35"`. ds4 never reads that key (§10), so this GGUF would be tokenised with
+the DeepSeek JoyAI splitter, silently. `tokenizer.ggml.model = "gpt2"`, i.e.
+byte-level BPE, which is the algorithm ds4 already implements.
+
+### Available quantisations
+
+`UD-IQ1_S`, `UD-IQ1_M`, `UD-Q2_K_XL`, `UD-Q3_K_XL`, `UD-IQ3_XXS`, `UD-IQ4_XS`,
+`UD-Q4_K_XL`. **There is no Q8, Q6_K or Q5_K.** Highest is **UD-Q4_K_XL at
+103.6 GiB** (4 shards; `general.file_type` 15 = Q4_K_M base with Unsloth
+dynamic per-tensor overrides, imatrix-calibrated over 45 chunks).
+
+| | model | + KV/state @131k | of 117 GiB usable |
+|---|---|---|---|
+| single node | 103.6 GiB | ~3.2 | **~107 — fits, no room to spare** |
+| **TP2** | ~52/rank + replication | ~1.6 | **~55–60/rank — comfortable** |
+
+Both work; TP2 has the headroom for multi-slot batching and matches the rig.
+
+Two caveats. **UD-Q4_K_XL is a *mixed* quant**, so the loader must tolerate a
+heterogeneous per-tensor type mix, and ds4's read side has gaps there — Q5_K/Q6_K
+are MoE-`mm`-only with no `mv`, and a Q8_K routed prefill requests kernels that
+exist in no `.metal` file (`ds4_metal.m:31044`). **And the repo is one day old
+with zero downloads** — nobody has validated these quants. Budget for the
+possibility that they are wrong, and lean on the S2 logits oracle.
+
+One upside for §8: modelling GDN weights at Q8 was conservative. At ~4.94
+bits/param average they are ~0.64 GB/rank rather than 1.04, taking decode from
+~3.5 to ~3.1 GB/token/rank — roughly 11% better than estimated.
 
 ## 5. Do our optimisations transfer?
 
