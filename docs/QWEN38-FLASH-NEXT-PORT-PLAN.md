@@ -225,12 +225,11 @@ argument holds verbatim and it should come back bit-identical.
    priced at **1.8 ms/token of new gates to save 0.63 ms** of duplicated read:
    net negative, and vLLM independently marks GR `disable_tp=True`. This is
    replicated work the campaign's most productive vein cannot mine.
-2. **The chunked/sequential accumulation-order problem.** DS4 buys its way out
-   by rebuilding the compressor frontier from the last 4 tokens
-   (`ds4.c:28503-28509`, explicitly to avoid mixing accumulation orders). **For
-   GDN there is no bounded rebuild** — the state is unbounded. The chunked and
-   sequential kernels must agree bit-for-bit by construction. In my judgement
-   this is the sharpest correctness constraint in the port.
+2. **State determinism — reframed; my earlier statement of this was wrong.**
+   I wrote that "the chunked and sequential kernels must agree bit-for-bit by
+   construction" and called it the sharpest constraint in the port. That is not
+   achievable, not required, and not what anyone does. Corrected in §7a below.
+
 3. **Every MXFP4 MoE decode specialisation dies** — all are keyed on
    DS4-Flash geometry constants (`n_total_expert==256`, `nei0==6`,
    `gate_row_bytes==2176`, …). A fused `sum11` is a **prerequisite**, not an
@@ -241,12 +240,116 @@ argument holds verbatim and it should come back bit-identical.
 5. **The recurrent state cannot be rewound.** 108 MiB/sequence, halving to
    54 MiB/rank under head split. `ds4_session_rewind()` becomes
    restore-from-snapshot, not integer truncation.
-6. **`dedc830` does not generalise** — and its own comment says why. The
-   alignment is legal *because* at an lcm boundary the correct frontier is a
-   known constant. A recurrent state has no such position other than 0. The
-   pattern that does generalise is `spec_frontier_snapshot/restore`, already an
-   O(state) copy at 12 MiB today versus 108 MiB then — a 9× scale-up of working
-   code, not a new mechanism.
+6. **`dedc830` half-generalises, and the useful half is the half that does.**
+   The *rebuild* does not — it needs a bounded window. But the **alignment**
+   does, and `ds4_session_rewind_align()` already snaps to `lcm(non-zero
+   ratios)` = **128, a multiple of 64**. It is already the right shape. What
+   that code is really doing is canonicalising the carried state — making it a
+   function of a fixed grid rather than of the chunk schedule — and GDN's state
+   at a 64-aligned position is a *complete* object, so it gets that
+   canonicality without needing the rebuild at all.
+
+   Independent convergence worth knowing: vLLM and SGLang both arrived at
+   `lcm(kernel chunk, cache page)` as the only depth at which a recurrent state
+   may be named. That is `ds4_session_rewind_align()` generalised.
+
+## 7a. State determinism — what actually has to hold
+
+Three comparisons matter, and they are not equally hard.
+
+**Chunked vs chunked at different boundaries — holds, and this is the one that
+matters.** The chunked gated delta rule is a pure reassociation (a closed-form
+unit-lower-triangular inverse, terminating in exactly `chunk_size` steps — no
+truncated series). Splitting a sequence is bitwise-identical **provided three
+riders hold**, confirmed empirically by vLLM PR #49827: 64-aligned splits came
+back bitwise equal, while splitting at [73, 128, 192] changed **131,061 of
+131,072 final-state elements**. Non-aligned splitting does not degrade the
+state, it replaces it.
+
+| rider | ds4 status |
+|---|---|
+| every carried-state boundary is a multiple of **64** | **violated** — the final chunk of a range is `remaining` (arbitrary, `ds4.c:36960`), and resumed prefill realigns to `prefill_cap`, not 64, from an arbitrary `pos0` |
+| the state handoff is **fp32** | free to satisfy; costs ~1.6% of decode versus bf16 |
+| **nothing selects a kernel by sequence length or batch row count** | **violated — see below** |
+
+**Chunked prefill → sequential decode — a non-issue**, as suspected. Every
+production stack does exactly this. The state handed over is a valid GDN state
+and decode continues correctly from it; nobody treats the one-time offset as a
+defect. One trap: the HF reference hardcodes `initial_state=None` on the chunk
+path, so *chunked prefill with a carried state is off the reference's tested
+path entirely*, and FLA's own test suite has no coverage for it either.
+
+**Speculative verify — I over-weighted this, and ds4 already shipped the
+concession.** `README.md:212-218` documents it verbatim: a long greedy DSpark
+run "may therefore diverge from a run without DSpark after an otherwise valid
+accepted block… use ordinary decoding, `--quality`, or `--dspark-strict` when
+byte-for-byte reproducibility with one-token decode is required." GDN widens
+the blast radius (divergence enters persistent state rather than appended rows)
+but creates no new problem class. Both vLLM and SGLang sidestep it anyway by
+verifying GDN with the **recurrent** kernel, so verify-vs-decode is not a
+chunked-vs-recurrent mismatch at all.
+
+### The hazard I missed, and it is live on the current branch
+
+**ds4's matmul dispatch is keyed on batch row count.** Verified:
+
+```c
+static int16_t ds4_gpu_mv_ext_nxpsg(uint64_t in_dim, uint64_t n_tok) {
+    if ((in_dim % 256u) == 0 && n_tok < 3) return 16;   // ds4_metal.m:5372
+    ...
+}
+```
+plus `ds4_gpu_mv_ext_r1ptg()` switching on `n_tok`, and `ds4_metal.m:20676`
+taking a different kernel entirely at `n_tok == 1`, `<= 8`, and above.
+
+`nxpsg` is the **reduction partition width along `in_dim`**. So the same row, in
+a differently-sized batch, gets a different dot-product reduction tree — and
+this sits *upstream* of any GDN scan, on the q/k/v/g projections.
+
+For attention today this is bounded: a perturbed K row shifts one attention
+weight. It is also exactly why `metal_graph_refresh_ratio4_compressor_state`
+exists (`ds4.c:28504`: the full-chunk path "uses the matrix-matrix path; mixing
+those two accumulation orders changes a few FP8 rounding decisions in later
+chunks"). **For GDN the same perturbation enters the state and persists.**
+
+Three consequences, most likely first:
+
+1. **The ragged final prefill chunk** permanently offsets the state, and no
+   choice of GDN kernel fixes it.
+2. **Multi-slot batching makes slot count part of session provenance.** A
+   session that ran alone and one that ran alongside three others would
+   diverge. This is a *new axis*, and it lands on the branch we are on.
+3. The DSpark batch verifier's projections differ from decode's regardless of
+   the GDN scan.
+
+Open question worth checking on the current model, independent of any port:
+whether DS4's decode-time compressor updates are already slot-count-dependent
+under multi-slot batching. The prefill path is canonicalised by the
+rebuild-from-4-tokens; the decode path may not be.
+
+### The mitigation package
+
+1. **Align, serialise, and run the residue recurrently.** Mandate every
+   internal chunk boundary at a multiple of 64; write the inter-chunk state
+   loop strictly serially (free — we author the kernel, so we inherit nobody's
+   parallel scan); run the final `N mod 64` tokens through the *recurrent*
+   kernel from the last aligned state. `metal_graph_prefill_decode_streaming_range`
+   (`ds4.c:32222`) already does prefill-by-decode-loop, and
+   `ds4_session_rewind_align()` already provides the alignment. Add a validator
+   asserting `chunk % 64 == 0` on every non-terminal chunk.
+2. **fp32 state.** ~1.6% of decode. Cheap insurance; vLLM calls it "necessary,
+   not sufficient."
+3. **Pin the projection dispatch for GDN inputs** — the mitigation for the
+   hazard above, and **the only item with no prior art and no free lunch.**
+   Force the q/k/v/g/beta projections onto one dispatch variant regardless of
+   `n_tok`, analogous to `g_quality_mode`. Without it, slot count is part of
+   session identity.
+4. **Gate CI on teacher-forced KL, never on greedy top-1.** vLLM's report is
+   unambiguous: "a single qualitatively-neutral logit difference flips an
+   argmax and the greedy path diverges forever afterward." Field calibration:
+   FLA gates at 0.5% relative RMS; vLLM's Mamba kernels at `atol=1e-2`; SGLang
+   at KL ≤ 0.003–0.005. Measured chunk-vs-recurrent divergence is **~1.2e-4**,
+   agreed by three independent sources.
 
 ## 8. Estimated throughput
 
