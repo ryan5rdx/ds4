@@ -243,6 +243,45 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### U12b — q_path split + inverse-RoPE isolation — 26.8% explained — 2026-08-27
+
+`DS4_METAL_GPU_STAGE_TIMESTAMPS=1` stage-profile on the rig (build
+`26ef09f`, which adds the `q_a_kv_proj` / `q_lora_norm` / `q_path` split
+markers), gen 128, 4 arms: default and
+`DS4_METAL_DISABLE_PRE_M5_ATTN_INV_ROPE_FUSE=1` at 32k and 131k. Per-token
+stage gpu_ms.
+
+**Arm 2 — q_path split (default; context-invariant):**
+
+| stage | contents | 32k | 131k |
+|---|---|---|---|
+| q_a_kv_proj | fused q_a/kv Q8_0 pair | 2.137 | 2.136 |
+| q_lora_norm | q-LoRA RMS norm (+ fused KV RoPE) | 1.680 | 1.680 |
+| q_path | q_b proj + per-head RMS norm + RoPE tail | 1.862 | 1.863 |
+
+Total ≈ 5.68 ms, matching U12's 5.47 (marker overhead ~0.2). **q_path is the
+largest of the three at 1.86 ms, slightly above the ~1.5 ms q_b-alone
+estimate** — so q_b is most of it and the per-head norm/RoPE tail is a small
+residual. q_a_kv_proj (2.14) and q_lora_norm (1.68) are the two larger
+pieces and are the place to look next.
+
+**Arm 1 — standalone inverse-RoPE isolation (norope = gathered branch forced
+onto the standalone RoPE; delta prices the dispatch across the 20 gathered
+layers):**
+
+| ctx | default | norope | delta |
+|---|---|---|---|
+| 32k | 3.393 | 3.526 | **+0.133 ms** |
+| 131k | 4.252 | 4.764 | **+0.512 ms** |
+
+**The standalone inverse-RoPE dispatch is ~0.13 ms at 32k and ~0.51 ms at
+131k** (per the plan's gate, the 131k delta is the relevant number for the
+long-context indexed layers). U13's prize is roughly this × 21/20 for the
+indexed layers — a real but modest win at 131k, not the 2–4 ms hoped for;
+most of `attn_inv_rope` is attention doing its job. Per the plan's gate
+(under ~0.3 ms → U13 dead; 0.51 ms at 131k is over it), the U13 call is
+marginal — see test plan.
+
 ### U12 — price q_path (5.47 ms) and attn_inv_rope (4.27 ms) — stage profile, 2026-08-27
 
 `DS4_METAL_GPU_STAGE_TIMESTAMPS=1` stage-profile run on the rig (mat worker

@@ -204,7 +204,7 @@ two are minutes and one of them can invalidate three completed runs.
 | **19** | **U10 — alias `sq`/`sw`/`sqk` over the dead `sk` buffer** — **built, +19.3% on M1 Max, bit-identical, opt-in. Rig A/B DONE 2026-08-27: +17.4% (mean 2015.6 vs 1717.2 GFLOP/s), beats NSG=4, bit-identical.** End-to-end ~2–4% of the token (see U10b). **U10c** (F16 cache, 2 → 7 resident) gated on it. | ~1 d | Residency 1 → 2 at *unchanged* NK — the distinction U10a could not isolate. |
 | ~~20~~ | ~~U11 — confirm U10 does not regress prefill~~ — **done 2026-08-27: neutral.** Prefill 393.03 vs 393.37 t/s @131k; first-token 36.5 vs 35.5 ms. No nsg4-style spike. **U10 stays default-on.** | — | One arm, closed. |
 | ~~21~~ | ~~U12 — price `q_path` (5.47 ms) and `attn_inv_rope` (4.27 ms)~~ — **done 2026-08-27.** q_path 5.474/5.472 ms/token (ctx-invariant, 15%); attn_inv_rope 3.389→4.258 ms (grows +26%, 11.7%). 26.8% of token priced. | — | 26.8% of the token, now attributed. |
-| **22** | **U13 — arm the inverse-RoPE fuse on the indexed branch (was T10)** — **sizing invalidated; gated on U12b arm 1** | ~1 d | The 4.27 ms stage is mostly attention. If arm 1's delta is under ~0.3 ms, U13 is dead. |
+| ~~22~~ | ~~U13 — arm the inverse-RoPE fuse on the indexed branch (was T10)~~ — **sizing invalidated by U12 correction 1; U12b arm 1 DONE 2026-08-27: standalone RoPE is +0.133 ms @32k / +0.512 ms @131k — U13's prize is ~0.5 ms at 131k, marginal.** | ~1 d | The 4.27 ms stage is mostly attention; the RoPE tail is ~0.5 ms at 131k. |
 | ~~23~~ | ~~U14 — MoE expert straggler~~ — **deprioritised 2026-08-27.** Design C is a repacked TP-specific model file for 3.5%; B blocked; A costs 27 GiB. Recorded that whole-expert reassignment provably cannot help (variance, not mean), and that §7 missed a cheaper option — shifting the shared expert to the routed-light rank, 2.3% for no memory and no repack. | — | Poor return against U12/U13; kept so it is not re-derived. |
 
 Steps 0–3 are about four hours of rig time and settle whether the last three
@@ -1713,7 +1713,16 @@ roofs, with the byte-reconciliation and epoch rules as hard constraints:
   history and on why §4's "~100% of isolated bench" does not answer the
   roofline question.
 
-### U12b — the two arms that turn 26.8% from "priced" into "explained"
+### U12b — the two arms that turn 26.8% from "priced" into "explained" — **DONE 2026-08-27**
+
+**Outcome.** Arm 1 (inverse-RoPE isolation): standalone RoPE dispatch is
+**+0.133 ms @32k / +0.512 ms @131k** (norope vs default, across the 20 gathered
+layers; ×21/20 for the indexed). Most of `attn_inv_rope` is attention, not
+RoPE — U13's prize is ~0.5 ms at 131k, marginal per the under-0.3 ms gate.
+Arm 2 (q_path split): q_a_kv_proj 2.14 / q_lora_norm 1.68 / q_path (q_b +
+norm + RoPE tail) 1.86 ms — all context-invariant; q_path is mostly q_b, and
+q_a_kv_proj + q_lora_norm are the two larger pieces to look at next. See
+`BENCHMARKS-TP-PP.md` §U12b.
 
 **Both are built and committed. Neither needs code on the rig side.**
 
