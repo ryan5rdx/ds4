@@ -90,6 +90,27 @@ static NSString *const kSource = @"#include <metal_stdlib>\n"
 "                     uint gid [[thread_position_in_grid]],\n"
 "                     uint gsz [[threads_per_grid]]) {\n"
 "    for (uint i = gid; i < n_vec; i += gsz) dst[i] = uint4(i, i + 1u, i + 2u, i + 3u);\n"
+"}\n"
+/* U8 bracket: walk fixed-size blocks instead of a flat vector stream.  MXFP4
+ * packs 32 4-bit values plus one E8M0 scale into 17 bytes, so block b starts
+ * at 17b and a simdgroup's 32 threads span 544 bytes at 32 different odd
+ * offsets -- every load straddles a 16-byte boundary and touches more cache
+ * lines than the same payload would at stride 16.  Running the identical
+ * kernel at blk=16 and blk=17 isolates that layout cost from dequant
+ * arithmetic and from the expert gather. */
+"kernel void stream_blocks(device const uchar *src  [[buffer(0)]],\n"
+"                          device uint4       *sink [[buffer(1)]],\n"
+"                          constant uint      &n_blk [[buffer(2)]],\n"
+"                          constant uint      &store [[buffer(3)]],\n"
+"                          constant uint      &blk  [[buffer(4)]],\n"
+"                          uint gid [[thread_position_in_grid]],\n"
+"                          uint gsz [[threads_per_grid]]) {\n"
+"    uint a = 0;\n"
+"    for (uint b = gid; b < n_blk; b += gsz) {\n"
+"        device const uchar *p = src + (ulong)b * blk;\n"
+"        for (uint k = 0; k < 16u; k++) a ^= (uint)p[k];\n"
+"    }\n"
+"    if (store) sink[gid & 1023u] = uint4(a);\n"
 "}\n";
 
 typedef struct {
@@ -102,6 +123,7 @@ static id<MTLCommandQueue>        g_queue;
 static id<MTLCommandQueue>        g_queue2;
 static id<MTLComputePipelineState> g_stream;
 static id<MTLComputePipelineState> g_fill;
+static id<MTLComputePipelineState> g_blocks;
 static id<MTLBuffer>              g_sink;
 
 /* One dispatch covering `bytes` of `buf`, timed by the command buffer's own
@@ -254,6 +276,8 @@ int main(int argc, char **argv) {
                         [lib newFunctionWithName:@"stream_read"] error:&err];
         g_fill = [g_dev newComputePipelineStateWithFunction:
                       [lib newFunctionWithName:@"fill_buf"] error:&err];
+        g_blocks = [g_dev newComputePipelineStateWithFunction:
+                        [lib newFunctionWithName:@"stream_blocks"] error:&err];
         if (!g_stream || !g_fill) {
             fprintf(stderr, "pipeline failed: %s\n", [[err localizedDescription] UTF8String]);
             return 1;
@@ -406,6 +430,46 @@ int main(int argc, char **argv) {
             }
         }
         priv = nil;
+
+        /* ---- U8: block-stride layout cost, aligned vs MXFP4's 17 ---- */
+        {
+            id<MTLBuffer> b = [g_dev newBufferWithLength:(NSUInteger)bytes
+                                                 options:MTLResourceStorageModePrivate];
+            if (b) {
+                gpu_fill(b, bytes);
+                printf("\n  block-stride arms (payload is 16 B either way; only the stride differs)\n");
+                for (int bi = 0; bi < 2; bi++) {
+                    const uint32_t blk = bi == 0 ? 16u : 17u;
+                    const uint32_t n_blk = (uint32_t)(bytes / blk);
+                    const uint32_t store = 0u;
+                    double best = 1e30;
+                    for (int i = -1; i < iters; i++) {
+                        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+                        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                        [e setComputePipelineState:g_blocks];
+                        [e setBuffer:b offset:0 atIndex:0];
+                        [e setBuffer:g_sink offset:0 atIndex:1];
+                        [e setBytes:&n_blk length:4 atIndex:2];
+                        [e setBytes:&store length:4 atIndex:3];
+                        [e setBytes:&blk length:4 atIndex:4];
+                        [e dispatchThreads:MTLSizeMake(256 * 8192, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                        [e endEncoding];
+                        [cb commit];
+                        [cb waitUntilCompleted];
+                        const double t = cb.GPUEndTime - cb.GPUStartTime;
+                        if (i >= 0 && t < best) best = t;
+                    }
+                    /* Payload is what a dequant kernel would consume: 16 B/block. */
+                    printf("  %-16s  %-34s  %7.1f GB/s\n",
+                           blk == 16u ? "blk-16 aligned" : "blk-17 mxfp4",
+                           blk == 16u ? "16 B payload, stride 16 (aligned)"
+                                      : "16 B payload, stride 17 (straddles)",
+                           (double)((uint64_t)n_blk * 16ull) / best / 1e9);
+                }
+                b = nil;
+            }
+        }
 
         printf("\nReading the result:\n"
                "  metal-private >> mmap-file      -> placement; fix is in the loader,\n"

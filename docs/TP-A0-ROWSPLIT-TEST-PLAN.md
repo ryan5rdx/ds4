@@ -1099,6 +1099,64 @@ first cheap experiment; the F16 staging is the first substantive one.
 stage split across ranks saves ~5 ms, but fixing 6% ALU utilisation is worth
 more and makes the split worth proportionally less. Fix the kernel first.
 
+#### U7 — instrumented, and the occupancy hypothesis is already dead — 2026-08-27
+
+**Built.** `DS4_METAL_INDEXER_LLT_NSG` ∈ {2, 4, 8} selects simdgroups per
+threadgroup; the dispatch is now generalised from `NK = 8*NSG` rather than two
+hardcoded branches, and reproduces the old constants exactly at 8 and 4.
+`DS4_METAL_INDEXER_LLT_NSG4` still works as an alias so the T3 arm reproduces.
+New instantiation `kernel_dsv4_indexer_scores_llt_nsg2`.
+
+**NSG=16 is not buildable** and that is the finding. Staging is
+`sk[NK*128]half + sq[8*128]half + sw[8]f32 + sqk[NK*8]f32`, so NSG=16 needs
+**38,944 B against a 32,768 B limit.** The residency ladder:
+
+| NSG | NK | threads | smem | threadgroups resident / core |
+|---|---|---|---|---|
+| 2 | 16 | 64 | 6,688 | 4 |
+| 4 | 32 | 128 | 11,296 | 2 |
+| **8** (default) | 64 | 256 | 20,512 | **1** |
+| 16 | 128 | 512 | 38,944 | **does not fit** |
+
+**Swept on the M1 Max — more residency is *worse*, so the occupancy hypothesis
+is falsified:**
+
+| NSG | GFLOP/s | vs default |
+|---|---|---|
+| 8 (default) | 1050.6 | — |
+| 4 | 1036.4 | −1.4% |
+| 2 | 784.9 | **−25%** |
+
+Q staging is amortised over NK keys, so shrinking NK to buy residency loses
+more than it gains. **The trend says bigger NK is better and we are pinned at
+NSG=8 by threadgroup memory** — one threadgroup per core is not the problem to
+fix, it is the price of the largest NK that fits.
+
+**All three arms are bit-identical** (`BENCH_DUMP`, 32768 rows, byte-for-byte).
+NSG changes how many keys a threadgroup owns, not the per-key reduction order,
+so unlike T1 and T2 this knob needs no correctness gate.
+
+**Correction to my own M1 Max number.** I reported 460 GFLOP/s / "4.4% of peak"
+earlier from a **stale binary** (`tests/bench_indexer_score`, built 2026-08-24,
+predating the LLT wiring). A fresh build gives **1050.6** — the earlier figure
+was the pre-LLT direct path. Anything computed from 460 is void.
+
+**The question that now matters most, and it is for the rig.** My fresh M1 Max
+number is **1050 GFLOP/s**; U2 measured **1015 on the M2 Ultra** at the same
+`n_comp`. A 60-core part matching a 32-core part means **the kernel does not
+scale with cores at all.** If that reproduces it is worth far more than any
+NSG arm — it says the grid or the staging serialises. **First rig action: re-run
+`bench_indexer_score 32768` on a freshly built binary and confirm or kill the
+non-scaling.** Check U2's binary date before trusting its 1015.
+
+**The remaining lever, and U3 returns for a third reason.** To grow NK past 64
+the `sk` staging must shrink. It exists to convert F32 keys to half; if the
+index cache were stored F16 (`ds4.c:17373`) the kernel could read K directly,
+freeing ~16 KB and admitting NSG=16. So T9/U3 — proposed for bandwidth, killed
+for bandwidth — is back on **two** independent grounds: it removes a per-key
+format conversion, and it unlocks the NK the sweep says we want. Re-open it
+after the scaling question is settled.
+
 #### U8 — diagnose the MoE matvec's 54% — re-opened by U6
 
 **Prize.** `routed_moe_folded` is 5.40 ms at 131k streaming at ~410 of 760
@@ -1112,11 +1170,23 @@ different question: **why does this kernel stream at 410 when the part does
 between the 17-byte MXFP4 block granularity (unaligned against any natural
 vector width), the expert gather/scatter, and the dequant interleave.
 
-**Cheapest first step:** add a pure-read arm to `tests/bench_moe_mxfp4_decode`
-that streams the same expert buffers with no dequant and no accumulation. That
-brackets the answer — if the raw gather already caps near 410, the block
-granularity and scatter are the problem; if it reaches ~700, the dequant path
-is.
+**Bracket built, and it already eliminates one of the three candidates.**
+Rather than touch the MoE harness, the arm went into `bench_membw`, which is
+validated against the streaming roof: `stream_blocks` walks fixed-size blocks
+and consumes a 16-byte payload from each, so running it at stride 16 and
+stride 17 isolates the MXFP4 layout cost from dequant arithmetic and from the
+expert gather. At 17 bytes a simdgroup's 32 threads span 544 B at 32 odd
+offsets, every load straddling a 16-byte boundary.
+
+**M1 Max result: stride 17 costs 4.7%** — 348.2 GB/s against 365.2 aligned,
+both ~91% of that part's roof. **So the 17-byte MXFP4 block granularity is not
+what puts the matvec at 54%.** It is worth ~5%, not ~46%.
+
+That leaves the expert gather and the dequant/accumulate path. Re-run the two
+block arms on the rig to confirm the 4.7% holds at Ultra scale, then attribute
+the rest between gather and dequant — the gather is 6 experts × 3 tensors = 18
+large contiguous regions per token, which *should* stream, so **dequant and
+accumulation are now the leading suspects.**
 
 #### U5 — n-gram speculation on the rig (R13 arms, re-prioritised)
 

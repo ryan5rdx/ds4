@@ -18231,11 +18231,25 @@ int ds4_gpu_indexer_score_one_tensor(
              * inside one process. */
             const bool score_llt =
                 getenv("DS4_METAL_DISABLE_INDEXER_LLT") == NULL;
-            const bool score_nsg4 = getenv("DS4_METAL_INDEXER_LLT_NSG4") != NULL;
+            /* U7: simdgroups per threadgroup.  Staging is NK=8*NSG keys, so
+             * NSG picks a point on a residency curve -- 20512 B at 8 (one
+             * threadgroup per 32 KiB core), 11296 at 4 (two), 6688 at 2
+             * (four).  Default 8 is the shipped behaviour.  NSG4 kept as an
+             * alias so the earlier T3 arm still reproduces. */
+            int score_nsg = 8;
+            const char *nsg_env = getenv("DS4_METAL_INDEXER_LLT_NSG");
+            if (nsg_env && nsg_env[0]) {
+                const int v = atoi(nsg_env);
+                if (v == 2 || v == 4 || v == 8) score_nsg = v;
+            } else if (getenv("DS4_METAL_INDEXER_LLT_NSG4") != NULL) {
+                score_nsg = 4;
+            }
             id<MTLComputePipelineState> direct_pipeline = score_llt
-                ? ds4_gpu_get_pipeline(score_nsg4
-                        ? "kernel_dsv4_indexer_scores_llt_nsg4"
-                        : "kernel_dsv4_indexer_scores_llt")
+                ? ds4_gpu_get_pipeline(score_nsg == 2
+                        ? "kernel_dsv4_indexer_scores_llt_nsg2"
+                        : (score_nsg == 4
+                                ? "kernel_dsv4_indexer_scores_llt_nsg4"
+                                : "kernel_dsv4_indexer_scores_llt"))
                 : ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_direct_pipeline,
                                         "kernel_dsv4_indexer_score_one_direct");
             if (!direct_pipeline) return 0;
@@ -18265,21 +18279,18 @@ int ds4_gpu_indexer_score_one_tensor(
             [enc setBuffer:wbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
             [enc setBuffer:compbuf offset:ds4_gpu_tensor_offset(index_comp) atIndex:3];
             [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-            if (score_llt && score_nsg4) {
-                /* NSG=4: sk[32x128]half + sq[8x128]half + sw[8] + sqk[256] f32 */
-                [enc setThreadgroupMemoryLength:(32u*128u + 8u*128u) * sizeof(uint16_t) +
-                                                (8u + 256u) * sizeof(float) atIndex:0];
-                ds4_gpu_trace_push(enc, "indexer_score_llt_nsg4");
-                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 31u) / 32u, 1, 1)
-                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                ds4_gpu_trace_pop(enc);
-            } else if (score_llt) {
-                /* sk[64x128]half + sq[8x128]half + sw[8] + sqk[512] f32 */
-                [enc setThreadgroupMemoryLength:(64u*128u + 8u*128u) * sizeof(uint16_t) +
-                                                (8u + 512u) * sizeof(float) atIndex:0];
-                ds4_gpu_trace_push(enc, "indexer_score_llt");
-                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 63u) / 64u, 1, 1)
-                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            if (score_llt) {
+                /* sk[NK*128]half + sq[8*128]half + sw[8]f32 + sqk[NK*8]f32,
+                 * NK = 8*NSG.  Reproduces the previous constants exactly at
+                 * NSG=8 (20512 B) and NSG=4 (11296 B). */
+                const NSUInteger nk = 8u * (NSUInteger)score_nsg;
+                [enc setThreadgroupMemoryLength:(nk*128u + 8u*128u) * sizeof(uint16_t) +
+                                                (8u + nk*8u) * sizeof(float) atIndex:0];
+                ds4_gpu_trace_push(enc, score_nsg == 2 ? "indexer_score_llt_nsg2"
+                                        : (score_nsg == 4 ? "indexer_score_llt_nsg4"
+                                                          : "indexer_score_llt"));
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + nk - 1u) / nk, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32u * (NSUInteger)score_nsg, 1, 1)];
                 ds4_gpu_trace_pop(enc);
             } else {
                 /* Legacy direct scorer.  Keeps our threadgroup sizing, which

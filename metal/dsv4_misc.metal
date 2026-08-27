@@ -6967,7 +6967,13 @@ typedef decltype(kernel_dsv4_indexer_scores_llt_impl<1,1>) kernel_dsv4_llt_t;
 template [[host_name("kernel_dsv4_indexer_scores_llt")]]   kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 8>;
 template [[host_name("kernel_dsv4_indexer_scores_llt16")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<16, 8>;
 template [[host_name("kernel_dsv4_indexer_scores_llt32")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<32, 8>;
+/* T_NSG trades threadgroup memory against residency.  Staging is
+ * sk[NK*128]half + sq[8*128]half + sw[8]f32 + sqk[NK*8]f32 with NK = 8*T_NSG,
+ * so NSG=8 needs 20512 B and only ONE threadgroup fits a 32 KiB core, NSG=4
+ * needs 11296 (two), NSG=2 needs 6688 (four).  NSG=16 would need 38944 and
+ * does not fit at all.  Select with DS4_METAL_INDEXER_LLT_NSG. */
 template [[host_name("kernel_dsv4_indexer_scores_llt_nsg4")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 4>;
+template [[host_name("kernel_dsv4_indexer_scores_llt_nsg2")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 2>;
 
 #ifdef DS4_METAL_HAS_TENSOR
 // Retained full-512 prefill indexer score path.  This is the part of sparse
