@@ -243,6 +243,43 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### Arm B — encoder-timestamp re-baseline (re-run, tick-calibrated build `0b987e5`) — 2026-08-27
+
+Re-run because the first arm-B run (build `fba4ef0`) predated the tick
+calibration (`d50bbaa`) and reported spans ~1.85× too large — it read the
+counter as nanoseconds when it is a GPU tick.
+
+**Tick calibration result — decisive.** The instrument now derives
+seconds-per-tick from the command buffer's own clock and prints coverage %
+and the inferred ns/tick:
+
+| ctx | gen_steady t/s | encoders/token | inferred tick | coverage |
+|---|---|---|---|---|
+| 2k | 42.04 | 175 | **0.632-0.642 ns** | **~198-199% OVERLAPPING** |
+| 131k | 29.70 | 174 | **1.000 ns (most), 0.92-0.93 (some)** | **~198% OVERLAPPING** |
+
+**Both causes are present.** (1) The M2 Ultra counter ticks at **~0.63 ns**,
+not 1.0 ns — so the original read-over-1.85× was a genuine unit error. (2)
+Coverage ~198% means the encoder spans **genuinely overlap ~2×** (the GPU
+pipelines encoder setup against the previous encoder's drain), so the
+per-encoder figures are **upper bounds**, not exact busy times. At 131k the
+derived tick reads ~1.0 ns because the overlap compresses `hi−lo`, inflating
+the inferred tick — the two effects are entangled there.
+
+**Calibrated labeled `reduce` span** (tick applied, still an upper bound due
+to overlap):
+
+| ctx | calls/token | µs/call |
+|---|---|---|
+| 2k | 41 | 199.4 |
+| 131k | 20 | 311.1 |
+
+These replace the void `fba4ef0` figures (313 / 339 µs/call). Throughput at
+baseline (42.04 / 29.70 t/s) again confirms the instrument's ~1-3% distortion
+claim. **Interpretation for the fan-out:** the true per-encoder busy times
+are at most ~half the reported spans (overlap), so `reduce` is ~100-155 µs
+per call — still to be reconciled against `attn_inv_rope`'s 3.64 ms stage.
+
 ### Arm B — encoder-timestamp re-baseline — 2026-08-27
 
 Build `fba4ef0` (with `df0037e` `DS4_METAL_GPU_ENCODER_TIMESTAMPS`), rig,
