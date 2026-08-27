@@ -18736,7 +18736,7 @@ static int ds4_gpu_indexer_scores_batch_tensor(
             const NSUInteger dot_shared = tm * 64u;
             [enc setThreadgroupMemoryLength:(q_shared + k_shared) * sizeof(uint16_t) +
                                             dot_shared * sizeof(float) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 63u) / 64u,
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + 63u) / 64u,
                                                   ((NSUInteger)n_tokens + tm - 1u) / tm,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
@@ -18971,7 +18971,7 @@ int ds4_gpu_indexer_topk_tensor(
             [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
             [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
             [enc setThreadgroupMemoryLength:2048u * sizeof(uint64_t) + 96u atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
             return ds4_gpu_finish_command_buffer(cb, owned, "indexer topk stream512");

@@ -783,6 +783,60 @@ measurement.** A0 as designed can never decompose the decode attention.
 different instrument, not a parameter change. **A2 stays unsized, and I should
 stop reporting A0 as built.**
 
+### RETRACTION: the "22 µs dependency-barrier dispatch" was my measurement error — 2026-08-27
+
+The 50 t/s fan-out caught this and it is the most consequential error I have
+made on this project, because several later conclusions were built on it.
+
+**What I claimed.** `tests/bench_qkv_norm` showed ~22 µs per dispatch, *flat
+across a 64× range of work*, so the kernel did no work and the cost was pure
+exposed dispatch latency. From that: a dependency-barrier dispatch costs ~22 µs
+against the ballast's 3.74 µs; U16's fix must therefore be dispatch removal
+rather than kernel optimisation; and `1021 × 22 µs ≈ the 24.34 ms token`.
+
+**What was wrong.** I swept `argv[1]` = `q_n` from 256 to 16384 while holding
+`argv[2]` = `kv_n` at 512. **`q_n` is not the cost driver.** Sweeping the other
+parameter:
+
+| kv_n | 128 | 512 | 2048 | 8192 |
+|---|---|---|---|---|
+| µs/dispatch | 10.7 | 21.3 | 76.9 | 293.7 |
+
+**It scales almost linearly.** A fit over the work-dominated end gives
+**0.0353 µs/element + 4.6 µs fixed**, which predicts 9.2 / 22.7 at kv_n 128 and
+512 against 10.7 / 21.3 measured. At the production shape the split is **~18 µs
+of work and ~5 µs fixed — 80/20, not 0/100.**
+
+**So the fixed cost is ~5 µs, consistent with the ballast's 3.74 µs.** The two
+numbers never needed reconciling; I invented a "barrier versus overlapped"
+distinction to explain a gap that did not exist.
+
+**What this invalidates.**
+
+1. **U16's kill reason is void.** I concluded that fusing the q-LoRA norm "buys
+   nothing because the dispatch is the cost". The kernel is 80% work at the
+   production shape, so **optimising it is exactly the right move** — the
+   opposite of what I recorded. U16 is reopened.
+2. **Grid widening is back on the table for this kernel.** 2 threadgroups doing
+   512 elements in ~18 µs is ~36 ns/element — a serialised chain
+   (norm → RoPE → quantize → store) with almost no parallelism. The "widening
+   has failed twice" caution came from *other* kernels and was over-generalised
+   here.
+3. **The `1021 × 22 µs ≈ token` arithmetic is dead.** It was numerology resting
+   on a wrong per-dispatch price.
+4. **The 30 W explanation is weakened but not void.** The underfill sightings
+   and the 99%-busy / ~20%-utilised gap stand on their own evidence; what falls
+   is the specific claim that per-dispatch latency accounts for most of the
+   token.
+
+**The methodology lesson, which is the durable part.** I swept a parameter,
+observed flatness, and concluded "no work happens here" — without checking that
+the parameter I varied was the one the kernel spends time on. **A flat response
+to a swept parameter means either the work is fixed, or you swept the wrong
+knob.** Distinguishing them costs one more sweep. Add to the rules in §
+Methodology: *when a sweep comes back flat, sweep a second parameter before
+concluding anything.*
+
 ### Queued work, built or scoped 2026-08-27
 
 #### Built: `DS4_METAL_GPU_ENCODER_TIMESTAMPS` — a profiler that does not distort
