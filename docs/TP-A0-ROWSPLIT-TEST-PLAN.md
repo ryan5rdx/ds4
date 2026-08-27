@@ -567,46 +567,43 @@ suggested — but only the ones that block. Identifying *which* dispatches are
 barriers with nothing alongside is now a first-class question, and
 `bench_qkv_norm` is the instrument for pricing any of them in isolation.
 
-### Next run — updated 2026-08-27 after U15
+### Next run — rebuilt 2026-08-27 after all three scoping agents
 
-**Rig — four arms, all zero-code now:**
+**Every arm below was verified to build and every knob verified to exist**
+(`make ds4` + all six benches clean; eight env knobs and four new stage markers
+grepped present). One exception is called out explicitly at the end.
 
-1. **Q8_0 shape sweep.** `make tests/bench_q8_attn_shapes && ./tests/bench_q8_attn_shapes 760`.
-   Model-free. **The build rule did not exist until `b95e7ff`** — the committed
-   binary dated 2026-08-24 and any rebuild failed on `ds4_gpu.h`, so this could
-   not have been reproduced on the rig before. Re-establishes the rig's k-curve
-   on the current build; it is the falsifier for **C1** and **C3**.
-2. **`DS4_METAL_ATTN_OUT_LOW_NSG` ∈ {1,2,4,8}** at 2k and 131k. `out_a` carried a
-   literal `nsg=4` that `DS4_METAL_Q8_MV_NSG` could not reach, so **T4 never
-   swept it** — and 4 is the value T4 measured as ~3% worse than TP's nsg=2
-   everywhere it *could* reach. Default unchanged at 4. This is **C2**, ~1% of
-   the token, and it is now one env var.
-3. **Stage profile with the new `ffn_tp_gate` marker** at 2k and 131k. Turns the
-   1.351 ms gate figure from a two-stage difference into a directly measured
-   row. Also picks up the `q_path` sub-stages.
-4. **U5 / R13 n-gram arms** — implemented, never run, independent of everything
-   else. Report acceptance rate alongside t/s; the delta is meaningless without
-   it.
+**Rig — six arms, all zero-code.** Three of them are decisive: they kill or
+confirm queued items outright.
 
-**Closed by U15, do not re-run:** the `hcpre` ablation (resolved the 2.7×
-disagreement — the chain covers only ~43% of the span) and the pre-norm fusion
-disable (**+0.58 ms, the fusion is a net win**).
+| # | arm | command | decides |
+|---|---|---|---|
+| 1 | **Per-slot gate profiler** | `DS4_TP_GATE_PROFILE=1`, 2k and 131k | **DECISIVE.** Prints ATTN vs FFN exchange and the implied straggler bound. `exchange_FFN − exchange_ATTN = E\|s\|/2` exactly, since only the FFN gate sits behind the routed shard. **If they measure equal, U14 and all three §7 designs die in one run.** |
+| 2 | **Flash-attn stage split** | `DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1`, 2k and 131k | **PREREQUISITE.** Splits `attn_inv_rope`'s 3.63 ms into `gather`/`packed`/`fa_core`/`reduce`. A2's prize is honestly 0–8% *because* this has never been measurable. Needs a batch context — it is inert on an owned command buffer by design. |
+| 3 | **Stage profile** | `DS4_METAL_GPU_STAGE_TIMESTAMPS=1`, 2k and 131k | Now carries four new rows: `q_a_kv_proj`, `q_lora_norm`, `ffn_tp_gate`, `attn_tp_gate`. Turns the 1.351 ms gate figure from a two-stage difference into a measured row. **Report every marker** — U15's table still omitted ~9%. |
+| 4 | **Q8_0 shape sweep** | `./tests/bench_q8_attn_shapes 760` | Falsifier for **C1** and **C3**. The rig's curve humps at k=2048 where the M1 Max climbs monotonically, so C1's shape must be re-established here. |
+| 5 | **`DS4_METAL_ATTN_OUT_LOW_NSG` ∈ {1,2,4,8}** | 2k and 131k | **C2.** `out_a` sat at a literal `nsg=4` the env could not reach, so T4 never swept it — and 4 is the value T4 measured ~3% worse everywhere else. Default unchanged. |
+| 6 | **n-gram arms (U5/R13)** | `DS4_NGRAM_SPEC`, repetitive vs novel text | Implemented, never run. **Report acceptance rate alongside t/s** — the delta is meaningless without it. |
 
-**Implementation queue — mine to write, in this order:**
+**Closed by U15 — do not re-run:** the `hcpre` ablation, and the pre-norm fusion
+disable (+0.58 ms; the fusion is a net win).
 
-| item | ms | why this order |
+**One arm is not ready and it is not mine to fix:** the gate report's
+`uc_pingpong` chaining test (4 × 4 KB vs 1 × 16 KB, ≤0.34 ms) needs the
+`uc_lat2`/`uc_pingpong` probe M3 was run with. **That tool is not in this
+repo** — it lives bench-side. Skip it unless the bench still has it.
+
+### Implementation queue — mine, and none of it blocks the run above
+
+| item | ms | state |
 |---|---|---|
-| ~~U16~~ | — | **Diagnosed, not implemented.** The kernel is ~22 µs of pure dispatch latency, flat across a 64× work range, so a fusion buys nothing. Same fix as the gate spin: concurrent scheduling. **Held behind the gate agent.** |
-| **C1** Q8_0 k-curve | 1.13–1.40 | **Program-wide** — one kernel, many stages. Gated on arm 1. |
-| **U14** shared-shift | ≤0.74 | **re-sized down** from 0.82, which exceeded the whole imbalance. Design changes from "shift all" to "shift to equalise", which reaches zero FFN-gate imbalance in the δ<S regime. Gated on the per-slot gate measurement. |
-| **C3** row-split `shared_down` | ~0.25 | Falls out of C1's mechanism. |
-| **U4** decode indexer TP split | ~4 at 131k | Long-context only; ~0 at 2k. Largest long-context item. |
-
-**Blocked on the three running scoping agents** — `routed_moe_folded` (4.72 ms)
-and `attn_inv_rope` (3.63 ms), together **34% of the 2k token with no proposal
-against either**, and the gate-overlap question (~2.7 ms, 11%). Those three are
-**45% of the token** and are why the implementation order above is not yet
-committed past U16.
+| **M3 + §7C paired repack** | **~15% of the token** | The only item that could move decode by more than a few percent. One offline conversion tool and one TP-specific model file serve *both* the MXFP4 planar layout and the intra-expert split. Reconsider §7C on these terms — I struck it when it was 3.5% alone. |
+| **A2** head-batched vec keeping split-K | 0–2.0 ms | **Gated on arm 2.** Cannot be sized until the 3.63 ms is decomposed. |
+| **C1** Q8_0 k-curve | 1.13–1.40 | **Gated on arm 4.** |
+| **C3** row-split `shared_down` | ~0.25 | Independent; implementable now. |
+| **U14** shared-shift | ≤0.74 | **Gated on arm 1**, and redesigned to "shift to equalise". |
+| **A1** split the reduce over DV (32→128 TGs) | 0.1–0.3 | Low cost, independent. |
+| ~~U16~~, ~~M1~~ | — | Both measured and killed. U16 is dispatch latency, not kernel cost; M1 was byte-identical and moved nothing. |
 
 ### Sequencing — run in this order
 
