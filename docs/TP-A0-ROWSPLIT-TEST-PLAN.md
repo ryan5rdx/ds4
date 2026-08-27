@@ -189,7 +189,16 @@ two are minutes and one of them can invalidate three completed runs.
 
 Steps 0–3 are about four hours of rig time and settle whether the last three
 campaigns are valid, whether the largest sized item is real, and whether the
-MoE port is worth writing. Nothing below step 3 should start before they land.
+MoE port is worth writing.
+
+**M0 does not gate everything.** Two queued items are **model-free harnesses**
+that never load the shard, so the wired limit is irrelevant to them and they
+can run immediately, on the dev box, in parallel with the rig work:
+`tests/bench_indexer_score` (T3 pre-screen, CPU-reference checked) and
+`tests/bench_moe_mxfp4_decode 256` (T8 pricing — though *that* one the audit
+says to run on the rig, since the M1 Max mispredicts MoE shapes). Everything
+that loads the model waits for M0, because M0 is not merely a re-validation:
+it is the **new baseline every subsequent A/B compares against**.
 
 ### R9 — the `nqptg = 8` ceiling (scoping, no code yet)
 
@@ -464,12 +473,17 @@ for the *same payload* it is ~15 µs/gate = **1.3 ms/token, +3.7%**. M0 decides
 which wire number is real — see above. Treat T1 as "open, worth 1.3–3.0
 ms/token" until then, and do not quote the upper end.
 
-Two implementation notes from the probe. A single 16,384 B UC SEND WR is
-confirmed working on this stack, so the gate needs no chunking. And one
-transient first-ping UC drop occurred across the whole battery: **UC has no
-retransmit**, so a T1 implementation needs a re-arm/retry path —
-`timeout_sec` covers correctness, not latency. Full table in
-`BENCHMARKS-TP-PP.md` (M3 section).
+One implementation note from the probe: a single 16,384 B UC SEND WR is
+confirmed working on this stack, so the gate needs no chunking.
+
+**No retry path needed** (owner's call, 2026-08-26): UC on this Apple stack is
+treated as lossless. The single first-ping drop M3 saw is the documented UC
+first-packet race in the probe's own OOB setup, not steady-state loss —
+`uc_bench`'s skeleton exists precisely because closing the OOB socket early
+triggers it. ds4's independent evidence is stronger than the probe's: R10e ran
+2,752 big gates and 11,008 row gates per cold run, all day, with no lost gate.
+So T1 does not carry a re-arm/retry design; `timeout_sec` remains the
+correctness backstop. Full table in `BENCHMARKS-TP-PP.md` (M3 section).
 
 #### The env battery — one rig session, `DS4_NGRAM_SPEC` off
 
