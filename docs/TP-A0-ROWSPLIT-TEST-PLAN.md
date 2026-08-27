@@ -556,6 +556,41 @@ not.
 so it costs one A/B arm to settle. No retry path: UC on this stack is treated
 as lossless. A single 16,384 B UC SEND WR needs no chunking.
 
+#### T2 follow-up — proceed, but size it honestly — **2026-08-27**
+
+**Verdict: run it. It is one rig session for two arms, and it is the last
+unfinished item from the env battery.** But M2 caps what it can be worth, and
+this document should say so rather than leaving T2 described as "the one real
+win."
+
+`DS4_METAL_DECODE_SPLITS` repartitions the online-softmax reduce inside the
+attention decode kernels — i.e. it lives in `attncore` + `attnout`, which M2
+measures at **1.91 + 2.92 = 4.83 ms of the 35.35 ms token at 131k**. A ~1% total
+gain is consistent with a ~7% improvement *within* those stages, a reasonable
+return for a constant; but T2's ceiling is 4.83 ms however the sweep comes out,
+and realistically a fraction of it. **It is a ~1% item.**
+
+**State the acceptance bar explicitly, because T1 just exposed an
+inconsistency.** T2 is *not* bit-exact — it repartitions a reduction, exactly
+the class of change that killed T1. But T1 was rejected for being a wash **and**
+perturbing logits (up to 2.3, top-1 preserved). The bar that actually applies
+is **a measurable win, top-1 preserved, and bounded Δlogit**; T1 failed on the
+win, not on the bit-exactness, so T2 at +1% can pass the bar T1 failed. Judge it
+that way, and record Δlogit alongside t/s so the two are comparable.
+
+**Two outcomes.**
+- Still climbing at 28/31 → move the default and rewrite the comment at
+  `ds4_metal.m:29988`, which reasons from exact fill; gains past 60
+  threadgroups on 60 cores mean oversubscription for latency hiding, not
+  occupancy.
+- Flat or regressing → set the default to the measured peak and close T2.
+
+**Interaction to keep in view:** with `DS4_NGRAM_SPEC` on, verify steps set
+`decode_splits = 1` (`ds4_metal.m:30001`) and T2 is inert on those steps. If
+n-gram ever defaults on, T2's value shrinks by the acceptance rate. Measure with
+n-gram off as before, but do not productionise the two independently without
+re-checking the combination.
+
 #### The env battery — one rig session, `DS4_NGRAM_SPEC` off
 
 **T2 — `DS4_METAL_DECODE_SPLITS`.** Its own comment names our rig: *"12 was
@@ -630,20 +665,46 @@ token at 2k it is ~55% of the token; at 131k it is still 35%. **It is the
 largest single item in the decode budget, larger than the routed MoE, and
 stage ablation cannot see it by construction** — it is not in any stage.
 
-This is the measured answer to "why are we not at 100% utilisation." Roughly
-half the short-context decode token is not compute at all. It is consistent
-with every negative in this document: T1 (wire latency, wash), T8 (MoE kernel
-specialisation, negative), R11 (gate count, negative) all attacked *stages*,
-and the stages are not where the missing time is.
+**What the residual is not.** It is unattributed, not known-to-be-overhead —
+an earlier draft of this section overstated it as "not compute at all," which
+is wrong. M2 ablated seven chains; the decode token contains several more that
+the battery deliberately skipped because they do not ablate cleanly: **`router`**
+(unusable — ran 0.574 ms *slower* while removing 92 dispatches), **`shared`**
+and **`kv`** (fusion rollbacks that *add* dispatches), plus the q_a/kv
+projections, the compressor update, HC post-combine, and per-token embedding /
+final norm / logits / sampling. The shared expert and router in particular are
+real, irreducible work. So the honest statement is: **~13 ms of the token is
+flat in context and unmeasured**, and its split between genuine unablated
+compute and true stall is the open question — not a foregone conclusion.
+
+What does survive is the negative pattern: T1 (wire latency, wash), T8 (MoE
+kernel specialisation, negative) and R11 (gate count, negative) all attacked
+chains *inside* the attributed 16–23 ms, and none of them moved the needle.
+
+**Decomposing the floor does not need ablation, and that is the unlock.** The
+three chains M2 skipped are precisely the ones that cannot be ablated cleanly —
+but they are all already instrumented in the decode stage profiler
+(`DS4_METAL_PROFILE_DECODE_STAGE("router")` at `ds4.c:24123`, and the same for
+`shared`, `compressor_proj`, `compressor_update`, `compressor_commit`). A
+single `DS4_METAL_DECODE_STAGE_PROFILE` run at 32k and 131k reports their cost
+directly, with no semantically-wrong output and no dispatch-count confound.
+**That is a ~20-minute measurement and it converts the largest unknown in this
+document into a table.** It should run before anything else.
 
 **Consequence for sequencing.** The remaining stage-level items are worth ~1%
-between them, and the floor is worth ~13 ms. R12b's reduced-ballast arm and
-the encoder-boundary instrument are the only queued items that probe the floor
-rather than a stage, which promotes them from "confirmation" to **the most
-valuable unrun measurement in this document**. The floor's composition — how
-much is per-layer dispatch versus per-token fixed cost — is the open question,
-and it is answerable: per-layer cost scales with `n_layer`, per-token cost does
-not.
+between them, and the floor is ~13 ms. Order:
+
+1. **Stage-profile run at 32k/131k** (above) — bounds `router`/`shared`/`kv`/
+   compressor and tells us how much of the 13 ms is real compute. ~20 min.
+2. **R12b reduced-ballast arm + the encoder-boundary instrument** — these probe
+   stall rather than stage, and are the right follow-up once step 1 says how
+   much stall there is to find.
+3. **T2 follow-up** (28/31) — see below. Cheap, but a loose end, not a lever.
+
+The floor's composition — per-layer dispatch versus per-token fixed cost — is
+answerable and matters beyond DS4: per-layer cost scales with `n_layer`, so it
+directly prices the Qwen port's 48-vs-43 layers (see
+`docs/QWEN38-FLASH-NEXT-PORT-PLAN.md` §10).
 
 The ablation method (re-run `DS4_TP_ABLATE` chains at 32k and 131k, plus
 `DS4_METAL_ABLATE_INDEXER_SCORE`/`_TOPK`, which are already wired into decode
