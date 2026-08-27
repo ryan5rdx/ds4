@@ -71,6 +71,14 @@ cd ~/Downloads/rdma-tb4/tests && ./setup-rdma-net.sh
   `check-roce-v2-gid.sh`.
 - If pingpong/RTR starts failing errno=1 (EPERM, "inet_arp_lookup failed") after
   working: run `./setup-rdma-net.sh --reset` on BOTH ends of the cable.
+- **The GID index is not stable across link flaps.** A reset/flap cycle can
+  leave a stale hole at index 1 and commit the new IPv4-mapped entry at index 2
+  (the table is not compacted). `check-roce-v2-gid.sh` and the
+  index-1-hardcoded probes (`uc_pingpong`, `jaccl`) then fail even though the
+  link is fine; ds4 itself is immune (it scans the GID table, `ds4_tp.c:780-790`).
+  Check `ibv_devinfo -d rdma_enX -v` for the real index before chasing the
+  network. Full failure-mode table: the rig runbook in
+  `docs/TP-A0-ROWSPLIT-TEST-PLAN.md`.
 
 ### GPU wired limit (re-run after every reboot)
 

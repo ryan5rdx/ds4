@@ -179,7 +179,7 @@ two are minutes and one of them can invalidate three completed runs.
 | # | Do | Time | Why first |
 |---|---|---|---|
 | 0 | **`sysctl iogpu.wired_limit_mb` on both hosts** — **done 2026-08-26**: it **was** `0` on both hosts; all 27 surviving R10/R11 coordinator logs carry the `wired_limit_mb is 0` warning, so **R10d/R10e/R11 decode numbers are suspect** (flat, stall-shaped, neither-bound profile = lazy paging). Set to `120000` on both; prerequisite added to `BENCHMARKS-TP-PP.md`. | — | If it was 0 after the 2026-08-26 reboot, the shard was paging lazily and **R10d, R10e and R11 are all suspect**. Set it to `120000` on both and note it in the prerequisites (done — `BENCHMARKS-TP-PP.md`). |
-| 0b | Confirm `DS4_METAL_FAST_SYNC=1` is in the **`ds4-server`** launch path | 2 min | Bench always sets it; production may not. Worth ~186 µs of a 508 µs gate, and without it the decode command-buffer split is a no-op under TP. |
+| 0b | Confirm `DS4_METAL_FAST_SYNC=1` is in the **`ds4-server`** launch path — **resolved 2026-08-26: nothing to confirm**. There is no `ds4-server` launch path in the repo and no production `ds4-server` deployment on the bench hosts; the knob is bench-only until a server path exists | — | Bench always sets it; production may not. Worth ~186 µs of a 508 µs gate, and without it the decode command-buffer split is a no-op under TP. |
 | **0c** | **M0 — re-baseline decode with the wired limit set** (sweep + cold 131k + `DS4_TP_GATE_PROFILE`) | ~1 h | **Step 0 came back positive: the limit was `0` on both hosts.** Everything measured on 2026-08-26 was on a lazily-paged shard. This re-run decides how much of R10c/R10e/R11 survives and re-sizes T1. Nothing else should run first. |
 | 1 | **M3** — **done 2026-08-26** (`uc_lat2`, byte-verified, n=2000/arm): half-RTT **8.0 µs (4 KB)** / **14.5–15.5 µs p50 (16 KB, single WR)** — both ≪20 µs → **T1 open** (~30 µs/gate ≈ 2.5 ms/token at 131k). Single 16 KB UC WR confirmed working on this stack. One transient first-ping UC drop seen; T1 needs a re-arm/retry path. Recorded in `BENCHMARKS-TP-PP.md`. | — | Decides T1, the largest sized item, before any code is written. ≲20 µs half-RTT → ~2.5 ms/token available; ~45 µs → T1 closes. |
 | 2 | **Env battery: T2 + T3 + T4** at 32k and 131k, `DS4_NGRAM_SPEC` **off** | ~1.5 h | Three knobs, no code, no correctness arm needed beyond top-1 + bounded Δlogit. T3 pre-screens free on the dev box with `tests/bench_indexer_score`. |
@@ -720,6 +720,86 @@ specifically:
   previous point, so the `131072` row measures the 65536→131072 increment and
   its mean attended position is ~3N/4. Use it for A/B against itself; use a
   cold single point for anything cross-machine.
+
+### Rig runbook — per-campaign operations
+
+Operational lessons from R10–R12, M3, and the M0 re-baseline. The prerequisites
+above say *what* must be true; this says *how the campaign actually runs* and
+where it quietly breaks.
+
+**After every reboot of either host, in this order** (all runtime-only, all
+lost on reboot):
+
+1. `./setup-rdma-net.sh` on **both** hosts (`~/Downloads/rdma-tb4/tests`), then
+   `./check-roce-v2-gid.sh` — expect the IPv4-mapped RoCEv2 GID.
+2. `sudo sysctl iogpu.wired_limit_mb=120000` on **both** hosts.
+3. Re-stage campaign artifacts: macOS **`/tmp` is wiped on reboot** — driver
+   scripts, the results tree, prompt copies, everything goes. Keep master
+   copies in the Linux repo or `~/Downloads`; the standard prompt now lives
+   persistently at `~/Downloads/promessi_sposi.txt` on both hosts.
+4. Re-establish ssh: key auth between the two Macs (both directions) and from
+   the Linux box. If a host was rebuilt, re-copy `id_ed25519.pub` into
+   `~/.ssh/authorized_keys` and `ssh-keyscan` the peer. No `sshpass`/`expect`
+   anywhere; `pexpect` works if a one-shot password prompt is unavoidable. The
+   password must never land in a doc, commit, or durable file — `/tmp` askpass
+   helpers are per-session and die with `/tmp`.
+5. Rebuild and **verify the build is current**: `make -j ds4-bench` on both,
+   then confirm with `strings ds4-bench | grep <a new env var from the commit>`
+   plus the binary timestamp. A stale same-name binary is the classic silent
+   wrong-run. Note: rsyncing the tree *without* `.git` leaves the Mac git tags
+   stale — verify the tree (binary strings, `git diff --stat` on the Linux
+   side), not the tag.
+
+**Per-arm driver requirements** (the campaign drivers in `/tmp/*_driver.sh`
+follow this; a new driver must too):
+
+- `cd $REPO` before launching `ds4-bench` — it finds `metal/*.metal` relative
+  to cwd, not the binary.
+- Coordinator first, then worker via ssh; **verify the worker actually
+  started** — count `ps aux | grep -F 'ds4-bench -m' | grep -v grep | grep -v
+  'zsh -c'` on the worker ~5 s after launch — and kill the coordinator if it
+  did not. The coordinator's `waiting for worker` has **no timeout**: a failed
+  worker launch hangs the arm forever. (The `zsh -c` exclusion matters: the
+  ssh wrapper shell self-matches the pattern.)
+- The worker's log redirect targets a directory on **the worker host** —
+  `mkdir -p` it there first *and* verify it (`test -d` over ssh). A missing
+  dir makes the backgrounded worker shell die before exec'ing `ds4-bench`,
+  silently.
+- `--dump-frontier-logits-dir DIR` does **not** mkdir DIR — pre-create it, or
+  the arm aborts into a header-only CSV.
+- Stale-process cleanup before each arm (single-instance guard per host):
+  `pkill -9 -f 'ds4-bench -m'` on both hosts, then verify zero matches.
+- Progress monitoring: watch `--csv` row growth and
+  `sudo powermetrics --samplers gpu_power -i 5000 -n 1` (prefill ~55–60 W,
+  decode ~30 W, idle ~0.1 W). Under `nohup` the log is fully buffered and
+  flushes at exit — an empty log mid-arm is normal, not a hang.
+- End-of-arm: wait for the coordinator process to **exit** (a fixed `sleep` +
+  `pkill` will murder a live sweep — the 131k chunk takes minutes), `pkill`
+  stragglers, copy the CSV into the results tree, and check row count ≥
+  expected (header-only = early abort; log the tail for triage).
+- Driver hygiene: **define bash functions before first use** — a call to an
+  undefined function under `2>/dev/null 2>&1` dies silently as "command not
+  found" (M0 first launch, 2026-08-26: the remote mkdir/launch helpers were
+  called before their definitions, so the worker never started and the
+  coordinator sat in `waiting for worker`). Remote operations must fail loudly
+  (`|| { log; return 1; }`) and be verified (`test -d`, process count); never
+  trust the exit code of a `… && nohup … & echo started` chain, which always
+  exits 0.
+- Timestamps in driver/watch logs are **Mac time**; the Linux box runs ~3 h
+  ahead.
+
+**Known infrastructure failure modes:**
+
+| symptom | cause | action |
+|---|---|---|
+| IPv4-mapped GID at index 2 with a hole at index 1 after a link flap or `--reset`; `check-roce-v2-gid.sh` / `uc_pingpong` / `jaccl` fail RTR errno=1 | the GID table is **not stable across flaps** — a stale invalidated slot is kept and the new entry lands after it | ds4 is immune (it scans the table, `ds4_tp.c:780-790`) — run ds4 as the link check. For probes, find the real index with `ibv_devinfo -d rdma_enX -v` and pass it in; do not flap blindly hoping it compacts |
+| UC ping-pong probe hangs after connect, no WC error on either side | **UC first-packet race**: closing the OOB TCP socket before the first data-plane SEND lets the initiator's first SEND arrive before the responder's recv is armed; UC has no retransmit, so one drop is permanent | keep the OOB socket open and `barrier()` before the first ping (documented in `uc_bench.c`) |
+| UC probe hang ≈ n × per-iteration poll deadline (e.g. 2000 × 500 ms) | a single silently dropped UC WR — UC mode has no retry of any kind | the barrier fix above; for long runs add a spin watchdog and treat ≫p50 as a drop, not a stall |
+| `bad bytes` ≈ 100 % of payload in one direction only | the responder replied with its own never-written send buffer instead of echoing what it received | the responder must `memcpy(send, recv, size)` before replying |
+| `kill -9` does not clear a stuck rank; process sits in `U`/`U+` state | uninterruptible kernel wait (RDMA/IOKit teardown) | reboot the host, then run the post-reboot checklist above; a wedged pair never recovers in-process (`tp->failed` is sticky) |
+| worker GPU `kIOGPUCommandBufferCallbackErrorTimeout` on a one-shot 200k-token cold prefill | 200k in one command buffer is beyond what the worker tolerates (observed once during prompt verification) | keep bench ctx ≤ 131072; a 200k-context run needs chunked prefill first |
+| remote `sed -i` inside an ssh single-quoted string dies with "may not be used with stdin" | the quoting breaks sed's redirection | patch remote C files with a `python3` heredoc, or pull the file local and edit it |
+| a note claiming >4096 B UC SEND fails with EPERM | stale comment in `uc_bench.c`; **false on this stack** — ds4 posts one 16,384 B UC SEND per gate all day, and the `uc_lat2` 16 KB single-WR runs are byte-verified both directions | single 16 KB WR is fine; do not chunk what ds4 sends as one WR |
 
 ### The correctness gate
 
