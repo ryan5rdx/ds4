@@ -182,8 +182,8 @@ two are minutes and one of them can invalidate three completed runs.
 | 0b | Confirm `DS4_METAL_FAST_SYNC=1` is in the **`ds4-server`** launch path — **resolved 2026-08-26: nothing to confirm**. There is no `ds4-server` launch path in the repo and no production `ds4-server` deployment on the bench hosts; the knob is bench-only until a server path exists | — | Bench always sets it; production may not. Worth ~186 µs of a 508 µs gate, and without it the decode command-buffer split is a no-op under TP. |
 | **0c** | ~~M0 — re-baseline on a pinned shard~~ — **done 2026-08-26. Decode survives within 1%; the gate exchange halved at 131k (49.7 → 24.8 µs); prefill moved +6–25% but the cause is confounded. T1 re-sizes down to ~+2%.** | — | **Step 0 came back positive: the limit was `0` on both hosts.** Everything measured on 2026-08-26 was on a lazily-paged shard. This re-run decides how much of R10c/R10e/R11 survives and re-sizes T1. Nothing else should run first. |
 | 1 | **M3** — **done 2026-08-26** (`uc_lat2`, byte-verified, n=2000/arm): half-RTT **8.0 µs (4 KB)** / **14.5–15.5 µs p50 (16 KB, single WR)** — both ≪20 µs → **T1 open** (~30 µs/gate ≈ 2.5 ms/token at 131k). Single 16 KB UC WR confirmed working on this stack. One transient first-ping UC drop seen; T1 needs a re-arm/retry path. Recorded in `BENCHMARKS-TP-PP.md`. | — | Decides T1, the largest sized item, before any code is written. ≲20 µs half-RTT → ~2.5 ms/token available; ~45 µs → T1 closes. |
-| 2 | **Env battery: T2 + T3 + T4** at 32k and 131k, `DS4_NGRAM_SPEC` **off** | ~1.5 h | Three knobs, no code, no correctness arm needed beyond top-1 + bounded Δlogit. T3 pre-screens free on the dev box with `tests/bench_indexer_score`. |
-| 3 | **T8 pricing** — `tests/bench_moe_mxfp4_decode 256` with the five disable envs, **on the rig** | 30 min | Prices four layers of MoE specialisation before writing the port. Model-free harness. |
+| 2 | ~~Env battery T2 + T3 + T4~~ — **done 2026-08-26. T2 +0.9% @131k and monotonic to the top of the tested range (not peaked); T3 mixed; T4 default already optimal.** Follow-up: sweep T2 at 28/31. | — | One small real win, two nulls. |
+| 3 | ~~T8 pricing~~ — **done 2026-08-26. The specialisation ladder is worth nothing to −5%; the generic path is faster. T8 is dead.** The routed MoE matvec is bandwidth-bound at ~400 GB/s. | — | 30 minutes of pricing saved five kernel patches for a negative. |
 | 4 | **M2** — ablation battery at 32k and 131k, incl. the never-run indexer ablations | ~2 h | The 11.1 ms/token of unattributed long-context decode growth — the largest unknown in the document. |
 | 5 | **R12a** split-schedule sweep + **R12b** reduced ballast arm + the encoder-boundary instrument | ~1.5 h | R12b is now a confirmation, not a discovery; the encoder-boundary half is the genuinely unmeasured one. |
 | 6 | **R13 n-gram rig arms** (inertness / correctness / decode A/B on repetitive vs novel text) | ~1 h | Independent of the above; run whenever convenient. |
@@ -430,6 +430,63 @@ count: closed by R11. Dispatch: bounded at ~6% by
 **compute**, which points the queue at the things that make compute cheaper —
 the T2/T3/T4 env battery, T8's MoE specialisations, T9 — and at **M2**, which
 is the only item that can say where the 11.1 ms of long-context growth goes.
+
+### Env battery + T8 pricing — **DONE 2026-08-26**
+
+Full tables in `BENCHMARKS-TP-PP.md`. Four results, one of which closes a
+workstream and one of which narrows M2 substantially.
+
+**T8 — dead, and the pricing step is why we know cheaply.** The five MXFP4
+routed-MoE decode specialisations are worth **nothing to −5%**: the
+fully-generic arm runs 0.1988 ms/iter against the full ladder's 0.2092
+(~403 vs ~383 GB/s), non-overlapping across three runs each. The audit ranked
+T8 as the largest byte-mover with unknown upside and promoted it to step 3 on
+the strength of a two-line-per-kernel fix. Thirty minutes of pricing saved
+writing five kernel patches for a regression. **This is the model for every
+future "cheap kernel patch, unknown upside" item.**
+
+**And the reason it is dead narrows M2.** The routed MoE matvec is
+**bandwidth-bound at ~400 GB/s** — roughly half of the M2 Ultra's 800 and good
+for a GEMV. Specialisation cannot buy what is not there. Since routed MoE is
+~1.7 GB/token/node of the ~3.3 GB total, that is ~4.3 ms of a 35.5 ms token,
+**near its ceiling and therefore not where the deficit lives.** ~31 ms of the
+token is something else, and M2's unattributed 11.1 ms is inside it.
+
+One caveat on how far to carry that: the harness is world-1, no gates, tight
+loop, so ~400 GB/s is an *isolated-kernel* ceiling. It shows the kernel is
+near-optimal; whether the *stage* achieves it in production is what
+`DS4_TP_ABLATE=moe` in M2 would show. (Note the R13b caveat inverts here —
+the harness's world-1 arm measures the generic path, which is what production
+actually runs, so for once the isolated number is the relevant one.)
+
+**T2 — the one real win, and it is not finished.** Decode split-K is
+**monotonic from 12 → 24**: +0.9% @131k, +1.3% @32k, across six arms. The
+default (12) is not optimal. Monotonicity across the whole range is the
+evidence here, not any single delta.
+
+Note the occupancy story does not explain it. Under TP each rank has 32 heads
+in groups of 8 = 4 groups, so `splits=15` already gives 60 threadgroups on 60
+cores; gains continuing to `splits=24` (96 threadgroups) means we want
+**oversubscription for latency hiding**, not exact fill. **Follow-up: sweep 28
+and 31** (the code allows 2..31). If it is still climbing, the default should
+move and the comment at `ds4_metal.m:29988` — which reasons from exact fill —
+needs rewriting.
+
+**T3 — mixed, close it.** LLT `nsg4` helps 32k steady (+1.4%) and hurts
+65k/131k (−1.7%/−0.6%), with first-token latency spiking to 189 ms @32k versus
+31 ms for the control. Not a win at the contexts we care about.
+
+**T4 — already optimal, monotonically.** `DS4_METAL_Q8_MV_NSG`'s TP-specific
+default of 2 is the best value: n=1 −0.9%, n=3 −1.6%, n=4 −3.0%, n=6 −4.1%.
+The `parallel_full_ffn` confound was isolated properly (t4_2 with the env set
+vs control: −0.1%).
+
+**Scoreboard.** Every *knob* has now returned null or ≤1% (NWG, Q8_MV_NSG, MoE
+specialisations, sub-gate, LLT nsg4), and every *structural* change has
+returned negative (gate count via R11, replication). The two survivors are T2
+at ~+1% and T1 at ~+2%. That is a strong signal that the remaining decode
+headroom is not in the knobs, and it makes **M2 — attributing the 11.1 ms —
+the only item left with real upside.**
 
 ### R14 — ranked decode targets from the audit
 
