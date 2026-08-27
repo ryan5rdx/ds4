@@ -144,6 +144,7 @@ typedef struct {
     uint32_t max_inline;
     ds4_tp_rdma_info peer;
     uint32_t send_outstanding;  /* signaled sends not yet reaped */
+    uint32_t send_since_signal; /* unsignaled sends since the last reaped one */
     uint64_t recv_done;         /* highest gate seq whose recv completed */
     uint64_t last_gate_seq;     /* last real decode receive consumed */
     bool recv_window_active;    /* decode recvs are queued ahead */
@@ -1006,6 +1007,47 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
     return 1;
 }
 
+/* T1: two latency changes to the decode gate critical path, together behind
+ * one flag.  Default off.
+ *
+ * M3 measured hardware half-RTT at 14.5-15.5 us for the gate's 16 KB payload
+ * against ds4's observed 29.9-49.7 us exchange, so most of the gate is
+ * software, not fabric.  86 gates/token makes that 1.3-3.0 ms/token at 131k
+ * (the range is wide because M0 has not yet said which of the two observed
+ * wire numbers was taken on a correctly-pinned shard).
+ *
+ * (a) Arm the next receive BEFORE waiting instead of after.  The slot posted
+ *     is DS4_TP_RDMA_RECV_WINDOW seqs ahead, so it is neither the slot this
+ *     gate consumes nor one already posted; posting a receive earlier is
+ *     never unsafe.  It removes one verb call from between "peer data
+ *     arrived" and "GPU unblocked".  Costs at most one extra seq in flight:
+ *     17 x 2 chunks = 34 WRs against max_recv_wr = 64.
+ *
+ * (b) Stop signalling every send.  Every gate currently posts with
+ *     IBV_SEND_SIGNALED, so tp_rdma_drain_cq() must chew a send CQE before
+ *     reaching the recv CQE it is actually waiting for.  Completions are
+ *     ordered per QP, so signalling every Nth reclaims N send-queue slots at
+ *     once; at N = 16 and <=2 WRs per gate that is <=32 unsignaled WRs
+ *     against max_send_wr = 256.  Nothing reads send_outstanding (it is a
+ *     diagnostic counter, only ever incremented and decremented), but keep it
+ *     accurate anyway.
+ *
+ * The one thing (b) gives up is per-send completion-time error detection.
+ * ibv_post_send still reports synchronous failures, and UC on this stack is
+ * treated as lossless (see the M3 note in the test plan), so the residual
+ * exposure is a completion-time error on an unsignaled WR -- which the next
+ * signalled completion or the gate timeout still surfaces, just later. */
+#define DS4_TP_GATE_SIGNAL_EVERY 16u
+
+static int tp_gate_fastpath(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_TP_GATE_FASTPATH");
+        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 /* One decode gate: ensure the receive window is armed, send our partial,
  * wait for the peer's receive completion, and advance the window. */
 static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
@@ -1024,6 +1066,7 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         (uintptr_t)(tp->slab + tp->out_off + (uint64_t)slot * tp->vec_bytes);
     pthread_mutex_lock(&r->post_lock);
     int ok = 1;
+    const int fast = tp_gate_fastpath();
     if (!r->recv_window_active) {
         for (uint64_t s = seq; ok && s < seq + DS4_TP_RDMA_RECV_WINDOW; s++)
             ok = tp_rdma_post_gate_recv(tp, s);
@@ -1042,16 +1085,25 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         wr.sg_list = &sge;
         wr.num_sge = 1;
         wr.opcode = IBV_WR_SEND;
-        wr.send_flags = IBV_SEND_SIGNALED;
+        const int signal_send =
+            !fast || ++r->send_since_signal >= DS4_TP_GATE_SIGNAL_EVERY;
+        wr.send_flags = signal_send ? IBV_SEND_SIGNALED : 0;
         ok = ibv_post_send(r->qp, &wr, &bad) == 0;
         if (!ok) {
             fprintf(stderr, "ds4-tp: rdma post_send: %s\n", strerror(errno));
-        } else {
+        } else if (signal_send) {
+            r->send_since_signal = 0;
             r->send_outstanding++;
         }
         off += len;
     }
 
+    /* T1a: arm the next receive here, before the wait, rather than after it. */
+    int rearmed = 0;
+    if (fast && ok) {
+        ok = tp_rdma_post_gate_recv(tp, seq + DS4_TP_RDMA_RECV_WINDOW);
+        rearmed = 1;
+    }
     double deadline = 0.0;
     uint32_t peer_poll = 0;
     while (ok && r->recv_done < seq) {
@@ -1067,7 +1119,7 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
             ok = 0;
         }
     }
-    if (ok) ok = tp_rdma_post_gate_recv(tp, seq + DS4_TP_RDMA_RECV_WINDOW);
+    if (ok && !rearmed) ok = tp_rdma_post_gate_recv(tp, seq + DS4_TP_RDMA_RECV_WINDOW);
     if (ok) r->last_gate_seq = seq;
     pthread_mutex_unlock(&r->post_lock);
     return ok;
