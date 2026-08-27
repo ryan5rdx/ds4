@@ -1,18 +1,16 @@
 # Inventory: DECODE per-token cost budget
 
-STATUS: IN PROGRESS (skeleton created 2026-08-27, being filled)
+Status: IN PROGRESS (skeleton created; sections filled as extraction proceeds)
 
-Assignment: decode-budget. Sources: docs/TP-A0-ROWSPLIT-TEST-PLAN.md,
-BENCHMARKS-TP-PP.md, speed-bench/tp_decode_investigation.md,
-speed-bench/tp_mtp_hunt.md, docs/SCOPE-*.md.
-
-## 1. Rigs, builds, instruments
-## 2. Byte model per token per rank
-## 3. Reconciled per-stage budget by context length
-## 4. Superseded figures
-## 5. Ablation batteries
-## 6. Isolated kernel rates
-## 7. Dispatch accounting
-## 8. Achieved vs isolated
-## 9. Contamination flags
-## 10. Gaps
+## Sections
+1. Provenance key (rigs, builds, instruments)
+2. Reconciled per-stage budget by context length (2k / 32k / 65k / 131k / ctx-512)
+3. Superseded figures and what replaced them
+4. Ablation batteries (raw)
+5. Stage profiles (raw)
+6. Isolated kernel rates
+7. Bytes/token per rank and derivation
+8. Achieved GB/s and GFLOP/s per stage
+9. Dispatch counts per token/stage
+10. Contamination flags
+11. Gaps

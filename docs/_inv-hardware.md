@@ -1,18 +1,24 @@
-# Inventory: Hardware & Configuration Reference
+# Inventory: Hardware and Configuration Reference
 
-Extraction for the consolidated DS4 reference. Every number carries provenance.
-Source abbreviations:
+STATUS: DRAFT 1 (2026-08-27) — sources mined so far: `speed-bench/tp_decode_investigation.md`,
+`BENCHMARKS-TP-PP.md`. Remaining: `docs/TP-A0-ROWSPLIT-TEST-PLAN.md`, `speed-bench/tp_mtp_hunt.md`,
+`docs/TP-PREFILL-LONG-CTX-INVESTIGATION.md`, the four SCOPE docs.
 
-| tag | file |
-|---|---|
-| **A0** | `docs/TP-A0-ROWSPLIT-TEST-PLAN.md` |
-| **BM** | `BENCHMARKS-TP-PP.md` |
-| **TDI** | `speed-bench/tp_decode_investigation.md` |
-| **MTP** | `speed-bench/tp_mtp_hunt.md` |
-| **PRE** | `docs/TP-PREFILL-LONG-CTX-INVESTIGATION.md` |
-| **S-HC** | `docs/SCOPE-HC-STAGES.md` |
-| **S-ARS** | `docs/SCOPE-ATTNOUT-ROUTER-SHARED.md` |
-| **S-GATE** | `docs/SCOPE-TP-GATE-OVERLAP.md` |
-| **S-MOE** | `docs/SCOPE-MOE-ATTN.md` |
+## 1. Rig topology and hosts
 
-STATUS: in progress
+| Host | Role | TB IP | iface | RDMA dev | Machine |
+|---|---|---|---|---|---|
+| `moiraine@lanfear.local` | coordinator / leader | 192.168.0.6 | `en6` | `rdma_en6` | M2 Ultra 60-core GPU, 128 GB |
+| `moiraine@mat.local` | worker | 192.168.0.5 | `en7` | `rdma_en7` | M2 Ultra 60-core GPU, 128 GB |
+
+Source: `BENCHMARKS-TP-PP.md:39-54`; `speed-bench/tp_decode_investigation.md:3-4`.
+
+## 2. RDMA link setup, latency, bandwidth
+## 3. GPU wired limit prerequisite
+## 4. Measured roofs
+## 5. Model shape constants
+## 6. Per-rank memory footprint
+## 7. Reboot / setup procedure
+## 8. TP gate mechanics
+## 9. Superseded figures and corrections
+## 10. Contamination flags

@@ -1253,7 +1253,7 @@ queue and stop proposing command-buffer or dispatch-count reductions.**
 flash-attn shape fields, the ballast arm, `powermetrics`, and the
 compressor-accounting arm.
 
-### Next run — iteration 3, rebuilt after the 50 t/s fan-out — 2026-08-27
+### Next run — iteration 4 — 2026-08-27
 
 **Read `docs/PATH-TO-50TPS.md` first.** Its verdict is that 50 t/s is **not
 reachable** with anything identified — believed 43–45, with 46–48 contingent on
@@ -1262,14 +1262,28 @@ one unsized item. Discounted budget across seven surviving candidates is
 model is **5.93 GB/rank/token, not 4.29**, so the floor is **13.2 ms and decode
 is 1.85× off it, not 2.6×**.
 
-**Rebuild first** — the last run was `6b962db`, which carried the C2 defect.
+**Rebuild first — the build must carry `d50bbaa` or later.** Arm B's tick
+calibration landed there, and without it that arm reports unusable numbers.
 
-#### Rig — seven arms, all zero-code, one session
+**What iteration 3 settled, so it is not re-run:** the TP crash fix holds
+(arm A, PASS against the exact one-token-chunk trigger); the baseline is
+restored and both hand-corrections landed within 5–8% (`attn_out_proj` 2.867,
+straggler 0.545); and R12a is a flat null across six split schedules inside
+0.9%, which — with the ballast and the `kv_n` sweep — is the third independent
+refutation of the round-trip framing. **Command-buffer and dispatch-count
+reduction should not be proposed again.**
+
+#### Rig — **five arms left**, all zero-code, one session
+
+Of the original seven: **A passed and is closed**, **G is a flat null and the
+avenue is dead**, and **B must be re-run** — it ran, but on a build predating
+the tick calibration, so its numbers cannot be used. Build must carry
+`d50bbaa` or later.
 
 | # | arm | decides | outcome |
 |---|---|---|---|
 | **A** | **Validate the TP crash fix.** Prefill **4095 tokens**, checkpoint, continue. Watch the worker for "not covered by mapped model views". | Gates a shipped fix (`69a3b86`). Single-box variant in `docs/BUG-TP-WORKER-MODEL-VIEW-2026-08-27.md`. | **PASS 2026-08-27** (build `06c2c6b`). Prefill 4095 fresh, resume 4095→4099 (`--step-incr 4`, first chunk = 1 token, `to_boundary=1`): **zero** "not covered" / "resumed prefill failed" / GPU-timeout lines. Fix holds. |
-| **B** | **`DS4_METAL_GPU_ENCODER_TIMESTAMPS=1`** at 2k and 131k | **The one that matters.** Re-baselines the whole budget at **1–3% distortion instead of 18%**, in ~172 labelled spans instead of 14. **Gate: if it disagrees with the hand-corrected table by >0.3 ms on any stage, believe this one and re-rank before writing code.** | **DONE 2026-08-27** (build `fba4ef0`). Instrument works: 175 encoders/token @2k, 174 @131k; throughput at baseline (42.08 / 29.71 t/s → ~1-3% distortion confirmed). Labeled `reduce` span 313 µs/call @2k (41/token), 339 µs/call @131k (20/token). Caveat flagged: the per-report GPU-time sum (~44 ms @2k, ~64-69 @131k) exceeds the wall clock — timestamp-unit/overlap note for the fan-out. See `BENCHMARKS-TP-PP.md` §Arm B. |
+| **B** | **`DS4_METAL_GPU_ENCODER_TIMESTAMPS=1`** at 2k and 131k. **Build ≥ `d50bbaa`.** | **Still the one that matters.** Re-baselines the budget at 1–3% distortion instead of 18%, in ~175 spans instead of 14. **Gate: where it disagrees with the hand-corrected table by >0.3 ms on any stage, believe it and re-rank before writing code.** | **RAN, NUMBERS VOID — re-run.** Build `fba4ef0`. The instrument itself is fine: 175 encoders/token, throughput at baseline (42.08 / 29.71 t/s), so the distortion claim holds. But the spans over-report — ~44 ms summed against a 23.8 ms token, `reduce` at 313 µs × 41 against `attn_inv_rope`'s 3.64 ms. Cause: I read the counter as nanoseconds when it is a GPU **tick**; that happens to be exactly 1.000 ns on the M1 Max but evidently not on M2 Ultra. `d50bbaa` calibrates against the command buffer's own clock and now prints coverage %, an `OVERLAPPING` marker, and the **inferred ns/tick** — which distinguishes a unit error (tick ≈ 0.54) from real span overlap (tick ≈ 1.0, coverage > 100%). |
 | **C** | **`DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1`** at 2k — **read only the shape fields** | `n_keys` and `n_comp` per layer, the missing input to sizing the `attn_inv_rope` item. Its *timings* are still host round trips; ignore them. | **Not yet run** (timings-only flash split already run in iter 2, shape fields still outstanding). |
 | **D** | **`DS4_METAL_DISPATCH_BALLAST` ∈ {0,2}** at 2k | The dispatch price **in the live graph**. Settles an 11.6× spread that four candidates live or die on — and my retracted 22 µs claim came from getting this wrong in isolation. | **Not yet run.** Queued. |
 | **E** | **`powermetrics --samplers gpu_power`** during decode vs `tests/bench_membw` | Retires the "30 W / 20% utilised" premise either way. The fan-out believes it dissolves. | **Not yet run.** Queued. |
