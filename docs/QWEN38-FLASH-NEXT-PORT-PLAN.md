@@ -124,11 +124,23 @@ The `qwen4exp.*` namespace maps cleanly onto `ds4_shape`:
 
 **`qwen4exp.attention.compress_ratios = [0,0,0,4, 0,0,0,4, …]`** — the GGUF
 uses **ds4's own per-layer convention**, with `4` on the QSA layers
-(`idx % 4 == 3`) and `0` on the GDN layers. `g_ds4_compress_ratios[]` can read
-it directly; what changes is only the *interpretation* of `ratio == 0`, which
-means "SWA-only" for DeepSeek and "GDN layer" for Qwen. That is a
-family-dependent reinterpretation of an existing array rather than the parallel
-layer-kind enum the audit assumed we would need.
+(`idx % 4 == 3`) and `0` on the GDN layers. `g_ds4_compress_ratios[]` holds it
+directly; what changes is the *interpretation* of `ratio == 0`, which means
+"SWA-only" for DeepSeek and "GDN layer" for Qwen. That is a family-dependent
+reinterpretation of an existing array rather than the parallel layer-kind enum
+the audit assumed we would need.
+
+**Two corrections to that optimism, both from the design review.** First, the
+accessor does not yet expose the array: `ds4_layer_compress_ratio()`
+hard-returns `0` for any family other than DeepSeek4 (`ds4.c:1114`), so under a
+`qwen4exp` family *every* layer reads as ratio 0 until that gate is widened.
+The array is right; the reader is family-locked. Second, the reinterpretation
+is far more invasive than "an existing array": `ratio == 0` / `!= 0` appears
+**54 times in `ds4.c`**, not the seven the kernel design lists, and under
+Qwen's convention each one inverts meaning on the 36 layers carrying the most
+state. Most are `continue`/`return true` guards that fail silently. This is the
+single largest correctness surface in the port and §7's line estimate does not
+carry it.
 
 **The whole n-gram hash specification is in the metadata as first-class keys** —
 `ple.layer_multipliers` `[23703573157769, 20109073645365, 8052911324071]`,
