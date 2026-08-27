@@ -605,11 +605,16 @@ Three things follow.
    inflating it across 36 additional layers. This is now the single most
    important constraint on the kernel design, and `docs/QWEN38-GDN-KERNEL-DESIGN.md`
    §3 should be judged primarily on it.
-3. **The floor is worth more than the port.** ~13 ms/token on the model we
-   already run, versus ~7 ms/token of long-context gain from a ~62,000-line
-   port. Whatever the floor turns out to be, attacking it is the better trade —
-   and it is unmeasured. R12b's reduced-ballast arm and the encoder-boundary
-   instrument are the queued items that probe it.
+3. **The floor may be worth more than the port — but that is not yet
+   established.** ~13 ms/token sits on the model we already run, against
+   ~7 ms/token of long-context gain from a ~62,000-line port. The caution is
+   that the 13 ms is *unattributed*, not *recoverable*: M2 skipped `router`,
+   `shared` and `kv` because they do not ablate cleanly, so the residual
+   contains the shared expert, the router and the KV store — real work that no
+   amount of stall-hunting removes. The recoverable fraction is unknown. A
+   single `DS4_METAL_DECODE_STAGE_PROFILE` run at 32k/131k bounds those three
+   directly and is ~20 minutes; **it should precede any Qwen implementation
+   work**, because it prices both sides of this trade at once.
 
 **The open question that decides how the table above reads:** whether the floor
 is per-layer or per-token. Per-layer cost scales with `n_layer` and Qwen is
