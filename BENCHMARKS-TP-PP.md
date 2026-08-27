@@ -243,6 +243,45 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### U15 — stage profile at 2k (first ever) + HC arms — 2026-08-27
+
+`DS4_METAL_GPU_STAGE_TIMESTAMPS=1` on the rig (build `c13e3bb`), gen 128,
+ctx 2048. Per-token stage gpu_ms. First 2k profile ever run.
+
+| stage | 2k ms/token | 32k (ref) |
+|---|---|---|
+| routed_moe_folded | 4.901 | 4.990 |
+| attn_inv_rope | 3.806 | 3.393 |
+| attn_output | 3.731 | 3.746 |
+| q_a_kv_proj | 2.150 | 2.137 |
+| ffn_hc_post | 1.921 | 1.812 |
+| q_path | 1.875 | 1.862 |
+| q_lora_norm | 1.684 | 1.680 |
+| attn_hc_pre | 1.135 | 1.142 |
+| ffn_hc_pre | 1.109 | 1.119 |
+| router | 1.101 | 1.112 |
+| shared_gate_up | 0.974 | 0.985 |
+| shared_down | 0.665 | 0.660 |
+| attn_hc_post | 0.471 | 0.467 |
+| compressor_indexer | 0.201 | 4.957 |
+| **total gpu_busy** | **28.613** | 32.70 |
+
+**Context-invariance confirmed at 2k.** Every stage matches its 32k value
+within noise except `compressor_indexer` (0.201 ms @2k vs 4.957 @32k) — the
+long-context term collapses exactly as the model predicts. The short-context
+token is dominated by context-invariant stages.
+
+**HC arm — `DS4_TP_ABLATE=hcpre`:** attn_hc_pre 1.135→0.645, ffn_hc_pre
+1.109→0.627 (−~0.48 each), total 28.61→27.86 (**−0.76 ms**). The ablation
+removes only 0.76 ms despite the profile attributing 2.24 ms to the hc_pre
+stages — **the ~2.7× profile-vs-ablation disagreement reproduces at 2k** (the
+plan's flagged open item).
+
+**HC arm — `DS4_METAL_DISABLE_PRE_M5_HC_PRODUCER_PRE_NORM_FUSE=1`:** attn_hc_pre
+1.135→1.416, ffn_hc_pre 1.109→1.398 (+~0.28 each), total 28.61→29.20
+(**+0.58 ms — the fusion is a net win**, not a free flip; the three `seq_cst`
+fences cost less than the dispatch they remove).
+
 ### U12b — q_path split + inverse-RoPE isolation — 26.8% explained — 2026-08-27
 
 `DS4_METAL_GPU_STAGE_TIMESTAMPS=1` stage-profile on the rig (build

@@ -1878,7 +1878,16 @@ the fixed pool realistically holds, so that additionally requires attacking
 removing shared fixed cost slightly *worsens* the 2k→131k ratio even as both
 improve.
 
-### U15 — stage-profile at 2k — **we have never run one**
+### U15 — stage-profile at 2k — **DONE 2026-08-27: context-invariance confirmed, HC arms resolved**
+
+**Outcome.** First 2k profile (build `c13e3bb`): every stage matches its 32k
+value within noise except `compressor_indexer` (0.201 ms @2k vs 4.957 @32k)
+— the long-context term collapses exactly as predicted. Short-context token
+(28.61 ms gpu_busy) is dominated by context-invariant stages.
+`DS4_TP_ABLATE=hcpre` removes only 0.76 ms despite the profile attributing
+2.24 ms to hc_pre — the ~2.7× disagreement reproduces at 2k.
+`DS4_METAL_DISABLE_PRE_M5_HC_PRODUCER_PRE_NORM_FUSE=1` costs **+0.58 ms** —
+the fusion is a net win, not a free flip. See `BENCHMARKS-TP-PP.md` §U15.
 
 Everything above is inferred from 32k/131k invariance. Sound, but indirect, and
 the two largest unexamined blocks deserve a direct measurement at the context
