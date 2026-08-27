@@ -1183,6 +1183,90 @@ somewhere else. M2 already said where: **`indexer topk` was 5.32 ms against
 **Still confirm on the rig with a freshly built binary** — this is inference
 from a dev-box A/B, not a measurement.
 
+#### U7c — the rig number lands: 1565 GFLOP/s, and it scales at 72%, not 100%
+
+Rig, fresh build, `n_comp=32768`, LLT path: **1565 GFLOP/s** against the M1
+Max's 1075.9.
+
+**Scaling is real but sub-linear, and my ~2100 estimate was 39% high.**
+
+| | M1 Max (32c @1.296) | M2 Ultra (60c @1.398) |
+|---|---|---|
+| measured | 1075.9 | **1565** |
+| ratio | — | **1.45×** |
+| ideal (cores × clock) | — | 2.02× |
+| **scaling efficiency** | — | **72%** |
+| FP32 peak | 10.6 TFLOP/s | 21.5 TFLOP/s |
+| **achieved** | **10.1%** | **7.3%** |
+
+So the non-scaling worry is dead (U7b was right that far) but **the bigger part
+is the *less* efficient one** — 7.3% of ALU peak against 10.1%. Something costs
+more on the Ultra, and the obvious candidate is memory latency: with
+threadgroup memory allowing **exactly one threadgroup resident per core**
+(U7's ladder), there is almost nothing to hide latency with, and the Ultra has
+more latency to hide. That is consistent with the NSG sweep, with T2's
+turnover, and with the constraint recalled from the earlier investigation.
+
+**A calibration worth keeping: the harness over-predicts this kernel by ~1.9×.**
+At 1565 GFLOP/s the scoring half works out to 0.343 ms/layer × 21 = **7.20 ms**,
+but M2's in-situ ablation attributed **3.84 ms** to `indexer score`. Ratio
+**1.88×**. That is the harness's documented failure mode — *"run the kernel
+alone and every stall becomes wall time; run it inside the graph and other work
+hides them"* — now quantified for this kernel. **Divide standalone indexer
+numbers by ~1.9 before projecting engine impact**, alongside the ~0.63
+standalone-to-rig factor already in this document. Note the in-situ numbers are
+the trustworthy ones, and they still put top-k (5.32 ms) above scoring (3.84).
+
+#### U10 — drop the `sk` staging buffer: 1 → 7 threadgroups resident per core
+
+This is where U7c points, and it is the strongest structural lever found so far.
+
+At NSG=8 the 20,512 B of threadgroup memory breaks down as:
+
+| buffer | bytes | purpose |
+|---|---|---|
+| `sk[64*128]half` | **16,384** | **F32 keys converted to half** |
+| `sq[8*128]half` | 2,048 | query tile |
+| `sqk[512]f32` | 2,048 | partial scores |
+| `sw[8]f32` | 32 | head weights |
+
+**`sk` is 80% of the budget and exists only because the cache is F32.** The
+index compressed cache is allocated `n * DS4_N_INDEXER_HEAD_DIM * sizeof(float)`
+(`ds4.c:17373`), so every key is converted F32→half on the way in. **Store it
+F16 and the kernel can `simdgroup_load` keys straight from device memory:
+threadgroup memory drops to 4,128 B and residency goes from 1 to 7 threadgroups
+per core — at unchanged NK.**
+
+That is the occupancy the kernel has never had, and U7c says occupancy is
+exactly what the Ultra is short of. It also removes a per-key format conversion
+and halves the cache's 352 MB/token of reads, though on the evidence neither of
+those is the main prize.
+
+**This is T9/U3 for the fourth time, and the first time with a mechanism worth
+the work.** Proposed for bandwidth, killed for bandwidth (correctly — the
+kernel is at 32 FLOP/byte), then revived for conversion cost, then for larger
+NK. The real argument is none of those: **it buys 7× residency.**
+
+**Risks to price, honestly.**
+- `simdgroup_load` from device memory may be slower per access than from
+  threadgroup memory, and staging exists partly to make the 8×8 matrix steps
+  cheap. **The win is occupancy; the cost is per-access. Measure, do not
+  assume.** A cheap intermediate exists: keep `sk` but halve it by staging 32
+  keys instead of 64 — 8,192 B, 3 resident — which separates "residency helps"
+  from "device-memory loads hurt" without an F16 cache conversion.
+- Apple8 has **no matrix unit** — `simdgroup_matrix` lowers to FP32 ALUs
+  (`speed-bench/tp_decode_investigation.md:178`) — so there is no hardware
+  matmul path being given up here, which makes the device-memory variant less
+  risky than it would be on a part with real tensor hardware.
+- F16 keys change score values. The scores feed a **ranking**, and U2
+  established the existing kernel already disagrees with a CPU reference at
+  7.6e-3 from reduction association. Gate on selected-index-set equality
+  against the F32 path, not on score equality.
+
+**Order the experiment cheapest-first:** halve `sk` to 32 keys (no format
+change, isolates the occupancy question) → if residency helps, do the F16 cache
+and drop `sk` entirely.
+
 #### U9 — decode sorts 32,768 scores to take 512 — **the largest untouched item**
 
 **What decode actually does.** `ds4_gpu_indexer_topk_tensor` has a purpose-built
