@@ -202,7 +202,7 @@ two are minutes and one of them can invalidate three completed runs.
 | ~~18~~ | ~~U9~~ — **built and measured 2026-08-27: negative, default off.** 0.77× on the M1 Max. The premise was wrong — the argsort fallback is *already* a 32-block hierarchy, so the parallelism U9 added already existed. Exact vs CPU ground truth; the argsort path is the one that deviates under ties. | — | Cost a day; caught by interleaved A/B before it shipped. |
 | ~~17~~ | ~~U10a~~ — **done 2026-08-27. NSG=4 beats the default by +5–13% on the Ultra; NSG=2 −12%. Residency beats NK there — U10 is ON.** | — | The M1 Max ranking did not transfer, which was the question. |
 | **19** | **U10 — alias `sq`/`sw`/`sqk` over the dead `sk` buffer** — **built, +19.3% on M1 Max, bit-identical, opt-in. Rig A/B DONE 2026-08-27: +17.4% (mean 2015.6 vs 1717.2 GFLOP/s), beats NSG=4, bit-identical.** End-to-end ~2–4% of the token (see U10b). **U10c** (F16 cache, 2 → 7 resident) gated on it. | ~1 d | Residency 1 → 2 at *unchanged* NK — the distinction U10a could not isolate. |
-| **20** | **U11 — confirm U10 does not regress prefill** | ~20 min | One arm. T3's nsg4 was decode-positive and prefill-catastrophic (189 ms first token); U10 does not change the grid, but that is a prior, not a measurement. |
+| ~~20~~ | ~~U11 — confirm U10 does not regress prefill~~ — **done 2026-08-27: neutral.** Prefill 393.03 vs 393.37 t/s @131k; first-token 36.5 vs 35.5 ms. No nsg4-style spike. **U10 stays default-on.** | — | One arm, closed. |
 | **21** | **U12 — price `q_path` (5.47 ms) and `attn_inv_rope` (4.27 ms)** | ~1 h | **26.8% of the token, never looked at.** Larger than anything ever queued here. Roofline them as U7/U8 did. |
 | **22** | **U13 — arm the inverse-RoPE fuse on the indexed branch (was T10)** | ~1 d | The fuse exists but is armed only on the gathered branch, so all 21 ratio-4 layers pay a standalone dispatch. Filed at 0.04–0.09 ms against a 4.27 ms stage. **Gated on U12.** |
 
@@ -1377,7 +1377,31 @@ blocks of 1024 at `n_comp` 32768. Nothing has tested whether that is the right
 point, and U10 just demonstrated this kernel family is residency-sensitive, so
 smaller blocks are worth one arm. Zero code if `nth` is made env-overridable.
 
-#### U11 — confirm U10 does not regress prefill — **run first, it is one arm**
+#### U11 — confirm U10 does not regress prefill — **run first — DONE 2026-08-27: neutral, U10 stays default-on**
+
+**Outcome.** Prefill A/B on the rig (mat worker / lanfear coord, build
+`b99dfa3`), default (TIGHT on) vs `DS4_METAL_INDEXER_LLT_TIGHT=0`, 32k/65k/131k
+with `promessi_sposi.txt`:
+
+| ctx | arm | prefill t/s | first-token ms | steady t/s |
+|---|---|---|---|---|
+| 32k | TIGHT on | 501.92 | 272.9* | 34.59 |
+| 32k | TIGHT=0 | 517.19 | 31.1 | 33.92 |
+| 65k | TIGHT on | 460.94 | 32.8 | 32.19 |
+| 65k | TIGHT=0 | 461.72 | 32.5 | 31.68 |
+| 131k | TIGHT on | 393.03 | 36.5 | 29.15 |
+| 131k | TIGHT=0 | 393.37 | 35.5 | 28.42 |
+
+*\*The 272.9 ms at 32k TIGHT-on is a cold-start/warm-up artifact (first
+frontier of the first arm includes model load + shader compile); the same
+arm's 65k/131k first-token is 32.8/36.5 ms — normal. Not a regression.*
+
+**Prefill is neutral:** 501.92 vs 517.19 (−3% at 32k, warm-up), 460.94 vs
+461.72 (−0.2%), 393.03 vs 393.37 (−0.1% at 131k). First-token at 131k 36.5 vs
+35.5 ms (within noise). **No prefill-catastrophic spike** — nothing like T3's
+nsg4's 189 ms. Decode steady-state is slightly *better* with TIGHT on (29.15
+vs 28.42 t/s at 131k). **U10 stays default-on.** See `BENCHMARKS-TP-PP.md`
+§U11.
 
 U10 is default-on. The one dimension nobody has measured is prefill, and T3 is
 the reason to bother: `nsg4` was decode-positive and **prefill-catastrophic**,

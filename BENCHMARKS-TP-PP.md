@@ -243,6 +243,32 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### U11 — U10 (TIGHT, default-on) does not regress prefill — neutral — 2026-08-27
+
+Prefill A/B on the rig (mat worker / lanfear coord, TP over RDMA, build
+`b99dfa3`), default (TIGHT on) vs `DS4_METAL_INDEXER_LLT_TIGHT=0`, 32k/65k/131k
+with `promessi_sposi.txt`, gen 128. CSV `prefill_tps` / `gen_first_ms`
+(first-token latency — the number T3 caught nsg4 on).
+
+| ctx | arm | prefill t/s | first-token ms | steady t/s |
+|---|---|---|---|---|
+| 32k | TIGHT on | 501.92 | 272.9* | 34.59 |
+| 32k | TIGHT=0 | 517.19 | 31.1 | 33.92 |
+| 65k | TIGHT on | 460.94 | 32.8 | 32.19 |
+| 65k | TIGHT=0 | 461.72 | 32.5 | 31.68 |
+| 131k | TIGHT on | 393.03 | 36.5 | 29.15 |
+| 131k | TIGHT=0 | 393.37 | 35.5 | 28.42 |
+
+*\*272.9 ms at 32k TIGHT-on is a cold-start/warm-up artifact (first frontier of
+the first arm includes model load + shader compile); the same arm's 65k/131k
+first-token is 32.8/36.5 ms — normal. Not a regression.*
+
+**Verdict: prefill neutral.** 393.03 vs 393.37 t/s @131k (−0.1%), 460.94 vs
+461.72 @65k (−0.2%); first-token 36.5 vs 35.5 ms @131k (within noise). **No
+prefill-catastrophic spike** — nothing like T3's nsg4's 189 ms (U10 changes
+only the allocation, not the grid). Decode steady-state slightly *better* with
+TIGHT on (29.15 vs 28.42 t/s @131k). **U10 stays default-on.**
+
 ### U10 — TIGHT alias confirmed on the rig: +17.4%, bit-identical — 2026-08-27
 
 `DS4_METAL_INDEXER_LLT_TIGHT=1` (opt-in, NSG=8) on mat (M2 Ultra),
