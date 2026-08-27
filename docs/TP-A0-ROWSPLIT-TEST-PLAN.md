@@ -1217,7 +1217,24 @@ numbers by ~1.9 before projecting engine impact**, alongside the ~0.63
 standalone-to-rig factor already in this document. Note the in-situ numbers are
 the trustworthy ones, and they still put top-k (5.32 ms) above scoring (3.84).
 
-#### U10a — run the NSG sweep on the rig — **zero code, and it decides U10**
+#### U10a — run the NSG sweep on the rig — **zero code, and it decides U10 — DONE 2026-08-27: U10 is ON**
+
+**Outcome.** NSG sweep on mat (M2 Ultra), n_comp=32768, 300 dispatches,
+`DS4_METAL_GPU_BUSY_PROFILE=1`, repeated 2–3× per arm for stability:
+
+| NSG | GFLOP/s (runs) | vs default |
+|---|---|---|
+| **8** (default) | 1525.2 / 1607.4 / 1683.0 | — |
+| **4** | **1720.7 / 1813.8 / 1704.4** | **+12.8% / +12.8% / +1.3%** |
+| 2 | 1342.2 | −12% |
+
+NSG=4 beats NSG=8 in every run (~+5–13%), and NSG=2 is clearly worse — the
+**first outcome in the decision table**. The M1 Max ranking (−1.4% at NSG=4)
+does **not** transfer to the Ultra: residency is worth more than NK there.
+**U10 is on** — dropping `sk` buys 7× residency at unchanged NK, strictly
+better than what NSG=4 trades for. (NSG=4 confounds halved NK with doubled
+residency, so it is suggestive, but the win is strong evidence because U10
+gets the residency without paying the NK.) See `BENCHMARKS-TP-PP.md` §U10a.
 
 **This is the gap in the U7 rig run.** The rig measured only the default
 (NSG=8, 1565 GFLOP/s). The `DS4_METAL_INDEXER_LLT_NSG` knob is built, committed

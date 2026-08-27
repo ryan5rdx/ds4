@@ -243,6 +243,29 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### U10a — NSG sweep on the rig: residency beats NK — U10 is ON — 2026-08-27
+
+`DS4_METAL_INDEXER_LLT_NSG` ∈ {8, 4, 2} with `DS4_METAL_GPU_BUSY_PROFILE=1
+tests/bench_indexer_score 32768 300` on mat (M2 Ultra), repeated for
+stability. Zero code — the knob was already built and bit-identical across
+arms. This is the direct test of U10's premise: is the Ultra short of latency
+hiding, so that residency is worth more than the NK it trades for?
+
+| NSG | GFLOP/s (runs) | vs default |
+|---|---|---|
+| **8** (default) | 1525.2 / 1607.4 / 1683.0 | — |
+| **4** | **1720.7 / 1813.8 / 1704.4** | **+12.8% / +12.8% / +1.3%** |
+| 2 | 1342.2 | −12% |
+
+**NSG=4 beats NSG=8 in every run (~+5–13%); NSG=2 is worse.** This is the
+plan's *first* outcome — the M1 Max ranking (NSG=4 −1.4%) does **not**
+transfer to the Ultra, so residency is worth more than NK there. The Ultra's
+72% scaling efficiency / 7.3% of ALU peak is consistent with a latency-hiding
+shortfall. **Consequence: U10 is ON.** Dropping the `sk` staging buffer (F16
+index cache, `ds4.c:17373`) buys 7× residency at *unchanged* NK — strictly
+better than what NSG=4 trades for (NSG=4 confounds halved NK with doubled
+residency; U10 gets the residency without the NK cost).
+
 ### U7 — indexer LLT scoring: 1565 GFLOP/s on the rig, 72% core scaling, occupancy is the lever — 2026-08-27
 
 `DS4_METAL_GPU_BUSY_PROFILE=1 tests/bench_indexer_score 32768 300` on mat
