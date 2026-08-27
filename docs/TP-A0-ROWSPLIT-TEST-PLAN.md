@@ -1657,12 +1657,41 @@ not dispatch count either. Nothing else measured in this project is this far
 from its roof — the indexer at 5% of ALU peak was the previous record and this
 is two orders of magnitude below that.
 
-The span (`ds4.c:22612`–`:22732`) is the q-LoRA RMS norm plus the fused KV RoPE
-and, on some paths, an FP8 KV-cache store — `dsv4_qkv_rms_norm_rows_kv_rope`,
-`dsv4_qkv_rms_norm_kv_rope_fp8_store`, `dsv4_qkv_rms_norm_rows`, and
-`rms_norm_weight`. **Which of those actually fires at decode has not been
-established**, and that is the first question: four variants exist and the
-selection is conditional.
+**Which variant fires — resolved from source 2026-08-27, and it explains the
+number.** The span (`ds4.c:22612`–`:22732`) selects among four variants. The
+first, `dsv4_qkv_rms_norm_rows_kv_rope`, is gated on `g->cuda_qkv_kv_rope_fuse`
+and is **CUDA-only**, so Metal takes either
+`dsv4_qkv_rms_norm_kv_rope_fp8_store` or `dsv4_qkv_rms_norm_rows`. **Both
+dispatch two threadgroups:**
+
+- `..._kv_rope_fp8_store` → `MTLSizeMake(1, 2, 1)` (`ds4_metal.m:22402`)
+- `..._rows` → `MTLSizeMake(rows, 2, 1)`, and the decode call site passes
+  **`rows = 1`** (`ds4.c:22701`)
+
+**So `q_lora_norm` runs 2 threadgroups on a 60-core GPU, 43 times per token —
+1/30th of the machine.** That is the most extreme underfill measured anywhere in
+this engine; the previous worst was the 32-threadgroup head-norm/RoPE, which
+turned out to cost only 0.36 ms.
+
+**39 µs is far too long even for two threadgroups**, so the cost is not the
+norm's arithmetic — a 1024-element reduction is microseconds. It is a
+**serialisation point**: the norm depends on the q_a/kv projection and q_b
+depends on the norm, so with two threadgroups resident the GPU drains and
+refills around it, 43 times a token. This is also why it does not contradict
+§6's "dispatch removal is not productive" — that concerns the *marginal* 1.9 µs
+cost of an additional dispatch, whereas this is one dispatch costing 20× that
+because it has no parallelism to hide behind.
+
+**The fix direction is fusion, and the tree has precedent for exactly this
+shape.** `kernel_dsv4_comp_row_finalize_f32` already collapses seven tiny
+single-row dispatches per layer into one two-threadgroup dispatch while
+preserving each kernel's reduction tree bit-exactly (`ds4.c:22966-22971`), and
+`ds4_gpu_head_rms_norm_rope_tail_tensor` already fuses norm+RoPE on the head
+path. Folding the q-LoRA norm into the preceding projection or the following
+q_b removes 43 serialisation points per token.
+
+**Prize: up to 1.68 ms — 6.9% at 2k, 4.9% at 131k** — though a fusion will not
+recover all of it, since the arithmetic still has to happen somewhere.
 
 `q_a_kv_proj` at 17% of roof is the second target — 2.14 ms, 8.8% of the 2k
 token, and a plain Q8_0 pair projection that ought to run near where `q_b`
