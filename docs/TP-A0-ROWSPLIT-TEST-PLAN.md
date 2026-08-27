@@ -729,6 +729,68 @@ between them, and the floor is ~13 ms. Order:
 3. **T2 follow-up** (28/31) — see below. Cheap, but a loose end, not a lever.
    Still the only remaining queued measurement.
 
+### Correction — "99% busy" is a time measurement, not a throughput one — 2026-08-27
+
+The stage profile shows the decode GPU busy 99% of the token. That does **not**
+mean it is saturated, and the rig's power draw says it is not: **decode pulls
+~30 W GPU / 90 W system against ~60 W GPU / 120 W system in prefill.** Same
+GPU, half the power. A GPU stalled on memory latency is "busy" and cool.
+
+**`BENCHMARKS-TP-PP.md:226` is wrong and it closed a workstream on that error.**
+It reads: "the routed MoE matvec is bandwidth-bound at ~400 GB/s — **near the
+M2 Ultra ceiling**." The M2 Ultra ceiling is **800 GB/s**; 400 GB/s is exactly
+one M2 *Max* die. T8 measured **50% of peak**, not the ceiling, and "kernel
+specializations cannot buy what is not there" does not follow. That 400.0 is
+suspiciously exactly half also raises a second hypothesis worth one test:
+single-die locality across UltraFusion.
+
+**The largest stage is nowhere near any roof.** `tests/bench_indexer_score
+32768` on an M1 Max (400 GB/s, ~10.4 TFLOP/s FP32):
+
+| | measured | of peak |
+|---|---|---|
+| FLOPs | 460 GFLOP/s | **4.4%** |
+| K-cache DRAM | 14.4 GB/s (16.78 MB/dispatch) | **3.6%** |
+| GPU busy | 1.01 ms/dispatch → 21.2 ms for 21 layers | ≈2× the rig's 10.5 ms ✓ |
+
+The bench reproduces the production stage cost, and the kernel sits at ~4% of
+*both* roofs — the signature of a latency-bound kernel, not a bandwidth-bound
+one. Three arms (`DS4_METAL_DISABLE_INDEXER_LLT`, `DS4_METAL_INDEXER_LLT_NSG4`,
+default) came back within 0.7% of each other: **the knobs we have do not touch
+it.** (The harness also flags its own correctness check — worst relative error
+7.6e-3 against the CPU reference, over its 1e-3 threshold. Probably benign for
+a ranking use, but it should not be left unexplained.)
+
+### The queue this reopens, ranked
+
+**1. The decode indexer is fully replicated across TP ranks — the biggest
+stage, computed twice.** `metal_graph_tp_split_indexer()` is gated on
+`DS4_TP_PREFILL_SPLIT_INDEXER` and is **prefill-only** (`ds4.c:29056-29062`);
+the decode call site passes the full `layer_n_index_comp[il]` with no rank or
+world argument (`ds4.c:23241`). Split the row range per rank, take a local
+top-k on each, exchange the two candidate lists and merge — **exact**, because
+top-k of the union of two local top-ks is the global top-k. The exchange is
+~4 KB/layer against a 10.5 ms stage. **Upside ~5 ms of 36 ms (14%).** This is
+the TP-topology lever.
+
+**2. T9 is mis-sized by an order of magnitude.** The indexer compressed cache
+is allocated **F32** (`ds4.c:17373`): 32768 × 128 × 4 B = 16.78 MB/layer, **352
+MB/token** across 21 ratio-4 layers at 131k. T9 (F32→F16) halves that. It is
+currently in the "lower tier … individually sub-1%" bucket at "~0.2–0.4 ms" —
+a figure written before the stage profile priced the stage at 10.5 ms.
+
+**3. Restructure the kernel for K-cache reuse.** 64 heads score against the
+same cache: 16.78 MB/dispatch with perfect reuse, **1.07 GB without**. The
+gap between those two numbers is the whole optimisation.
+
+**4. Speculative decode (`DS4_NGRAM_SPEC`, R13).** Implemented, never run on
+the rig. Turns matvec into matmul and is the textbook fix for a latency-bound
+decode.
+
+**5. One test for the UltraFusion hypothesis** — a pure streaming-read kernel
+on the rig. If it also caps at ~400 GB/s, placement is the problem, not the
+kernels.
+
 **The real lever is now the stage costs.** compressor_indexer (10.5 ms @131k,
 the entire long-context growth), q_path (5.5), routed_moe (5.4), attn_inv_rope
 (4.3). Any future decode work must target these stages, not stall.
