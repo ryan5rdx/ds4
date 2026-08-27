@@ -783,6 +783,85 @@ measurement.** A0 as designed can never decompose the decode attention.
 different instrument, not a parameter change. **A2 stays unsized, and I should
 stop reporting A0 as built.**
 
+### Queued work, built or scoped 2026-08-27
+
+#### Built: `DS4_METAL_GPU_ENCODER_TIMESTAMPS` — a profiler that does not distort
+
+`df0037e`. Samples the GPU timestamp counter at **encoder** boundaries inside one
+command buffer, instead of ending the command buffer and reading
+`cb.GPUStartTime`. Overhead **~1–3%** against the existing profiler's **13–18%**.
+
+Probed the hardware before designing: `atStageBoundary` is supported,
+`atDispatchBoundary` is **not**, so per-encoder is the finest granularity
+available. Mechanism validated against known workloads — 4× work measured 3.82×,
+2× measured 1.92×, encoder sum within 4% of the command-buffer span.
+
+**Why this matters beyond one stage.** Every stage figure in this document
+carries a 13–18% correction, and two conclusions were wrong because of
+measurement distortion rather than the thing being measured. This removes the
+correction.
+
+**Limitation, stated plainly:** a stage that is one encoder yields one number.
+Decomposing `attn_inv_rope` further needs encoder splits at the sub-stage points
+— much cheaper than the command-buffer splits they replace, but not free and
+**not yet done**.
+
+**Rig use:** add `DS4_METAL_GPU_ENCODER_TIMESTAMPS=1` to the iteration-3
+re-baseline. It cross-checks the old profiler on the same run, and if the two
+disagree the new one is the one to believe.
+
+#### Scoped: speculation under TP2 — and a terminology correction that matters
+
+**Three different things have been conflated, including by me:**
+
+| | what it is |
+|---|---|
+| **MTP** | a draft *model* file (`--mtp FILE`), i.e. the support model |
+| **DSpark** | the speculative *driver* that uses it — `--dspark` **requires** `--mtp` |
+| **n-gram** (PR #846) | a *drafter* needing no model at all, just history matching |
+
+So we are **not** "using MTP instead of DSpark". n-gram **replaces the MTP
+support model as the drafter, while sharing DSpark's batch verify** — the code
+says so at `ds4.c:69992`: *"N-gram speculation replaces the support-model drafter
+rather than stacking with it: both end in the same batch verify."*
+
+**Consequence: switching drafter does not avoid the TP problem.** The exclusion
+is in the shared verify/session path (`s->distributed`, `ds4.c:69931`), which
+n-gram inherits.
+
+**What it does avoid is the reason DSpark lost.** From
+`speed-bench/tp_mtp_hunt.md` (2026-08-19, single-node, ctx-512 Promessi):
+
+| arm | steady decode | acceptance |
+|---|---|---|
+| target only | **41.98 t/s** | — |
+| published 5.99 GB support, forced d5 | 21.29–21.35 | 189/1596 = **11.84%** |
+| full-fat MXFP4 support after the F32-HC fix | 19.91 | 157/1767 = **8.89%** |
+| low-yield production policy | 41.57 | verifier never launched |
+
+**DSpark's pass cost ~3× a decode step, and that is dominated by a 5.99 GB
+support-model forward every cycle.** n-gram's draft is a hash lookup — free. The
+last row is the tell: with no verifier launched, drafting alone costs ~1%.
+
+**So the open question is verify cost alone, which nobody has isolated.** If a
+verify pass with N rows costs ~1× a decode step (weights are read once per pass
+regardless of rows), 50 t/s needs acceptance **L = 1.22**. If it costs 2×, it
+needs **L = 2.43**.
+
+**And acceptance is fixture-dependent in exactly the way that favours us.** The
+same doc records llama.cpp at ~50% on predictable code generation and ~25% on
+literary prose, and warns their "mean 3.5" includes the unconditional target
+token. **Promessi prose is the worst case; this rig's production workload is
+tool-calling and structured output**, which is where n-gram drafting is
+strongest. The 8.89–11.84% figures are prose numbers with a weak drafter.
+
+**Do not start this without reading `tp_mtp_hunt.md` in full.** It documents a
+completed attempt at the structural TP work and the reasons it was set aside.
+The remaining pieces are the batched verify across the pair — the machinery
+exists, since multi-row batches already cross the gates in prefill — and
+checkpoint/rewind on rejection under the mirrored-session protocol, which does
+not. **Days, not hours.**
+
 ### Speculation is structurally excluded under TP2 — the wiring task is not a wiring task — 2026-08-27
 
 Before writing an n-gram call site I checked whether one would help. It would
