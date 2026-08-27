@@ -343,6 +343,39 @@ accumulation order enough to matter for sampling, though greedy argmax is
 unchanged. Since the perf is a wash and the logits are perturbed, **the
 fastpath should stay default-off; do not enable.**
 
+### T2 follow-up — decode split-K peaked at 24 — 2026-08-26
+
+The env battery's T2 curve was monotonic 12→24 with 24 the top of the
+tested range (the code allows 2..31). This follow-up sweeps 28 and 31 in
+the same session shape (32k/65k/131k decode rows, gen 128,
+`DS4_NGRAM_SPEC` off). Decode steady t/s:
+
+| splits | 32k | 65k | 131k |
+|---|---|---|---|
+| 12 (control) | 33.79 | 31.71 | 28.43 |
+| **24 (peak)** | 34.24 | 31.99 | **28.68** |
+| 28 | 34.19 | 31.99 | 28.48 |
+| 31 | 34.24 | 31.94 | 28.45 |
+
+**T2 peaked at 24.** 28 and 31 both regress at 131k (28.48 and 28.45 vs
+24's 28.68); the trend is no longer monotonic — it turns over at 28. At
+65k, 28 ties 24 and 31 is within 0.2%; the 24/28/31 arms are flat within
+0.15% at 32k (34.19–34.24).
+
+**Decision per the plan: set the default to the measured peak (24) and
+close T2 — do not move to 28/31.** The comment at `ds4_metal.m:29988`
+reasons from exact fill: under TP each rank holds 32 heads, so 4 × 24 = 96
+threadgroups on 60 cores. Gains out to 24 mean oversubscription for
+latency hiding, not occupancy, and the turnover at 28 (4 × 28 = 112)
+caps it — 24 is the sweet spot. The code default and the comment move
+with this decision.
+
+Interaction caveat to keep with any future n-gram work: with
+`DS4_NGRAM_SPEC` on, verify steps set `decode_splits = 1`
+(`ds4_metal.m:30001`) and T2 is inert on those steps, so T2's value shrinks
+by the n-gram acceptance rate if n-gram ever defaults on. Measured with
+n-gram off.
+
 ### Env battery — T2 + T3 + T4 at 32k/65k/131k — 2026-08-26
 
 One rig session, `DS4_NGRAM_SPEC` off, sweep `32768→131072 --step-mul 2`

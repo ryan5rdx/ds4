@@ -182,7 +182,7 @@ two are minutes and one of them can invalidate three completed runs.
 | 0b | Confirm `DS4_METAL_FAST_SYNC=1` is in the **`ds4-server`** launch path — **resolved 2026-08-26: nothing to confirm**. There is no `ds4-server` launch path in the repo and no production `ds4-server` deployment on the bench hosts; the knob is bench-only until a server path exists | — | Bench always sets it; production may not. Worth ~186 µs of a 508 µs gate, and without it the decode command-buffer split is a no-op under TP. |
 | **0c** | ~~M0 — re-baseline on a pinned shard~~ — **done 2026-08-26. Decode survives within 1%; the gate exchange halved at 131k (49.7 → 24.8 µs); prefill moved +6–25% but the cause is confounded. T1 re-sizes down to ~+2%.** | — | **Step 0 came back positive: the limit was `0` on both hosts.** Everything measured on 2026-08-26 was on a lazily-paged shard. This re-run decides how much of R10c/R10e/R11 survives and re-sizes T1. Nothing else should run first. |
 | 1 | **M3** — **done 2026-08-26** (`uc_lat2`, byte-verified, n=2000/arm): half-RTT **8.0 µs (4 KB)** / **14.5–15.5 µs p50 (16 KB, single WR)** — both ≪20 µs → **T1 open** (~30 µs/gate ≈ 2.5 ms/token at 131k). Single 16 KB UC WR confirmed working on this stack. One transient first-ping UC drop seen; T1 needs a re-arm/retry path. Recorded in `BENCHMARKS-TP-PP.md`. | — | Decides T1, the largest sized item, before any code is written. ≲20 µs half-RTT → ~2.5 ms/token available; ~45 µs → T1 closes. |
-| 2 | ~~Env battery T2 + T3 + T4~~ — **done 2026-08-26. T2 +0.9% @131k and monotonic to the top of the tested range (not peaked); T3 mixed; T4 default already optimal.** Follow-up: sweep T2 at 28/31. | — | One small real win, two nulls. |
+| 2 | ~~Env battery T2 + T3 + T4~~ — **done 2026-08-26. T2 +0.9% @131k and monotonic to the top of the tested range (not peaked); T3 mixed; T4 default already optimal.** Follow-up: sweep 28/31 — **done 2026-08-26, peaked at 24 (28/31 regress); default set to 24, T2 closed.** | — | One small real win, two nulls. |
 | 3 | ~~T8 pricing~~ — **done 2026-08-26. The specialisation ladder is worth nothing to −5%; the generic path is faster. T8 is dead.** The routed MoE matvec is bandwidth-bound at ~400 GB/s. | — | 30 minutes of pricing saved five kernel patches for a negative. |
 | 4 | ~~M2~~ — **done 2026-08-26.** Ablation at 32k/65k/131k. **Routed MoE is the dominant decode stage (~22–25%)**; **the indexer is the long-context story** (score +5.9→12.2%, topk +7.9→17.7% as ctx 32k→131k — the largest attributed slice of the 11.1 ms); attnout ~9–10%, qb/attncore ~5%, hcpre ~2%. **Refined by the stage profile (done below): the indexer cost is `compressor_indexer` (+5.06 of +5.93 ms growth), and the ~13 ms residual is real compute, not stall.** | ~2 h | The 11.1 ms/token of unattributed long-context decode growth — the largest unknown in the document. |
 | 4b | ~~Stage profile at 32k/131k~~ — **done 2026-08-26.** Decode gpu_busy 30.43/36.36 ms, **gap ~0.31 ms (1%) — decode is ~99% GPU-busy, no stall.** Stage sum = busy exactly (100% attribution). compressor_indexer = the long-context term (+5.06 ms). **The ~13 ms M2 residual is real compute (unablated stages), not idle.** | ~20 min | Bounds router/shared/kv/compressor and decomposes the ~13 ms floor without ablation. |
@@ -562,7 +562,7 @@ not.
 so it costs one A/B arm to settle. No retry path: UC on this stack is treated
 as lossless. A single 16,384 B UC SEND WR needs no chunking.
 
-#### T2 follow-up — proceed, but size it honestly — **2026-08-27**
+#### T2 follow-up — proceed, but size it honestly — **DONE 2026-08-26: peaked at 24, T2 closed**
 
 **Verdict: run it. It is one rig session for two arms, and it is the last
 unfinished item from the env battery.** But M2 caps what it can be worth, and
@@ -589,7 +589,23 @@ that way, and record Δlogit alongside t/s so the two are comparable.
   `ds4_metal.m:29988`, which reasons from exact fill; gains past 60
   threadgroups on 60 cores mean oversubscription for latency hiding, not
   occupancy.
-- Flat or regressing → set the default to the measured peak and close T2.
+- **Flat or regressing → set the default to the measured peak and close
+  T2 — the branch taken (below).**
+
+**Outcome — done 2026-08-26: peaked at 24; set the default to 24; close
+T2.** The follow-up sweep at 28/31 regressed at 131k (28.48 and 28.45 vs
+24's 28.68); the trend is no longer monotonic — it turns over at 28:
+
+| splits | 32k | 65k | 131k |
+|---|---|---|---|
+| 12 (control) | 33.79 | 31.71 | 28.43 |
+| **24 (peak)** | 34.24 | 31.99 | **28.68** |
+| 28 | 34.19 | 31.99 | 28.48 |
+| 31 | 34.24 | 31.94 | 28.45 |
+
+Per the decision rule above: set the default to the measured peak (24) and
+close T2; do not move to 28/31. Recorded in `BENCHMARKS-TP-PP.md` (T2
+follow-up section).
 
 **Interaction to keep in view:** with `DS4_NGRAM_SPEC` on, verify steps set
 `decode_splits = 1` (`ds4_metal.m:30001`) and T2 is inert on those steps. If
