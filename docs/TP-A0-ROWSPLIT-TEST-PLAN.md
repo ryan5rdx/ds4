@@ -599,6 +599,52 @@ indexer the largest attributed slice of the 11.1 ms (caveat: ablating it also
 removes its contribution to MoE top-6 selection, so `indexer` and `moe` are
 not disjoint). attnout ~9–10%, qb/attncore ~5%, hcpre ~2%. No chain is free.
 
+**Converted to milliseconds, M2 says something the percentages hide.** A t/s
+gain of X from removing a chain is `t_ctrl · X/(1+X)` of in-situ time, so:
+
+| chain | 32k (29.48 ms token) | 131k (35.35 ms token) | growth |
+|---|---|---|---|
+| routed MoE | 5.90 | 6.38 | +0.48 |
+| indexer topk | 2.16 | 5.32 | **+3.16** |
+| indexer score | 1.64 | 3.84 | **+2.20** |
+| attnout | 2.80 | 2.92 | +0.12 |
+| attncore | 1.27 | 1.91 | +0.64 |
+| qb | 1.54 | 1.78 | +0.24 |
+| hcpre | 0.75 | 0.76 | +0.01 |
+| **attributed** | **16.05** | **22.90** | +6.85 |
+| **residual** | **13.43 (46%)** | **12.45 (35%)** | **−0.98** |
+
+Two findings, and the second is the one that matters.
+
+**1. The context term is the indexer, essentially in full.** Measured growth
+32k→131k is +5.87 ms; the two indexer chains alone supply +5.36 ms of it. The
+other five chains together contribute +1.49 ms, and the sum over-counts by
+0.98 ms — which is exactly the indexer/MoE overlap the caveat predicts. So the
+11.1 ms long-context penalty is an indexer story with a small attention tail,
+and nothing else in the token grows meaningfully with context.
+
+**2. There is a ~13 ms floor that no ablated chain touches, and it does not
+move with context.** The residual is 13.43 ms at 32k and 12.45 ms at 131k —
+flat, and the apparent shrink is just the double-count. Against the 24.34 ms
+token at 2k it is ~55% of the token; at 131k it is still 35%. **It is the
+largest single item in the decode budget, larger than the routed MoE, and
+stage ablation cannot see it by construction** — it is not in any stage.
+
+This is the measured answer to "why are we not at 100% utilisation." Roughly
+half the short-context decode token is not compute at all. It is consistent
+with every negative in this document: T1 (wire latency, wash), T8 (MoE kernel
+specialisation, negative), R11 (gate count, negative) all attacked *stages*,
+and the stages are not where the missing time is.
+
+**Consequence for sequencing.** The remaining stage-level items are worth ~1%
+between them, and the floor is worth ~13 ms. R12b's reduced-ballast arm and
+the encoder-boundary instrument are the only queued items that probe the floor
+rather than a stage, which promotes them from "confirmation" to **the most
+valuable unrun measurement in this document**. The floor's composition — how
+much is per-layer dispatch versus per-token fixed cost — is the open question,
+and it is answerable: per-layer cost scales with `n_layer`, per-token cost does
+not.
+
 The ablation method (re-run `DS4_TP_ABLATE` chains at 32k and 131k, plus
 `DS4_METAL_ABLATE_INDEXER_SCORE`/`_TOPK`, which are already wired into decode
 at `ds4.c:23240`/`:23257` and had never been run at long context). Caveats
