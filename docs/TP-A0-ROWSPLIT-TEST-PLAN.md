@@ -1166,15 +1166,17 @@ is 1.85× off it, not 2.6×**.
 
 #### Rig — seven arms, all zero-code, one session
 
-| # | arm | decides |
-|---|---|---|
-| **A** | **Validate the TP crash fix.** Prefill **4095 tokens**, checkpoint, continue. Watch the worker for "not covered by mapped model views". | Gates a shipped fix (`69a3b86`). Single-box variant in `docs/BUG-TP-WORKER-MODEL-VIEW-2026-08-27.md`. |
-| **B** | **`DS4_METAL_GPU_ENCODER_TIMESTAMPS=1`** at 2k and 131k | **The one that matters.** Re-baselines the whole budget at **1–3% distortion instead of 18%**, in ~172 labelled spans instead of 14. **Gate: if it disagrees with the hand-corrected table by >0.3 ms on any stage, believe this one and re-rank before writing code.** |
-| **C** | **`DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1`** at 2k — **read only the shape fields** | `n_keys` and `n_comp` per layer, the missing input to sizing the `attn_inv_rope` item. Its *timings* are still host round trips; ignore them. |
-| **D** | **`DS4_METAL_DISPATCH_BALLAST` ∈ {0,2}** at 2k | The dispatch price **in the live graph**. Settles an 11.6× spread that four candidates live or die on — and my retracted 22 µs claim came from getting this wrong in isolation. |
-| **E** | **`powermetrics --samplers gpu_power`** during decode vs `tests/bench_membw` | Retires the "30 W / 20% utilised" premise either way. The fan-out believes it dissolves. |
-| **F** | **`DS4_METAL_DISABLE_PRE_M5_QKV_PAIR_QUAD_FUSE=1`** + stage profiler | Confirms the 608 MB compressor accounting the corrected byte model rests on. |
-| **G** | **R12a command-buffer split schedule** — arms 4/0, 2/8, 2/16, 2/32, 3/12, 4/12. **`DS4_METAL_FAST_SYNC=1` on both ranks** or every arm collapses to one buffer and reads as a false null. | Bit-identical, free, and the only queued item that attacks command-buffer round-trip cost. |
+| # | arm | decides | outcome |
+|---|---|---|---|
+| **A** | **Validate the TP crash fix.** Prefill **4095 tokens**, checkpoint, continue. Watch the worker for "not covered by mapped model views". | Gates a shipped fix (`69a3b86`). Single-box variant in `docs/BUG-TP-WORKER-MODEL-VIEW-2026-08-27.md`. | **PASS 2026-08-27** (build `06c2c6b`). Prefill 4095 fresh, resume 4095→4099 (`--step-incr 4`, first chunk = 1 token, `to_boundary=1`): **zero** "not covered" / "resumed prefill failed" / GPU-timeout lines. Fix holds. |
+| **B** | **`DS4_METAL_GPU_ENCODER_TIMESTAMPS=1`** at 2k and 131k | **The one that matters.** Re-baselines the whole budget at **1–3% distortion instead of 18%**, in ~172 labelled spans instead of 14. **Gate: if it disagrees with the hand-corrected table by >0.3 ms on any stage, believe this one and re-rank before writing code.** | **Not yet run.** New instrument (`df0037e`); queued. |
+| **C** | **`DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1`** at 2k — **read only the shape fields** | `n_keys` and `n_comp` per layer, the missing input to sizing the `attn_inv_rope` item. Its *timings* are still host round trips; ignore them. | **Not yet run** (timings-only flash split already run in iter 2, shape fields still outstanding). |
+| **D** | **`DS4_METAL_DISPATCH_BALLAST` ∈ {0,2}** at 2k | The dispatch price **in the live graph**. Settles an 11.6× spread that four candidates live or die on — and my retracted 22 µs claim came from getting this wrong in isolation. | **Not yet run.** Queued. |
+| **E** | **`powermetrics --samplers gpu_power`** during decode vs `tests/bench_membw` | Retires the "30 W / 20% utilised" premise either way. The fan-out believes it dissolves. | **Not yet run.** Queued. |
+| **F** | **`DS4_METAL_DISABLE_PRE_M5_QKV_PAIR_QUAD_FUSE=1`** + stage profiler | Confirms the 608 MB compressor accounting the corrected byte model rests on. | **Not yet run.** Queued. |
+| **G** | **R12a command-buffer split schedule** — arms 4/0, 2/8, 2/16, 2/32, 3/12, 4/12. **`DS4_METAL_FAST_SYNC=1` on both ranks** or every arm collapses to one buffer and reads as a false null. | Bit-identical, free, and the only queued item that attacks command-buffer round-trip cost. | **FLAT NULL 2026-08-27** (build `06c2c6b`, 131k, `DS4_METAL_FAST_SYNC=1`). All arms within 0.9%: 4/0 29.31, 2/8 29.21, 2/16 29.24, 2/32 29.38, 3/12 29.19, 4/12 29.12 t/s. Split schedule makes no measurable difference at 131k. |
+
+**Also recorded 2026-08-27** (clean re-baseline on `06c2c6b`, pre-encoder-timestamp build): `attn_out_proj` = **2.867 ms** ctx-invariant (confirming ~2.73, not the C2-broken 2.38); `attn_tp_gate` 0.935 ms; total gpu_busy 28.83 / 38.37 ms; straggler **~0.52-0.55 ms/token** (gate delta +12.2-12.7 µs). Full data in `BENCHMARKS-TP-PP.md` §Iteration 3. Note: arms B/C/D/E/F supersede/re-baseline these figures with the low-distortion encoder-timestamp instrument, so treat the above as the last pre-instrument numbers. |
 
 #### Built for this run
 

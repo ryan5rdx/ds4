@@ -243,6 +243,64 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### Iteration 3 — TP crash-fix validation, clean re-baseline, R12a split-schedule sweep — 2026-08-27
+
+Build `06c2c6b` (post-C2-revert, with TP crash fix `69a3b86`), rig
+(lanfear coord / mat worker). Three arms.
+
+**Arm 1 — TP crash fix validation — PASS.** Prefilled 4095 tokens fresh
+(493.64 t/s), then resumed 4095→4099 (`--step-incr 4`): the CSV shows the
+resume prefilled only **4 tokens** (first chunk = 1 token, `to_boundary=1`,
+the exact trigger). **Zero** "Metal model range … not covered by mapped model
+views" / "resumed prefill failed" / GPU-timeout / "transport marked failed"
+lines in the worker or coordinator logs. The double expert-offset rebase fix
+(`69a3b86`) holds.
+
+**Arm 2 — clean re-baseline (post-revert).** Confirms both corrected figures:
+
+| stage | 2k ms/token | 131k ms/token |
+|---|---|---|
+| compressor_indexer | 0.198 | 9.657 |
+| routed_moe_folded | 4.899 | 4.956 |
+| attn_inv_rope | 3.817 | 4.243 |
+| **attn_out_proj** | **2.867** | **2.865** |
+| q_a_kv_proj | 2.138 | 2.135 |
+| q_path | 1.867 | 1.852 |
+| q_lora_norm | 1.672 | 1.656 |
+| ffn_tp_gate | 1.558 | 1.485 |
+| **attn_tp_gate** | **0.935** | — |
+| **total gpu_busy** | **28.834** | **38.365** |
+
+**`attn_out_proj` = 2.867 ms** (ctx-invariant), not the 2.38 from iteration
+2's compromised build — close to the predicted ~2.73. `attn_tp_gate` 0.935
+ms. The iteration-2 2.38 was the C2-broken build's artefact.
+
+**Arm 3 — per-slot gate profiler (corrected formula) re-baseline:**
+
+| ctx | ATTN | FFN | delta | straggler |
+|---|---|---|---|---|
+| 2k | 16.6 µs | 29.3-29.4 µs | +12.7 µs | **0.54-0.55 ms/token** |
+| 131k | 15.9 µs | 28.1 µs | +12.2 µs | **0.52 ms/token** |
+
+Straggler **~0.52-0.55 ms/token** — close to the predicted ~0.50 (not the
+0.66 from iteration 2's broken build). U14 + §7 survive at ~0.5 ms.
+
+**Arm 4 — R12a command-buffer split schedule sweep (131k):**
+
+| split (first/second) | 131k t/s |
+|---|---|
+| 4/0 | 29.31 |
+| 2/8 | 29.21 |
+| 2/16 | 29.24 |
+| 2/32 | 29.38 |
+| 3/12 | 29.19 |
+| 4/12 | 29.12 |
+
+**Flat null — all arms within 0.9%** (29.12-29.38 t/s). The command-buffer
+split schedule makes no measurable difference at 131k; best 2/32 (29.38),
+worst 4/12 (29.12). The round-trip cost is not being attacked by the split
+schedule, or it is already amortised at this context.
+
 ### Iteration 2 — stage profile (fixed attn_out_proj boundary), sampled flash-attn, corrected gate profiler, n-gram — 2026-08-27
 
 Build `6b962db`, gen 128, rig (lanfear coord / mat worker). Zero-code arms
