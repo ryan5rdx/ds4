@@ -28988,8 +28988,13 @@ static int ds4_gpu_encode_flash_attention_prefill_raw_heads(
     return 1;
 }
 
+/* A0: takes the command buffer by pointer so DS4_METAL_FLASH_ATTN_STAGE_PROFILE
+ * can split the decode attention into stages the way the four prefill encoders
+ * already do.  `attn_inv_rope` is 3.63 ms net at 2k -- 14.9% of the token and
+ * the second-largest stage -- and it cannot be decomposed today, which is why
+ * any estimate for restructuring it spans 0-8%. */
 static int ds4_gpu_encode_flash_attention_gathered_heads(
-        id<MTLCommandBuffer>   cb,
+        id<MTLCommandBuffer> __strong *cbp,
         ds4_gpu_tensor      *heads,
         id<MTLBuffer>          sinks_buf,
         NSUInteger             sinks_offset,
@@ -29005,11 +29010,37 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         uint32_t               use_mask,
         uint32_t               n_head,
         uint32_t               head_dim) {
+    if (!cbp || !*cbp) return 0;
+    id<MTLCommandBuffer> cb = *cbp;
     const uint32_t n_keys = n_raw + n_comp;
     if (head_dim != 512 || n_head == 0 || n_raw == 0 || n_keys == 0 ||
         raw_cap < n_raw || n_keys < n_raw) {
         return 0;
     }
+    /* Mirrors the prefill encoders: only available inside a batch, since the
+     * boundary ends and restarts the command buffer and an owned one belongs
+     * to the caller. */
+    const bool flash_stage_profile =
+        getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE") != NULL && g_batch_cb != nil;
+    double flash_stage_t0 = 0.0;
+    if (flash_stage_profile) {
+        if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) return 0;
+        int profile_owned = 0;
+        cb = ds4_gpu_command_buffer(&profile_owned);
+        if (!cb || profile_owned) return 0;
+        *cbp = cb;
+        flash_stage_t0 = ds4_gpu_now_ms();
+    }
+#define DS4_METAL_PROFILE_DECODE_FA_STAGE(name) do { \
+        if (flash_stage_profile) { \
+            if (!ds4_gpu_flash_attn_stage_profile_boundary(cbp, \
+                    "decode_gathered", (name), 1u, n_comp, n_keys, \
+                    n_head, head_dim, 0u, 0u, &flash_stage_t0)) { \
+                return 0; \
+            } \
+            cb = *cbp; \
+        } \
+    } while (0)
 
     id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
     id<MTLBuffer> rawbuf = ds4_gpu_tensor_buffer(raw_kv);
@@ -29228,6 +29259,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
+        DS4_METAL_PROFILE_DECODE_FA_STAGE("gather");
     }
 
     ds4_gpu_flash_attn_vec_args vec_args = {
@@ -29288,6 +29320,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         [DS4_DISP(packed_enc) dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
                       threadsPerThreadgroup:MTLSizeMake(packed_threads, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, packed_enc);
+        DS4_METAL_PROFILE_DECODE_FA_STAGE("packed");
         g_decode_attn_rope_fuse = 0;
         g_decode_attn_rope_fuse_used = 1;
         return 1;
@@ -29307,6 +29340,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, n_head, nwg)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
+    DS4_METAL_PROFILE_DECODE_FA_STAGE("fa_core");
 
     ds4_gpu_flash_attn_reduce_args reduce_args = {
         .nrows = (int32_t)nrows,
@@ -29334,8 +29368,10 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32u * nwg, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
+    DS4_METAL_PROFILE_DECODE_FA_STAGE("reduce");
 
     return 1;
+#undef DS4_METAL_PROFILE_DECODE_FA_STAGE
 }
 
 static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
@@ -30607,7 +30643,7 @@ int ds4_gpu_attention_decode_heads_tensor(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
-        if (!ds4_gpu_encode_flash_attention_gathered_heads(cb,
+        if (!ds4_gpu_encode_flash_attention_gathered_heads(&cb,
                                                              heads,
                                                              sinks_buf,
                                                              (NSUInteger)sinks_inner,

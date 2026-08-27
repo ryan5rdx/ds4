@@ -137,6 +137,15 @@ tests/test_topk_ab: tests/test_topk_ab.o ds4_metal.o
 test-topk-ab: tests/test_topk_ab
 	./tests/test_topk_ab
 
+tests/bench_moe_mxfp4_decode.o: tests/bench_moe_mxfp4_decode.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/bench_moe_mxfp4_decode: tests/bench_moe_mxfp4_decode.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+bench-moe-mxfp4-decode: tests/bench_moe_mxfp4_decode
+	./tests/bench_moe_mxfp4_decode
+
 tests/bench_qkv_norm.o: tests/bench_qkv_norm.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 

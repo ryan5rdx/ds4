@@ -211,5 +211,17 @@ int main(int argc, char **argv) {
 
     const float *o = ds4_gpu_tensor_contents(out[(iters - 1) % NSETS]);
     printf("  out[0]=%g out[1]=%g (liveness only)\n", (double)o[0], (double)o[1]);
+    /* Bit-exact fingerprint of the whole output, so a kernel edit that is meant
+     * to change only how bytes are fetched -- not what they decode to -- can be
+     * proved identical rather than assumed.  FNV-1a over the raw float bits;
+     * any single-bit change moves it. */
+    {
+        uint64_t h = 1469598103934665603ull;
+        const unsigned char *b = (const unsigned char *)o;
+        const size_t n = (size_t)N_EMBD * sizeof(float);
+        for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+        printf("  output fnv1a=%016llx over %zu bytes\n",
+               (unsigned long long)h, n);
+    }
     return 0;
 }
