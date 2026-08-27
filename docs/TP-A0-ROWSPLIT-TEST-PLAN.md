@@ -1347,11 +1347,16 @@ offsets, every load straddling a 16-byte boundary.
 both ~91% of that part's roof. **So the 17-byte MXFP4 block granularity is not
 what puts the matvec at 54%.** It is worth ~5%, not ~46%.
 
+**Rig confirmation (mat, M2 Ultra, 2026-08-27): stride 17 costs 5.9%** — 713.2
+GB/s against 758.0 aligned. The M1 Max finding holds at Ultra scale. So the
+block granularity is worth ~6%, not the ~46% gap.
+
 That leaves the expert gather and the dequant/accumulate path. Re-run the two
-block arms on the rig to confirm the 4.7% holds at Ultra scale, then attribute
-the rest between gather and dequant — the gather is 6 experts × 3 tensors = 18
-large contiguous regions per token, which *should* stream, so **dequant and
-accumulation are now the leading suspects.**
+block arms on the rig to confirm the 4.7% holds at Ultra scale (done — 5.9%),
+then attribute the rest between gather and dequant — the gather is 6 experts ×
+3 tensors = 18 large contiguous regions per token, which *should* stream, so
+**dequant and accumulation are now the leading suspects.** See
+`BENCHMARKS-TP-PP.md` §U8.
 
 #### U5 — n-gram speculation on the rig (R13 arms, re-prioritised)
 

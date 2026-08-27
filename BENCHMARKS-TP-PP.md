@@ -221,6 +221,88 @@ not even bandwidth-bound — it sits at ~54% of the achievable streaming rate.
 stage profile) is the largest single decode stage and the one whose ~2× is
 closest to reachable — if its access pattern can be made to stream.
 
+**Validated on lanfear (second M2 Ultra), 2026-08-27** — same command, both
+16 and 32 GiB per arm, `BENCH_MEMBW_FILE` at the real GGUF:
+
+| arm | lanfear 16G | lanfear 32G |
+|---|---|---|
+| metal-shared | 791.5 | 778.3 |
+| mmap-anon | 764.6 | 760.1 |
+| mmap-file (ds4) | 760.5 | 758.2 |
+| mmap-untracked | 760.9 | 753.6 |
+| mmap-parallel | 758.6 | 757.6 |
+| metal-private | 791.2 | 784.7 |
+| two-queue (agg) | 789.3 | 775.2 |
+
+The core verdict holds on both hosts: every arm is ~750–790 GB/s (94–99% of
+the 800 spec), far above U1's ~410 plateau. **One host difference:** on
+lanfear the Metal-allocated arms (shared/private/two-queue) run ~2–4% faster
+(~778–791 GB/s) than the mmap arms (~753–764), whereas on mat all seven arms
+were within 1%. The mmap arms match mat's numbers almost exactly; lanfear's
+Metal allocations are the faster ones. It is a small (~2–4%), repeatable
+host-to-host effect — Metal's allocator placing buffers slightly better on
+that host — and it does **not** change the verdict (roof ~760+, not 400).
+
+### U7 — indexer LLT scoring: 1565 GFLOP/s on the rig, 72% core scaling, occupancy is the lever — 2026-08-27
+
+`DS4_METAL_GPU_BUSY_PROFILE=1 tests/bench_indexer_score 32768 300` on mat
+(M2 Ultra), freshly built binary. The decode path is
+`kernel_dsv4_indexer_scores_llt <NBPTG=8,T_NSG=8>` (64 keys/threadgroup), not
+the per-row fallback.
+
+| metric | value |
+|---|---|
+| GFLOP/s | **1565.2** |
+| K-cache GB/s | 48.9 (16.78 MB/dispatch) |
+| vs M1 Max LLT (1075.9) | **1.45×** — cores×clock predicts 2.02× → **72% efficient** |
+| ALU peak | 7.3% (Ultra) vs 10.1% (M1 Max) |
+| scoring ×21 layers | 7.20 ms/token (harness, over-predicts ~1.9× vs M2's 3.84 ms) |
+
+**Scaling is real but 72% efficient, and the bigger part is the less
+efficient one.** U2's 1015 was the *direct* fallback path (its own note
+records the (32,4) shape), not LLT — the non-scaling worry was an artefact.
+The deficit is memory latency: threadgroup memory allows exactly one
+threadgroup resident per core, so there is almost nothing to hide latency
+with, and the Ultra has more latency to hide. Consistent with the NSG sweep
+(more residency is worse — bigger NK wins), T2's turnover at ~112
+threadgroups, and U9/U10's constraint recall.
+
+**Calibration:** at 1565 the scoring half is 7.20 ms across 21 layers, but
+M2's in-situ ablation attributed 3.84 ms — this harness over-predicts by
+**1.88×**. Standalone indexer numbers should be divided by ~1.9 before
+projecting engine impact.
+
+**Direction (U10):** `sk[64*128]half` is 16,384 of the 20,512 B budget and
+exists only because the index cache is F32. Storing it F16 lets the kernel
+`simdgroup_load` keys straight from device memory → threadgroup memory drops
+to 4,128 B → **residency 1 → 7 threadgroups/core** at unchanged NK. T9/U3
+returns for a fourth reason with a real mechanism: 7× residency, not
+bandwidth. Cheapest-first experiment: halve `sk` to 32 keys (no format
+change) to isolate whether residency helps at all, then do the F16 cache only
+if it does. See test plan U9/U10.
+
+### U8 — the 17-byte MXFP4 block granularity is ~6%, not the 46% gap — 2026-08-27
+
+`bench_membw` block-stride arms on mat (M2 Ultra), 16 GiB buffer, 20 iters —
+`stream_blocks` consumes a 16 B payload from each block, stride 16 (aligned)
+vs stride 17 (MXFP4 layout, every load straddling a 16-byte boundary),
+isolating layout cost from dequant arithmetic and from the expert gather:
+
+| arm | GB/s |
+|---|---|
+| blk-16 aligned | 758.0 |
+| blk-17 mxfp4 | 713.2 |
+
+**Gap: 5.9%** (713.2/758.0), versus 4.7% on the M1 Max pre-screen. The
+17-byte MXFP4 block granularity is worth ~6%, **not** the ~46% that separates
+the matvec's ~410 from the ~760 GB/s roof. So the block layout is not what
+puts `routed_moe_folded` at 54% of achievable. **Remaining suspects:** the
+expert gather/scatter and the dequant/accumulate path — the gather is 6
+experts × 3 tensors = 18 large contiguous regions per token, which should
+stream, so dequant and accumulation are now the leading candidates. See
+test plan U8 (diagnosis deliverable, not a patch; T8's specialisations stay
+dead).
+
 ### U2 — indexer-score roofline: latency-bound, U3 will not pay — 2026-08-26
 
 `tests/bench_indexer_score` on lanfear (M2 Ultra), model-free, one rank, no
