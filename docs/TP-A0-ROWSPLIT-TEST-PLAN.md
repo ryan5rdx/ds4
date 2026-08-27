@@ -204,7 +204,7 @@ two are minutes and one of them can invalidate three completed runs.
 | **19** | **U10 — alias `sq`/`sw`/`sqk` over the dead `sk` buffer** — **built, +19.3% on M1 Max, bit-identical, opt-in. Rig A/B DONE 2026-08-27: +17.4% (mean 2015.6 vs 1717.2 GFLOP/s), beats NSG=4, bit-identical.** End-to-end ~2–4% of the token (see U10b). **U10c** (F16 cache, 2 → 7 resident) gated on it. | ~1 d | Residency 1 → 2 at *unchanged* NK — the distinction U10a could not isolate. |
 | ~~20~~ | ~~U11 — confirm U10 does not regress prefill~~ — **done 2026-08-27: neutral.** Prefill 393.03 vs 393.37 t/s @131k; first-token 36.5 vs 35.5 ms. No nsg4-style spike. **U10 stays default-on.** | — | One arm, closed. |
 | ~~21~~ | ~~U12 — price `q_path` (5.47 ms) and `attn_inv_rope` (4.27 ms)~~ — **done 2026-08-27.** q_path 5.474/5.472 ms/token (ctx-invariant, 15%); attn_inv_rope 3.389→4.258 ms (grows +26%, 11.7%). 26.8% of token priced. | — | 26.8% of the token, now attributed. |
-| **22** | **U13 — arm the inverse-RoPE fuse on the indexed branch (was T10)** | ~1 d | The fuse exists but is armed only on the gathered branch, so all 21 ratio-4 layers pay a standalone dispatch. Filed at 0.04–0.09 ms against a 4.27 ms stage. **Gated on U12.** |
+| **22** | **U13 — arm the inverse-RoPE fuse on the indexed branch (was T10)** — **sizing invalidated; gated on U12b arm 1** | ~1 d | The 4.27 ms stage is mostly attention. If arm 1's delta is under ~0.3 ms, U13 is dead. |
 | ~~23~~ | ~~U14 — MoE expert straggler~~ — **deprioritised 2026-08-27.** Design C is a repacked TP-specific model file for 3.5%; B blocked; A costs 27 GiB. Recorded that whole-expert reassignment provably cannot help (variance, not mean), and that §7 missed a cheaper option — shifting the shared expert to the routed-light rank, 2.3% for no memory and no repack. | — | Poor return against U12/U13; kept so it is not re-derived. |
 
 Steps 0–3 are about four hours of rig time and settle whether the last three
@@ -1632,14 +1632,53 @@ Same underfill family as packed32-at-32-heads (−1.35 t/s), T2's turnover at
 between `q_a`, `q_b` and the norm/RoPE tail: three lines, and it splits 5.47 ms
 into three numbers that are all from one run.
 
-**Revised request — two cheap arms, then decide:**
-1. `DS4_METAL_DISABLE_PRE_M5_ATTN_INV_ROPE_FUSE=1` A/B → prices the standalone
-   RoPE, and therefore U13.
-2. Stage markers inside `q_path` → splits the largest context-invariant stage
-   into its three parts.
+### U12b — the two arms that turn 26.8% from "priced" into "explained"
 
-Both are same-run, same-epoch, and together they turn 26.8% of the token from
-"priced" into "explained".
+**Both are built and committed. Neither needs code on the rig side.**
+
+**Arm 1 — isolate the standalone inverse RoPE from FlashAttention. Zero code.**
+
+```
+DS4_METAL_DISABLE_PRE_M5_ATTN_INV_ROPE_FUSE=1   # vs default, 32k and 131k
+```
+
+The flag (`ds4.c:22094`) forces the **gathered** branch onto the standalone
+RoPE as well. Default vs this arm prices that dispatch across the 20 gathered
+layers; scale by 21/20 for the indexed layers that pay it unconditionally
+today. The delta **is** U13's prize — the 4.258 ms `attn_inv_rope` figure is
+not, because most of it is the attention core.
+
+Expect a *small* number. If the delta is under ~0.3 ms, **U13 is dead** and the
+4.27 ms is simply attention doing its job at long context.
+
+**Arm 2 — `q_path` split three ways.** `863e8fa` adds two boundaries, so the
+existing stage-profile run now reports:
+
+| new stage | contents |
+|---|---|
+| `q_a_kv_proj` | the fused q_a/kv Q8_0 pair projection |
+| `q_lora_norm` | the q-LoRA RMS norm (+ fused KV RoPE where it fires) |
+| `q_path` | Phase B: q_b projection + per-head RMS norm + RoPE tail |
+
+Same command as U12 (`DS4_METAL_GPU_STAGE_TIMESTAMPS=1`, 32k and 131k) — the
+markers are inert unless profiling is on, and stage names pass through
+dynamically, so nothing else changes.
+
+**What each outcome means.** `q_b` should be ≈0.744 GB/token; at the ~492 GB/s
+§4 measured for that kernel it is ~1.5 ms. So:
+
+- **remaining `q_path` ≈ 1.5 ms** → q_b is the whole of it, the per-head
+  norm/RoPE is free, and the cost is in `q_a_kv_proj` — look there.
+- **remaining `q_path` ≫ 1.5 ms** → the per-head norm/RoPE tail is the target,
+  and the suspect is its `n_head × n_tok` grid (`ds4_metal.m:22589`) — **32
+  threadgroups on 60 cores** at decode, one per head for 512 floats. That is
+  the same underfill family as packed32-at-32-heads (−1.35 t/s), T2's turnover
+  at 112, and U7's smem cap, and it would be the fourth sighting of one
+  constraint.
+
+**Do not size this by subtracting §4's `q_b` from U12's `q_path`** — different
+epochs, and §14.6 records three wrong conclusions from exactly that shortcut.
+That is why the markers exist.
 
 #### U13 — arm the inverse-RoPE fuse on the indexed branch — **T10 — SIZING INVALIDATED, see U12 correction 1**
 
