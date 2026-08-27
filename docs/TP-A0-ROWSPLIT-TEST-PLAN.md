@@ -203,7 +203,7 @@ two are minutes and one of them can invalidate three completed runs.
 | ~~17~~ | ~~U10a~~ — **done 2026-08-27. NSG=4 beats the default by +5–13% on the Ultra; NSG=2 −12%. Residency beats NK there — U10 is ON.** | — | The M1 Max ranking did not transfer, which was the question. |
 | **19** | **U10 — alias `sq`/`sw`/`sqk` over the dead `sk` buffer** — **built, +19.3% on M1 Max, bit-identical, opt-in. Rig A/B DONE 2026-08-27: +17.4% (mean 2015.6 vs 1717.2 GFLOP/s), beats NSG=4, bit-identical.** End-to-end ~2–4% of the token (see U10b). **U10c** (F16 cache, 2 → 7 resident) gated on it. | ~1 d | Residency 1 → 2 at *unchanged* NK — the distinction U10a could not isolate. |
 | ~~20~~ | ~~U11 — confirm U10 does not regress prefill~~ — **done 2026-08-27: neutral.** Prefill 393.03 vs 393.37 t/s @131k; first-token 36.5 vs 35.5 ms. No nsg4-style spike. **U10 stays default-on.** | — | One arm, closed. |
-| **21** | **U12 — price `q_path` (5.47 ms) and `attn_inv_rope` (4.27 ms)** | ~1 h | **26.8% of the token, never looked at.** Larger than anything ever queued here. Roofline them as U7/U8 did. |
+| ~~21~~ | ~~U12 — price `q_path` (5.47 ms) and `attn_inv_rope` (4.27 ms)~~ — **done 2026-08-27.** q_path 5.474/5.472 ms/token (ctx-invariant, 15%); attn_inv_rope 3.389→4.258 ms (grows +26%, 11.7%). 26.8% of token priced. | — | 26.8% of the token, now attributed. |
 | **22** | **U13 — arm the inverse-RoPE fuse on the indexed branch (was T10)** | ~1 d | The fuse exists but is armed only on the gathered branch, so all 21 ratio-4 layers pay a standalone dispatch. Filed at 0.04–0.09 ms against a 4.27 ms stage. **Gated on U12.** |
 | ~~23~~ | ~~U14 — MoE expert straggler~~ — **deprioritised 2026-08-27.** Design C is a repacked TP-specific model file for 3.5%; B blocked; A costs 27 GiB. Recorded that whole-expert reassignment provably cannot help (variance, not mean), and that §7 missed a cheaper option — shifting the shared expert to the routed-light rank, 2.3% for no memory and no repack. | — | Poor return against U12/U13; kept so it is not re-derived. |
 
@@ -1536,7 +1536,13 @@ explicitly**, not just steady-state t/s — that is the number T3 caught it on.
 regression → gate TIGHT to the decode call site only, which is a one-line
 change since the two callers are distinct.
 
-#### U12 — price `q_path` and `attn_inv_rope` — **26.8% of the token, never looked at**
+#### U12 — price `q_path` and `attn_inv_rope` — **26.8% of the token — DONE 2026-08-27**
+
+**Outcome.** Stage-profile at 32k/131k (build `b99dfa3`): **q_path 5.474 →
+5.472 ms/token** (context-invariant, 15.0% of token) and **attn_inv_rope
+3.389 → 4.258 ms** (+26% with context, 11.7% of token). Together 9.7 ms =
+26.8% of the 36.36 ms token. q_path is the largest non-indexer decode stage;
+attn_inv_rope grows with context. See `BENCHMARKS-TP-PP.md` §U12.
 
 Together they are **9.74 ms of the 36.36 ms token**, larger than any item ever
 queued in this document, and neither has been priced against a roof. Both are

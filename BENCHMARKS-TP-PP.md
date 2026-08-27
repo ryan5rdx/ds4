@@ -243,6 +243,39 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### U12 — price q_path (5.47 ms) and attn_inv_rope (4.27 ms) — stage profile, 2026-08-27
+
+`DS4_METAL_GPU_STAGE_TIMESTAMPS=1` stage-profile run on the rig (mat worker
+/ lanfear coord, TP over RDMA, build `b99dfa3`), gen 128, at 32k and 131k.
+Per-token stage gpu_ms (sum over 128 decode tokens ÷ 128).
+
+| stage | 32k ms/token | 131k ms/token |
+|---|---|---|
+| **q_path** | **5.474** | **5.472** |
+| **attn_inv_rope** | **3.389** | **4.258** |
+| routed_moe_folded | 4.990 | 4.950 |
+| compressor_indexer | 4.957 | 9.668 |
+| attn_output | 3.746 | 3.804 |
+| ffn_hc_post | 1.834 | 1.812 |
+| attn_hc_pre | 1.142 | 1.155 |
+| ffn_hc_pre | 1.119 | 1.121 |
+| router | 1.112 | 1.108 |
+| shared_gate_up | 0.985 | 0.965 |
+| shared_down | 0.660 | 0.657 |
+| attn_hc_post | 0.467 | 0.461 |
+| total gpu_busy | 32.70 | 37.99 |
+
+**q_path is context-invariant** (5.474 → 5.472 ms from 32k to 131k) — it is
+the fixed per-token query projection cost (q_a/q_b Q8_0 matvecs + head RMS
+norm + RoPE tail), 15.0% of the token, and the single largest non-indexer
+stage. **attn_inv_rope grows with context** (3.389 → 4.258 ms, +26%) — the
+standalone 64-threadgroup inverse-RoPE dispatch on the attention output, paid
+per layer. Together they are 9.7–9.7 ms, 26.8% of the token.
+
+Model shape (from `speed-bench/tp_decode_investigation.md`): n_head 64,
+n_head_kv 1, n_head_dim 512, n_rot 64, n_lora_q 1024, n_key_mla 256, n_embd
+4096, 43 layers (21 ratio-4).
+
 ### U11 — U10 (TIGHT, default-on) does not regress prefill — neutral — 2026-08-27
 
 Prefill A/B on the rig (mat worker / lanfear coord, TP over RDMA, build
