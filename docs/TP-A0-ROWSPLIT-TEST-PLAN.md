@@ -321,6 +321,77 @@ obviously recoverable — an RDMA round trip has to happen — but 11% of the to
 in a 1-thread spin deserves its own investigation before more kernel work. The
 question is whether it can be overlapped rather than removed.
 
+### U15 result — the model holds, and the 2.7× disagreement resolves — 2026-08-27
+
+**Context-invariance is confirmed.** Every stage at 2k matches its 32k value
+within noise except `compressor_indexer`, which collapses **4.957 → 0.201 ms**
+exactly as predicted. The short-context program rests on a measurement now, not
+an inference.
+
+**One reclassification: `attn_inv_rope` is not context-growing.** It reads
+**3.806 @2k / 3.393 @32k / 4.252 @131k** — it *dips* then rises, so its 32k→131k
+slope was misleading. At 2k it is the **second-largest stage**. Consistent with
+it being mostly FlashAttention taking a different branch at short context, and
+with U13 being worthless to the short-context program.
+
+**The profiler tax at 2k is 18%, not 13%** — 28.613 ms profiled against ~24.34
+unprofiled. Same fixed per-boundary cost over a smaller token, so the correction
+is larger here. Net of ~0.18 ms/marker:
+
+| stage | net ms | % of the 24.34 ms token |
+|---|---|---|
+| `routed_moe_folded` | 4.72 | **19.4%** |
+| `attn_inv_rope` | 3.63 | **14.9%** |
+| `attn_output` | 3.55 | **14.6%** (0.4–1.35 of it ATTN gate) |
+| `q_a_kv_proj` | 1.97 | 8.1% |
+| `ffn_hc_post` | 1.74 | 7.2% (**1.35 of it FFN gate**) |
+| `q_path` | 1.70 | 7.0% |
+| `q_lora_norm` | **1.50** | **6.2%** |
+| `attn_hc_pre` | 0.96 | 3.9% |
+| `ffn_hc_pre` | 0.93 | 3.8% |
+| `router` | 0.92 | 3.8% |
+| `shared_gate_up` | 0.79 | 3.3% |
+| `shared_down` | 0.49 | 2.0% |
+| `attn_hc_post` | 0.29 | 1.2% |
+| `compressor_indexer` | 0.02 | 0.1% |
+
+**The gate decomposition holds at 2k.** `ffn_hc_post` net 1.74 − 1.351 gate =
+**0.39 ms** of real HC-post work, against `attn_hc_post`'s **0.29 ms** for the
+identical kernel with no gate. Two independent stages, same answer.
+
+**The 2.7× profile-vs-ablation disagreement is resolved, and it is not a
+measurement error.** `DS4_TP_ABLATE=hcpre` takes `attn_hc_pre` 1.135→0.645 and
+`ffn_hc_pre` 1.109→0.627 — it removes only ~43% of each span and **leaves
+1.27 ms still in them**. So the ablation chain simply does not cover the whole
+stage; §9's caveat applies exactly. The profile is right, the ablation is right,
+and they measure different things. **Close this open item.**
+
+Consequence: the real ablatable HC-pre pool is **~0.76 ms end-to-end**, and the
+HC candidate pool shrinks toward the bottom of its 0.6–1.0 ms range.
+
+**The pre-norm fusion is a net win — do not flip it.** Disabling it costs
+**+0.58 ms** (attn_hc_pre 1.135→1.416, ffn_hc_pre 1.109→1.398). The three
+device-scope `seq_cst` fences cost less than the dispatch they remove. That was
+one of the three speculative zero-code arms; it closes as *current default is
+correct*.
+
+### Revised short-context ranking after U15
+
+| item | ms | % of the 2k token | status |
+|---|---|---|---|
+| **gate spin** (ATTN + FFN) | 1.75–2.7 | **7–11%** | confirmed at 2k; largest, least understood |
+| **C1** Q8_0 k-curve, program-wide | 1.13–1.40 | 4.6–5.8% | 2.9× spread confirmed model-free |
+| **U16** `q_lora_norm` fusion | ≤1.50 | ≤6.2% | 2 threadgroups; diagnosed |
+| **U14** shared-shift | 0.82 | 3.4% | measured mechanism |
+| **C3** row-split `shared_down` | ~0.25 | ~1.0% | k-curve consequence; `shared_down` is only 0.49 ms net |
+| **C2** `out_a` nsg (unswept) | ~0.25 | ~1.0% | one literal |
+| **HC pool** | **~0.5** | ~2% | **downgraded** — ablation says 0.76 ms exists at all |
+
+Non-gate sum **≈4.0–5.2 ms** against the **4.34 ms** needed for 50 t/s. Still
+covered, but the HC contribution shrank and the two largest items (`routed_moe`
+4.72 and `attn_inv_rope` 3.63, together 34% of the token) remain without a
+proposal.
+
 ### Next run — 2026-08-27
 
 **Rig: U15, the three zero-code HC arms above, and the Q8_0 shape sweep**
