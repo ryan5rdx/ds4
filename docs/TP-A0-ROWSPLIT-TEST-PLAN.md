@@ -772,7 +772,10 @@ follow this; a new driver must too):
 - Progress monitoring: watch `--csv` row growth and
   `sudo powermetrics --samplers gpu_power -i 5000 -n 1` (prefill ~55–60 W,
   decode ~30 W, idle ~0.1 W). Under `nohup` the log is fully buffered and
-  flushes at exit — an empty log mid-arm is normal, not a hang.
+  flushes only on **normal exit** — `kill -9` loses the whole buffer (all
+  M0 worker logs came back empty for exactly this reason), and an empty log
+  mid-arm is normal, not a hang. The coordinator exits normally so its log
+  flushes and is the one to read.
 - End-of-arm: wait for the coordinator process to **exit** (a fixed `sleep` +
   `pkill` will murder a live sweep — the 131k chunk takes minutes), `pkill`
   stragglers, copy the CSV into the results tree, and check row count ≥
