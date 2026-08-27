@@ -199,8 +199,9 @@ two are minutes and one of them can invalidate three completed runs.
 | ~~15~~ | ~~U7 — indexer LLT scoring on the rig~~ — **done 2026-08-27. 1565 GFLOP/s, 72% core scaling, 7.3% of ALU peak.** U2's 1015 was the *direct* fallback, so the non-scaling worry was an artefact. Deficit is latency hiding: one threadgroup resident per core. | — | Sized the largest stage against the right kernel for the first time. |
 | ~~16~~ | ~~U8 — MoE block granularity~~ — **done 2026-08-27. 17-byte stride costs 5.9%, not 46%.** `blk-16` hits 758 GB/s ≈ roof, so it is not load granularity in any form. **Dequant/accumulate are what remain.** | — | Eliminated one of three suspects for the matvec's 54%. |
 | **17** | **U10a — NSG sweep {8,4,2} on the rig** | **~10 min, zero code** | **Run this next.** The knob is built, committed and bit-identical; the rig ran only the default. It is the direct test of whether residency is the Ultra's deficit, and it decides whether U10 gets written at all. |
-| **18** | **U9 — replace decode's full argsort with a grid-parallel select** | ~1–2 d | **Largest single item.** 5.32 ms in situ, more than the scoring it selects from. Algorithmic, not a tune: O(n log²n) → O(n). Independent of U10 — different kernel, different half of the stage. |
-| **19** | **U10 — drop the `sk` staging buffer (F16 index cache)** | ~1 d | 1 → 7 threadgroups resident per core at unchanged NK. **Gated on U10a.** Cheapest-first: prove residency helps before converting the cache. |
+| **18** | **U9 — replace decode's full argsort with a grid-parallel select** — **do this first** | ~1–2 d | **Largest single item: 15.0% of the token; 4× is +11.3% end-to-end.** 5.32 ms in situ, more than the scoring it selects from. Algorithmic, not a tune: O(n log²n) → O(n). Independent of U10 — different kernel, different half of the stage. |
+| ~~17~~ | ~~U10a~~ — **done 2026-08-27. NSG=4 beats the default by +5–13% on the Ultra; NSG=2 −12%. Residency beats NK there — U10 is ON.** | — | The M1 Max ranking did not transfer, which was the question. |
+| **19** | **U10 — drop the `sk` staging buffer (F16 index cache)** | ~1 d | 1 → 7 threadgroups resident per core at unchanged NK. **Sized at +2.5–5.4% end-to-end, not 25%** — a constant-factor tune on 10.9% of the token. Worth doing; not worth doing first. See U10b. |
 
 Steps 0–3 are about four hours of rig time and settle whether the last three
 campaigns are valid, whether the largest sized item is real, and whether the
@@ -1270,6 +1271,56 @@ Note NSG=4 confounds two changes (NK halved *and* residency doubled), so it can
 only ever be suggestive — but a **win** there is strong evidence for U10 because
 U10 gets the residency without paying the NK. Run this before writing any U10
 code.
+
+#### U10b — sizing U9 against U10 end-to-end, and resolving the T3 contradiction
+
+**The apparent contradiction first, because it looks worse than it is.** U10a's
+harness says NSG=4 is **+12.8%** at `n_comp=32768`. T3's *production* A/B of the
+same flag, at the ctx that corresponds to exactly that `n_comp` (131072 / 4),
+measured **−1.7%**. Opposite signs on the same knob at the same operating point.
+
+They reconcile on sizing. The score kernel is **3.84 ms of a 36.36 ms token —
+10.9%.** A +12.8% kernel win is therefore **+1.2% end-to-end**, and T3's decode
+deltas at 131k ran −1.7% / −0.6% against a noise floor of about ±1%. **The
+predicted effect sits inside T3's noise.** No contradiction, but no production
+confirmation either — and note T3 also recorded first-token latency spiking to
+189 ms vs 31 ms control, so the flag is clearly *prefill*-negative and must not
+be flipped globally on decode evidence.
+
+**Now size the two live items against the token, which I failed to do when I
+called U10 "the strongest structural lever."**
+
+| | share of token | 2× | 4× | 7× |
+|---|---|---|---|---|
+| **U9** — top-k, 5.32 ms | **15.0%** | **+7.5%** | **+11.3%** | +13.0% |
+| **U10** — score, 3.84 ms | 10.9% | +5.4% | +8.2% | +9.3% |
+
+**U9 is the larger item, and the gap is wider than the table shows.** Top-k is
+**algorithmic** — a full bitonic sort replaced by an O(n) select, where 4× is a
+conservative ask. U10 is a **constant-factor** occupancy tune on a kernel
+already running a reasonable algorithm, where 7× residency will not become 7×
+throughput; the honest expectation is the 1.3–2× band, i.e. **+2.5–5.4%**.
+
+**Revised recommendation: U9 first, U10 second.** I had them roughly co-equal
+and led with U10 because U10a was cheap to decide. That was sequencing
+convenience, not sizing.
+
+**Two things that follow.**
+
+1. **Do not flip the NSG=4 default on harness evidence.** The end-to-end effect
+   (~1.2%) is below what our decode A/B can resolve, and T3 says it is
+   prefill-negative. If it is wanted, it needs a decode-only gate and a
+   production A/B with enough repeats to resolve ~1%, which M0-class runs
+   currently cannot.
+2. **U10's ceiling should be re-stated honestly wherever it appears.** "7×
+   residency" is the mechanism, not the outcome. Against the token it is a
+   **~2.5–5.4%** item — worth doing, not worth doing first.
+
+**And the general lesson, which has now cost us twice.** T9 and T6 were both
+mis-sized because they were priced before the stage profile existed. U10 was
+mis-*ranked* because I priced the kernel and not the token. **Every future item
+in this document should carry its end-to-end share, not just its kernel-level
+multiple.**
 
 #### U10 — drop the `sk` staging buffer: 1 → 7 threadgroups resident per core
 
