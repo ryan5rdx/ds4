@@ -303,7 +303,7 @@ Net of the ~0.18 ms/marker profiler tax, and with both scoping reports in:
 | item | ms | % of 2k token | confidence |
 |---|---|---|---|
 | **gate spin** (ATTN + FFN) | ~2.7 | 11.1% | measured twice, independently |
-| **U16** `q_lora_norm` fusion | ≤1.50 | ≤6.2% | 2 threadgroups; diagnosed |
+| ~~U16~~ | — | **Diagnosed, not implemented.** The kernel is ~22 µs of pure dispatch latency, flat across a 64× work range, so a fusion buys nothing. Same fix as the gate spin: concurrent scheduling. **Held behind the gate agent.** |
 | **C1** Q8_0 k-curve, program-wide | 1.13–1.40 | 4.6–5.8% | 2.9× spread confirmed model-free |
 | **U14** shared-shift | 0.82 | 3.4% | now has a measured mechanism |
 | **HC pool** (H4/H6/H2) | 0.6–1.0 | 2.5–4.1% | scoped; grid-widening already negative |
@@ -381,7 +381,7 @@ correct*.
 |---|---|---|---|
 | **gate spin** (ATTN + FFN) | 1.75–2.7 | **7–11%** | confirmed at 2k; largest, least understood |
 | **C1** Q8_0 k-curve, program-wide | 1.13–1.40 | 4.6–5.8% | 2.9× spread confirmed model-free |
-| **U16** `q_lora_norm` fusion | ≤1.50 | ≤6.2% | 2 threadgroups; diagnosed |
+| ~~U16~~ | — | **Diagnosed, not implemented.** The kernel is ~22 µs of pure dispatch latency, flat across a 64× work range, so a fusion buys nothing. Same fix as the gate spin: concurrent scheduling. **Held behind the gate agent.** |
 | **U14** shared-shift | 0.82 | 3.4% | measured mechanism |
 | **C3** row-split `shared_down` | ~0.25 | ~1.0% | k-curve consequence; `shared_down` is only 0.49 ms net |
 | **C2** `out_a` nsg (unswept) | ~0.25 | ~1.0% | one literal |
@@ -391,6 +391,57 @@ Non-gate sum **≈4.0–5.2 ms** against the **4.34 ms** needed for 50 t/s. Stil
 covered, but the HC contribution shrank and the two largest items (`routed_moe`
 4.72 and `attn_inv_rope` 3.63, together 34% of the token) remain without a
 proposal.
+
+### U16 — measured before implementing, and the fix changed — 2026-08-27
+
+I set out to fuse the q-LoRA norm away. Measuring the kernel first
+(`tests/bench_qkv_norm`, `867cae3`) showed the fusion would have bought nothing.
+
+**The kernel does no work.** Batched with rotated outputs to avoid
+write-after-write serialisation, per-dispatch cost converges to **~22 µs** — and
+sweeping `q_n` from 256 to 16384, **a 64× range of work, leaves it flat at
+21–23 µs**:
+
+| q_n | 256 | 1024 | 4096 | 16384 |
+|---|---|---|---|---|
+| µs/dispatch | 22.6 | 21.4 | 23.5 | 23.0 |
+
+It is **entirely per-dispatch latency**. The engine's 34.9 µs/layer is that
+~22 µs plus ~13 µs of surrounding serialisation.
+
+**This reconciles with §6 rather than contradicting it.** The ballast measured
+~1.9–3.7 µs marginal, but ballast dispatches are independent no-ops inserted
+*among* real work and pipeline with it. `q_lora_norm` is the opposite: a
+dependency barrier with two threadgroups and nothing to overlap, so it pays full
+end-to-end latency. **Both numbers are right; they measure different
+situations.** Record the distinction — a dispatch's cost in this engine is
+~2–4 µs if it overlaps and **~22 µs if everything waits on it.**
+
+**So U16's fix is not a kernel change and not a partial fusion.** Folding only
+the q half into `q_b` would leave the kv norm/RoPE/store dispatch in place, and
+the dispatch *is* the cost — the saving would be ~0. Removing the whole dispatch
+needs the kv half folded somewhere too, and its consumer is the KV cache, which
+persists across tokens and cannot absorb it.
+
+**U16 therefore converges on the gate problem.** Both are dependency barriers on
+a serial encoder with nothing scheduled alongside; both are fixed by giving the
+GPU concurrent work, not by making a kernel faster. The relevant prior is §8's
+*"Concurrent decode encoder — only one `memoryBarrierWithResources` exists in
+43k lines; dependent dispatches cannot overlap. **Argued down, not tested.**"*
+The batch encoder already supports `MTLDispatchTypeConcurrent`
+(`g_batch_encoder_concurrent`, `ds4_metal.m:1026`), and at that point in the
+layer the **compressor projection is independent of the q path** — it reads
+`attn_norm`, not `qr` — so there is real work available to overlap.
+
+**Held behind the gate-overlap agent**, which is investigating exactly this
+mechanism at larger scale (~2.7 ms vs U16's ~0.95 ms). Implementing concurrent
+scheduling twice, differently, would be worse than waiting for its answer.
+
+**What this reprices.** If a dependency-barrier dispatch costs ~22 µs, the
+engine's small dispatches are worth far more than §6's campaign estimate
+suggested — but only the ones that block. Identifying *which* dispatches are
+barriers with nothing alongside is now a first-class question, and
+`bench_qkv_norm` is the instrument for pricing any of them in isolation.
 
 ### Next run — updated 2026-08-27 after U15
 
@@ -421,7 +472,7 @@ disable (**+0.58 ms, the fusion is a net win**).
 
 | item | ms | why this order |
 |---|---|---|
-| **U16** `q_lora_norm` fusion | ≤1.50 | Diagnosed to 2 threadgroups. Largest item with a known mechanism. |
+| ~~U16~~ | — | **Diagnosed, not implemented.** The kernel is ~22 µs of pure dispatch latency, flat across a 64× work range, so a fusion buys nothing. Same fix as the gate spin: concurrent scheduling. **Held behind the gate agent.** |
 | **C1** Q8_0 k-curve | 1.13–1.40 | **Program-wide** — one kernel, many stages. Gated on arm 1. |
 | **U14** shared-shift | 0.82 | Now has a measured mechanism (gate spin), no memory cost, fixed work. |
 | **C3** row-split `shared_down` | ~0.25 | Falls out of C1's mechanism. |
