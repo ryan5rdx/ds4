@@ -1332,6 +1332,48 @@ worst-rel row 22878). The implemented cheap half (alias `sq`/`sw`/`sqk` over
 it is a ~2–4% token item (see U10b). **U10c** (F16 cache, 2 → 7 resident) is
 gated on.
 
+**Productionised: `TIGHT` is now the default**, with
+`DS4_METAL_INDEXER_LLT_TIGHT=0` as the rollback. Unlike T3's nsg4 it **does not
+change the grid** — only the threadgroup-memory allocation — so it carries none
+of the prefill risk that made nsg4 spike first-token latency to 189 ms. Worth
+confirming prefill on the next rig run regardless: the same single-token scorer
+runs per token in the prefill tail loop (`ds4.c:30833`), so this is not a
+decode-only path.
+
+**End-to-end it delivers ~+1.6%** — score is 3.84 ms of 36.36, and +17.4% saves
+0.57 ms. **U10b predicted +1.7%**, so the end-to-end sizing discipline is now
+validated against a measurement and should stay.
+
+**Dead code found while wiring this:** `kernel_dsv4_indexer_scores_llt16` and
+`_llt32` (`NBPTG` 16/32) are referenced by **no host call site**. The LLT
+pipelines have exactly one dispatch site, `ds4_gpu_indexer_score_one_tensor`,
+which always passes `n_tokens = 1`, so the `NBPTG` template axis is inert
+everywhere and both instantiations are unreachable. Add to the cleanup batch.
+
+### Where the decode token stands after U9 and U10 — 2026-08-27
+
+| stage | ms | share of 36.36 | status |
+|---|---|---|---|
+| `q_path` | 5.47 | **15.0%** | **never priced** |
+| `routed_moe_folded` | 5.40 | 14.9% | 54% of roof; dequant/accumulate (U8) |
+| indexer top-k | 5.32 | 14.6% | **U9 failed**; residual idea below |
+| `attn_inv_rope` | 4.27 | **11.7%** | **never priced** |
+| indexer score | 3.84 | 10.6% | **U10 done: +17.4% kernel → +1.6% token** |
+
+**`q_path` + `attn_inv_rope` are 9.74 ms — 26.8% of the token — and neither has
+ever been looked at.** With U9 dead that is the largest unexplored area in this
+document, larger than anything queued. It is also cheap to start: the stage
+profile already names them, so the work is identifying the kernels and pricing
+their achieved rate against the 760 GB/s roof and the ~21 TFLOP/s ALU peak,
+exactly as U7 and U8 did.
+
+**Residual U9-shaped idea, far cheaper than U9 was.** The argsort path's own
+split has never been swept: `nth` is the largest power of two ≤
+`maxTotalThreadsPerThreadgroup`, and `npr = ceil(n_comp/nth)` falls out — 32
+blocks of 1024 at `n_comp` 32768. Nothing has tested whether that is the right
+point, and U10 just demonstrated this kernel family is residency-sensitive, so
+smaller blocks are worth one arm. Zero code if `nth` is made env-overridable.
+
 This is where U7c points, and it is the strongest structural lever found so far.
 
 At NSG=8 the 20,512 B of threadgroup memory breaks down as:
