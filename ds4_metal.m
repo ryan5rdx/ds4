@@ -10207,9 +10207,14 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                     const double f_x = f_n ? g_tp_stat_slot_exchange_ms[1] / f_n * 1000.0 : 0.0;
                     fprintf(stderr,
                             "ds4: TP row gates by slot: attn %.0f x %.1f us, ffn %.0f x %.1f us, "
-                            "exchange delta %+.1f us -> straggler <= %.2f ms/token\n",
+                            "exchange delta %+.1f us -> straggler %.2f ms/token\n",
                             a_n, a_x, f_n, f_x, f_x - a_x,
-                            (f_x - a_x) * 2.0 * 43.0 / 1000.0);
+                            /* delta = E|s|/2 is already the per-layer excess on
+                             * the critical path (the token advances at the
+                             * slower rank's pace, so the cost is
+                             * E[max] - E[mean] = E|s|/2).  One layer's worth
+                             * per layer -- do not double it. */
+                            (f_x - a_x) * 43.0 / 1000.0);
                 }
                 fprintf(stderr,
                         "ds4: TP gate kinds: row %llu %.1f/%.1f us, "
@@ -26426,7 +26431,12 @@ int ds4_gpu_attention_output_q8_tp_tensor(
          * worse than TP's nsg=2 everywhere else it could reach.  Route it
          * through the same knob so the arm can actually be run; the default is
          * unchanged at 4 until the rig says otherwise. */
-        int16_t out_low_nsg = 4;
+        /* C2, measured on the rig 2026-08-27: nsg 1/2/4/8 gave 38.86/40.66/
+         * 41.15/41.85 t/s at 2k and 28.02/28.79/29.20/29.61 at 131k --
+         * monotonically better with width, so the default moves 4 -> 8 for
+         * +1.5-1.7%.  T4's "nsg=4 is ~3% worse everywhere else" does not
+         * reproduce here. */
+        int16_t out_low_nsg = 8;
         {
             const char *e = getenv("DS4_METAL_ATTN_OUT_LOW_NSG");
             if (e && e[0]) {

@@ -23853,6 +23853,11 @@ static bool metal_graph_encode_decode_layer_phase(
          * on both ranks — identical expression on both machines keeps them
          * bit-exact. */
         const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN;
+        /* Ends the projection span so `attn_tp_gate` below measures the gate
+         * alone.  Without this the gate marker's span reaches back to
+         * `attn_inv_rope` and reports the out_a/out_b projections as gate
+         * time, which is exactly what the first version did. */
+        DS4_METAL_PROFILE_DECODE_STAGE("attn_out_proj");
         ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_ATTN) != 0;
         /* Mirrors the ffn_tp_gate marker.  The ATTN gate carries no routed
          * straggler, so pricing the two separately isolates the imbalance from

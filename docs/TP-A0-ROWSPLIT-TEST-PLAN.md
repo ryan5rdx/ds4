@@ -392,6 +392,62 @@ covered, but the HC contribution shrank and the two largest items (`routed_moe`
 4.72 and `attn_inv_rope` 3.63, together 34% of the token) remain without a
 proposal.
 
+### Five-arm battery — one win banked, C1 falsified, and two of my instruments were wrong — 2026-08-27
+
+**C2 banked and shipped.** `DS4_METAL_ATTN_OUT_LOW_NSG` swept 1/2/4/8 →
+38.86/40.66/41.15/**41.85** t/s at 2k and 28.02/28.79/29.20/**29.61** at 131k.
+**Monotonically better with width; nsg=8 is +1.7% at 2k, +1.4% at 131k.** T4's
+"nsg=4 is ~3% worse everywhere else" does **not** reproduce on the rig. Default
+moved 4 → 8. This is the second banked win after U10, and it came from a literal
+that was simply unreachable by the sweep that was supposed to cover it.
+
+**Arm 1 — the straggler is real: U14 and §7 survive.** ATTN and FFN exchange are
+not equal — the FFN gate, which alone sits behind the routed shard, trails by
+**+11.6 µs at 2k / +8.1 µs at 131k**.
+
+**But my instrument's derived figure double-counted, and I am correcting it
+down.** It printed `43 × 2 × delta`. Since `delta = E|s|/2` is *already* the
+per-layer excess on the critical path — the token advances at the slower rank's
+pace, so the cost is `E[max] − E[mean] = E|s|/2` — the per-token figure is
+`43 × delta`:
+
+| ctx | delta | printed | **correct** |
+|---|---|---|---|
+| 2k | 11.6 µs | 1.00 ms | **0.50 ms** |
+| 131k | 8.1 µs | 0.70 ms | **0.35 ms** |
+
+So the straggler is **0.50 ms at 2k (2.1% of the token) and 0.35 ms at 131k**,
+and it is *smaller* at long context. **U14 survives but is now a ~2% item**, down
+from the 0.82 ms I first claimed and the ≤0.74 ms first correction. Formula
+fixed in `ds4_metal.m`.
+
+**Arm 3 — my `attn_tp_gate` marker renamed a stage instead of splitting it.**
+It reads 3.719 ms at 2k against the old `attn_output`'s 3.731, and `attn_output`
+fell to ~0.000. The cause: I placed the boundary *after* `ds4_gpu_tp_gate_encode`
+(`ds4.c:23856`), so the span still began at `attn_inv_rope` and swallowed the
+out_a/out_b projections. **The 3.72 ms is the projections, not the gate.** Fixed
+by adding an `attn_out_proj` boundary immediately *before* the encode, so the
+three spans separate: projections → gate → post-gate add. **Re-run arm 3.**
+
+**Arm 4 — C1 is falsified as specified, and C3 is supported.** The rig's Q8_0
+curve peaks at **k=4096 (445–458 GB/s)** and dips at 8192 — a different shape
+from the M1 Max's monotonic climb *and* from §5's historical peak at k=2048
+(283/413/581/541/517). The current absolute numbers are also well below §5's, so
+**§5's curve should not be quoted further**. C1's premise (a fixable shape) does
+not survive contact.
+
+C3 does: **k=1024 → k=2048 is 279 → 410 GB/s = 1.47×** on the current rig. On
+`shared_down`'s 0.49 ms net that is **0.16 ms, 0.64% of the 2k token** —
+real, small, and now measured rather than inferred.
+
+**Arm 2 — my flash-attn split does not reconcile, and the reason is my
+implementation.** Per-call `fa_core` ~0.31–0.33 ms and `reduce` ~0.40–0.49 ms
+at 2k, but the per-call sums come to ~30 ms against the 3.8 ms stage marker, and
+the profiled run does 13 t/s against 41 unprofiled. **I mirrored the prefill
+pattern, which requires batch context — and batch context distorts decode
+beyond usefulness.** A0 therefore does not yet decompose the 3.63 ms, and A2
+stays unsized. Needs a non-batch decode path before it is worth re-running.
+
 ### Repack-on-load — makes M3 and §7C the same mechanism, and kills the objection that buried §7C — 2026-08-27
 
 **Both M3 and §7C are pure byte reorganisations of data we already have.**
