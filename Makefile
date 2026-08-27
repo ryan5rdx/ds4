@@ -128,6 +128,15 @@ tests/bench_indexer_score: tests/bench_indexer_score.o ds4_metal.o
 bench-indexer-score: tests/bench_indexer_score
 	./tests/bench_indexer_score
 
+tests/test_topk_ab.o: tests/test_topk_ab.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_topk_ab: tests/test_topk_ab.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-topk-ab: tests/test_topk_ab
+	./tests/test_topk_ab
+
 tests/bench_membw.o: tests/bench_membw.m
 	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
 

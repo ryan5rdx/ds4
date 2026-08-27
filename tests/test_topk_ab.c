@@ -5,12 +5,16 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
+#include <time.h>
 #include <string.h>
 #include "ds4_gpu.h"
 
 #define CHECK(cond, msg) do { \
     if (!(cond)) { fprintf(stderr, "FAIL: %s\n", msg); return 1; } \
 } while (0)
+
+bool ds4_log_is_tty(FILE *fp) { (void)fp; return false; }
 
 static const float *g_row;
 static int cmp_desc_idx(const void *x, const void *y) {
@@ -49,12 +53,98 @@ int main(void) {
 
     setenv("DS4_METAL_ARGSORT_CANON", "1", 1);
     unsetenv("DS4_METAL_TOPK_STREAM512");
+    /* Reference arm is always the canonical argsort: pin the U9 hierarchical
+     * selector off, or at NT < 32 both arms would take it and compare a path
+     * against itself. */
+    setenv("DS4_METAL_TOPK_PARTITIONS", "0", 1);
     CHECK(ds4_gpu_indexer_topk_tensor(sel, scores, n_comp, n_tokens, top_k), "canon topk");
     CHECK(ds4_gpu_tensor_read(sel, 0, a, (size_t)top_k * n_tokens * 4), "read a");
 
     setenv("DS4_METAL_TOPK_STREAM512", "1", 1);
+    /* NT >= 32 exercises stream512; NT < 32 (the decode shape) exercises the
+     * U9 two-level select, which is default-off and so must be asked for. */
+    setenv("DS4_METAL_TOPK_PARTITIONS", getenv("PARTS") ? getenv("PARTS") : "8", 1);
     CHECK(ds4_gpu_indexer_topk_tensor(sel, scores, n_comp, n_tokens, top_k), "stream topk");
     CHECK(ds4_gpu_tensor_read(sel, 0, b, (size_t)top_k * n_tokens * 4), "read b");
+
+    /* Timing (ITERS=n): both arms, GPU-side, so the U9 two-level select can be
+     * priced against the argsort it replaces at the same shape. */
+    if (getenv("ITERS")) {
+        const int it = atoi(getenv("ITERS"));
+        /* ARM=a|b times a single arm in its own process, so
+         * DS4_METAL_GPU_BUSY_PROFILE=1 attributes GPU time to one path.  Wall
+         * clock here is dominated by per-call command-buffer round trip
+         * (~0.5 ms), which swamps the kernel at this shape. */
+        const char *arm = getenv("ARM");
+        if (arm && arm[0] == 'b') setenv("DS4_METAL_TOPK_PARTITIONS",
+                                         getenv("PARTS") ? getenv("PARTS") : "8", 1);
+        if (arm) {
+            if (arm[0] == 'a') setenv("DS4_METAL_TOPK_PARTITIONS", "0", 1);
+            ds4_gpu_indexer_topk_tensor(sel, scores, n_comp, n_tokens, top_k);
+            ds4_gpu_synchronize();
+            for (int i = 0; i < it; i++)
+                ds4_gpu_indexer_topk_tensor(sel, scores, n_comp, n_tokens, top_k);
+            ds4_gpu_synchronize();
+            fprintf(stderr, "arm=%s iters=%d done\n", arm, it);
+            return 0;
+        }
+        struct timespec t0, t1;
+        /* Interleave the arms and keep the minimum of each.  Sequential
+         * back-to-back blocks are not comparable on this box: the same arm
+         * measured 56-124 ms of GPU-busy across repeats (thermal drift), which
+         * is far wider than the effect.  Alternating shares that drift, and the
+         * minimum is the least-interfered sample. */
+        {
+            const int rounds = it < 20 ? it : 20;
+            const int inner = it / rounds > 0 ? it / rounds : 1;
+            double best_a = 1e30, best_b = 1e30;
+            for (int r = 0; r < rounds; r++) {
+                for (int arm2 = 0; arm2 < 2; arm2++) {
+                    if (arm2 == 0) setenv("DS4_METAL_TOPK_PARTITIONS", "0", 1);
+                    else setenv("DS4_METAL_TOPK_PARTITIONS",
+                                getenv("PARTS") ? getenv("PARTS") : "8", 1);
+                    ds4_gpu_indexer_topk_tensor(sel, scores, n_comp, n_tokens, top_k);
+                    ds4_gpu_synchronize();
+                    clock_gettime(CLOCK_MONOTONIC, &t0);
+                    for (int i = 0; i < inner; i++)
+                        ds4_gpu_indexer_topk_tensor(sel, scores, n_comp, n_tokens, top_k);
+                    ds4_gpu_synchronize();
+                    clock_gettime(CLOCK_MONOTONIC, &t1);
+                    const double ms = ((t1.tv_sec - t0.tv_sec) * 1e3 +
+                                       (t1.tv_nsec - t0.tv_nsec) / 1e6) / inner;
+                    if (arm2 == 0) { if (ms < best_a) best_a = ms; }
+                    else           { if (ms < best_b) best_b = ms; }
+                }
+            }
+            fprintf(stderr,
+                    "interleaved best-of-%d n_comp=%u: argsort %.4f ms  new %.4f ms  %.2fx\n",
+                    rounds, n_comp, best_a, best_b, best_a / best_b);
+        }
+        setenv("DS4_METAL_TOPK_PARTITIONS", "0", 1);
+        ds4_gpu_indexer_topk_tensor(sel, scores, n_comp, n_tokens, top_k);
+        ds4_gpu_synchronize();
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < it; i++)
+            ds4_gpu_indexer_topk_tensor(sel, scores, n_comp, n_tokens, top_k);
+        ds4_gpu_synchronize();
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double ms_a = ((t1.tv_sec - t0.tv_sec) * 1e3 +
+                             (t1.tv_nsec - t0.tv_nsec) / 1e6) / it;
+        unsetenv("DS4_METAL_TOPK_PARTITIONS");
+        ds4_gpu_indexer_topk_tensor(sel, scores, n_comp, n_tokens, top_k);
+        ds4_gpu_synchronize();
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        for (int i = 0; i < it; i++)
+            ds4_gpu_indexer_topk_tensor(sel, scores, n_comp, n_tokens, top_k);
+        ds4_gpu_synchronize();
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        const double ms_b = ((t1.tv_sec - t0.tv_sec) * 1e3 +
+                             (t1.tv_nsec - t0.tv_nsec) / 1e6) / it;
+        fprintf(stderr,
+                "timing n_comp=%u n_tokens=%u: argsort %.4f ms  new %.4f ms  "
+                "%.2fx   (x21 layers: %.2f -> %.2f ms/token)\n",
+                n_comp, n_tokens, ms_a, ms_b, ms_a / ms_b, ms_a * 21.0, ms_b * 21.0);
+    }
 
     /* CPU ground truth: strict (score desc, idx asc) top-k per row */
     int32_t *ref = malloc((size_t)top_k * n_tokens * 4);

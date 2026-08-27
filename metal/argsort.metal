@@ -327,28 +327,40 @@ static inline void ds4_topk_bitonic_desc_2048(
     }
 }
 
-[[max_total_threads_per_threadgroup(512)]]
-kernel void kernel_dsv4_indexer_topk_stream512(
-        constant ds4_metal_args_argsort & args,
-        device const char * src0,
-        device      int32_t * dst,
-        threadgroup ulong * buf [[threadgroup(0)]],
-        uint3   tgpig[[threadgroup_position_in_grid]],
-        ushort  tid  [[thread_index_in_threadgroup]],
-        ushort  lane [[thread_index_in_simdgroup]],
-        ushort  sgid [[simdgroup_index_in_threadgroup]]) {
+/* U9: the streaming selector, factored so it can run over a slice of a row and
+ * over either source layout.  Decode selects top-512 of 32768 with ONE
+ * threadgroup (n_tokens == 1), which is 1/60th of the GPU and measured 5.32 ms
+ * in situ -- more than the scoring it selects from.  Splitting the row into P
+ * slices lets P threadgroups run this concurrently and a second pass merge
+ * their P*top_k candidates.
+ *
+ * SRC_KEYS=false reads floats and packs (value, global index); SRC_KEYS=true
+ * reads already-packed keys, which is what the merge pass consumes.  Both
+ * produce the same (score desc, idx asc) total order as the single-pass path,
+ * so the hierarchy is exact: the global top-k is always contained in the union
+ * of the per-slice top-k sets. */
+template <bool SRC_KEYS>
+static inline void ds4_topk_stream_core(
+        device const char *src,
+        uint64_t           row_stride,
+        uint               row,
+        uint               begin,
+        uint               count,
+        uint               top_k,
+        uint               salt,
+        threadgroup ulong *buf,
+        ushort             tid,
+        ushort             lane,
+        ushort             sgid) {
     constexpr uint CAP = 2048u;
     constexpr uint TILE = 512u;
-    const uint n_comp = (uint)args.ne00;
-    const uint top_k = (uint)args.top_k;
-    const uint t = tgpig.x;
 
-    threadgroup uint *cnt = (threadgroup uint *)(buf + CAP);
+    threadgroup uint  *cnt = (threadgroup uint *)(buf + CAP);
     threadgroup ulong *thr_tg = (threadgroup ulong *)(buf + CAP + 1);
-    threadgroup uint *sg_counts = (threadgroup uint *)(buf + CAP + 2); // [16]
+    threadgroup uint  *sg_counts = (threadgroup uint *)(buf + CAP + 2); // [16]
 
-    device const float *row =
-        (device const float *)(src0 + args.nb01 * t);
+    device const float *frow = (device const float *)(src + row_stride * row);
+    device const ulong *krow = (device const ulong *)(src + row_stride * row);
 
     if (tid == 0) {
         cnt[0] = 0u;
@@ -356,22 +368,22 @@ kernel void kernel_dsv4_indexer_topk_stream512(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint start = (uint)(((ulong)(t + 1u) * 0x9E3779B9ul) % n_comp);
-    for (uint base = 0; base < n_comp; base += TILE) {
+    /* Rotate the scan start so an ascending input still warms the threshold
+     * quickly.  Salted per slice so slices do not all walk in lockstep. */
+    const uint start = count ? (uint)(((ulong)(salt + 1u) * 0x9E3779B9ul) % count) : 0u;
+
+    for (uint base = 0; base < count; base += TILE) {
         const ulong thr = thr_tg[0];
         const uint i = base + tid;
         ulong key = 0ul;
         bool take = false;
-        if (i < n_comp) {
+        if (i < count) {
             uint c = start + i;
-            if (c >= n_comp) c -= n_comp;
-            key = ds4_topk_pack_key(row[c], c);
+            if (c >= count) c -= count;
+            const uint g = begin + c;
+            key = SRC_KEYS ? krow[g] : ds4_topk_pack_key(frow[g], g);
             take = key > thr;
         }
-        /* Deterministic, atomic-free compaction: per-simdgroup accept
-         * counts land in a threadgroup array, one thread prefix-sums the
-         * sixteen entries, and every simdgroup writes at its reserved
-         * offset.  All simd ops run in uniform control flow. */
         const uint ballot = (uint)(ulong)simd_ballot(take);
         const uint sg_count = popcount(ballot);
         const uint sg = (uint)sgid;
@@ -408,16 +420,91 @@ kernel void kernel_dsv4_indexer_topk_stream512(
         }
     }
 
-    {
-        const uint have = cnt[0];
-        for (uint j = tid; j < CAP; j += 512u) {
-            if (j >= have) buf[j] = 0ul;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        ds4_topk_bitonic_desc_2048(buf, tid);
+    const uint have = cnt[0];
+    for (uint j = tid; j < CAP; j += 512u) {
+        if (j >= have) buf[j] = 0ul;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ds4_topk_bitonic_desc_2048(buf, tid);
+}
+
+[[max_total_threads_per_threadgroup(512)]]
+kernel void kernel_dsv4_indexer_topk_stream512(
+        constant ds4_metal_args_argsort & args,
+        device const char * src0,
+        device      int32_t * dst,
+        threadgroup ulong * buf [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tid  [[thread_index_in_threadgroup]],
+        ushort  lane [[thread_index_in_simdgroup]],
+        ushort  sgid [[simdgroup_index_in_threadgroup]]) {
+    const uint n_comp = (uint)args.ne00;
+    const uint top_k  = (uint)args.top_k;
+    const uint t      = tgpig.x;
+
+    ds4_topk_stream_core<false>(src0, args.nb01, t, 0u, n_comp, top_k, t,
+                                buf, tid, lane, sgid);
 
     device int32_t *out = dst + (ulong)t * args.top_k;
+    for (uint j = tid; j < top_k; j += 512u) {
+        out[j] = (int32_t)(0xffffffffu - (uint32_t)buf[j]);
+    }
+}
+
+/* U9 level 1: slice p of row t -> its own top_k, emitted as packed keys.
+ * Grid is (n_parts, n_tokens), so a single-token decode finally uses n_parts
+ * cores instead of one. */
+[[max_total_threads_per_threadgroup(512)]]
+kernel void kernel_dsv4_indexer_topk_partial(
+        constant ds4_metal_args_argsort & args,
+        device const char * src0,
+        device      ulong * dst,
+        threadgroup ulong * buf [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tid  [[thread_index_in_threadgroup]],
+        ushort  lane [[thread_index_in_simdgroup]],
+        ushort  sgid [[simdgroup_index_in_threadgroup]]) {
+    const uint n_comp  = (uint)args.ne00;
+    const uint top_k   = (uint)args.top_k;
+    const uint n_parts = (uint)args.ne02;
+    const uint p       = tgpig.x;
+    const uint t       = tgpig.y;
+
+    /* Ceil-split, so the tail slice is the short one and every element of the
+     * row belongs to exactly one slice. */
+    const uint per   = (n_comp + n_parts - 1u) / n_parts;
+    const uint begin = p * per;
+    const uint count = begin >= n_comp ? 0u : min(per, n_comp - begin);
+
+    ds4_topk_stream_core<false>(src0, args.nb01, t, begin, count, top_k,
+                                t * n_parts + p, buf, tid, lane, sgid);
+
+    /* A slice shorter than top_k pads with zero keys; zero sorts last and the
+     * merge treats it as empty, so no candidate is invented. */
+    device ulong *out = dst + ((ulong)t * n_parts + p) * top_k;
+    for (uint j = tid; j < top_k; j += 512u) out[j] = buf[j];
+}
+
+/* U9 level 2: merge n_parts*top_k packed candidates down to the final top_k. */
+[[max_total_threads_per_threadgroup(512)]]
+kernel void kernel_dsv4_indexer_topk_merge(
+        constant ds4_metal_args_argsort & args,
+        device const char * src0,
+        device      int32_t * dst,
+        threadgroup ulong * buf [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tid  [[thread_index_in_threadgroup]],
+        ushort  lane [[thread_index_in_simdgroup]],
+        ushort  sgid [[simdgroup_index_in_threadgroup]]) {
+    const uint top_k   = (uint)args.top_k;
+    const uint n_parts = (uint)args.ne02;
+    const uint t       = tgpig.x;
+    const uint count   = n_parts * top_k;
+
+    ds4_topk_stream_core<true>(src0, (uint64_t)count * sizeof(ulong), t,
+                               0u, count, top_k, t, buf, tid, lane, sgid);
+
+    device int32_t *out = dst + (ulong)t * top_k;
     for (uint j = tid; j < top_k; j += 512u) {
         out[j] = (int32_t)(0xffffffffu - (uint32_t)buf[j]);
     }
