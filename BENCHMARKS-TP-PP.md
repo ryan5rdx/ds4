@@ -202,6 +202,76 @@ Cold 131k prefill (TP): 402.64 — +54.9% over the pre-workstream flag-off cold
 baseline (259.90); sweep +65.8% (221.50 → 367.29). TP wins prefill at
 ≤16k and decode at every point; PP wins prefill from 32k up.
 
+### M0 — re-baseline decode on a pinned shard — `upstream-metal-wins` @ `5866100` tree build, 2026-08-26
+
+Step 0 came back positive: `iogpu.wired_limit_mb` was `0` on both hosts for
+the entire R10/R11 era, so the 76.7 GiB shard paged lazily. M0 re-runs the
+decode baseline with it set to `120000` (prefill splits default-on since
+`f45b535`, `DS4_NGRAM_SPEC` off, `DS4_METAL_FAST_SYNC=1` both ranks, standard
+prompt, no other TP flags).
+
+**Headline: the decode numbers survive; the gate-exchange numbers do not.**
+Decode t/s moved at most ~1% vs the wired=0 era — lazy paging cost almost
+nothing at the throughput level. The gate exchange was the lazy-paging
+casualty: it halved at 131k.
+
+Sweep (incremental, `--ctx-start 2048 --ctx-max 131072 --step-mul 2`, gen 128):
+
+| ctx | prefill t/s | decode t/s | first ms |
+|---|---|---|---|
+| 2048 | 448.69 | 41.09 | 26.9 |
+| 4096 | 522.62 | 36.58 | 26.2 |
+| 8192 | 555.47 | 36.04 | 29.1 |
+| 16384 | 532.93 | 35.39 | 29.3 |
+| 32768 | 506.71 | 33.71 | 30.2 |
+| 65536 | 461.88 | 31.56 | 32.1 |
+| 131072 | 393.53 | 28.34 | 35.2 |
+
+| arm | prefill t/s | decode t/s | first ms |
+|---|---|---|---|
+| cold 131k | 435.67 | 28.40 | 36.0 |
+| gate 2048 (`DS4_TP_GATE_PROFILE=1`) | 452.30 | 41.15 | 26.3 |
+| gate 131k | 435.87 | 28.24 | 36.1 |
+
+Gate profile (final cumulative snapshot, `DS4_TP_GATE_PROFILE=1`):
+
+| ctx | row gates | row wait µs | row exchange µs | BIG gates | BIG wait µs | BIG exchange µs |
+|---|---|---|---|---|---|---|
+| 2048 | 10,234 | 247.1 | 23.6 | 86 | 35,197 | 10,350 |
+| 131072 | 11,008 | 375.0 | 24.8 | 2,752 | 89,595 | 17,091 |
+
+Vs R10e (wired=0, word-soup prompt, `f3668a1` build):
+
+| quantity | R10e | M0 | Δ |
+|---|---|---|---|
+| decode @2048 t/s | 40.91 | 41.15 | +0.6% |
+| decode @131k t/s | 28.09 | 28.24–28.40 | +0.5–1.1% |
+| row gate exchange @2k µs | 34.8 | 23.6 | −32% |
+| row gate exchange @131k µs | 49.7 | 24.8 | **−50%** |
+| row gate wait @2k µs | 292.6 | 247.1 | −15.5% |
+| row gate wait @131k µs | 401.4 | 375.0 | −6.6% |
+| BIG exchange @131k µs | 22,531 | 17,091 | −24% |
+
+Consequences:
+
+1. **R10/R11 conclusions survive the re-baseline.** The sub-gate wash, the
+   4.4/4.1 GB/s link ceiling, and the replicated-attention negative none
+   hinged on the ≤1% decode shift (R11's A/B was in-session anyway).
+2. **T1 re-sizes, downward.** Its "86 × 49.7 µs = 4.27 ms/token, 12%" sizing
+   used a lazy-paging exchange. At 24.8 µs the exchange sits within ~9–10 µs
+   of M3's probe one-way p50 (14.5–15.5 µs for the same 16 KB single WR) —
+   no longer 3–4× above the fabric. The recoverable gap is at most
+   ~9 µs/gate × 86 = **0.8 ms/token ≈ +2% at 131k**, and that upper bound
+   assumes the entire delta to the probe RTT is recoverable, which it is not
+   (probe ping-pong and in-engine exchange are not the same measurement).
+   T1 stays on the sequence — it is a cheap A/B — but it is no longer "the
+   largest sized item".
+3. **The decode critical path is the gpu-wait, not the link.** A row gate
+   waits 375 µs @131k to exchange 24.8 µs — wire is 6–7% of gate time, the
+   rest is waiting on local GPU completion. 86 gates × 375 µs ≈ 32 ms ≈ the
+   whole 35.4 ms token. That is the regime M2/R13 are aimed at, and the
+   reason R10c's "stall-bound, ~30 W" profile was real all along.
+
 ### M3 — RDMA ping-pong latency, the T1 gate — probe battery, 2026-08-26
 
 **Question (plan step 1):** is T1 (reclaim the per-gate software cost) viable?
