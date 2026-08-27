@@ -854,16 +854,15 @@ against a defect worth several milliseconds, and item 3 costs nothing but a run.
 
 ### Next run — iteration 2, rebuilt 2026-08-27
 
-**Verified: `make ds4` plus all six benches clean, every knob and marker grepped
-present.** Three arms exist only because the last run exposed defects in my own
-instruments; those are fixed here, not deferred.
+**DONE 2026-08-27 (`6b962db`):** arms 1-3 measured, arm 4 (n-gram) did not
+engage (see below). Full data in `BENCHMARKS-TP-PP.md` §Iteration 2.
 
-| # | arm | what changed since last run | decides |
-|---|---|---|---|
-| 1 | **Stage profile** `DS4_METAL_GPU_STAGE_TIMESTAMPS=1`, 2k + 131k | **`attn_out_proj` boundary added.** Last run's `attn_tp_gate` marker sat *after* the gate encode, so its span reached back to `attn_inv_rope` and reported the out_a/out_b projections as gate time — it renamed a stage rather than splitting one (3.719 vs the old 3.731, `attn_output` → 0.000). Now projections / gate / post-gate add separate. | Prices the ATTN gate for the first time, and the 3.72 ms projections that were mislabelled as it. |
-| 2 | **Flash-attn split** `DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1`, 2k | **Sampling added** (`..._EVERY`, default 43 = one layer/token). Last run profiled *every* call: 4 boundaries × 43 layers = **172 command-buffer splits per token** against the 3 the engine uses, which drove it to 13 t/s and made the per-call sums irreconcilable. My earlier "batch context distorts decode" explanation was wrong — it was the split count. | **Finally decomposes `attn_inv_rope`'s 3.63–4.22 ms** into gather/packed/fa_core/reduce, and sizes A2. |
-| 3 | **Per-slot gate profiler** `DS4_TP_GATE_PROFILE=1`, 2k + 131k | **Straggler formula corrected** — it printed `43 × 2 × delta`, double-counting, because `delta = E\|s\|/2` is *already* the per-layer critical-path excess. | Re-confirms the straggler at the right magnitude: **0.50 ms @2k / 0.35 @131k**, not 1.00/0.70. |
-| 4 | **n-gram arms** `DS4_NGRAM_SPEC=1 DS4_NGRAM_SPEC_STATS=1`, repetitive vs novel | **Acceptance-rate instrument added** — the bench deferred this arm last run precisely because none existed. Reports steps, fraction with a draft, drafted/accepted, acceptance %, and extra tokens/step. | Whether speculation pays on prose. A t/s delta alone is uninterpretable: identical throughput can mean "drafts rarely fire" or "drafts fire and are rejected", which call for opposite responses. |
+| # | arm | outcome |
+|---|---|---|
+| 1 | **Stage profile** | **`attn_out_proj` is a real 2.38 ms top-4 stage** (ctx-invariant) that the last run's `attn_tp_gate` marker had swallowed; the true `attn_tp_gate` is only **0.91-0.99 ms**. The 3.72 ms figure was a mislabel, not a gate cost. |
+| 2 | **Flash-attn split** | Sampling fixed (123 vs 10496 calls). fa_core 0.251 / reduce 0.274 ms/token @2k, but per-layer × 43 ≈ 22.6 ms still does **not** reconcile to the 3.78 ms stage. Honest A2 decomposition still open. |
+| 3 | **Per-slot gate profiler** | Corrected formula: **straggler 0.66 ms @2k / 0.70 @131k** (was 1.00/0.70, double-counted). U14 + §7 survive at ~0.7 ms, not 1.0. |
+| 4 | **n-gram arms** | **DID NOT ENGAGE.** Plain bench decode (`ds4_session_eval` → `ds4_session_eval_probe_tp`, `ds4_bench.c:883`) never reaches the n-gram dispatch (`ds4.c:69923`, only via `..._speculative_argmax_excluding` when `cfg.dspark`, which requires `--mtp FILE`). 0 spec-stat lines, baseline throughput at 2k/131k. **Needs a dspark invocation to exercise — implementation-side, mine.** |
 
 **Do not re-run:** the Q8_0 shape sweep (C1 falsified — the rig peaks at k=4096,
 a different shape from both the M1 Max and §5, and **§5's curve should not be

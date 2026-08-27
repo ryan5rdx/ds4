@@ -243,6 +243,66 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### Iteration 2 — stage profile (fixed attn_out_proj boundary), sampled flash-attn, corrected gate profiler, n-gram — 2026-08-27
+
+Build `6b962db`, gen 128, rig (lanfear coord / mat worker). Zero-code arms
+(four).
+
+**Arm 1 — stage profile with `attn_out_proj` boundary added.** The boundary
+fix separates what the last run's mislabeled `attn_tp_gate` (3.72 ms) was
+hiding:
+
+| stage | 2k ms/token | 131k ms/token |
+|---|---|---|
+| compressor_indexer | 0.199 | 9.643 |
+| routed_moe_folded | 4.927 | 4.784 |
+| attn_inv_rope | 3.784 | 4.260 |
+| **attn_out_proj** | **2.383** | **2.384** |
+| q_a_kv_proj | 2.141 | 2.144 |
+| q_path | 1.876 | 1.859 |
+| q_lora_norm | 1.675 | 1.676 |
+| ffn_tp_gate | 1.643 | 1.651 |
+| **attn_tp_gate** | **0.994** | **0.912** |
+| **total gpu_busy** | **28.174** | **37.712** |
+
+**`attn_out_proj` (2.38 ms, ctx-invariant) is a real top-4 stage** that the
+last run's gate marker had swallowed; the actual `attn_tp_gate` is only
+~0.91-0.99 ms. `attn_output` still reads ~0.000 (absorbed). The 3.72 ms
+figure was a mislabel, not a real gate cost.
+
+**Arm 2 — flash-attn split, sampled** (`..._EVERY` default 43 = one
+layer/token). `decode_gathered` per-token: **fa_core 0.251 ms, reduce
+0.274 ms** (123 calls/128 tokens — the sampling works, vs 10496 calls
+un-sampled). Per-call fa_core ~0.25-0.41 ms, reduce ~0.27-0.35 ms @2k.
+Still does **not** reconcile to the 3.78 ms `attn_inv_rope` stage marker
+(per-layer × 43 ≈ 22.6 ms) — the honest decomposition of the 3.63-4.22 ms
+remains open; A2 stays unsized.
+
+**Arm 3 — per-slot gate profiler, corrected formula** (was printing
+`43 × 2 × delta`, double-counting since `delta = E|s|/2` is already the
+per-layer excess):
+
+| ctx | ATTN | FFN | delta | straggler |
+|---|---|---|---|---|
+| 2k | 16.0 µs | 31.4 µs | +15.4 µs | **0.66 ms/token** |
+| 131k | 17.5-17.6 µs | 33.5-33.9 µs | +15.9-16.3 µs | **0.68-0.70 ms/token** |
+
+**Straggler ~0.66-0.70 ms/token** — the pre-fix 1.00/0.70 was double-counted.
+The exchange delta is actually larger (+15-16 µs) but the per-layer cost is
+halved. U14 and §7 survive at **~0.7 ms**, not 1.0.
+
+**Arm 4 — n-gram arms: DID NOT ENGAGE.** The bench's plain-decode path calls
+`ds4_session_eval` → `ds4_session_eval_probe_tp` (`ds4_bench.c:883`), which
+**never reaches the n-gram dispatch** — that lives only inside
+`ds4_session_eval_speculative_argmax_impl` (`ds4.c:69923`), reachable only via
+`ds4_session_eval_speculative_argmax_excluding`, which the bench calls only
+when `cfg.dspark`, and `--dspark` requires `--mtp FILE`. With
+`DS4_NGRAM_SPEC=1 DS4_NGRAM_SPEC_STATS=1` on the plain bench, both 2k and
+131k printed **zero `ngram spec` stat lines** and ran at baseline throughput
+(42.00 / 29.55 t/s vs gate 41-42 / 29.7). **The n-gram arm needs a dspark
+invocation (`--dspark --mtp FILE`) to be exercised — implementation-side
+(user's domain).**
+
 ### Next-run battery (arms 1-5) — gate profiler, flash-attn split, stage profile, q8 shapes, attn_out nsg — 2026-08-27
 
 Build `345de30`, gen 128, rig (lanfear coord / mat worker). Zero-code arms.
