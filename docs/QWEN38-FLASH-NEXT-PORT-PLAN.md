@@ -195,15 +195,124 @@ argument holds verbatim and it should come back bit-identical.
 
 ## 8. Estimated throughput
 
-*Pending — a dedicated modelling pass is in flight. Will give prefill and
-decode across the seven sweep contexts with sensitivity ranges, anchored to our
-measured achieved rates rather than peaks.*
+**This is my own first-order model, not a validated one.** Two attempts at a
+dedicated modelling pass died on server errors, so I built it directly. The
+arithmetic is reproducible from the numbers below; the *effective-rate*
+assumption is doing all the work, and our own ~0.63 transfer-factor lesson says
+to treat the optimistic end as an upper bound.
 
-First-order expectation, to be replaced: decode roughly comparable to or better
-than DS4-Flash at short context and **substantially flatter with context**, on
-the strength of §6.1. Prefill is the less certain half — the 96 GR modules add
-~3.5% of a cold 131k prefill in pure FLOPs, but the 512-expert routing and the
-loss of every MoE decode specialisation cut the other way.
+### The model validates against a known quantity first
+
+Summing active parameters by component gives **5.995 B against the card's
+~6 B** — 0.1%. That is the check that the component breakdown is right before
+any throughput claim rests on it.
+
+| | routed | shared | GDN | QSA | GR | router | (head) |
+|---|---|---|---|---|---|---|---|
+| active params | 2.359 B | 0.236 | 2.087 | 0.617 | **0.633** | 0.063 | 0.636 |
+
+### Decode — bytes per token per rank
+
+MXFP4 experts, Q8 dense, fp32 state, TP2 with GDN head-split, GR replicated,
+experts split by id with a top-10 straggler factor of 6.23/10.
+
+| component | MB | note |
+|---|---|---|
+| routed experts | 780.9 | straggler-adjusted |
+| GDN weights | 1043.3 | head-split |
+| GR | 633.1 | **replicated — cannot be split (§7.1)** |
+| output head | 317.8 | vocab-split |
+| QSA weights | 308.7 | head-split |
+| shared expert | 118.0 | row-split |
+| router + n-gram proj | 95.9 | |
+| GDN state r/w | 113.0 | fp32; **56.6 at bf16**, which production stacks use |
+| KV read | 50.0 | capped at 2048 selected + tail — **context-independent** |
+| indexer keys | 1.3 → 50.0 | the only term that grows: 2k → 131k |
+| **total** | **3.46 → 3.51 GB** | **+1.4% across a 64× context range** |
+
+Against DS4-Flash's ~3.3 GB. **Roughly the same bytes, but almost none of the
+context slope** — that is the architectural claim, quantified.
+
+### Decode — throughput
+
+DS4's measured effective bandwidth falls 123 → 93.5 GB/s from 2k to 131k, and
+that decline *is* its context-dependent work (indexer scoring on 21 layers × 64
+heads). Qwen's equivalent term is 28× smaller, so its effective rate should
+hold near its short-context value rather than decaying.
+
+| ctx | bytes/rank | at 123 GB/s | with a 2× dispatch penalty | DS4 actual |
+|---|---|---|---|---|
+| 2048 | 3.46 GB | 35.5 t/s | ~31 | 41.09 |
+| 131072 | 3.51 GB | 35.0 t/s | ~30 | 28.34 |
+
+**Estimate: 31–38 t/s at 2k, 29–36 t/s at 131k — degradation of −3 to −6%
+against DS4's −31%.** Likely *slower* than DS4 at short context and *faster*
+at long, with a crossover somewhere around 16–32k.
+
+### Prefill — FLOPs per 4096-token chunk, at 131k
+
+| | Qwen | DS4-Flash |
+|---|---|---|
+| MoE | 19.33 (36.7%) | 53.2 |
+| GDN projections | 17.01 (32.3%) | — |
+| QSA / attention projections | 5.06 (9.6%) | 26.6 |
+| **GR** | **5.15 (9.8%)** | — |
+| attention core | 2.48 (4.7%) | 19.4 |
+| **indexer scoring** | **1.65 (3.1%)** | **46.0 (32%)** |
+| **total** | **52.6 TFLOP** | **145.4 TFLOP** |
+
+**Qwen is 0.36× the prefill FLOPs.** The dominant term is the indexer: 4 heads
+on 12 layers versus 64 heads on 21 gives `(64/4) × (21/12) = 28×` less work,
+which alone accounts for 44 of the 93 TFLOP difference. Active params (6.0 vs
+~9.7 B) account for most of the rest.
+
+GDN's *recurrence* is negligible and I checked it rather than assuming: at
+chunk 64 the per-head state update is ~4e6 MACs per (chunk, head), giving
+~0.9 TFLOP/chunk against 17 for its projections.
+
+DS4 measures 10.41 s/chunk at 131k → **13.97 TFLOP/s effective**. At the same
+rate Qwen would be 3.77 s/chunk = **~1070 t/s**. Both mixes are ~80%
+matmul-shaped, so the rate should be comparable.
+
+**Estimate: 600–900 t/s at 131k** — discounting the FLOP-parity figure hard for
+an immature kernel set, more dispatches, and the GR modules' small rank-320
+matmuls. Against DS4's measured 393.53.
+
+### Sensitivity — what would change the answer
+
+| assumption | if wrong | effect |
+|---|---|---|
+| **dispatch count** (assumed ~2× DS4's 1021: 48 layers, GDN has more ops each) | 3× instead | decode −15 to −20%; **this is the dominant decode risk** |
+| GDN weight quant (assumed Q8) | BF16 | +1.04 GB/token/rank → decode −25%. **The single most consequential quantisation decision in the model**, and the feasibility doc got it wrong |
+| effective TFLOP/s in prefill | 10 instead of 14 | prefill ~750 t/s |
+| GR read fusion | not fused | +168 MB/module materialised in prefill — untenable, must be fused end-to-end |
+| state dtype | bf16 not fp32 | decode +1.6%, and halves per-slot memory |
+
+### What dominates, and therefore what to optimise
+
+**Prefill**: MoE (37%) and GDN projections (32%) — both plain matmul, both
+already well served. GR at 9.8% is the only novel cost. Nothing here resembles
+DS4's indexer problem, which is why the A0/indexer/static-mixed arc has no
+analogue.
+
+**Decode**: GDN weights (30%), routed experts (22%), GR (18%). The context-
+dependent part is 1.4% of bytes. So decode optimisation should target the GDN
+weight path and quantisation — **not** the context-scaling work that consumed
+R1–R14 on DS4.
+
+### The caveat that matters most
+
+DS4 decode is **latency-bound, not bandwidth-bound** — it achieves 93–135 GB/s
+of 800, and T8 has since shown the routed MoE matvec alone runs at ~400 GB/s in
+isolation. So a bytes model is a *floor*, not a forecast, and the gap between
+the two on DS4 is exactly the 11.1 ms M2 is chasing. If that gap is a fixed
+per-layer cost, Qwen inherits it 48/43 = 1.12× over. If it scales with the
+context-dependent work, Qwen largely escapes it.
+
+**Which of those is true is the single measurement that would most reduce the
+uncertainty here — and it is M2, on the model we already have.** That is a
+strong argument for finishing M2 before committing to this port, independent of
+anything about Qwen.
 
 ## 9. Do this first — it applies to DS4 today
 
