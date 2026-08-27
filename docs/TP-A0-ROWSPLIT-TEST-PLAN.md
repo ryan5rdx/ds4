@@ -180,7 +180,7 @@ two are minutes and one of them can invalidate three completed runs.
 |---|---|---|---|
 | 0 | **`sysctl iogpu.wired_limit_mb` on both hosts** — **done 2026-08-26**: it **was** `0` on both hosts; all 27 surviving R10/R11 coordinator logs carry the `wired_limit_mb is 0` warning, so **R10d/R10e/R11 decode numbers are suspect** (flat, stall-shaped, neither-bound profile = lazy paging). Set to `120000` on both; prerequisite added to `BENCHMARKS-TP-PP.md`. | — | If it was 0 after the 2026-08-26 reboot, the shard was paging lazily and **R10d, R10e and R11 are all suspect**. Set it to `120000` on both and note it in the prerequisites (done — `BENCHMARKS-TP-PP.md`). |
 | 0b | Confirm `DS4_METAL_FAST_SYNC=1` is in the **`ds4-server`** launch path — **resolved 2026-08-26: nothing to confirm**. There is no `ds4-server` launch path in the repo and no production `ds4-server` deployment on the bench hosts; the knob is bench-only until a server path exists | — | Bench always sets it; production may not. Worth ~186 µs of a 508 µs gate, and without it the decode command-buffer split is a no-op under TP. |
-| **0c** | **M0 — re-baseline decode with the wired limit set** (sweep + cold 131k + `DS4_TP_GATE_PROFILE`) | ~1 h | **Step 0 came back positive: the limit was `0` on both hosts.** Everything measured on 2026-08-26 was on a lazily-paged shard. This re-run decides how much of R10c/R10e/R11 survives and re-sizes T1. Nothing else should run first. |
+| **0c** | ~~M0 — re-baseline on a pinned shard~~ — **done 2026-08-26. Decode survives within 1%; the gate exchange halved at 131k (49.7 → 24.8 µs); prefill moved +6–25% but the cause is confounded. T1 re-sizes down to ~+2%.** | — | **Step 0 came back positive: the limit was `0` on both hosts.** Everything measured on 2026-08-26 was on a lazily-paged shard. This re-run decides how much of R10c/R10e/R11 survives and re-sizes T1. Nothing else should run first. |
 | 1 | **M3** — **done 2026-08-26** (`uc_lat2`, byte-verified, n=2000/arm): half-RTT **8.0 µs (4 KB)** / **14.5–15.5 µs p50 (16 KB, single WR)** — both ≪20 µs → **T1 open** (~30 µs/gate ≈ 2.5 ms/token at 131k). Single 16 KB UC WR confirmed working on this stack. One transient first-ping UC drop seen; T1 needs a re-arm/retry path. Recorded in `BENCHMARKS-TP-PP.md`. | — | Decides T1, the largest sized item, before any code is written. ≲20 µs half-RTT → ~2.5 ms/token available; ~45 µs → T1 closes. |
 | 2 | **Env battery: T2 + T3 + T4** at 32k and 131k, `DS4_NGRAM_SPEC` **off** | ~1.5 h | Three knobs, no code, no correctness arm needed beyond top-1 + bounded Δlogit. T3 pre-screens free on the dev box with `tests/bench_indexer_score`. |
 | 3 | **T8 pricing** — `tests/bench_moe_mxfp4_decode 256` with the five disable envs, **on the rig** | 30 min | Prices four layers of MoE specialisation before writing the port. Model-free harness. |
@@ -368,47 +368,68 @@ Also recorded: there is no `#if 0` anywhere in the decode sources, and
 requirement (`metal/norm.metal:231`), **not** a missed optimisation — do not
 flip it for speed.
 
-### M0 — re-baseline decode; the 2026-08-26 numbers were taken on a paged shard
+### M0 — re-baseline on a pinned shard — **DONE 2026-08-26**
 
-**Step 0 came back positive.** `iogpu.wired_limit_mb` was **0 on both hosts**,
-and all 27 surviving R10/R11 coordinator logs carry the `wired_limit_mb is 0`
-warning. With it at 0, `ds4.c:59886` takes `ds4_gpu_model_residency_skip(1)`
-and TP never declares the 76.7 GiB shard resident, so Metal validates/pages it
-per use instead of pinning it.
+`iogpu.wired_limit_mb` was `0` on both hosts for the whole R10/R11 era. M0
+re-ran the decode baseline with it at `120000`. Full tables in
+`BENCHMARKS-TP-PP.md`.
 
-**Why this is not a small correction.** A shard that pages produces a decode
-profile that is stall-shaped, flat with context, and neither bandwidth- nor
-compute-bound — which is *the exact profile* R10c/R10e/R11 were built to
-explain. The conclusions drawn from it may be describing a misconfiguration
-rather than the engine.
+**What survived, and what did not.**
 
-| result | status now |
+| | verdict |
 |---|---|
-| R10c decode is stall-bound (~30 W vs 55.5 W prefill) | **suspect** — page-fault stalls look identical to gate stalls in a power trace |
-| R10d `DECODE_NWG` plateau 8–32 | **shape probably survives** (all arms shared the defect), absolutes do not |
-| R10e per-gate waits (292.6 / 401.4 µs) | **suspect** — residency validation inflates exactly this measure |
-| R11 replicated attention, −8.4 to −11.8% | **sign probably survives, magnitude suspect** — replication adds ~1.6 GB/token of weight reads, which a paged shard punishes harder than a pinned one |
-| R1–R9, all prefill | **unaffected** — pre-date the reboot; and prefill's 86–91% residency is not a paging signature |
-| The +65.8% sweep / +54.9% cold prefill arc | **unaffected** |
+| R10a sub-gate wash, R10b link ceiling, R10c stall-bound, R10d NWG plateau, R11 negative | **all survive** — decode moved ≤1.1%, and R11's A/B was in-session anyway |
+| R10e gate *exchange* numbers | **wrong** — 49.7 → **24.8 µs** at 131k (−50%), 34.8 → 23.6 at 2k |
+| The R9-vs-R10e "discordant" wire spread | **explained**: it was the wired limit. R9's 29.9 µs was near-pinned; R10e's 49.7 was paged |
+| T1's sizing | **halved and then some** — see below |
 
-**A concrete hypothesis this re-run tests.** R9 measured row-gate wire at
-**29.9 µs**; R10e measured **49.7 µs** for identical 16,384-byte payloads,
-+66%, which the bench flagged as discordant and widened the error bar for. R9
-is 2026-08-25, before the reboot; R10e is 2026-08-26, after. **If the gate wire
-returns to ~30 µs with the limit set, the discrepancy was the wired limit** —
-and that halves T1's prize (see below). If it stays at ~50 µs, the spread has
-another cause and T1 is worth what M3 says.
+So the suspicion was right about the gates and wrong about decode throughput.
+Lazy paging cost the *exchange* half its speed and cost decode t/s almost
+nothing — worth remembering as a shape: a misconfiguration can be invisible in
+the headline metric and dominant in a component of it.
 
-**Do this before anything else in the table.** Re-run: the 7-point sweep, cold
-131k, and `DS4_TP_GATE_PROFILE=1` at 2048 and 131072. That is one session and
-it re-validates or discards three campaigns.
+**T1 re-sized down to ~+2%.** At 24.8 µs the exchange sits within ~9–10 µs of
+M3's probe one-way (14.5–15.5 µs, same 16 KB single WR) rather than 3–4× above
+it. Upper bound is now ~9 µs/gate × 86 = **0.8 ms/token ≈ +2% at 131k**, and
+that assumes the whole delta to a ping-pong RTT is recoverable, which it is
+not. `DS4_TP_GATE_FASTPATH` is built and default-off, so it is still a cheap
+A/B — but it is no longer the largest item and should not be scheduled as if it
+were.
 
-**Also worth deciding after it lands:** whether R11 deserves a re-test.
-`DS4_TP_DECODE_REPLICATE_ATTN` was deleted in `f45b535` on the strength of a
-measurement now known to be taken on a paged shard. The mechanism argument
-("the gate wait is the window the peer's half runs in") is not obviously
-residency-dependent, so I would not restore it speculatively — but if M0 moves
-decode materially, reverting that one hunk and re-running is cheap.
+**Correcting my own consequences table.** I wrote that prefill was "unaffected —
+prefill's 86–91% residency is not a paging signature." Prefill moved **+6% to
++25%** (131k sweep 367.29 → 393.53, cold 402.64 → 435.67). The residency
+argument was wrong: prefill touches nearly every expert per 4096-token chunk
+where decode touches six per token, so per-command-buffer residency validation
+scales with prefill's working set and barely with decode's. That mechanism fits
+the split perfectly — prefill ~+10%, decode ~+1%.
+
+**But the prefill delta is confounded and must not be quoted.** M0 also switched
+the prompt from the `/tmp` word-soup to `speed-bench/promessi_sposi.txt`, which
+the R12 note warned has a different token/byte ratio and different routing
+entropy. Pinning is the more likely driver by the mechanism above, but nothing
+separates them. Consequences:
+
+- **The prefill arc ends at 367.29.** Do not extend it with 393.53; the two
+  numbers are not the same experiment. M0 opens a new baseline series.
+- A same-prompt control (word-soup on the pinned shard) would separate them in
+  one arm, if anyone wants the attribution. It is not needed for anything
+  currently queued.
+- All prefill A/Bs in R5–R8 remain valid — both arms shared prompt and shard
+  state within each comparison.
+
+**Where the decode critical path actually is.** At 131k a row gate waits
+**375 µs** to exchange **24.8 µs** — wire is 6–7% of gate time. The write-up
+reads that as "the rest is waiting on local GPU completion", which is true but
+close to the tautology this doc keeps tripping on: the wait *contains* the
+compute, so 86 × 375 µs ≈ the token by construction.
+
+The informative content is what is now excluded. Link: 6–7%, closed. Gate
+count: closed by R11. Dispatch: bounded at ~6% by
+`tp_decode_investigation.md`'s own 1.9 µs. What remains inside the 375 µs is
+**compute**, which points the queue at the things that make compute cheaper —
+the T2/T3/T4 env battery, T8's MoE specialisations, T9 — and at **M2**, which
+is the only item that can say where the 11.1 ms of long-context growth goes.
 
 ### R14 — ranked decode targets from the audit
 
@@ -466,27 +487,17 @@ Three ordered changes in `tp_rdma_gate_exchange()` (`ds4_tp.c:1011-1073`):
 ~30 µs/gate is recoverable — **2.5 ms/token, +8% at 131k**. ~45 µs means T1 is
 closed and we have documented a hard floor. Minutes to find out.
 
-**M3 result (2026-08-26): T1 is open, but its size now depends on M0.**
-Half-RTT **8.0 µs (4 KB)** and **14.5–15.5 µs p50 (16 KB, single WR — the gate
-shape)**, both well under the 20 µs threshold, byte-verified ×2000 per arm.
+**M3 + M0 result: T1 is open but small — ~+2%, not the 9% first sized.**
+M3 measured hardware half-RTT at 8.0 µs (4 KB) / 14.5–15.5 µs p50 (16 KB, the
+gate shape), byte-verified ×2000 per arm. M0 then showed the 49.7 µs exchange
+that motivated T1 was a lazy-paging artifact: on a pinned shard it is **24.8
+µs**, within ~9–10 µs of the probe. Upper bound **0.8 ms/token ≈ +2% at 131k**,
+and that assumes the full delta to a ping-pong RTT is recoverable, which it is
+not.
 
-Sizing, and the caveat that matters: against R10e's 49.7 µs the software
-overhead is ~35 µs/gate = **3.0 ms/token, +9% at 131k**. Against R9's 29.9 µs
-for the *same payload* it is ~15 µs/gate = **1.3 ms/token, +3.7%**. M0 decides
-which wire number is real — see above. Treat T1 as "open, worth 1.3–3.0
-ms/token" until then, and do not quote the upper end.
-
-One implementation note from the probe: a single 16,384 B UC SEND WR is
-confirmed working on this stack, so the gate needs no chunking.
-
-**No retry path needed** (owner's call, 2026-08-26): UC on this Apple stack is
-treated as lossless. The single first-ping drop M3 saw is the documented UC
-first-packet race in the probe's own OOB setup, not steady-state loss —
-`uc_bench`'s skeleton exists precisely because closing the OOB socket early
-triggers it. ds4's independent evidence is stronger than the probe's: R10e ran
-2,752 big gates and 11,008 row gates per cold run, all day, with no lost gate.
-So T1 does not carry a re-arm/retry design; `timeout_sec` remains the
-correctness backstop. Full table in `BENCHMARKS-TP-PP.md` (M3 section).
+`DS4_TP_GATE_FASTPATH` (`177b50a`) implements both changes and is default-off,
+so it costs one A/B arm to settle. No retry path: UC on this stack is treated
+as lossless. A single 16,384 B UC SEND WR needs no chunking.
 
 #### The env battery — one rig session, `DS4_NGRAM_SPEC` off
 
