@@ -191,8 +191,8 @@ two are minutes and one of them can invalidate three completed runs.
 | 7 | ~~T1~~ — **done 2026-08-26: dead.** `DS4_TP_GATE_FASTPATH` is a wash (±0.6% decode, no gate-exchange change) and is **not bit-identical** (logits shift up to 2.3, top-1 preserved). Stay default-off. ~~T8 port~~ — dead, see row 3. | — | Both are code, both are gated on a measurement above. |
 | 8 | Cleanup batch: T6, T10, T13 (**T9 removed — promoted to U3**) | — | Small, low-risk, individually sub-1%. |
 | **9** | **U1 — streaming-read ceiling on the rig**, one rank, no TP | ~15 min | **done 2026-08-26** — pinned at ~408–410 GB/s across maps 3.19–25.5 GiB = one M2 Max die; platform/placement (UltraFusion), not kernels; escalate, do not tune kernels. **Run first.** Decides whether ~400 GB/s is the platform or our kernels, and therefore how to read every number below. Also re-scores T8. |
-| **10** | **U2 — indexer-score roofline + working-set sweep** | ~30 min | The largest stage sits at ~4% of *both* roofs. Says whether it is addressable by configuration or needs a restructure — **and U3's prize depends on the answer.** |
-| **11** | **U3 — T9 re-sized: indexer cache F32→F16** | ~1 h | 352 MB/token at 131k, halved. Was filed sub-1% at "0.2–0.4 ms"; the stage is 10.5 ms. **Gated on U2.** |
+| **10** | **U2 — indexer-score roofline + working-set sweep** | ~30 min | **done 2026-08-26.** Latency-bound per byte — 39.7 GB/s at 65536 = ~10% of the 400 GB/s platform, one threadgroup per row; GPU-busy ~linear in `n_comp`. **U3 will not pay** (honest prize near zero); go to the restructure. Correctness flag (worst rel 7.6e-3, row 17391) = expected FP32 tree-vs-sequential tolerance, benign. The largest stage sits at ~4% of *both* roofs. |
+| **11** | **U3 — T9 re-sized: indexer cache F32→F16** | ~1 h | **gated off by U2 2026-08-26.** U2 reported latency-bound, so per its own gate the honest prize is near zero — do not start the F32→F16 code work; go to the restructure. 352 MB/token at 131k, halved. Was filed sub-1% at "0.2–0.4 ms"; the stage is 10.5 ms. **Gated on U2.** |
 | **12** | **U4 — TP row-split the decode indexer** | ~3 h | The biggest stage is computed *twice* today, once per rank. ~5 ms of 36 ms. Largest single item in this document. |
 | **13** | **U5 — R13 n-gram arms, re-prioritised** | ~1 h | Raises arithmetic intensity without requiring any kernel to get faster — the structural answer to a latency-bound decode. |
 
@@ -794,7 +794,15 @@ is 800; 400 is one M2 Max die. That sentence should be corrected whatever U1
 returns, because T8's "specializations cannot buy what is not there" rests on
 it.
 
-#### U2 — indexer-score roofline and working-set sweep — **gates U3**
+#### U2 — indexer-score roofline and working-set sweep — **gates U3 — DONE 2026-08-26**
+
+**Outcome.** Latency-bound: 39.7 GB/s at 65536 = ~10% of the 400 GB/s
+platform (one threadgroup per row, per-thread row count 1), GPU-busy
+~linear in `n_comp`. **U3 will not pay** — halving bytes of a kernel at
+~10% of bandwidth buys little time; go to the restructure instead.
+Correctness gate: worst rel 7.6e-3 at row 17391 (same row at 32768 and
+65536) — expected FP32 tree-vs-sequential reduction tolerance, benign for
+ranking.
 
 **Where:** model-free, so the dev box works, but **also run it on the rig** —
 the ratio between the two is itself informative and the 0.63 transfer factor
@@ -840,7 +848,11 @@ but it must not stay unexplained on the stage we are about to spend three days
 optimising. Say whether it is an expected FP32-vs-reference tolerance or a
 real defect.
 
-#### U3 — T9 re-sized: indexer compressed cache F32 → F16 — **gated on U2**
+#### U3 — T9 re-sized: indexer compressed cache F32 → F16 — **gated on U2 — GATED OFF by U2 2026-08-26**
+
+**Outcome.** U2 reported latency-bound, so per its own gate U3's honest
+prize is near zero — do not start the F32→F16 code work; go to the
+restructure instead.
 
 **Why it moved tier.** The cache is allocated F32 at `ds4.c:17373`
 (`layer_comp_cap[il] * DS4_N_INDEXER_HEAD_DIM * sizeof(float)`): at 131k that

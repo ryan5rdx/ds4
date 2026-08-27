@@ -181,6 +181,49 @@ Format: one table per (branch, commit, date). Newest first. Every table should
 name the branch + HEAD commit + date + the exact env flags that differ from
 defaults; the sweep semantics above apply to all rows.
 
+### U2 — indexer-score roofline: latency-bound, U3 will not pay — 2026-08-26
+
+`tests/bench_indexer_score` on lanfear (M2 Ultra), model-free, one rank, no
+TP. `n_comp` swept with `DS4_METAL_GPU_BUSY_PROFILE=1 tests/bench_indexer_score
+$n 300`; 300 dispatches per arm.
+
+| n_comp | GPU busy (ms/dispatch) | GFLOP/s | K-cache (GB/s) |
+|---|---|---|---|
+| 4096 | 0.066 | 287 | 9.0 |
+| 8192 | 0.097 | 495 | 15.5 |
+| 16384 | 0.184 | 731 | 22.9 |
+| 32768 | 0.352 | 1015 | 31.7 |
+| 65536 | 0.693 | 1271 | 39.7 |
+
+Kernel config: the single-token score kernel
+(`ds4_gpu_indexer_score_one_tensor`, direct path at n_head=32/head_dim=128)
+dispatches n_rows threadgroups of (32,4) = 128 threads — one threadgroup per
+compressed row, per-thread row count 1.
+
+**Verdict: latency-bound.** GPU-busy scales ~linearly in `n_comp` (each
+doubling ~1.9–2.0× past 16k; the 4096→8192 step is sublinear because small
+arms are overhead-dominated). Achieved bandwidth stays far below any roof:
+39.7 GB/s at 65536 is ~10% of the 400 GB/s platform (5% of the 800 GB/s
+spec), and 1271 GFLOP/s is ~12% of the ~10.4 TFLOP/s FP32 peak. That is the
+signature of a latency-bound kernel — one threadgroup per row, dependent
+loads, poor K-cache reuse.
+
+**Consequence for U3: it will not pay.** Per the plan's U2 decision fork, a
+kernel that is latency-bound per byte buys little from halving its bytes:
+halving bytes of a kernel at ~10% of bandwidth is a near-zero prize. Skip
+U3 (indexer cache F32→F16); go instead to the restructure (batching layers
+per dispatch / K-cache reuse).
+
+**Correctness, resolving the plan's open item.** The harness's own gate
+flags worst relative error 7.6e-3 at `n_comp` ≥ 32768 (row 17391), over its
+1e-3 threshold ("kernel looks wrong"). Per the harness header the CPU
+reference sums lanes sequentially while the Metal `simd_sum` reduces as a
+tree, so exact agreement was never expected. The worst row is the same
+(17391) at both 32768 and 65536 — one near-cancellation row where FP32
+tree-vs-sequential ordering diverges. Verdict: expected FP32
+reduction-association tolerance, benign for ranking; not a real defect, but
+watch that row if scores are used for exact tie-breaking.
+
 ### U1 — streaming-read ceiling: ~400 GB/s is the platform, not our kernels — 2026-08-26
 
 `tests/bench_moe_mxfp4_decode` on lanfear (M2 Ultra, 800 GB/s spec), one
