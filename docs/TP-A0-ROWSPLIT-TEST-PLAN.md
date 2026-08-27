@@ -189,7 +189,7 @@ two are minutes and one of them can invalidate three completed runs.
 | 5 | ~~R12a~~ split-schedule sweep + **R12b** reduced ballast arm + **encoder-boundary instrument** — **R12b and encoder-boundary MOOT** (probe stall; stage profile shows no stall). R12a split-schedule still valid if wanted. | ~1.5 h | R12b is now a confirmation, not a discovery; the encoder-boundary half is the genuinely unmeasured one. |
 | 6 | **R13 n-gram rig arms** (inertness / correctness / decode A/B on repetitive vs novel text) | ~1 h | Independent of the above; run whenever convenient. |
 | 7 | ~~T1~~ — **done 2026-08-26: dead.** `DS4_TP_GATE_FASTPATH` is a wash (±0.6% decode, no gate-exchange change) and is **not bit-identical** (logits shift up to 2.3, top-1 preserved). Stay default-off. ~~T8 port~~ — dead, see row 3. | — | Both are code, both are gated on a measurement above. |
-| 8 | Cleanup batch: T10, T13 (**T9 → U3/U10; T6 → U9** — both were sized before the stage profile) | — | Small, low-risk, individually sub-1%. |
+| 8 | Cleanup batch: T13, and the unreachable `llt16`/`llt32` instantiations (**T9 → U3/U10; T6 → U9; T10 → U13** — all sized before the stage profile) | — | Small, low-risk, individually sub-1%. |
 | **9** | **U1 — streaming-read ceiling on the rig**, one rank, no TP | ~15 min | **done 2026-08-26** — pinned at ~408–410 GB/s across maps 3.19–25.5 GiB. Initially read as one M2 Max die / platform; **superseded by U6 2026-08-27** — the part streams at ~760 GB/s on the same `mmap` path, so U1's plateau is the MoE matvec kernel's access pattern, not the platform. Kernel headroom re-opens. **Run first.** Decides whether ~400 GB/s is the platform or our kernels, and therefore how to read every number below. Also re-scores T8. |
 | **10** | **U2 — indexer-score roofline + working-set sweep** | ~30 min | **done 2026-08-26.** Latency-bound per byte — 39.7 GB/s at 65536 = ~10% of the 400 GB/s platform, one threadgroup per row; GPU-busy ~linear in `n_comp`. **U3 will not pay** (honest prize near zero); go to the restructure. Correctness flag (worst rel 7.6e-3, row 17391) = expected FP32 tree-vs-sequential tolerance, benign. The largest stage sits at ~4% of *both* roofs. |
 | **11** | ~~U3~~ — **folded into U10.** U2 gated it off as "latency-bound, halving bytes will not pay" — correct on bandwidth, but U2 measured the *direct* fallback, not production's LLT kernel, and the real argument for F16 was never bandwidth. It is that `sk` is 80% of the threadgroup-memory budget. See U10. | — | Killed for the right reason on the wrong kernel; returns with a different mechanism. |
@@ -202,6 +202,9 @@ two are minutes and one of them can invalidate three completed runs.
 | ~~18~~ | ~~U9~~ — **built and measured 2026-08-27: negative, default off.** 0.77× on the M1 Max. The premise was wrong — the argsort fallback is *already* a 32-block hierarchy, so the parallelism U9 added already existed. Exact vs CPU ground truth; the argsort path is the one that deviates under ties. | — | Cost a day; caught by interleaved A/B before it shipped. |
 | ~~17~~ | ~~U10a~~ — **done 2026-08-27. NSG=4 beats the default by +5–13% on the Ultra; NSG=2 −12%. Residency beats NK there — U10 is ON.** | — | The M1 Max ranking did not transfer, which was the question. |
 | **19** | **U10 — alias `sq`/`sw`/`sqk` over the dead `sk` buffer** — **built, +19.3% on M1 Max, bit-identical, opt-in. Rig A/B DONE 2026-08-27: +17.4% (mean 2015.6 vs 1717.2 GFLOP/s), beats NSG=4, bit-identical.** End-to-end ~2–4% of the token (see U10b). **U10c** (F16 cache, 2 → 7 resident) gated on it. | ~1 d | Residency 1 → 2 at *unchanged* NK — the distinction U10a could not isolate. |
+| **20** | **U11 — confirm U10 does not regress prefill** | ~20 min | One arm. T3's nsg4 was decode-positive and prefill-catastrophic (189 ms first token); U10 does not change the grid, but that is a prior, not a measurement. |
+| **21** | **U12 — price `q_path` (5.47 ms) and `attn_inv_rope` (4.27 ms)** | ~1 h | **26.8% of the token, never looked at.** Larger than anything ever queued here. Roofline them as U7/U8 did. |
+| **22** | **U13 — arm the inverse-RoPE fuse on the indexed branch (was T10)** | ~1 d | The fuse exists but is armed only on the gathered branch, so all 21 ratio-4 layers pay a standalone dispatch. Filed at 0.04–0.09 ms against a 4.27 ms stage. **Gated on U12.** |
 
 Steps 0–3 are about four hours of rig time and settle whether the last three
 campaigns are valid, whether the largest sized item is real, and whether the
@@ -1373,6 +1376,88 @@ split has never been swept: `nth` is the largest power of two ≤
 blocks of 1024 at `n_comp` 32768. Nothing has tested whether that is the right
 point, and U10 just demonstrated this kernel family is residency-sensitive, so
 smaller blocks are worth one arm. Zero code if `nth` is made env-overridable.
+
+#### U11 — confirm U10 does not regress prefill — **run first, it is one arm**
+
+U10 is default-on. The one dimension nobody has measured is prefill, and T3 is
+the reason to bother: `nsg4` was decode-positive and **prefill-catastrophic**,
+spiking first-token latency to 189 ms against a 31 ms control. The mechanism
+there was a doubled threadgroup count; U10 does not touch the grid, only the
+allocation, so the prior is that it is neutral-to-positive. That is a prior, not
+a measurement.
+
+**It matters because this scorer is not decode-only.** `ds4_gpu_indexer_score_one_tensor`
+has exactly one dispatch site, but two callers: decode (`ds4.c:23241`) and the
+**prefill tail loop** (`ds4.c:30833`), which calls it once per token for every
+token past the raw prefix — thousands of calls in a 4096-token chunk.
+
+**Arms:** default (TIGHT on) vs `DS4_METAL_INDEXER_LLT_TIGHT=0`, prefill sweep
+at 32k/131k with `speed-bench/promessi_sposi.txt`. **Report first-token latency
+explicitly**, not just steady-state t/s — that is the number T3 caught it on.
+
+**Decision:** prefill neutral or better → U10 stays default-on, done. Prefill
+regression → gate TIGHT to the decode call site only, which is a one-line
+change since the two callers are distinct.
+
+#### U12 — price `q_path` and `attn_inv_rope` — **26.8% of the token, never looked at**
+
+Together they are **9.74 ms of the 36.36 ms token**, larger than any item ever
+queued in this document, and neither has been priced against a roof. Both are
+already named by the stage profile, so this is measurement, not archaeology.
+
+**What they are** (read from the stage boundaries, so the request is concrete):
+
+- **`q_path`, 5.47 ms, 15.0%** (`ds4.c:22776`) — the whole query path: the
+  `q_a`/`q_b` projections, head RMS norm, and the RoPE tail. It has a fusion,
+  `ds4_gpu_head_rms_norm_rope_tail_tensor` (`ds4.c:22749`), with a standalone
+  fallback of `head_rms_norm` + `rope_tail` when it does not fire. **First
+  question: does the fused path actually fire in production at 131k, or are we
+  paying two extra dispatches per layer?** M2's `qb` ablation was only 1.78 ms,
+  so ~3.7 ms of this stage is *not* the q_b projection and has never been
+  attributed.
+- **`attn_inv_rope`, 4.27 ms, 11.7%** (`ds4.c:23568`) — a standalone
+  64-threadgroup inverse-RoPE dispatch applied to the attention output heads.
+
+**Method, mirroring U7/U8:** stage-profile at 32k and 131k with per-kernel
+attribution; compute achieved GB/s and GFLOP/s for each and place them against
+the **760 GB/s** roof and the **~21 TFLOP/s** ALU peak. Report which of the two
+roofs each is near, exactly as U7 did — that is what turned the indexer from
+"slow" into "occupancy-bound", and it is the step that has produced every real
+win here.
+
+**Report the end-to-end share alongside any kernel multiple** (U10b).
+
+#### U13 — arm the inverse-RoPE fuse on the indexed branch — **T10, mis-sized by ~50×**
+
+**T10 is filed in the row-8 cleanup batch at "~0.04–0.09 ms" and the stage it
+targets is 4.27 ms.** That is the fourth item mis-sized the same way — T9, T6,
+U10 and now T10 — all priced before the stage profile existed.
+
+**The finding.** `fuse_attn_inv_rope` (`ds4.c:22093`) defers the inverse RoPE
+into the FlashAttention reduce, so "the separate 64-threadgroup RoPE dispatch
+disappears". It is armed **only in the `else` branch** — gathered/non-indexed
+attention (`ds4.c:23531`). **The indexed branch never arms it**, so all **21
+ratio-4 layers** pay the standalone dispatch every decode token, and those are
+exactly the layers that dominate at long context.
+
+**Why it was left this way is not recorded**, and that is the first thing to
+establish — the comment explains the mechanism, not the restriction. The
+indexed path's attention reduce may not own a whole head row the way the
+gathered path does, in which case the fusion is not applicable and the honest
+answer is a cheaper standalone kernel instead. **Determine that before writing
+anything.**
+
+**Prize if it is applicable:** up to ~4.27 ms minus whatever the gathered
+branch's share already is — call it **2–4 ms, or 6–11% of the token**, which
+would make it the largest banked win in this document. **Gated on U12**, which
+prices the stage properly and says how much of it is the indexed branch.
+
+**Correctness:** moving the rotation into the reduce changes FP32 accumulation
+order, so this is not bit-exact. T2 bar — measurable win, top-1 preserved,
+bounded Δlogit — and note `attn_inv_rope_fuse_armed` exists precisely because
+the backend's consumed flag is process-global and a stale value would make an
+indexed layer skip its required standalone RoPE (`ds4.c:22098-22101`). Any
+change here must keep that guard intact.
 
 This is where U7c points, and it is the strongest structural lever found so far.
 
