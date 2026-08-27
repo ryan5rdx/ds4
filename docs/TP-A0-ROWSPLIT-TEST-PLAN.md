@@ -1153,53 +1153,61 @@ fixing it pays twice.
 They are not wrong, but they are not the path to 50 t/s. Item 1 is a day's work
 against a defect worth several milliseconds, and item 3 costs nothing but a run.
 
-### Next run — iteration 3, rebuilt 2026-08-27 after the C2 revert
+### Next run — iteration 3, rebuilt after the 50 t/s fan-out — 2026-08-27
 
-**Honest state: the measurement programme is nearly exhausted.** Of iteration
-2's four arms, two are compromised and two were never runnable. What remains is
-three items, and only one of them is a new question.
+**Read `docs/PATH-TO-50TPS.md` first.** Its verdict is that 50 t/s is **not
+reachable** with anything identified — believed 43–45, with 46–48 contingent on
+one unsized item. Discounted budget across seven surviving candidates is
+**0.90 ms against 4.34 needed.** It also corrected two of my figures: the byte
+model is **5.93 GB/rank/token, not 4.29**, so the floor is **13.2 ms and decode
+is 1.85× off it, not 2.6×**.
 
-**Rebuild first.** The last run used `6b962db`, which had the C2 defect
-(`out_low_nsg = 8` against a 4-simdgroup dispatch → garbage output that measured
-as a win). Reverted in `da63283`. **Every number from that build is suspect
-until re-taken.**
+**Rebuild first** — the last run was `6b962db`, which carried the C2 defect.
 
-| # | arm | zero-code? | why |
-|---|---|---|---|
-| **1** | **Validate the TP crash fix.** Prefill a prompt of **4095 tokens**, checkpoint, then continue. Watch the worker for "Metal model range … is not covered by mapped model views". | yes | **Highest priority — it gates a shipped fix.** `69a3b86` corrects a double expert-offset rebase that put rank 1 one whole expert blob out of range. It fires only when a chunk is exactly one token, which is why it took a `cached = 4096×22 − 1` resume to surface. A single-box variant is documented in `docs/BUG-TP-WORKER-MODEL-VIEW-2026-08-27.md`. |
-| **2** | **Clean re-baseline.** `DS4_METAL_GPU_STAGE_TIMESTAMPS=1` and `DS4_TP_GATE_PROFILE=1`, 2k and 131k, on the post-revert build. Report **every** marker. | yes | Both recent profiles are compromised — one by the C2 artifact, the earlier one by the `attn_tp_gate` mislabel. **Everything downstream compares against this**, and two corrected figures need confirming: `attn_out_proj` ≈ 2.73 ms (not 2.38) and the straggler ≈ 0.50 ms (not 0.66). |
-| **3** | **R12a — command-buffer split schedule.** Arms 4/0, 2/8, 2/16, 2/32, 3/12, 4/12. **Hard prerequisite: `DS4_METAL_FAST_SYNC=1` on both ranks**, or `ds4_gpu_tp_split_safe()` returns 0 and every arm collapses to one buffer — a flat null for the wrong reason. | yes | **Revived, and worth more than when it was filed.** We now know a command-buffer round trip costs ~0.25–0.4 ms host-observed, and decode uses 3 buffers per token at `pos ≥ 128`. This sweeps that schedule **bit-identically**. Nothing else on the list attacks the round-trip cost, and it is free. |
+#### Rig — seven arms, all zero-code, one session
 
-**Not yet runnable — these need code written before there is anything to run.**
-They are *not* rig arms today; they become rig arms once the instrument exists.
-(Division of labour: the dev box is an M1 Max with no model weights, one die and
-no TP, so it can only run the model-free harnesses and source analysis.
-Anything touching the model, TP2, real contexts or t/s is rig work.)
+| # | arm | decides |
+|---|---|---|
+| **A** | **Validate the TP crash fix.** Prefill **4095 tokens**, checkpoint, continue. Watch the worker for "not covered by mapped model views". | Gates a shipped fix (`69a3b86`). Single-box variant in `docs/BUG-TP-WORKER-MODEL-VIEW-2026-08-27.md`. |
+| **B** | **`DS4_METAL_GPU_ENCODER_TIMESTAMPS=1`** at 2k and 131k | **The one that matters.** Re-baselines the whole budget at **1–3% distortion instead of 18%**, in ~172 labelled spans instead of 14. **Gate: if it disagrees with the hand-corrected table by >0.3 ms on any stage, believe this one and re-rank before writing code.** |
+| **C** | **`DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1`** at 2k — **read only the shape fields** | `n_keys` and `n_comp` per layer, the missing input to sizing the `attn_inv_rope` item. Its *timings* are still host round trips; ignore them. |
+| **D** | **`DS4_METAL_DISPATCH_BALLAST` ∈ {0,2}** at 2k | The dispatch price **in the live graph**. Settles an 11.6× spread that four candidates live or die on — and my retracted 22 µs claim came from getting this wrong in isolation. |
+| **E** | **`powermetrics --samplers gpu_power`** during decode vs `tests/bench_membw` | Retires the "30 W / 20% utilised" premise either way. The fan-out believes it dissolves. |
+| **F** | **`DS4_METAL_DISABLE_PRE_M5_QKV_PAIR_QUAD_FUSE=1`** + stage profiler | Confirms the 608 MB compressor accounting the corrected byte model rests on. |
+| **G** | **R12a command-buffer split schedule** — arms 4/0, 2/8, 2/16, 2/32, 3/12, 4/12. **`DS4_METAL_FAST_SYNC=1` on both ranks** or every arm collapses to one buffer and reads as a false null. | Bit-identical, free, and the only queued item that attacks command-buffer round-trip cost. |
 
-- **Arm 2 (flash-attn split) is dead as designed.** The boundary takes a host
-  wall clock either side of `end_commands()`/`begin_commands()`, so it measures a
-  command-buffer round trip, not kernel time — which is why per-call figures
-  (0.25–0.41 ms) match the round trip exactly and miss the stage by 6×. Needs
-  `MTLCounterSampleBuffer` timestamps **inside one command buffer**. A2 stays
-  unsized until then.
-- **Arm 4 (n-gram) needs a call site, not a rig slot.** There is no speculation
-  in the production path at all: `ds4_session_eval` → `..._probe_tp`, and the
-  only caller of the speculative entry anywhere is `ds4_bench.c:866` behind
-  `--dspark --mtp FILE`.
+#### Built for this run
 
-**Live implementation queue, and it is thin.** C3 row-split `shared_down`
-(0.16 ms, measured mechanism, unblocked), U14/§7C shared-shift (**0.50 ms** after
-three downward revisions), A1 reduce split over DV (0.1–0.3 ms). **That is
-~1 ms against the 4.34 ms needed.**
+- **`DS4_METAL_GPU_ENCODER_TIMESTAMPS`** (`df0037e`) — GPU timestamp counters at
+  encoder boundaries inside one command buffer. Probed first: `atStageBoundary`
+  supported, `atDispatchBoundary` not. Validated against known workloads (4×
+  work → 3.82×, 2× → 1.92×, encoder sum within 4% of the cb span).
+- **A0 rewired onto it** (this commit) — the four decode flash-attn phases
+  (`gather`, `packed`, `fa_core`, `reduce`) now just *name* the encoder they
+  already close, instead of ending the command buffer and bracketing it with a
+  host clock. **This is what finally splits `attn_inv_rope`**, the only stage the
+  fan-out found off its roof and the only place 4.34 ms could come from. The
+  sampling knob added earlier is deleted — with no cb splits there is nothing to
+  sample around.
+  *Caveat:* the timestamp path is gated on `!g_batch_encoder_concurrent`, so this
+  instrument and any concurrent-encoder work are mutually blind.
+- **`make check-dispatch-count` is green again** — two sites I left unwrapped in
+  the U9 top-k are fixed.
 
-**The honest position: this plan no longer contains a path to 50 t/s.** It
-contains a re-baseline, a correctness gate, one free sweep, and ~1 ms of
-implementation. The 15 ms gap between the 9.5 ms bandwidth floor and the 24.34 ms
-actual is not addressed by anything on this list. A fan-out is running against
-exactly that question (eight lenses, adversarially refuted, `docs/PATH-TO-50TPS.md`
-when it lands) — **hold further implementation until it reports**, because
-committing days to a 0.16 ms item while a 15 ms question is open is the wrong
-trade.
+#### Not runnable — needs code, not a rig slot
+
+- **n-gram / speculation.** Structurally excluded under TP2: the speculative
+  entry bails on `s->distributed` (`ds4.c:69931`), which every TP coordinator
+  session has. Days of work, and `speed-bench/tp_mtp_hunt.md` must be read first.
+
+#### Live implementation queue
+
+**U16 is reopened** — its kill reason was my measurement error; the kernel is
+~80% work at the production shape, so optimising it is the right move and grid
+widening is back on the table *for that kernel*. Then C3 row-split `shared_down`
+(0.16 ms), U14/§7C shared-shift (**0.50 ms, measured**), A1 reduce split
+(0.1–0.3 ms). **Hold all of it until arm B lands** — it re-baselines everything
+these are ranked against.
 
 ### Sequencing — run in this order
 

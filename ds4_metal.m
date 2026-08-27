@@ -1088,6 +1088,12 @@ static void ds4_gpu_ts_label(const char *label) {
     }
 }
 
+/* Name the encoder that just closed, overriding any generic trace label.  Used
+ * where a caller knows the phase name only after encoding it. */
+static void ds4_gpu_ts_name_last(const char *label) {
+    if (label && g_ts_enabled > 0 && g_ts_n > 0) g_ts_labels[g_ts_n - 1] = label;
+}
+
 static void ds4_gpu_ts_report(const char *tag) {
     if (!ds4_gpu_ts_active() || g_ts_n == 0) return;
     NSData *rd = [g_ts_buffer resolveCounterRange:NSMakeRange(0, g_ts_n * 2u)];
@@ -29153,52 +29159,18 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         raw_cap < n_raw || n_keys < n_raw) {
         return 0;
     }
-    /* Mirrors the prefill encoders: only available inside a batch, since the
-     * boundary ends and restarts the command buffer and an owned one belongs
-     * to the caller.
+    /* A0, rewired.  These four phases used to call the prefill-style boundary,
+     * which ENDS the command buffer and brackets it with a host wall clock
+     * (ds4_metal.m:11040) -- at decode the submit round trip IS the measurement,
+     * which is why it reported per-call figures 6x the stage they belong to.
+     * Each phase already closes its own encoder, so naming that encoder is
+     * enough: DS4_METAL_GPU_ENCODER_TIMESTAMPS then prices it from the GPU
+     * timestamp counter at 1-3% overhead instead of 18%, with no cb splits and
+     * no sampling needed.
      *
-     * Sampling matters here in a way it does not for prefill.  Each boundary
-     * splits the command buffer, and decode calls this once per layer, so
-     * profiling every call adds 4 x 43 = 172 splits per token against the 3
-     * the engine normally uses -- which drove the first run to 13 t/s against
-     * 41 unprofiled and left the per-call sums irreconcilable with the stage
-     * marker.  Profiling one call in N keeps the boundaries to 4 and the
-     * distortion negligible; layers are near-identical, so one layer x 43 is
-     * the estimate.  Default 43 = one layer per token.  Set to 1 for the old
-     * every-call behaviour. */
-    static uint64_t flash_stage_call_n;
-    uint32_t flash_stage_every = 43u;
-    {
-        const char *e = getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE_EVERY");
-        if (e && e[0]) {
-            const long v = strtol(e, NULL, 10);
-            if (v > 0 && v < 100000) flash_stage_every = (uint32_t)v;
-        }
-    }
-    const bool flash_stage_enabled =
-        getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE") != NULL && g_batch_cb != nil;
-    const bool flash_stage_profile =
-        flash_stage_enabled &&
-        (flash_stage_call_n++ % (uint64_t)flash_stage_every) == 0u;
-    double flash_stage_t0 = 0.0;
-    if (flash_stage_profile) {
-        if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) return 0;
-        int profile_owned = 0;
-        cb = ds4_gpu_command_buffer(&profile_owned);
-        if (!cb || profile_owned) return 0;
-        *cbp = cb;
-        flash_stage_t0 = ds4_gpu_now_ms();
-    }
-#define DS4_METAL_PROFILE_DECODE_FA_STAGE(name) do { \
-        if (flash_stage_profile) { \
-            if (!ds4_gpu_flash_attn_stage_profile_boundary(cbp, \
-                    "decode_gathered", (name), 1u, n_comp, n_keys, \
-                    n_head, head_dim, 0u, 0u, &flash_stage_t0)) { \
-                return 0; \
-            } \
-            cb = *cbp; \
-        } \
-    } while (0)
+     * Caveat: the timestamp path is gated on !g_batch_encoder_concurrent, so
+     * this instrument and any concurrent-encoder work are mutually blind. */
+#define DS4_METAL_PROFILE_DECODE_FA_STAGE(name) ds4_gpu_ts_name_last((name))
 
     id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
     id<MTLBuffer> rawbuf = ds4_gpu_tensor_buffer(raw_kv);
