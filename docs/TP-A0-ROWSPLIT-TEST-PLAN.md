@@ -719,44 +719,35 @@ suggested — but only the ones that block. Identifying *which* dispatches are
 barriers with nothing alongside is now a first-class question, and
 `bench_qkv_norm` is the instrument for pricing any of them in isolation.
 
-### Next run — rebuilt 2026-08-27 after all three scoping agents
+### Next run — iteration 2, rebuilt 2026-08-27
 
-**Every arm below was verified to build and every knob verified to exist**
-(`make ds4` + all six benches clean; eight env knobs and four new stage markers
-grepped present). One exception is called out explicitly at the end.
+**Verified: `make ds4` plus all six benches clean, every knob and marker grepped
+present.** Three arms exist only because the last run exposed defects in my own
+instruments; those are fixed here, not deferred.
 
-**Rig — six arms, all zero-code.** Three of them are decisive: they kill or
-confirm queued items outright. **Arms 1-5 DONE 2026-08-27** (`345de30`);
-arm 6 (n-gram) deferred — needs the acceptance-rate instrument decision.
+| # | arm | what changed since last run | decides |
+|---|---|---|---|
+| 1 | **Stage profile** `DS4_METAL_GPU_STAGE_TIMESTAMPS=1`, 2k + 131k | **`attn_out_proj` boundary added.** Last run's `attn_tp_gate` marker sat *after* the gate encode, so its span reached back to `attn_inv_rope` and reported the out_a/out_b projections as gate time — it renamed a stage rather than splitting one (3.719 vs the old 3.731, `attn_output` → 0.000). Now projections / gate / post-gate add separate. | Prices the ATTN gate for the first time, and the 3.72 ms projections that were mislabelled as it. |
+| 2 | **Flash-attn split** `DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1`, 2k | **Sampling added** (`..._EVERY`, default 43 = one layer/token). Last run profiled *every* call: 4 boundaries × 43 layers = **172 command-buffer splits per token** against the 3 the engine uses, which drove it to 13 t/s and made the per-call sums irreconcilable. My earlier "batch context distorts decode" explanation was wrong — it was the split count. | **Finally decomposes `attn_inv_rope`'s 3.63–4.22 ms** into gather/packed/fa_core/reduce, and sizes A2. |
+| 3 | **Per-slot gate profiler** `DS4_TP_GATE_PROFILE=1`, 2k + 131k | **Straggler formula corrected** — it printed `43 × 2 × delta`, double-counting, because `delta = E\|s\|/2` is *already* the per-layer critical-path excess. | Re-confirms the straggler at the right magnitude: **0.50 ms @2k / 0.35 @131k**, not 1.00/0.70. |
+| 4 | **n-gram arms** `DS4_NGRAM_SPEC=1 DS4_NGRAM_SPEC_STATS=1`, repetitive vs novel | **Acceptance-rate instrument added** — the bench deferred this arm last run precisely because none existed. Reports steps, fraction with a draft, drafted/accepted, acceptance %, and extra tokens/step. | Whether speculation pays on prose. A t/s delta alone is uninterpretable: identical throughput can mean "drafts rarely fire" or "drafts fire and are rejected", which call for opposite responses. |
 
-| # | arm | command | decides | outcome |
-|---|---|---|---|---|
-| 1 | **Per-slot gate profiler** | `DS4_TP_GATE_PROFILE=1`, 2k and 131k | **DECISIVE.** Prints ATTN vs FFN exchange and the implied straggler bound. `exchange_FFN − exchange_ATTN = E\|s\|/2` exactly, since only the FFN gate sits behind the routed shard. **If they measure equal, U14 and all three §7 designs die in one run.** | **NOT equal.** ATTN 17.9 µs vs FFN 29.6 µs @2k (delta +11.6 µs, ≤1.0 ms/token); ATTN 19.0 vs FFN 27.1 @131k (delta +8.1 µs, ≤0.70 ms). **U14 + §7 SURVIVE** — straggler real but modest. |
-| 2 | **Flash-attn stage split** | `DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1`, 2k and 131k | **PREREQUISITE.** Splits `attn_inv_rope`'s 3.63 ms into `gather`/`packed`/`fa_core`/`reduce`. A2's prize is honestly 0–8% *because* this has never been measurable. Needs a batch context — it is inert on an owned command buffer by design. | Ran, but per-call fa_core ~0.31-0.33 / reduce ~0.40-0.49 ms @2k do **not** reconcile to the 3.8 ms stage marker (batch-context epoch; t/s not comparable). Recorded raw; honest A2 decomposition still needs a non-batch measurement. |
-| 3 | **Stage profile** | `DS4_METAL_GPU_STAGE_TIMESTAMPS=1`, 2k and 131k | Now carries four new rows: `q_a_kv_proj`, `q_lora_norm`, `ffn_tp_gate`, `attn_tp_gate`. Turns the 1.351 ms gate figure from a two-stage difference into a measured row. **Report every marker** — U15's table still omitted ~9%. | Gate is now measured: **attn_tp_gate 3.72 ms** (ctx-invariant, top-5 stage!), ffn_tp_gate 1.58/1.49 ms. total gpu_busy 28.66/38.40. `attn_output` timing absorbed into attn_tp_gate (~0 at 2k). |
-| 4 | **Q8_0 shape sweep** | `./tests/bench_q8_attn_shapes 760` | Falsifier for **C1** and **C3**. The rig's curve humps at k=2048 where the M1 Max climbs monotonically, so C1's shape must be re-established here. | **C1 falsified on the rig.** Curve humps at k=2048 (410-413) then recovers at k=8192 (421-441); k=512 worst (224-227). Not monotonic — C1 shape must be re-established. |
-| 5 | **`DS4_METAL_ATTN_OUT_LOW_NSG` ∈ {1,2,4,8}** | 2k and 131k | **C2.** `out_a` sat at a literal `nsg=4` the env could not reach, so T4 never swept it — and 4 is the value T4 measured ~3% worse everywhere else. Default unchanged. | **C2 positive.** Monotonic with nsg: nsg=8 best (41.85 @2k, 29.61 @131k) vs default nsg=4 (41.15/29.20) = **+1.5-1.7%**. T4's "nsg=4 ~3% worse" does NOT reproduce. Candidate: raise attn_out_low_nsg to 8. |
-| 6 | **n-gram arms (U5/R13)** | `DS4_NGRAM_SPEC`, repetitive vs novel text | Implemented, never run. **Report acceptance rate alongside t/s** — the delta is meaningless without it. | **DEFERRED.** Needs the acceptance-rate instrument (code, user's domain). |
+**Do not re-run:** the Q8_0 shape sweep (C1 falsified — the rig peaks at k=4096,
+a different shape from both the M1 Max and §5, and **§5's curve should not be
+quoted again**), the `attn_out_low_nsg` sweep (**C2 banked, default now 8**), the
+`hcpre` ablation, and the pre-norm fusion disable.
 
-**Closed by U15 — do not re-run:** the `hcpre` ablation, and the pre-norm fusion
-disable (+0.58 ms; the fusion is a net win).
-
-**One arm is not ready and it is not mine to fix:** the gate report's
-`uc_pingpong` chaining test (4 × 4 KB vs 1 × 16 KB, ≤0.34 ms) needs the
-`uc_lat2`/`uc_pingpong` probe M3 was run with. **That tool is not in this
-repo** — it lives bench-side. Skip it unless the bench still has it.
-
-### Implementation queue — mine, and none of it blocks the run above
+### Implementation queue after iteration 2
 
 | item | ms | state |
 |---|---|---|
-| **M3 + §7C paired repack** | **~15% of the token** | The only item that could move decode by more than a few percent. One offline conversion tool and one TP-specific model file serve *both* the MXFP4 planar layout and the intra-expert split. Reconsider §7C on these terms — I struck it when it was 3.5% alone. |
-| **A2** head-batched vec keeping split-K | 0–2.0 ms | **Gated on arm 2.** Cannot be sized until the 3.63 ms is decomposed. |
-| **C1** Q8_0 k-curve | 1.13–1.40 | **Gated on arm 4.** |
-| **C3** row-split `shared_down` | ~0.25 | Independent; implementable now. |
-| **U14** shared-shift | ≤0.74 | **Gated on arm 1**, and redesigned to "shift to equalise". |
-| **A1** split the reduce over DV (32→128 TGs) | 0.1–0.3 | Low cost, independent. |
-| ~~U16~~, ~~M1~~ | — | Both measured and killed. U16 is dispatch latency, not kernel cost; M1 was byte-identical and moved nothing. |
+| **C3** row-split `shared_down` | 0.16 | **Measured, unblocked, implementable now.** k=1024→2048 is 279→410 GB/s = 1.47× on the current rig. |
+| **§7C** intra-expert split via repack-on-load | ≤0.50 @2k | Straggler confirmed real but **halved by the formula fix**. Justify the loader on this alone — **not** on M3. |
+| **A2** head-batched vec | 0–2.0 | **Gated on arm 2**, which should finally size it. |
+| **A1** split the reduce over DV | 0.1–0.3 | Independent, low cost. |
+| ~~C1~~, ~~M3~~, ~~U16~~, ~~M1~~ | — | C1 falsified by arm 4; M3's mechanism bounded at ~1.1% by U8+M1 against a 9.7% estimate; U16 is dispatch latency; M1 measured null. |
+
+**Banked so far: U10 (+1.6%), T2 (+0.9%), C2 (+1.5–1.7%).**
 
 ### Sequencing — run in this order
 

@@ -29029,9 +29029,31 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     }
     /* Mirrors the prefill encoders: only available inside a batch, since the
      * boundary ends and restarts the command buffer and an owned one belongs
-     * to the caller. */
-    const bool flash_stage_profile =
+     * to the caller.
+     *
+     * Sampling matters here in a way it does not for prefill.  Each boundary
+     * splits the command buffer, and decode calls this once per layer, so
+     * profiling every call adds 4 x 43 = 172 splits per token against the 3
+     * the engine normally uses -- which drove the first run to 13 t/s against
+     * 41 unprofiled and left the per-call sums irreconcilable with the stage
+     * marker.  Profiling one call in N keeps the boundaries to 4 and the
+     * distortion negligible; layers are near-identical, so one layer x 43 is
+     * the estimate.  Default 43 = one layer per token.  Set to 1 for the old
+     * every-call behaviour. */
+    static uint64_t flash_stage_call_n;
+    uint32_t flash_stage_every = 43u;
+    {
+        const char *e = getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE_EVERY");
+        if (e && e[0]) {
+            const long v = strtol(e, NULL, 10);
+            if (v > 0 && v < 100000) flash_stage_every = (uint32_t)v;
+        }
+    }
+    const bool flash_stage_enabled =
         getenv("DS4_METAL_FLASH_ATTN_STAGE_PROFILE") != NULL && g_batch_cb != nil;
+    const bool flash_stage_profile =
+        flash_stage_enabled &&
+        (flash_stage_call_n++ % (uint64_t)flash_stage_every) == 0u;
     double flash_stage_t0 = 0.0;
     if (flash_stage_profile) {
         if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) return 0;

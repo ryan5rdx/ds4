@@ -69856,6 +69856,30 @@ static int ds4_session_eval_ngram_speculative_argmax(
             commit++;
         }
     }
+    /* Acceptance accounting.  A t/s delta from speculation is uninterpretable
+     * without it -- the same throughput can mean "drafts rarely fire" or
+     * "drafts fire constantly and are usually rejected", and those call for
+     * opposite responses.  DS4_NGRAM_SPEC_STATS=1 reports it. */
+    if (getenv("DS4_NGRAM_SPEC_STATS") != NULL) {
+        static uint64_t st_steps, st_drafted, st_accepted, st_with_draft;
+        st_steps++;
+        st_drafted += (uint64_t)(draft_n > 1 ? draft_n - 1 : 0);
+        st_accepted += (uint64_t)(ok && commit > 1 ? commit - 1 : 0);
+        if (draft_n > 1) st_with_draft++;
+        if ((st_steps % 128u) == 0u) {
+            fprintf(stderr,
+                    "ds4: ngram spec %llu steps, %llu with a draft (%.1f%%), "
+                    "%llu drafted / %llu accepted (%.1f%% acceptance), "
+                    "%.3f extra tokens/step\n",
+                    (unsigned long long)st_steps,
+                    (unsigned long long)st_with_draft,
+                    100.0 * (double)st_with_draft / (double)st_steps,
+                    (unsigned long long)st_drafted,
+                    (unsigned long long)st_accepted,
+                    st_drafted ? 100.0 * (double)st_accepted / (double)st_drafted : 0.0,
+                    (double)st_accepted / (double)st_steps);
+        }
+    }
     if (!ok) {
         /* Verifier failed or mutated state: restore and fall back to the
          * single free token, exactly as the MTP path does. */
