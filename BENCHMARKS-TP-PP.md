@@ -181,6 +181,46 @@ Format: one table per (branch, commit, date). Newest first. Every table should
 name the branch + HEAD commit + date + the exact env flags that differ from
 defaults; the sweep semantics above apply to all rows.
 
+### U6 — the roof is ~760 GB/s, not 400 — allocation path costs nothing — 2026-08-27
+
+`tests/bench_membw` on mat (M2 Ultra, 800 GB/s spec), one rank, no model — a
+self-contained grid-stride `uint4` streaming kernel (no dependent chains, 2M
+threads, a compiler-cannot-fold store sink) over seven allocation arms of
+identical size, `BENCH_MEMBW_FILE` pointed at the real GGUF so the `mmap-file`
+arm is literally the engine's own load path. Best-of-20 GPU time; 16 GiB and
+32 GiB per arm.
+
+| arm | allocation | 16 GiB | 32 GiB |
+|---|---|---|---|
+| metal-shared | `newBufferWithLength:` Shared | 760.9 | 756.5 |
+| mmap-anon | NoCopy MAP_ANON | 760.0 | 757.1 |
+| mmap-file | NoCopy MAP_SHARED (**ds4 today**) | 759.9 | 756.7 |
+| mmap-untracked | as above + untracked | 760.2 | 755.7 |
+| mmap-parallel | as above, 16-thread fault | 760.3 | 756.6 |
+| metal-private | `newBufferWithLength:` Private | 761.7 | 757.4 |
+| two-queue | 2× Private, 2 queues, overlapped | 754.7 (agg) | 752.1 (agg) |
+
+**Verdict: the platform reads at ~760 GB/s — 94–95% of the 800 GB/s spec —
+and every arm is within 1%.** The M2 Ultra saturates *both* dies with a plain
+streaming kernel on ds4's *own* `mmap` path. Allocation path (Shared / Private
+/ mmap / untracked / parallel-fault) costs nothing; concurrency (`two-queue`)
+costs nothing.
+
+**This reverses U1.** U1's ~408–410 GB/s plateau is not the platform and not
+placement — it is the **MoE matvec kernel**, which achieves only ~54% of the
+~760 GB/s the part can stream. The matvec is bound by its own access pattern
+(MXFP4 17-byte blocks, gather/scatter, dequant interleave), not by the chip.
+
+**Correction to U1 and T8.** U1's "platform/placement — escalate, do not tune
+kernels" is wrong; the headroom is in the kernel's access pattern and the
+loader is exonerated. T8's "matvec is bandwidth-bound at ~400 — near the M2
+Ultra ceiling" is doubly wrong: the ceiling is 800 GB/s, and the matvec is
+not even bandwidth-bound — it sits at ~54% of the achievable streaming rate.
+
+**Consequence:** matvec tuning re-opens. The MoE stage (5.4 ms at 131k in the
+stage profile) is the largest single decode stage and the one whose ~2× is
+closest to reachable — if its access pattern can be made to stream.
+
 ### U2 — indexer-score roofline: latency-bound, U3 will not pay — 2026-08-26
 
 `tests/bench_indexer_score` on lanfear (M2 Ultra), model-free, one rank, no
@@ -239,14 +279,13 @@ rank, no TP, no model — T8's conditions with the working set pushed 8× via
 | 2048 | 25.50 GiB | 410.8 / 406.8 / 412.0 | ~410 |
 
 **Verdict: nothing exceeds ~410 GB/s even with the working set pushed 8×.**
-The ~408–410 plateau is exactly one M2 Max die's worth of the 800 GB/s
-Ultra spec (400/die). So ~400 GB/s is a platform/placement characteristic
-(single-die UltraFusion locality), not a kernel limit. **Escalate; do not
-tune kernels.**
-
-**Correction to T8:** T8's "bandwidth-bound at ~400 GB/s — near the M2
-Ultra ceiling" is wrong — the ceiling is 800 GB/s; ~400 GB/s is one die's
-worth, not the chip's ceiling.
+The ~408–410 plateau was initially read as exactly one M2 Max die's worth of
+the 800 GB/s Ultra spec (400/die), i.e. a platform/placement characteristic
+(single-die UltraFusion locality), not a kernel limit. **This verdict was
+superseded by U6 (2026-08-27): the part streams at ~760 GB/s on ds4's own
+`mmap` path, so U1's plateau is the MoE matvec kernel's access pattern, not
+the platform. The kernel headroom (~2×) re-opens; do not escalate as a
+platform bug.**
 
 ### Current state — `upstream-metal-wins` @ `f3668a1`/`627ccc1`, 2026-08-25
 

@@ -190,12 +190,12 @@ two are minutes and one of them can invalidate three completed runs.
 | 6 | **R13 n-gram rig arms** (inertness / correctness / decode A/B on repetitive vs novel text) | ~1 h | Independent of the above; run whenever convenient. |
 | 7 | ~~T1~~ — **done 2026-08-26: dead.** `DS4_TP_GATE_FASTPATH` is a wash (±0.6% decode, no gate-exchange change) and is **not bit-identical** (logits shift up to 2.3, top-1 preserved). Stay default-off. ~~T8 port~~ — dead, see row 3. | — | Both are code, both are gated on a measurement above. |
 | 8 | Cleanup batch: T6, T10, T13 (**T9 removed — promoted to U3**) | — | Small, low-risk, individually sub-1%. |
-| **9** | **U1 — streaming-read ceiling on the rig**, one rank, no TP | ~15 min | **done 2026-08-26** — pinned at ~408–410 GB/s across maps 3.19–25.5 GiB = one M2 Max die; platform/placement (UltraFusion), not kernels; escalate, do not tune kernels. **Run first.** Decides whether ~400 GB/s is the platform or our kernels, and therefore how to read every number below. Also re-scores T8. |
+| **9** | **U1 — streaming-read ceiling on the rig**, one rank, no TP | ~15 min | **done 2026-08-26** — pinned at ~408–410 GB/s across maps 3.19–25.5 GiB. Initially read as one M2 Max die / platform; **superseded by U6 2026-08-27** — the part streams at ~760 GB/s on the same `mmap` path, so U1's plateau is the MoE matvec kernel's access pattern, not the platform. Kernel headroom re-opens. **Run first.** Decides whether ~400 GB/s is the platform or our kernels, and therefore how to read every number below. Also re-scores T8. |
 | **10** | **U2 — indexer-score roofline + working-set sweep** | ~30 min | **done 2026-08-26.** Latency-bound per byte — 39.7 GB/s at 65536 = ~10% of the 400 GB/s platform, one threadgroup per row; GPU-busy ~linear in `n_comp`. **U3 will not pay** (honest prize near zero); go to the restructure. Correctness flag (worst rel 7.6e-3, row 17391) = expected FP32 tree-vs-sequential tolerance, benign. The largest stage sits at ~4% of *both* roofs. |
 | **11** | **U3 — T9 re-sized: indexer cache F32→F16** | ~1 h | **gated off by U2 2026-08-26.** U2 reported latency-bound, so per its own gate the honest prize is near zero — do not start the F32→F16 code work; go to the restructure. 352 MB/token at 131k, halved. Was filed sub-1% at "0.2–0.4 ms"; the stage is 10.5 ms. **Gated on U2.** |
 | **12** | **U4 — TP row-split the decode indexer** | ~3 h | The biggest stage is computed *twice* today, once per rank. ~5 ms of 36 ms. Largest single item in this document. |
 | **13** | **U5 — R13 n-gram arms, re-prioritised** | ~1 h | Raises arithmetic intensity without requiring any kernel to get faster — the structural answer to a latency-bound decode. |
-| **14** | **U6 — why ~400 GB/s on an 800 GB/s part** — allocation-path + concurrency arms | ~1 h + harness | **Now the largest open question.** U1 ruled out working-set size but never varied allocation path or kernel. Our weights are an `mmap` wrapped with `newBufferWithBytesNoCopy`, so Metal never places them — if they sit on one die, that is exactly 400 GB/s. Decides whether the roof is 400 or 800, and therefore how every other item here is sized. **Ahead of U3/U4/U5.** |
+| **14** | **U6 — why ~400 GB/s on an 800 GB/s part** — allocation-path + concurrency arms | ~1 h + harness | **done 2026-08-27 — roof is ~760 GB/s, not 400.** `bench_membw` on mat: all seven arms 752–762 GB/s (94–95% of 800), within 1%. Allocation path costs nothing; concurrency costs nothing. The part saturates both dies on ds4's own `mmap` path. **U1's ~408–410 is the MoE matvec kernel (~54% of achievable), not the platform** — kernel headroom re-opens, loader exonerated. |
 
 Steps 0–3 are about four hours of rig time and settle whether the last three
 campaigns are valid, whether the largest sized item is real, and whether the
@@ -756,11 +756,13 @@ between them, and the floor is ~13 ms. Order:
 Five items from the throughput reopening. **U1 first**: it decides how to read
 the other four, and it is fifteen minutes.
 
-#### U1 — is ~400 GB/s the platform or our kernels? — **DONE 2026-08-26**
+#### U1 — is ~400 GB/s the platform or our kernels? — **DONE 2026-08-26; verdict SUPERSEDED by U6 2026-08-27**
 
-**Outcome.** Pinned at ~408–410 GB/s across maps 3.19–25.5 GiB = one M2 Max
-die; platform/placement (UltraFusion), not kernels; escalate, do not tune
-kernels.
+**Outcome.** Pinned at ~408–410 GB/s across maps 3.19–25.5 GiB. Initially read
+as one M2 Max die / platform; **U6 reversed this** — the part streams at ~760
+GB/s on the same `mmap` path, so U1's plateau is the MoE matvec kernel's
+access pattern (~54% of achievable), not the platform. Kernel headroom
+re-opens; the loader is exonerated.
 
 **Where:** the rig (M2 Ultra, 800 GB/s spec). **Not** the M1 Max — its peak
 *is* 400 GB/s, so it cannot discriminate. One rank, no TP, no model, matching
@@ -789,11 +791,10 @@ noisy.
   and by far the largest thing in this document. Escalate; do not tune kernels
   until it is understood.
 
-**Note for the benchmark doc:** `BENCHMARKS-TP-PP.md:226` currently reads
-"bandwidth-bound at ~400 GB/s — near the M2 Ultra ceiling". The Ultra ceiling
-is 800; 400 is one M2 Max die. That sentence should be corrected whatever U1
-returns, because T8's "specializations cannot buy what is not there" rests on
-it.
+**Note for the benchmark doc (resolved by U6 2026-08-27):** the T8 sentence
+at `BENCHMARKS-TP-PP.md` ("bandwidth-bound at ~400 GB/s — near the M2 Ultra
+ceiling") has been corrected — the Ultra ceiling is 800 GB/s and the matvec
+is not bandwidth-bound at all (~54% of the achievable streaming rate).
 
 #### U2 — indexer-score roofline and working-set sweep — **gates U3 — DONE 2026-08-26**
 
@@ -906,7 +907,19 @@ separately from the stage saving.
 **Prerequisite:** U1, so we know whether the halved per-rank work actually
 converts to time or just moves us along a flat part of the curve.
 
-#### U6 — why ~400 GB/s on an 800 GB/s part — **the largest open question**
+#### U6 — why ~400 GB/s on an 800 GB/s part — **DONE 2026-08-27: the roof is ~760 GB/s, not 400**
+
+**Outcome.** `bench_membw` on mat (M2 Ultra): all seven arms land at
+**752–762 GB/s — 94–95% of the 800 GB/s spec**, within 1% of each other, at
+both 16 and 32 GiB per arm. `mmap-file` (ds4's own path, pointed at the real
+GGUF) is 756.7–759.9 — identical to `metal-private` (757.4–761.7) and
+`two-queue` (752–755 aggregate). **Allocation path costs nothing; concurrency
+costs nothing.** A plain grid-stride kernel saturates *both* dies on ds4's own
+`mmap` path. **U1's ~408–410 GB/s is therefore the MoE matvec kernel — ~54%
+of achievable bandwidth — not the platform.** The placement hypothesis and
+both rivals are falsified together; the loader is exonerated and the headroom
+is in the matvec's access pattern (MXFP4 17-byte blocks, gather/scatter,
+dequant interleave). See `BENCHMARKS-TP-PP.md` §U6.
 
 **U1's conclusion is right about kernels and wrong about "platform."** It swept
 the *working set* 8× (3.19 → 25.50 GiB) and found a hard 408–410 GB/s plateau.
@@ -997,6 +1010,14 @@ fix applies.
   Then 400 GB/s is the real roof, U2's 39.7 GB/s is 10% of a *correct* roof,
   and the kernel-level work stands as planned.
 
+**Actual outcome (2026-08-27): neither branch fired — the third case.** All
+arms landed at **752–762 GB/s (94–95% of 800), within 1%**, so neither
+placement nor concurrency nor an architectural ceiling explains U1's ~410.
+The part saturates both dies on ds4's own `mmap` path; the ~410 plateau is
+the **MoE matvec kernel** at ~54% of achievable bandwidth. Matvec access-
+pattern tuning re-opens (loader exonerated); U1's "escalate, do not tune
+kernels" is retracted.
+
 **Run on the rig only.** The M1 Max is a single 400 GB/s die and cannot
 discriminate any of this. One useful pre-screen *is* available on the dev box
 though: if A and D differ materially even on a single-die part, the penalty is
@@ -1029,13 +1050,15 @@ mean it is saturated, and the rig's power draw says it is not: **decode pulls
 ~30 W GPU / 90 W system against ~60 W GPU / 120 W system in prefill.** Same
 GPU, half the power. A GPU stalled on memory latency is "busy" and cool.
 
-**`BENCHMARKS-TP-PP.md:226` is wrong and it closed a workstream on that error.**
-It reads: "the routed MoE matvec is bandwidth-bound at ~400 GB/s — **near the
-M2 Ultra ceiling**." The M2 Ultra ceiling is **800 GB/s**; 400 GB/s is exactly
-one M2 *Max* die. T8 measured **50% of peak**, not the ceiling, and "kernel
-specializations cannot buy what is not there" does not follow. That 400.0 is
-suspiciously exactly half also raises a second hypothesis worth one test:
-single-die locality across UltraFusion.
+**The T8 "near the ceiling" claim was wrong and it closed a workstream on
+that error — now corrected and resolved by U6 (2026-08-27).** It read: "the
+routed MoE matvec is bandwidth-bound at ~400 GB/s — **near the M2 Ultra
+ceiling**." The M2 Ultra ceiling is **800 GB/s**; 400 GB/s was read as exactly
+one M2 *Max* die, raising the single-die locality hypothesis. **U6 falsified
+the placement hypothesis**: the part streams at ~760 GB/s on ds4's own `mmap`
+path, so the 400.0 is the MoE matvec kernel at ~54% of achievable bandwidth,
+not the ceiling and not one die. The workstream re-opens as matvec access-
+pattern tuning, not as a loader/platform fix.
 
 **The largest stage is nowhere near any roof.** `tests/bench_indexer_score
 32768` on an M1 Max (400 GB/s, ~10.4 TFLOP/s FP32):
