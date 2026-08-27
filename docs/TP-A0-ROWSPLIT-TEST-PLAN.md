@@ -242,9 +242,92 @@ fusion's three device-scope `seq_cst` fences cost more than the dispatch they
 removed — a possible free default flip); and a three-line marker after
 `ds4.c:25335` that turns finding 1 from inference into a measured row.
 
+### attn_output / router / shared scoping result — 2026-08-27
+
+Full report: `docs/SCOPE-ATTNOUT-ROUTER-SHARED.md`.
+
+**It independently reached the gate finding**, from the other side: the ATTN
+gate (`kernel_dsv4_tp_flag_set_coherent` + `kernel_dsv4_tp_fence_wait`) is
+encoded at `ds4.c:23856` into the same batch, before the marker, so
+**0.4–1.35 ms of `attn_output`'s 3.804 ms is gate, not kernel.** Two agents
+working different stages converged on the same 1-thread spin. That is now the
+best-supported finding in the document.
+
+**Net of the gate, `attn_output` is 524–534 GB/s = 69–70% of roof** — not the
+84% I estimated from the first report, and not §4's "~100%". The byte model was
+re-derived from the encoder and reconciles to §3 within **0.3%**, so the
+`attnout` phantom is not repeated. It is not underfill either (4096
+threadgroups/layer).
+
+**The 30% gap is the Q8_0 matvec's k-curve, and it is program-wide.**
+Confirmed model-free on an M1 Max (`b95e7ff`) — identical 17.83 MB at every
+shape, rate varying **2.9×**:
+
+| k | GB/s | % of peak |
+|---|---|---|
+| 512 | 89.8 | 22.4% |
+| 1024 | 113.7 | 28.4% |
+| 2048 | 185.4 | 46.4% |
+| 4096 | 253.1 | 63.3% |
+| 8192 | 261.5 | 65.4% |
+
+Stable under 1% across four passes. **The rig's curve is a different shape** —
+§5 records 283/413/**581**/541/517, a hump peaking at k=2048 — so the corrective
+must be validated there, but both machines agree the rate is strongly
+k-dependent at constant bytes.
+
+**`shared_down` is the clean consequence.** `shared_tp_local = shared_dim/2`
+(`ds4.c:24150`) k-slices a natural **k=2048** matvec down to **k=1024** — from
+the peak of the rig's curve to well below it — and measures **293 GB/s, 39% of
+roof**. The M1 Max ratio for that same step is 185.4/113.7 = **1.63×**, against
+the rig's 581/293 = 1.98×. **Row-splitting instead reads identical bytes at the
+peak k**, and the summing FFN gate composes if the unowned half is zeroed once
+at allocation. This is a TP-split-axis choice, not a kernel rewrite.
+
+**`router` has no kernel headroom** — 82 GB/s and 0.4% of ALU peak, but only two
+dispatches (a 128-threadgroup matvec and a *single-threadgroup* 256-element
+bitonic sort). 25.8 µs/layer is latency, dispatch and ~16–20% profiler tax. Only
+dispatch removal moves it, and the router+shared fusion is TP-blocked at
+`ds4.c:24042`.
+
+**Two corrections to standing docs.** `ds4.c:23802`'s "2560 threadgroups" is
+stale — the actual grid is 4096. And **this plan at :648 is wrong** that T4
+swept attention-output-low: `out_a` passes a **literal `nsg=4`**
+(`ds4_metal.m:26399`) that `DS4_METAL_Q8_MV_NSG` cannot reach, so it sits
+unswept at the value T4 measured as 3% worse everywhere else.
+
+### Consolidated ranking — 2026-08-27
+
+Net of the ~0.18 ms/marker profiler tax, and with both scoping reports in:
+
+| item | ms | % of 2k token | confidence |
+|---|---|---|---|
+| **gate spin** (ATTN + FFN) | ~2.7 | 11.1% | measured twice, independently |
+| **U16** `q_lora_norm` fusion | ≤1.50 | ≤6.2% | 2 threadgroups; diagnosed |
+| **C1** Q8_0 k-curve, program-wide | 1.13–1.40 | 4.6–5.8% | 2.9× spread confirmed model-free |
+| **U14** shared-shift | 0.82 | 3.4% | now has a measured mechanism |
+| **HC pool** (H4/H6/H2) | 0.6–1.0 | 2.5–4.1% | scoped; grid-widening already negative |
+| **C3** row-split `shared_down` | ~0.25 | 0.8–1.1% | k-curve consequence |
+| **C2** `out_a` nsg (unswept) | ~0.25 | 0.8–1.2% | one literal to change |
+
+**Sum of the non-gate items: 3.75–4.92 ms against the 4.34 ms needed for 50 t/s
+at 2k.** For the first time the target is covered by *identified, measured-gap*
+items rather than by extrapolation. Temper that with this project's hit rate —
+roughly one in five proposals has survived contact — but the estimates are now
+grounded in roofline gaps rather than guesses.
+
+**The gate spin is the largest single item and the least understood.** It is not
+obviously recoverable — an RDMA round trip has to happen — but 11% of the token
+in a 1-thread spin deserves its own investigation before more kernel work. The
+question is whether it can be overlapped rather than removed.
+
 ### Next run — 2026-08-27
 
-**Rig: U15, plus the three zero-code HC arms above.** U15 is the sole
+**Rig: U15, the three zero-code HC arms above, and the Q8_0 shape sweep**
+(`make tests/bench_q8_attn_shapes && ./tests/bench_q8_attn_shapes 760` — the
+build rule was missing until `b95e7ff`, so this could not have been rebuilt
+there before). The sweep re-establishes the rig's k-curve on the current build
+and is the falsifier for C1 and C3. U15 is the sole
 *queued* item that is zero-code and rig-blocked; the HC arms are new and cost
 minutes. Everything else is now implementation-gated, not measurement-gated.
 
