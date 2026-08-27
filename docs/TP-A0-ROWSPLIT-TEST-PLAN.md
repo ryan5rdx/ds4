@@ -1,4 +1,7 @@
-# TP2 prefill: row-split-at-pos0>0 (A0) rig test plan
+# TP2 rig test plan — prefill and decode
+
+Started as the A0 row-split plan; A0 shipped and is default-on, and this is
+now the standing request channel for TP performance work on the pair.
 
 Branch: `upstream-metal-wins`
 Rig: 2× M2 Ultra 60-core 128GB, tensor-parallel over Thunderbolt RDMA
@@ -618,769 +621,135 @@ encoder close/reopen from a checkpoint copy.
 
 Switch to `speed-bench/promessi_sposi.txt` as previously described.
 
-### R11 — halve the decode gate count (`DS4_TP_DECODE_REPLICATE_ATTN=1`) — **DONE, 2026-08-26, NEGATIVE: decode −8.5 to −11.8%, recorded in `BENCHMARKS-TP-PP.md`**
+## Closed work — results in `BENCHMARKS-TP-PP.md`, lessons kept here
 
-**What it cost, and why that number is the finding.** Decode fell uniformly:
-B/A = 0.882 / 0.912 / 0.912 / 0.913 / 0.916 / 0.913 / 0.916 across the sweep.
-In per-token terms that is **+3.28 ms at 2048 and +3.24 ms at 131072** — flat
-to within 1% across a 64× context range. Flat means the cost is the duplicated
-*weight* traffic (+1.6 GB/token/node of `q_b`/`o_a`, which does not scale with
-context) and **not** the full-head KV re-read (which would). At ~500 GB/s that
-+1.6 GB is ~3.2 ms: the measured cost is the duplicated weights, essentially
-in full.
+Full tables live in the benchmark doc. What is kept below is only the reasoning
+that would otherwise be re-derived — the corrections, the mechanisms, and the
+things that turned out not to be true.
 
-**Now the part that matters. Removing 43 gates saved approximately nothing.**
-Those gates carried 43 × 293 µs ≈ **12.6 ms/token** of wait at 2048, against a
-24.5 ms token. Had that been transport/sync overhead, deleting it would have
-paid for the 3.2 ms of extra traffic several times over. Net was +3.25 ms,
-i.e. the ~12.6 ms of removed wait bought ~0 — because a TP gate wait is not
-idle, it is **the window in which the peer rank's half of the attention runs**.
-Replication does not remove that work, it moves it onto both ranks and
-serialises what used to be two half-attentions in parallel.
-
-**This falsifies R10e's headline, and the error was mine.** R10e concluded
-"short-context decode is entirely per-gate fixed cost" from 86 × ~284 µs ≈
-24.4 ms ≈ the 41 t/s floor. That sum is the same tautology this doc has now
-flagged four times: Σwait ≈ token time wherever gates bracket the work, because
-`wait` *contains* the compute. I wrote that warning into the R10e request and
-then used the quantity it warns about to argue the floor was overhead — and
-built R11 on it.
-
-The corrected reading, and it closes the subject: subtracting the duplicated
-traffic from the measured delta leaves **~0 recoverable per-gate sync
-overhead**. The decode gate mechanism is not costing us anything worth
-reclaiming; the 86 gates/token are measuring compute. **Decode is closed as a
-TP-structural problem.** What remains is making the compute itself cheaper —
-kernels, quantisation, or fewer active parameters — not restructuring the
-exchange.
-
-**Two harness findings worth acting on before the next campaign.**
-
-*The correctness gate has degraded ~125×.* In-session control-vs-control max
-|Δlogit| is **0.688**, against the R2-era 0.0055 — at logit magnitude ~27 that
-is 2.5% relative, and 5 of 7 frontiers fall into a degenerate "of/and"
-repetition regime where near-tied logits amplify any perturbation. The
-candidate (0.665) passing "inside the in-session baseline" is therefore a very
-weak pass. The degenerate prompt is the likely cause, but `dedc830`
-(compressor-frontier rewind) is also new in this build and the frontier chain
-exercises restore paths, so **confirm the cause rather than assume it** before
-this harness gates anything non-bit-identical again. R5/R7/R8's bit-identical
-results are unaffected — 0 differing logits needs no baseline.
-
-*Warm-sweep prefill is ±5% with occasional single-point ~13% dips*, evidenced
-by two opposite-direction outliers (32768 and 65536) in runs where the flag
-cannot reach prefill. Same-day A/B is the only clean comparison. This does not
-disturb the large deltas in the arc (R7 +20.5%, R8 +7.3% at 131k), but it does
-mean the small ones — R8's +1.5% at 4096, +2.8% at 16384, and R10a's ±1%
-agreements — sit at or inside the noise floor and should not be quoted as
-individually resolved.
-
-
-Built on `upstream-metal-wins`. Opt-in, default off, must be set on BOTH ranks.
-Builds warning-clean; `ds4_test --server`, `ds4_agent_test`,
-`ds4-eval --self-test-extractors` and `test_engine_mgpu_placement` (123/123)
-all pass.
-
-R10e closed out every knob and left exactly one lever: **the 86 gates/token**.
-Short-context decode is entirely per-gate fixed cost (86 × ~284 µs ≈ 24.4 ms
-≈ the measured 41 t/s floor), wire is only ~12% of gate time at both contexts,
-and NWG is already optimal. This is the design change that moves the count.
-
-**What it does.** Replicates the whole decode attention block instead of
-splitting it, so the per-layer ATTN gate disappears and the schedule goes from
-2 gates/layer to 1 — `start = DS4_TP_GATE_FFN, step = 2, per_token = 43`.
-
-**The precedent is already in the same function.**
-`ds4_engine_tp_gate_schedule()` gives GLM exactly this shape today ("One FFN
-gate per sparse layer"), so neither the schedule form nor the transport's
-arithmetic-progression slot mapping needs changing. Prefill is untouched: it
-uses `ds4_gpu_tp_big_gate_encode()` with its own sequencing, not the row-gate
-schedule.
-
-**This is a trade, and it can lose.** Correcting my own framing when I proposed
-it — this is not "one branch". Three decode splits have to come off together
-(the head split, the independently group-sliced output projection at the
-`tp_attn_decode_split` branch, and the gate itself) or the gate slot carries a
-partial nobody sums. All three now key off one predicate. The cost is that each
-rank runs the full attention block: roughly **+1.6 GB/token/node** of weight
-traffic on Flash, because `q_b` and `o_a` are 32768-wide.
-
-The bet is R10c: decode runs at ~54% of prefill power, so it is stall-bound,
-and added reads should land in existing bubbles while removed gates take real
-wall time. If decode were bandwidth-bound this would be strictly worse. **I
-would not be surprised by a negative result** — record it either way, because a
-clean negative closes the last lever and says the 86-gate structure is load
-bearing.
-
-**R11a — inertness.** Flag unset must reproduce the current arm exactly; the
-default path is untouched.
-
-**R11b — correctness** (16384, greedy). Expect **not** bit-identical, unlike
-R5/R7/R8: replication changes the attention output from `rank0_partial +
-rank1_partial` to a single full-width computation, so the summation order
-differs. Judge it on the R2-era criterion — top-1 identity plus max |Δlogit|
-bounded against the ~0.0055 control-vs-control baseline. A large divergence
-means a genuine bug, not accumulation order.
-
-**R11c — throughput**: decode at 2048 and 131072, plus a full sweep to confirm
-prefill is unmoved. Decode is the metric; prefill should be flat to within
-noise, and if it is not, something leaked out of the decode path.
-
-No projection recorded, deliberately. The two terms — per-gate fixed cost saved
-and duplicated attention traffic added — are each uncertain by more than their
-difference, and R8 is the standing reminder of what happens when a shaky
-estimate gets quoted as a number. Direction is genuinely unknown; that is why
-it is worth one run.
-
-**Asymmetry fails safe here**, unlike the prefill split flags:
-`gates_per_token` is exchanged in the TP hello and a mismatch is rejected at
-handshake (`ds4_tp.c:1386`) rather than deadlocking mid-run.
-
-### R10 — the gate path, and the first hard look at decode — **DONE, 2026-08-26, recorded in `BENCHMARKS-TP-PP.md`**
-
-**Two readings to fix before they propagate.**
-
-**The "93% of 2048 prefill wall time is BIG-gate wait+wire, versus 18.5% at
-131k" comparison is apples-to-oranges.** The 18.5% figure is **wire only**; the
-93% is **wait + wire**, and `wait` contains the layer's compute. Σ(wait+wire) ≈
-wall time is near-tautological wherever gates bracket all the work — at 131k
-the same sum is 319 s of 325 s, i.e. **98%**, *higher* than 2048's 93%. The
-comparable number is wire alone: 86 × 13.07 ms = 1.12 s of 4.96 s = **~23% at
-2048** against 19.1% at 131k. Similar, slightly worse at short context. No R10
-conclusion changes, but "the gate *is* the prefill at 2048" reads as an
-overhead finding when it is a bracketing artifact — the third instance of this
-exact trap in this doc, after the two corrections above.
-
-**R10c confirms its prior via a proxy, not directly.** These boxes report GPU
-power, not residency, so the 86–91% prefill residency figure has no
-counterpart. Decode at 30 W against prefill's 55.5 W is 54% of prefill power;
-multiplied through prefill's ~88% residency that is a **~48% residency
-equivalent** — the top edge of the predicted 30–50% band, so confirmed but only
-just, and power is not linear in residency under DVFS. The qualitative finding
-(decode is not compute-saturated) is solid; the number is directional.
-
-**And one prediction that was simply wrong.** R10d was requested on the
-suspicion that `DECODE_NWG`'s bucket heuristic was "exactly the class of
-tuned-once constant `nsg=8` turned out to be". It is not: the default 32 sits at
-the top of the plateau on **both** contexts (40.91 @2k, 0.03% off best @131k).
-The knob is a real lever — NWG=2 costs 14% — with nothing left to tune. One for
-two on suspecting heuristics; worth remembering before the next such request.
-
-
-**No code.** Everything here is an existing knob or a measurement. R9's own
-arithmetic put a kernel rewrite at +6–8%; the R9 gate profile put **BIG-gate
-wire at 60 s of a 325 s cold prefill — 18.5%, on the critical path and not
-overlapped**. That is the larger target, and it is also the structural reason
-PP wins at long context: PP moves activations twice per pipeline pass, TP moves
-them once per layer per chunk, so TP's transfer cost scales with layers ×
-chunks and PP's does not.
-
-**R10a — re-test `DS4_TP_SUBGATE_PIPELINE=1`** (both ranks; full sweep + cold
-131k against the current arm). Documented as "measured net-negative on the M5
-Max pair", but that predates this entire workstream, when BIG wait:wire was
-**8.0 : 1**. It is now **4.3 : 1** with per-gate wait halved (190 → 93 ms).
-Overlapping sub-chunks is worth much more when wire is a larger share of the
-gate, so the regime it was rejected in no longer exists. Cheapest possible
-probe of an 18.5% target: one flag, no code. If it is still net-negative,
-record it and the sub-gate avenue closes for good.
-
-**R10b — link ceiling at the real message size.** Effective BIG-gate wire is
-2.8–3.1 GB/s (67,108,864 B / 21.8 ms) against a link we treat as ~5 GB/s.
-Before anyone tries to overlap the transfer, establish whether it can simply go
-faster: run `uc_pingpong` (or the existing RDMA test harness) at **64 MiB**
-message size, not the default, and record achieved GB/s each way. If the link
-delivers ~5 GB/s at that size, the gate path is leaving ~40% on the floor and
-staging/window tuning is back on the table — the workstream this doc closed
-earlier was closed on the argument that exchange was only ~9% of the run, which
-the 18.5% figure supersedes.
-
-**Decode.** Prefill has had all the attention; decode has been "untouched" in
-every arm since R3 and has never been profiled on its own. It is now the
-weaker half of the story in absolute terms — 28.13 t/s at 131k against 367
-prefill — and it is where TP's remaining advantage lives (+37–48% over PP at
-every context). Three cheap measurements, in priority order:
-
-**R10c — decode residency and power** (`powermetrics --samplers gpu_power`
-during the *generation* phase only, at 2048 and 131072). **This has never been
-measured** — every residency figure in this doc is from prefill. It decides the
-other two: prefill sits at 86–91%, and if decode sits far below that, decode is
-stall-bound and the gate chain is the target; if it is also ~90%, decode is
-compute-bound and the kernels are.
-
-Prior expectation, so it can be scored: **low**, 30–50%. Decode moves ~3.3 GB
-per token per node (experts + attention weights + KV) which is ~4 ms at 800
-GB/s, against a measured 35.5 ms/token at 131k — about 12% of bandwidth and,
-per the standing note, ~2% of peak FLOPs. If residency comes back at ~90% that
-prediction is wrong in an interesting way and worth stopping on.
-
-**R10d — `DS4_METAL_DECODE_NWG` sweep** (2, 4, 8, 12, 16, 24, 32; both ranks;
-at 2048 and 131072). An existing env knob (`ds4_gpu_flash_attn_decode_nwg`,
-range 2–32) whose default is a **coarse bucket heuristic** — "bound runtime PSO
-compilation while still removing most empty work". That is exactly the class of
-tuned-once constant `nsg=8` turned out to be, and it costs nothing to sweep.
-Note it only branches on `ds4_gpu_tp_world_is_two()`, so world-1 keeps NWG=32
-regardless — sweep under TP.
-
-**R10e — decode gate profile at two contexts** (`DS4_TP_GATE_PROFILE=1` at
-2048 and 131072). We have ROW-gate data only at 131k: 11,008 gates
-(= 128 tokens × 86, the fixed per-token schedule) at 418 µs wait / 29.9 µs
-wire. One context cannot separate fixed overhead from context-dependent
-compute; two can.
-
-What to read from it, and what **not** to. Decode's 86 gates run in fixed
-sequential order, so unlike the bulk prefill gates they cannot overlap — which
-means Σwait ≈ token time is close to **tautological** (86 × 418 µs = 35.9 ms
-against a measured 35.5 ms/token) and is *not* evidence of anything. Two prior
-readings in this doc went wrong exactly here. The informative quantities are:
-
-- **wire as a fraction of wait** — currently 29.9/418 = **7.2%**, i.e. the link
-  is not decode's problem and R10b will not help decode;
-- **how wait scales with context** — 2048 decode is 40.91 t/s → 284 µs/gate
-  implied, 131k is 418 µs. If wire is flat ~29 µs at both, the growth is
-  compute and the floor is ~284 µs/gate × 86 = 24.4 ms/token ≈ 41 t/s, which
-  is precisely the measured 2048 number. That would mean **short-context decode
-  is entirely per-gate fixed cost**, and the only lever with real headroom is
-  reducing the 86 gates/token (2 per layer) — a design change, not a knob, but
-  worth knowing before anyone tunes kernels for it.
-
-### R8 — FlashAttention simdgroup count — **DONE, default flipped**
-
-`DS4_METAL_FA_NSG` now defaults to 4; set `=8` to restore the old value for
-A/B. Bit-identical on the rig as predicted, inertness exact, positive at every
-context, and the gain grows with context (1.5% @4k → 7.3% @131k) exactly as the
-mechanism implies. The one off-trend point is 2048 at +8.5%, which is above 4k
-and 8k; 2048 is a single `pos0 == 0` chunk served by the zero-prefix path,
-which uses the same kernel, so it is not inert here — but the size looks like
-scatter rather than signal.
-
-What follows is the original request, kept for the projection record.
-
-**Why.** `nsg=8`, which `head_dim >= 512` has always selected, is the worst
-legal value for this kernel at `C = 64`, on two compounding counts:
-
-- `NC = (C/8)/NSG` is the number of 8×8 QK tiles a simdgroup produces per key
-  block. `NSG=8` pins `NC` at its floor of **1** — one tile, then
-  `simdgroup_store` and the barriers — where `NSG=4` does two, halving sync
-  overhead per unit work. A `static_assert((C/8) % NSG == 0)` makes 8 the
-  largest value the kernel admits at all.
-- the QK loop unrolls by `MIN(DK8/2, 4*NSG)`, jumping from 16× to a full 32× at
-  `NSG=8` and doubling live simdgroup matrices. No occupancy is won back:
-  shared memory is `Q*(DK + 2*PV + 2*SH)*2` = 28,672 B against a 32,768 B
-  limit, so **exactly one threadgroup is resident per core** either way. (The
-  same budget is why `nqptg` cannot go to 16 — it would need 57,344 B and
-  simply fails to launch. `head_dim=512` is what caps the query tile at 8.)
-
-**Measured standalone** (M1 Max, ds4's own shader extracted and run against the
-real kernel; executed keys counted from the mask, not assumed):
-
-| shape | nsg=8 | nsg=4 | speedup | differing floats |
-|---|---|---|---|---|
-| odd ratio-128, late 131k chunk | 852.4 ms | 387.2 ms | **2.20×** | 0 / 134,217,728 |
-| odd ratio-128, mid 64k chunk | 509.4 ms | 236.1 ms | **2.16×** | 0 / 134,217,728 |
-| odd ratio-128, early 8k chunk | 210.0 ms | 97.7 ms | **2.15×** | 0 / 134,217,728 |
-| short chunk (1024 tok) | 203.7 ms | 105.0 ms | **1.94×** | 0 / 33,554,432 |
-
-Context for the size of that: at `nsg=8` the kernel runs at **0.76 TFLOP/s**
-while an equal-FLOP GEMM on the same GPU reaches **5.2–6.0** — a ~7× gap, which
-independently reproduces the ~6× implied by R6 on the M2 Ultra (attention 2.4
-vs `q_path` 14.7 TFLOP/s). `nsg=4` recovers about half of it.
-
-**R8a — inertness.** Flag unset must reproduce the R7 arm. Should be exact:
-the default path is untouched.
-
-**R8b — correctness** (16384, `DS4_TP_FORCE_DENSE_ATTN_OUT=1` both arms,
-greedy). Expect **bit-identical**, as it was standalone on 134M output floats
-across four shapes. `nsg` changes only how work is partitioned across
-simdgroups, not accumulation order within a QK tile. If logits differ at all,
-stop and report — that would mean the partitioning is not accumulation-neutral
-on this hardware, which the standalone run says it is.
-
-**R8c — throughput**: full sweep + cold 131k, all four flags on, vs the R7 arm.
-
-Projection, recorded before the run: if the standalone ratio transfers, the
-FlashAttention consumption roughly halves. Post-R7 that stage is ~128 ms on an
-odd layer and ~39 ms on an even one, so the saving is ≈ 1.4 s + 0.4 s per late
-chunk out of ~12.5 s → **sweep 131k 342.25 → ~375–395, cold 380.27 → ~415–440**
-(+10–15%).
-
-Weaker than R7's projection, for a reason worth stating: R7 extrapolated from
-measurements on *this rig*, whereas this extrapolates from a **24-core M1 Max
-to a 60-core M2 Ultra**. The 32 KB threadgroup-memory limit is architectural so
-the occupancy argument carries, but the barrier-vs-register tradeoff that makes
-`nsg=4` win could scale differently with core count. Treat the direction as
-solid and the magnitude as unverified — that is exactly what R8c is for.
-
-If it lands, flip the default in `ds4_gpu_flash_attn_nonvec_nsg()` and drop the
-env knob.
-
-**Outcome:** direction, shape and bit-identity all landed; the magnitude did
-not — +7.3% against a projected +10–15%. Default flipped, but the knob is
-**kept** (`=8` restores the old value) rather than dropped: it costs nothing
-and it is the only way to re-A/B this on new silicon or after a kernel change.
-The scoring caveat above was the right one to raise and the wrong one to then
-ignore in the number.
-
-### R7 — static-mixed row split — **DONE, passed**
-
-Bit-identical, and both pre-recorded projections landed (sweep ~340 → 342.25,
-cold ~380 → 380.27). Full results in `BENCHMARKS-TP-PP.md`. Notable: 2048
-came in at ~0%, which is the correct inertness signal — a 2048-token prompt is
-a single `pos0 == 0` chunk, so the flag has nothing to act on.
-
-R6's single-threaded 43 MB mask-fill concern **did not bite**, as the follow-up
-measurement predicted: ported and timed exactly, that loop is 5.25 ms serial,
-2.1% of the `attention` stage and ~0.8% of a full 131k prefill. Parallelising
-it with `dispatch_apply` gives 4.1×, and it is still not worth doing.
-
-### Heterogeneous compute (ANE / CPU) — **evaluated and closed, 2026-08-26**
-
-Asked whether the ANE or the CPU could take some of the prefill matmul load.
-Answer: no for ANE, marginal for CPU. Recorded so it is not re-opened.
-
-**The premise needed adjusting first.** Prefill *is* matmul-bound, but the GPU
-is not bad at matmul. Scoring R6's stages against their FLOP counts: `q_path`
-**14.7 TFLOP/s** (68% of the M2 Ultra's 21.5 TF fp32 peak), `output_proj`
-**8.9**, `attention` **~2.4**. The problem was one kernel at ~6× below what the
-same GPU does on a plain GEMM 30 ms earlier in the same layer — hence R8, not
-more silicon.
-
-**ANE — four independent blockers**, from the ANE guide plus local probing:
-
-- **Bandwidth.** ANE's roof is 24–51 GB/s on M1, ~145 GB/s on M5. It does not
-  see unified-memory bandwidth; the rig's GPU has ~800 GB/s per node.
-- **Ultra does not aggregate.** The driver "steers whole independent
-  submissions to the least-busy engine die and never exchanges tensor data
-  between them," and the collective-enable capability byte reads zero on all 28
-  targets. An M2 Ultra is two independent 16-core ANEs; a single graph cannot
-  span dies.
-- **fp16 numerics fail on our worst case.** The guide names value, **output
-  projection** and down-projection as the projections that break in fp16 e2e.
-  `o_a` is K=32768 — and on M2 (A14-generation ANE) the MAC output stage
-  saturates at 2¹⁵ = 32768; the non-saturating path arrives at A15/M3.
-- **Shape tax.** One compiled program per concrete shape, no dynamic dims
-  without entitlement, 0.23 ms dispatch floor.
-
-Throughput loses anyway: the guide's M1 head-to-head is ANE 3.6 vs GPU 7.3
-TFLOP/s on a K=4096 GEMM, and it classifies large-batch matmul as "GPU regime
-throughout" — which is exactly what 4096-token prefill is.
-
-Probed locally on an M1 Max via CoreML at ds4's real shapes: ANE appears as a
-*candidate* for every op tried (`candidates=CPU|GPU|NeuralEngine`) but CoreML
-never once scheduled it, including for a canonical 3×3 conv stack. That matches
-the guide — under CoreML the device is "a scheduling outcome, not a choice."
-Forcing it means the private `e5rt_*` Espresso API.
-
-On zero-copy: every boundary "charges a tensor repack between the engine
-channel-interleaved fp16 layout and the host layout," IOSurface sharing is
-listed as reachable-but-unexercised, and overlapping streams is called out as
-unsound. Unified memory does not buy a free hand-off here.
-
-**CPU/AMX** measured on the same M1 Max via Accelerate at ds4's shapes:
-**1.32–1.79 TFLOP/s** fp32 (`q_a` 1.75, `q_b` 1.78, `o_a` 1.32, `ffn` 1.79).
-Scaling by P-cluster count an M2 Ultra should reach ~3–3.5 — ~20% more compute
-against a GPU doing 14.7, and not free, since those cores already drive the
-Metal encoder and the RDMA gate service thread. Poor trade against R8.
-
-One incidental cross-check worth keeping: AMX reproduces the GPU's
-`q_b`-vs-`o_a` asymmetry (1.78 vs 1.32, same direction as 14.7 vs 8.9), so the
-K=32768 reduction being slower is a property of the shape on two independent
-engines, not a ds4 defect.
-
-### R6 — size the ratio-128 layers — **DONE**, and it corrected this doc
-
-Results in `BENCHMARKS-TP-PP.md`. The prize is large: `q_path` + `attention` +
-`output_proj` on an odd layer = **311.2 ms**, ~71% of that layer's chunk time,
-×20 layers ≈ **6.2 s of every late chunk**. The hard floor (`kv_path` +
-`compressor`, which must stay full-width) is only ~3.5–5.5 ms/layer, so
-row-splitting's ceiling on these layers really is the whole attention block.
-
-**The data validates itself.** Odd `output_proj` / even `output_proj` =
-34.857 / 17.190 = **2.03×** — almost exactly the replicated-vs-split ratio, on a
-stage whose cost has nothing to do with `ratio`. That is an internal control
-saying the profiler is faithful and that these layers are indeed running
-full-width.
-
-Two things this doc asserted, both wrong:
-
-**1. "`comp = 1024` on ratio-128 means their attention is small."** Backwards.
-It is 255.3 ms against the ratio-4 layer's 182.8. Having *no indexer* is the
-whole point: `top_k` caps a ratio-4 row at 512 + window keys, while a ratio-128
-row attends its entire compressed cache — 1024 + window at 131k, and **growing
-with context**. Fewer compressed keys, but all of them, beats more compressed
-keys with only 512 read. I inverted the comparison by reasoning from cache size
-instead of from keys-read-per-row.
-
-The growth confirms it: allocated `n_keys` rises only 7.2% from pos 81920 to
-126976 (4896 → 5248), but the stage rises 33% (192.0 → 255.3). Cost tracks
-*visible* keys per row (784 → 1136, +45%), not allocated ones — so the kernel's
-block skipping is working, and what grows is the compressed span.
-
-**2. "The static-mixed path carries a mask that needs a token-axis slice."**
-Not on this path. `use_comp_mask` is set only inside the `ratio == 4 &&
-n_comp > top_k` branch, which then takes `use_indexed_comp` and never reaches
-this kernel — so the `pos0 > 0` mixed call always passes `comp_mask = NULL`.
-Its mask is the one `ds4_gpu_fill_mixed_decode_batch_mask()` rebuilds per call
-from `(pos0, n_tokens, n_raw, n_comp, window, ratio)`. Hand it this rank's
-origin and row count and it regenerates exactly this rank's half: **the mask
-slices itself.** The blocker I described is real, but it belongs to the
-*zero-prefix* static-mixed path, which is a different call site.
-
-So R7 was a predicate relaxation plus one call site passing
-`q_work_rows`/`attn_pos0` instead of `n_tokens`/`pos0` — not the "real work" this
-doc budgeted for. Corroboration that the surrounding machinery was always ready:
-ratio-128 layers **already row-split at chunk 0** through the zero-prefix
-static-mixed kernel, so nothing about those layers was unsafe to split.
-
-Method note for future sizing runs: `DS4_METAL_LAYER_STAGE_PROFILE` **blocks the
-CPU** at every boundary (`ds4_gpu_end_commands()`), unlike
-`DS4_METAL_GPU_STAGE_TIMESTAMPS`. Its numbers are wall time per stage —
-CPU-side work included, which is what made the mask fill visible — but they
-serialise a layer that would otherwise overlap, so read one profiled layer
-against another profiled layer, never against a clean run.
-
-### R5 — indexer split (the main event; `589e93e`) — **DONE, passed**
-
-Splits the score + top-k by query row, which R1 measured at ~61% of the
-layer-chunk against the ~8% A0 splits. Needs **no extra gates** — each rank
-scores its own rows and feeds its own top-k into attention rows it already
-owns — so unlike A0 it should convert compute saving straight to throughput.
-
-**Requires A0 on.** It reuses `tp_row0`/`tp_rows`/`attn_pos0`.
-
-```
-DS4_TP_PREFILL_SPLIT_NONZERO=1 DS4_TP_PREFILL_SPLIT_INDEXER=1    # BOTH ranks
-```
-
-**R5a — correctness first**, same protocol as Run 2: `DS4_TP_FORCE_DENSE_ATTN_OUT=1`
-on both arms, temp 0, compare against the A0-only arm (not against flags-off).
-Gate: tokens byte-identical, argmax identical at every frontier, `max |Δlogit|`
-in the same ULP class as the 0.0055 control baseline. Expect a *smaller*
-deviation than A0's 0.049 — this split does not move the FlashAttention block
-geometry, it only changes which rows a rank scores.
-
-**R5b — throughput**: cold single point at 131072, plus the full sweep. Compare
-against the A0-on arm (237.44 sweep / 281.20 cold), not the baseline.
-
-| | A0 only | A0 + indexer | Δ |
-|---|---|---|---|
-| cold 131072 | 281.20 | | |
-| sweep 131072 | 237.44 | | |
-| sweep 8192 | 422.05 | | |
-
-**R5c — re-run R1 with the split on.** `score` per layer-chunk should roughly
-halve (317.7 → ~160 ms) if the split is doing what it claims. This is the
-cleanest confirmation that the mechanism works, independent of end-to-end noise.
-
-No throughput prediction from me this time. The last two were wrong — 7× high on
-A0, and then wrong about which term the gate cost lived in. R1's score share
-bounds it; the rig decides the rest.
-
-### Answered — kept for protocol reference
-
-R1–R4 are complete; see the status table. Commands retained below.
-
-### R1 — indexer stage breakdown at 131k (highest value)
-
-Sizes the indexer split before it is built. Everything above is arithmetic; this
-is the measurement that replaces it.
-
-```
-DS4_METAL_FAST_SYNC=1 DS4_TP_PREFILL_SPLIT_NONZERO=1 \
-DS4_METAL_INDEXER_STAGE_PROFILE=1 \
-  ./ds4-bench ... --ctx-start 131072 --ctx-max 131072
-```
-
-Emits per layer per chunk:
-```
-ds4: metal indexer stage layer=<il> pos=<pos0> tokens=<n> comp=<n_comp> score=<ms> ms
-                                                                        topk=<ms> ms
-                                                                   attention=<ms> ms
-```
-
-Record the three stage times for **a few even layers ≥ 2** (they carry the
-indexer) at a late chunk, plus `comp=`. Paste a representative handful of lines
-rather than the whole log.
-
-**Caveat:** the boundary helper calls `ds4_gpu_end_commands()` /
-`ds4_gpu_begin_commands()` around each stage, so it forces a command-buffer
-split per stage. Throughput under this flag is **not** comparable to a clean
-run — only the relative score : topk : attention split is meaningful.
-
-What it decides: if `score` dominates `attention` by the predicted ~6×, the
-indexer split is the next change and its ceiling is roughly the `score` share.
-If it does not, the model above is wrong and I want to know before building.
-
-### R2 — gate profile, both arms
-
-Turns "~90% GPU util" into a number, and gives the bandwidth figure that decides
-whether the RDMA workstream is worth anything.
-
-```
-DS4_TP_GATE_PROFILE=1 ...  --ctx-start 131072 --ctx-max 131072
-```
-once with `DS4_TP_PREFILL_SPLIT_NONZERO=1`, once without.
-
-From the **BIG** line record, for each arm:
-
-| | A0 off | A0 on |
+| run | outcome | the part worth remembering |
 |---|---|---|
-| `gates` (expect 43 → 66 per chunk) | | |
-| avg **gpu wait** µs — the pipeline bubble | | |
-| avg **exchange** µs | | |
+| Runs 1–3b, R1–R4 | A0 landed, +7.2% @131k | R4 found the argsort canon comparator was not token-count gated like its siblings; fixed in `6fa977c`. |
+| R5 indexer split | bit-identical, +19.5% | Bit-identical *because* the split moves no FlashAttention block geometry — it only reassigns which rank computes an order-invariant per-row quantity. A0 perturbed (0.049) for the opposite reason. |
+| R6 sizing | prize 311.2 ms × 20 layers | Two premises of this doc were wrong. See below. |
+| R7 static-mixed split | bit-identical, +20.5% | The "mask needs a token-axis slice" blocker did not exist on the `pos0 > 0` path: that mask is rebuilt per call from the origin, so it slices itself. |
+| R8 FA `nsg` | bit-identical, +7.3% | The standalone→rig transfer factor. See below. |
+| R9 `nqptg` | scoped, no runs | A 2× standalone kernel discounts to ~+6–8% end-to-end. Prototype only if a restructure shows ≥1.5–2×. |
+| R10a sub-gate | wash | The decisive argument was that a *prefill* flag moved *decode* by 10% in one arm — which proved the control run was bad, not that the flag worked. |
+| R10b link ceiling | 4.4/4.1 GB/s | Its stated reason (UC SEND EPERMs >4096 B) was later disproved by M3. |
+| R10c/d/e, R11 | see M0 | **All taken on a shard with `iogpu.wired_limit_mb = 0`.** Suspect. |
+| R11 replicated attention | −8.4 to −11.8% | The gate wait is not idle — it is the window the peer's half of the attention runs in. Flag and code deleted in `f45b535`. |
+| ANE / CPU offload | closed | See the section below; do not re-open. |
 
-Effective per-direction bandwidth = `67,108,864 / avg_exchange_us`.
+### R6's two corrected premises
 
-The gpu-wait delta between arms is the true cost of A0's added gates, and is the
-number I got wrong by estimating wire time only.
+**"`comp = 1024` on ratio-128 means their attention is small."** Backwards. It
+is 255.3 ms against the ratio-4 layer's 182.8. Having *no indexer* is the
+point: `top_k` caps a ratio-4 row at 512 + window keys, while a ratio-128 row
+attends its entire compressed cache — and that count grows with context. Fewer
+compressed keys, but all of them, beats more keys with only 512 read. The error
+was reasoning from cache size instead of keys-read-per-row.
 
-### R3 — GPU utilisation shape
+**"The static-mixed path needs a token-axis mask slice."** True of the
+*zero-prefix* call site, not the `pos0 > 0` one, where `use_comp_mask` is
+always 0 and the mask comes from `ds4_gpu_fill_mixed_decode_batch_mask()`.
 
-Was the ~90% seen with A0 **on**, **off**, or both? And is the idle flat across
-the sweep or growing with context? Flat implicates gate count; growing
-implicates something else. A rough `powermetrics --samplers gpu_power` reading
-at 8k and at 131k in each arm is enough.
+### The standalone-to-rig transfer factor: ~0.63
 
-### R4 — short-context regression (cheap, low priority)
+R8 is the only result measured both ways. Backing the kernel speedup out of the
+end-to-end numbers gives **~1.39× on M2 Ultra** from both the sweep and the
+cold run independently, against **2.19× measured standalone on M1 Max**.
+Discount future standalone M1 Max numbers accordingly and treat them as upper
+bounds. R8's projection quoted the full 2.19× while only *verbally* flagging
+the microarchitecture risk — flagging a risk is not pricing it in.
 
-Run 1 showed −2.2% prefill and −2.0% decode at 4096 vs the old base, above the
-~1% noise floor. Suspect is #832's canonical argsort comparator: unlike the rest
-of the indexer stack it is **not** token-count gated, so it applies where the
-sort is a large fraction.
+### The metric trap, five times over
 
-```
-DS4_METAL_DISABLE_ARGSORT_CANON=1     # 2048 and 4096 points only
-```
+`Σ(per-gate wait) ≈ token time` is **tautological** wherever gates bracket all
+the work, because `wait` contains the compute. It is not evidence of overhead.
+This doc has now drawn a wrong conclusion from it three separate times (R2's
+"451 s of stall", R10e's "the floor is per-gate fixed cost", and the
+"93% of 2048 prefill is gate time" comparison, which measured wait+wire against
+a wire-only baseline). Related: a per-gate *ratio* does not bound a *total* —
+"exchange is only ~9% of the run" was drawn from R2 and superseded once the
+splits tripled the gate count.
 
-If that recovers the 2%, it should be gated on `n_tokens >= 32` like its
-siblings and I will patch it.
+When reading gate data, use: wire as a share of the token (absolute), and how
+wait scales with context. Not the sum, and not the ratio alone.
 
-## What is being measured
+### Heterogeneous compute (ANE / CPU) — closed, do not re-open
 
-Two independent changes landed on this branch. **They must be separated**, or the
-A0 result will be contaminated by the upstream prefill stack.
+**Premise correction first:** the GPU is not bad at matmul. Scoring R6's stages
+against their FLOP counts gives `q_path` **14.7 TFLOP/s**, `output_proj` 8.9,
+`attention` ~2.4. The problem was one kernel at ~6× below what the same GPU
+does on a plain GEMM in the same layer — hence R8/R9, not more silicon.
 
-| group | commits | expected effect |
-|---|---|---|
-| upstream indexer stack | `4760333`, `557ebf4`, `4624e5f`, `1718151`, `ead8786`, `5321d86`, `b7dc56c` | prefill +~24% at 131k, bit-exact |
-| LLT decode scorer | `4333606` | decode +6–7% at long ctx only |
-| **A0 row split** | `309c0e2`, `534648e`, `82d9e9a` | **prefill, opt-in, the thing under test** |
-| server/correctness | `958b248`, `92c4a5a`, `4cc4497`, `471d11b`, `5994f7d`, `d2367a3`, `318e6eb` | no prefill throughput effect |
+**ANE — four independent blockers.** Bandwidth roof 24–51 GB/s (M1) / ~145
+(M5), not unified-memory bandwidth. Ultra does not aggregate: the driver
+*"steers whole independent submissions to the least-busy engine die and never
+exchanges tensor data between them"*. fp16 fails on our worst case — the guide
+names output projection and down-projection as breaking in fp16 e2e, and `o_a`
+is K=32768, with the M2-generation MAC saturating at 2¹⁵. One compiled program
+per concrete shape, 0.23 ms dispatch floor. Its own head-to-head has ANE at 3.6
+vs GPU 7.3 TFLOP/s on a K=4096 GEMM and classifies large-batch matmul as "GPU
+regime throughout". Probed locally: ANE is a *candidate* for every op tried but
+CoreML never schedules it, even for a canonical conv stack.
 
-**The old 183.4 t/s at 131072 is from `tp-multi-slot-batching` and is NOT the A0
-baseline.** A0's baseline is this branch with the flag off, which should already
-be faster because of the indexer stack.
+**CPU/AMX** measured at **1.32–1.79 TFLOP/s** on our shapes — ~20% more compute
+against a GPU doing 14.7, and not free, since those cores drive the Metal
+encoder and the RDMA service thread.
 
-## Hard prerequisites
+One cross-check worth keeping: AMX reproduces the GPU's `q_b`-vs-`o_a`
+asymmetry (1.78 vs 1.32, same direction as 14.7 vs 8.9), so the K=32768
+reduction being slower is a property of the shape on two independent engines.
 
-1. **Same commit on both hosts.** `git rev-parse HEAD` must match on lanfear and
-   mat. Rebuild both; do not reuse a stale binary.
-2. **Env symmetry.** `DS4_TP_PREFILL_SPLIT_NONZERO` changes the per-layer gate
-   count. An asymmetric setting **deadlocks the gate exchange**, it does not
-   degrade. Set it on both ranks or neither. Same for
-   `DS4_TP_FORCE_DENSE_ATTN_OUT`.
-3. **RDMA device names are host-local and the docs disagree.** `BENCHMARKS-TP-PP.md`
-   has lanfear=`rdma_en6`, mat=`rdma_en7`; `speed-bench/README.md` has them
-   reversed. Confirm against the actual hardware before the first run — a wrong
-   name is a failed QP bring-up, not a silent slowdown.
-4. **The sweep is incremental.** `ds4_bench.c:780-795` advances the frontier from
-   the previous ctx point, so the `131072` row measures the 65536→131072
-   increment (65536 tokens), not a 131k prefill from scratch. Every chunk in that
-   row has `pos0 > 0`, which is why it is the cleanest A0 signal in the sweep —
-   but it also means the row's mean attended position is ~3N/4, not N/2, so it is
-   **not comparable** to any single-node number whose protocol we do not know.
-   Use the sweep for A/B against itself, and Run 3b below for anything
-   cross-machine.
+## Protocol
 
-## Run 0 — build and sanity
+### Prerequisites
 
-On **both** hosts:
+Operational prerequisites (same commit, env symmetry, RDMA setup, **the
+`iogpu.wired_limit_mb=120000` sysctl**, `DS4_METAL_FAST_SYNC`) live in
+`BENCHMARKS-TP-PP.md` and are the authoritative copy. Two that bite here
+specifically:
 
-```
-git fetch && git checkout upstream-metal-wins && git rev-parse HEAD
-make -j ds4-bench ds4-server ds4
-```
+- **Env symmetry.** Anything that changes the per-layer gate count
+  **deadlocks** the exchange if asymmetric; it does not degrade. The exception
+  is `DS4_TP_DECODE_REPLICATE_ATTN`-class changes to `gates_per_token`, which
+  the TP hello rejects at handshake (`ds4_tp.c:1386`).
+- **The sweep is incremental.** `ds4_bench.c` advances the frontier from the
+  previous point, so the `131072` row measures the 65536→131072 increment and
+  its mean attended position is ~3N/4. Use it for A/B against itself; use a
+  cold single point for anything cross-machine.
 
-Sanity, short prompt, all new flags unset. Expect normal output and no new
-warnings in stderr.
+### The correctness gate
 
-## Run 1 — inertness (do this first, it is the cheapest failure)
+Byte-identical is **not** a usable criterion on this rig: two identical control
+runs already differ. The gate is **top-1 identity plus max |Δlogit| bounded
+against a same-session control-vs-control baseline**.
 
-Flag unset. Confirms A0 is a true no-op when off, and establishes the A0 baseline.
+Baselines observed so far: **0.0055** (R2-era, 16k prompt) and **0.688** (R11's
+prompt, ~125× worse, with 5 of 7 frontiers in a degenerate repetition regime
+where near-tied logits amplify anything). A candidate "inside the in-session
+baseline" means little when the baseline is 0.688 — **fix the prompt before
+trusting this harness on anything non-bit-identical.** Changes that come back
+bit-identical (R5, R7, R8) need no baseline at all.
 
-**lanfear (coordinator):**
-```
-DS4_METAL_FAST_SYNC=1 ./ds4-bench -m <MODEL> --role coordinator \
-  --tensor-parallel --transport rdma --listen 0.0.0.0 1234 \
-  --rdma-device rdma_en6 --prompt-file /tmp/bench_long.txt \
-  --ctx-start 2048 --ctx-max 131072 --step-mul 2 \
-  --gen-tokens 128 --csv /tmp/a0_baseline.csv
-```
-
-**mat (worker):**
-```
-DS4_METAL_FAST_SYNC=1 ./ds4-bench -m <MODEL> --role worker \
-  --coordinator 192.168.0.6 1234 --transport rdma --tensor-parallel \
-  --rdma-device rdma_en7
-```
-
-Pass criteria: completes with zero faults; prefill at 131072 is **≥ the old
-183.4 t/s**. If the indexer stack is working it should be nearer ~228.
-
-## Run 2 — correctness (must pass before any throughput claim)
-
-Bit-equality of split vs unsplit. **`DS4_TP_FORCE_DENSE_ATTN_OUT=1` on both arms
-and both ranks** — without it the arms differ by the output-projection kernel as
-well as by the split, and the comparison is meaningless.
-
-Use a fixed prompt long enough to cross a chunk boundary (>8k tokens), temp 0.
-
-**Arm A (control):**
-```
-DS4_METAL_FAST_SYNC=1 DS4_TP_FORCE_DENSE_ATTN_OUT=1 \
-  ./ds4-bench ... --gen-tokens 128 > /tmp/a0_ctrl.txt
-```
-
-**Arm B (candidate):** identical plus `DS4_TP_PREFILL_SPLIT_NONZERO=1` on both
-ranks.
-
-```
-cmp -s /tmp/a0_ctrl.txt /tmp/a0_cand.txt && echo IDENTICAL || echo MISMATCH
-```
-
-**Superseded criterion (2026-08-25).** The original gate here was
-"byte-identical logits". That is unsatisfiable on this rig and always was:
-**two identical control runs** (flag off) already differ in all 129,280 dumped
-logits, max abs 0.0055, argmax identical. The unsplit TP path is not
-bit-deterministic run to run, so cross-run bit equality cannot be a gate for
-anything.
-
-The earlier reasoning — "each output row is an independent accumulation over the
-same key sequence, so the split cannot change how a row is computed" — is right
-about the per-row math and wrong about the surrounding blocking. The split
-changes `n_raw` and `raw_start`, so the SWA ring is linearised from a different
-offset and the FlashAttention block geometry moves with it (`has_kvpad` from
-`n_keys`, `bc_mask` from `n_tokens % 8`). Same keys, same values, different
-block boundaries, different rounding.
-
-**Actual pass criteria — all three:**
-
-1. Generated tokens **byte-identical** to the control at temp 0. This is the
-   strong one: it means every sampling decision matched.
-2. Frontier **argmax identical at every dumped frontier**.
-3. `max |Δlogit|` within a few ULP of f16 at the observed logit magnitude, and
-   within ~10× the control-vs-control baseline measured in the same session.
-   Record both numbers; the baseline is the scale, not zero.
-
-Measured 2026-08-25: control-vs-control 0.0055, split-vs-control 0.049 at logit
-magnitude ~27 (f16 ULP there is ~0.026, so ~2 ULP). 128/128 tokens identical,
-305/305 argmax identical. **Pass.**
-
-**If criteria 1 or 2 fail, stop.** Criterion 3 alone drifting means investigate
-before trusting the throughput numbers, not necessarily abort.
-
-## Run 3 — A0 throughput sweep
-
-`DS4_TP_PREFILL_SPLIT_NONZERO=1` on both ranks, `DS4_TP_FORCE_DENSE_ATTN_OUT`
-**unset** (it costs throughput).
-
-```
-DS4_METAL_FAST_SYNC=1 DS4_TP_PREFILL_SPLIT_NONZERO=1 \
-  ./ds4-bench ... --csv /tmp/a0_split.csv
-```
-
-### Results table
-
-| ctx | old branch | Run 1 (flag off) | Run 3 (flag on) | Δ vs Run 1 |
-|---|---|---|---|---|
-| 2048 | 381.3 | | | |
-| 4096 | 353.8 | | | |
-| 8192 | 377.1 | | | |
-| 16384 | 346.3 | | | |
-| 32768 | 310.4 | | | |
-| 65536 | 252.6 | | | |
-| **131072** | **183.4** | | | |
-
-Expected shape: **~0% at 2048** (chunk 0 only, already split), rising with
-context, largest at 131072. A0 does nothing at short context by construction —
-if you see a gain at 2048 something else changed.
-
-Target at 131072: **~1.5× over Run 1.** Derivation: the pair executes ~8.9e10
-FLOPs/token of which ~45% duplicates the peer; halving the splittable part
-predicts 1.51×, and the measured TP2-vs-single-node ratio after discounting the
-M2/M3 gap independently gives 1.52.
-
-## Run 3b — cold single-point prefill (do this, it is the honest number)
-
-The sweep rows are incremental suffixes. For a number that means something on
-its own — and for any comparison against a single-node figure — run one **cold**
-point, flag off then flag on:
-
-```
---ctx-start 131072 --ctx-max 131072      # no --step-mul; one cold prefill
-```
-
-This is the number to quote. The sweep tells you the *shape* of the gain across
-context; this tells you the *size* of it at the context you care about, without
-the 3N/4 mean-position artefact.
-
-| | flag off | flag on | Δ |
-|---|---|---|---|
-| cold 131072 prefill t/s | | | |
-
-## Run 4 — free diagnostics while the rig is up
-
-Costs one extra run and decides whether the RDMA workstream is worth anything.
-
-```
-DS4_TP_GATE_PROFILE=1 DS4_METAL_FAST_SYNC=1 ... --ctx-start 131072 --ctx-max 131072
-```
-
-The profile prints per gate kind (ROW / VERIFY / BIG): gate count, average GPU
-wait µs, average exchange µs. From the **BIG** line record:
-
-- `gates` — sanity check: should be ~16 chunks × 43 layers = 688 with the flag
-  off, roughly double with it on (A0 adds the attn_out row swap per layer)
-- `avg exchange us` → **effective per-direction bandwidth =
-  67,108,864 / avg_exchange_us** (bytes/µs = MB/s)
-- `avg gpu wait us` → the pipeline bubble per gate. This is the number I could
-  only estimate statically; if it is large relative to the exchange, the cost is
-  the encoder drain and not the wire.
-
-The bandwidth number decides WS3+4 on its own: two of its three proposed gain
-arms required bandwidth above TB4 line rate, i.e. were impossible.
-
-Also worth capturing, same run:
-```
-DS4_METAL_GPU_STAGE_TIMESTAMPS=1 DS4_METAL_GPU_STAGE_TIMESTAMPS_LAYER=<il> ...
-```
-(`_LAYER` restricts to one layer, `_DETAIL` adds sub-stages). Pick a ratio-4
-layer — even `il` ≥ 2 — since those carry the indexer. This gives the per-stage
-split of the ~519 ms/layer-chunk: indexer scoring vs attention core vs
-projections. That sizes the *next* change — splitting indexer score/top-k, which
-needs no cross-rank merge because it is per-query-row, and is the largest
-remaining win once A0 lands.
-
-## Failure signatures
+### Failure signatures
 
 | symptom | meaning |
 |---|---|
-| Gate wait hangs, or `tp: worker sync send failed` | **asymmetric env.** The flag is set on one rank only. |
-| `kIOGPUCommandBufferCallbackErrorTimeout` on the worker | watchdog kill; check whether it also happens with the flag off (then it is pre-existing, see #852) |
-| Row-range view rejected / prefill aborts | a bounds case the even-chunk guard did not cover — capture `n_tokens`, `pos0`, `il` |
-| Run 2 mismatch | real correctness defect in the split |
-| Run 3 gain ≈ 0 at all ctx | flag not reaching the predicate — confirm with `DS4_LOG` that split chunks are firing |
-| Run 3 gain at 2048 | contamination; something other than A0 changed |
+| gate wait hangs, or `tp: worker sync send failed` | asymmetric env on a gate-count flag |
+| TP hello rejects at startup | asymmetric `gates_per_token` — the safe failure mode |
+| `kIOGPUCommandBufferCallbackErrorTimeout` on the worker | watchdog kill; check whether it reproduces with the flag off |
+| a knob shows ~0 effect at every context | confirm it reaches its predicate before believing the null — several knobs here are gated on context, quant, or `tp_world` |
+| `wired_limit_mb is 0` anywhere in the log | discard the arm and re-run |
 
-## Abort criteria
+Any hang → **restart both ranks**; `tp->failed` is sticky and a wedged pair
+does not recover in-process.
 
-- Run 2 mismatch → revert to Run 1 config, report the prompt and ctx.
-- Any hang → both ranks must be restarted (`tp->failed` is sticky and never
-  cleared; a wedged pair does not recover in-process).
-- Worker exits with a GPU command-buffer error → expected behaviour as of
-  `03cbf99`; it now exits loudly rather than lingering as a zombie.
+### Rollback
 
-## Rollback
-
-Everything under test is opt-in and off by default. Unsetting
-`DS4_TP_PREFILL_SPLIT_NONZERO` restores current behaviour with no rebuild. To
-drop A0 entirely: `git revert 82d9e9a 534648e 309c0e2`.
+The three prefill splits are default-on; set each to `0` on both ranks to
+disable without a rebuild. Everything currently under test
+(`DS4_NGRAM_SPEC`, `DS4_TP_GATE_FASTPATH`, `DS4_METAL_FA_NSG=8`) is opt-in or
+has an escape hatch, so no rollback needs a rebuild.

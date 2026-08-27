@@ -920,7 +920,7 @@ bit-identical (R5a), score stage 317.7 → 138.0 ms (R5c).
 **Do not** use the old 131072 = 183.4 figure as the A0 baseline; the A0
 baseline is the branch-under-test with the flag off (table above).
 
-### PP-RDMA — `pp-rdma-new` (rebuilt off tp-multi-slot-batching)
+### PP-RDMA — `pp-rdma-new` (old base, **superseded** by the same-commit PP re-measure above; kept for history only — do not quote)
 
 | ctx | prefill t/s | decode t/s |
 |-----|-------------|------------|
@@ -934,65 +934,43 @@ baseline is the branch-under-test with the flag off (table above).
 
 ## TP vs PP takeaways
 
-- **TP wins decode at every context**: 41% faster at 2k (40.9 vs 29.0), narrowing
-  to **25% at 128k** (25.3 vs 20.2). TP splits compute per-layer; PP serializes
-  full ~131 KB activations over RDMA on the decode critical path.
-- **PP degrades less with context**: decode drops 38% (TP 40.9→25.3) vs 30%
-  (PP 29.0→20.2) — PP's per-node KV is halved.
-- **PP prefill is much faster at scale**: 462 vs 310 t/s at 32k; 335 vs 183 t/s
-  at 128k. PP pipelines prefill and each node only touches its layer block's KV.
+Numbers in the **Current state** table above; it is same-commit and supersedes
+everything here. Summary:
 
-## TP regression on pp-rdma-new (verbs-layer extraction check)
-
-2048: prefill 382.9 t/s, steady decode 40.86 t/s — matches baseline. The verbs
-RDMA transport extraction did not change TP behavior.
-
-## Power observation (investigation target)
-
-During **TP prefill**, node power drops as context grows:
-- ~120 W prefill at < 50k context
-- ~100 W prefill at ~180k+ context
-
-Caveat before reproducing: these two readings predate the sweep tables above and
-are not from them — the documented sweep stops at 131072, so the ~180k point is
-not reachable by re-running it. The measurement command, per-node vs pair basis,
-and host were not recorded. Re-measure with
-`sudo powermetrics --samplers gpu_power` on a named host and record the context
-of each reading before treating the delta as a quantitative result.
-
-Interpretation: lower power = GPU under-utilization / more waiting as context
-grows. See investigation notes in `docs/TP-PREFILL-LONG-CTX-INVESTIGATION.md`
-(if present) for root-cause analysis and improvement options.
+- **TP wins decode at every context**, +37–48%. TP splits compute per layer; PP
+  serialises full activations over the link on the decode critical path.
+- **TP wins prefill at ≤16k** (+34% @2k, +44% @8k, +5% @16k); **PP wins from 32k
+  up** (+15/22/21%). PP moves activations twice per pipeline pass while TP moves
+  them once per layer per chunk, so TP's transfer cost scales with layers ×
+  chunks and PP's does not.
+- Score cross-architecture claims **only against a same-commit PP run**. Several
+  wins in this series (the upstream indexer stack, `nsg=4`) sit on the shared
+  Metal path and lifted PP too, so TP-only deltas do not move the comparison by
+  the same amount. The earlier "TP now beats PP at 131k" headline was drawn
+  against a stale PP figure and was wrong.
 
 ## Key TP internals (from code read)
 
-- Transport: RDMA over AppleThunderboltRDMA. Decode uses per-token gate schedule
-  (86 gates/token fixed order); prefill uses **bulk "big gate" row swaps** —
-  one full-batch hidden-state exchange per layer over the latency QP, chunked
-  into 16 KiB messages with a 1 MiB receive window (`tp_rdma_big_gate_exchange`,
-  `ds4_tp.c`).
-- Attention **head** splitting (`tp_split_attn = g->tp_world==2`) is the **decode**
-  path only. **Prefill** splits attention **rows** (`tp_row_split_attn` in
-  `metal_graph_encode_layer_attention_batch`), and only for `pos0 == 0` chunks —
-  `const bool zero_prefix = pos0 == 0` gates every split shape. With the default
-  4096-token chunking, a 131072-token prefill row-splits chunk 0 and runs the
-  whole attention path replicated on both ranks for the other 31 chunks.
-  (A0 on `upstream-metal-wins` extends row-splitting to `pos0 > 0`; do not read
-  the decode fact as a prefill fact; it changes which fix is worth doing.)
+- Transport: RDMA over AppleThunderboltRDMA. Decode uses a per-token gate
+  schedule (86 gates/token = 43 layers × 2, derived not hardcoded); prefill uses
+  bulk "big gate" row swaps — one full-batch hidden-state exchange per layer,
+  chunked into 16 KiB messages (`tp_rdma_big_gate_exchange`, `ds4_tp.c`).
+- Attention **head** splitting is the **decode** path; **prefill** splits
+  attention **rows** (`tp_row_split_attn` in
+  `metal_graph_encode_layer_attention_batch`). Row-splitting now covers
+  `pos0 > 0` chunks and the ratio-128 layers, and the indexer score/top-k splits
+  too — all three default-on since `f45b535`. (This section previously described
+  the pre-A0 state; that is what the whole R5–R7 arc changed.)
 - Prefill chunking is layer-major; chunk cap from `ds4_prefill_cap_for_prompt`
-  (env `DS4_METAL_PREFILL_CHUNK`, default 4096 for prompt > 4096).
-- Compressed KV cache grows with context: `comp_cap = ctx_size/4 + 2`
-  (per-layer ratio). Raw SWA cache is bounded by sliding window (`DS4_N_SWA`).
-- **Indexer top-k scoring over the compressed cache is replicated on both TP
-  ranks** — see the TP row-split comment at the top of
-  `metal_graph_encode_layer_attention_batch()` in `ds4.c`: score/top-k selection
-  "stays replicated while the attention consumption splits by rows", and both
-  ranks update the compressor/indexer from full rows. This replicated work grows
-  linearly with context and does not benefit from TP. (Anchor on the function
-  name, not a line number — line citations here rot within a few commits.)
+  (env `DS4_METAL_PREFILL_CHUNK`, default 4096 for prompt > 4096). The **server**
+  additionally slices prefill into `--prefill-quantum` steps in batched mode
+  (default 2048), and the smaller of the two is what actually runs.
+- Compressed KV grows with context: `comp_cap = ctx_size/ratio + 2`. Raw SWA
+  cache is a ring bounded by `DS4_N_SWA`; `ds4_session_rewind()` snaps to a
+  compressor-window boundary (`lcm` of the non-zero ratios, 128 here).
 - CUDA TP has cache-duplication/peer-read infra (`cuda_tp_attn_cache_dup`,
   `cuda_tp_attn_peer_read`, `layer_attn_comp_cache_tp[]`, `copy_xdev`) that could
-  be a template for splitting the Metal TP compressed cache / indexer.
+  template a Metal TP compressed-cache split.
 
 ## Useful env knobs seen in code
 
