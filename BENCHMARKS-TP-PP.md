@@ -376,9 +376,18 @@ lever on the 18.5% BIG-wire target was a hypothesis about *where* the wait
 lives, and the measurement says it does not live where sub-gating can reach.
 
 **R10b — link ceiling (4.4 / 4.1 GB/s per direction, not 5).** The request
-asked for a 64 MiB message; that is structurally impossible on this provider —
-Apple TB UC SEND is capped at 4096 B per WR (anything larger never completes;
->4096 posts EPERM), and `-s` is clamped to MTU. The valid proxy is sustained
+asked for a 64 MiB message; that is structurally impossible on this provider.
+
+> **Correction (M3, 2026-08-26):** the stated reason — *"Apple TB UC SEND is
+> capped at 4096 B per WR (anything larger never completes; >4096 posts
+> EPERM)"* — is **wrong**. M3 posted 2000 single **16,384 B** UC SEND WRs per
+> arm and byte-verified every delivery, and ds4 itself runs
+> `DS4_TP_RDMA_MAX_MSG = 16384` as one WR in production. The EPERM was a
+> property of `uc_bench`'s configuration, not the stack. The bandwidth numbers
+> below stand (they were measured, not inferred); only the explanation for why
+> 64 MiB was not attempted does not.
+
+`-s` is clamped to MTU. The valid proxy is sustained
 4 KiB SEND streaming (50k messages ≈ 205 MB), `uc_bench --bw --send`, both
 directions, twice for stability:
 
