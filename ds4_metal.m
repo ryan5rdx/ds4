@@ -42058,6 +42058,16 @@ int ds4_gpu_routed_moe_batch_tensor(
     uint32_t n_bind_expert = 0;
     ds4_gpu_tp_expert_range(n_total_expert, &first_expert, &n_bind_expert);
     const int32_t tp_expert_base_host = (int32_t)first_expert;
+    /* Keep the caller's un-rebased tensor bases. The single-token delegation
+     * below hands the work to ds4_gpu_routed_moe_one_tensor, which applies the
+     * very same TP rebase itself; passing the rebased values there advanced
+     * rank 1 by two expert halves (one whole blob) into memory this rank does
+     * not map, which surfaced as "Metal model range ... is not covered by
+     * mapped model views" and a dead TP gate on the peer. Rank 0 is unaffected
+     * because its first_expert is 0. */
+    const uint64_t caller_gate_offset = gate_offset;
+    const uint64_t caller_up_offset = up_offset;
+    const uint64_t caller_down_offset = down_offset;
     gate_offset += (uint64_t)first_expert * gate_expert_bytes;
     up_offset += (uint64_t)first_expert * gate_expert_bytes;
     down_offset += (uint64_t)first_expert * down_expert_bytes;
@@ -42187,9 +42197,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                                              experts,
                                              model_map,
                                              model_size,
-                                             gate_offset,
-                                             up_offset,
-                                             down_offset,
+                                             caller_gate_offset,
+                                             caller_up_offset,
+                                             caller_down_offset,
                                              gate_type,
                                              down_type,
                                              gate_expert_bytes,
