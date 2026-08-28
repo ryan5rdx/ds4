@@ -300,6 +300,42 @@ is one composite; pass 2 perturbs). The encoder instrument has gone as far as
 it can. The unnamed ~1.9-2.4 ms inside `attn_inv_rope` is not separable at the
 GPU-encoder boundary and must be chased where the stages are distinct code paths.
 
+### Arm W1 — does prefill pay the batch-encode fixed cost? — 2026-08-28
+
+Build `6d632c9`. Prefill 2048 tokens in 1/4/16/64 steps (additive path,
+`--step-incr 512/128/32`), gen 8, pair restart per arm. Total prefill time =
+Σ per-step (prefill_tokens / prefill_tps) from CSV.
+
+| batches | total prefill |
+|---|---|
+| 1 | 4.522 ms |
+| 4 | 5.676 ms |
+| 16 | 10.168 ms |
+| 64 | 25.387 ms |
+
+**Fit (R² = 0.9989): total = 4.45 + 0.329 × batches ms** →
+**F = 329 µs/batch = 7.6 µs/layer** (per 43-layer batch).
+
+**Decision rule fires: F ≪ 35 ms → the verify's fixed term is verify-specific.**
+Prefill pays **7.6 µs/layer** of per-batch fixed cost against the verify's
+**810 µs/layer** — ~100× smaller. The 34.83 ms verify fixed term is NOT the
+general batch-encode cost; it is local to the speculative path (TP batch gates,
+capture-row bookkeeping, the spec-cycle wrapper). This closes the "largest
+unexplained quantity in the engine" question: it is not an engine-wide encode
+overhead, it is the spec-cycle machinery, and it does not threaten prefill or
+any non-speculative multi-row batch.
+
+**Note on the 1-batch arm:** 2048-token single prefill = 4.522 ms = 452.9 t/s,
+consistent with the established 2k prefill. The 64-batch arm's 25.4 ms total is
+all fixed-cost accumulation (63 × 0.329 ms = 20.7 ms of overhead on a 4.45 ms
+base) — the fixed cost is real and additive even at prefill scale, just 100×
+smaller than the verify's.
+
+**W2 (analysis) and W3 (ds4-server multi-slot) follow from this:** W2's
+proportionality question is now moot at rig level — the per-batch cost is
+7.6 µs/layer, not 810; W3's multi-slot exposure is bounded by this smaller F,
+not the verify's 34.83 ms.
+
 ### Arm V-residual — the verify's unattributed 44 ms — 2026-08-28
 
 Build `d8536ed` (latest `99601ca`). Three `--dspark --mtp SUPPORT` runs at 2k,

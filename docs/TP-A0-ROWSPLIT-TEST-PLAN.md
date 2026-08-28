@@ -203,6 +203,17 @@ what this measures. Sum the per-step prefill times from the CSV.
   bookkeeping, the spec-cycle wrapper) and prefill is unaffected. That is also a
   useful answer: it localises the cost to the speculative path and closes it.
 
+**RESULT 2026-08-28** (build `6d632c9`): **F ≪ 35 ms — the fixed term is
+verify-specific, prefill does not pay it.** Prefill 2048 in 1/4/16/64 steps:
+total 4.52/5.68/10.17/25.39 ms → fit `total = 4.45 + 0.329×batches` (R²=0.999),
+**F = 329 µs/batch = 7.6 µs/layer** against the verify's 810 µs/layer — ~100×
+smaller. The 34.83 ms fixed term is local to the speculative path (TP batch
+gates / capture bookkeeping / spec-cycle wrapper), not a general batch-encode
+overhead, and does not threaten prefill or any non-speculative multi-row batch.
+W2's proportionality question is moot (7.6 vs 810 µs/layer); W3's multi-slot
+exposure is bounded by the small F, not the verify's 34.83 ms. Full data in
+`BENCHMARKS-TP-PP.md` §Arm W1.
+
 **Confound to watch.** The engine re-chunks internally to a work budget
 (`DS4_PREFILL_CHUNK_WORK_BUDGET`, `ds4.c:12265`), so a 2048-token request may
 already be split. If the 1-batch and 4-batch arms are indistinguishable, the
