@@ -142,6 +142,88 @@ reduction it is ~2.5 µs/dispatch, at scale ~1 µs. Full data in
 
 ---
 
+### V-residual — the 44 ms of the verify that no byte model explains
+
+Of the measured 108.18 ms/verifier (`speed-bench/tp_mtp_hunt.md:148-149`),
+**44.43 ms is unattributed** — 39% of V, and 12× everything that splitting across
+nodes could recover. It is the single largest unexplained quantity in the
+speculation budget and it gates both drafters at once.
+
+```
+DS4_DSPARK_VERIFY_PROFILE=1 DS4_DSPARK_STATS=1 \
+  ./ds4-bench -m <MODEL> --mtp <SUPPORT.gguf> --dspark \
+    --role coordinator --tensor-parallel --transport rdma --listen 0.0.0.0 1234 \
+    --rdma-device rdma_en6 --prompt-file ~/Downloads/promessi_sposi.txt \
+    --ctx-start 2048 --ctx-max 2048 --gen-tokens 512 --csv /tmp/vres.csv
+```
+
+Worker as usual. **Use plain `--dspark`, never `--dspark-strict`** — strict sets
+`strict_dspark` (`ds4.c:70083`), which disables block drafting entirely, and in
+the bench loop `--dspark-strict` falls through to plain `ds4_session_eval`
+(`ds4_bench.c:859`), so you would measure the baseline and think you measured
+dspark.
+
+**Read:** per-stage boundaries from `ds4.c:37228`, bucketed by `draft_n`, plus the
+`DS4_DSPARK_STATS` accepted-length histogram. Fit `V = a + b·k` across the draft
+lengths observed. If the intercept `a` lands near 42.5 ms, that fixed term is 39%
+of V(5) and no per-row bucket in the byte model accounts for it — that is the
+thing to attack, not the acceptance rate.
+
+### Why we do not see Unsloth's dspark numbers — three causes, one of them ours
+
+Their published figure is **120 t/s against a 60 t/s baseline on a single B200**
+(unsloth.ai/docs/models/deepseek-v4). Three separate things separate that from our
+19.9–21.3 t/s against a 41.2 baseline:
+
+1. **The machine, and it is most of it.** A B200 has roughly 10× our memory
+   bandwidth and vastly more compute. Speculation trades compute for latency: a
+   5-row verify on a compute-rich part is nearly free, while ours costs **4.46×**
+   a single token. Our decode is already at 1398 MHz, 100% residency, ~2% of peak
+   FLOPs — there is no compute headroom to trade. Not a defect.
+2. **The acceptance headline is not theirs and is defined differently.** Unsloth's
+   docs report **no acceptance rate at all**, only tokens/s. The ~50% figure came
+   from llama.cpp/GaelicThunder, and `speed-bench/tp_mtp_hunt.md:32-37` already
+   records the reconciliation: their "mean 3.5" counts accepted drafts **plus the
+   target token** per cycle, i.e. ~2.5 accepted of 5, not 3.5 of 5.
+3. **Ours: we have only ever measured the setting they warn against.** Unsloth
+   recommends `--spec-draft-n-max 3` and states "larger values seem to be slower".
+   **Every rig run was forced d5** (`tp_mtp_hunt.md:21-24`). Our draft length is
+   not a flag — it comes from the support GGUF's `deepseek4.dspark_block_size`
+   (`ds4.c:2658`, `:16274`), which is 5, and there is no cap.
+
+**The arithmetic that decides whether a model swap is worth it.** Break-even is
+mean commit > V/T. Observed mean commit ≈ 0.59 (189 accepted over ~319 cycles):
+
+| verify cost | break-even commit | observed | short by |
+|---|---|---|---|
+| measured V = 108.18 ms | 4.46 | 0.59 | 7.6× |
+| corrected floor V ≈ 50 ms | 2.06 | 0.59 | 3.5× |
+| **a hypothetically free verify, V = T = 24.26** | **1.03** | 0.59 | **1.7×** |
+
+**Even a perfect verify leaves us 1.7× short.** So fixing V alone cannot rescue
+dspark, and neither can a better drafter alone — both have to move. That is why
+the model swap is third on the list, not first.
+
+**Order, cheapest first:**
+
+1. **V-residual probe** (above) — 44 ms unexplained, gates both drafters.
+2. **Proposal parity.** A 4× acceptance gap against the public figure is more
+   likely a wiring defect than a model difference, and `tp_mtp_hunt.md:28` already
+   lists it as open. `DS4_DSPARK_SPEC_LOG=1` prints per-cycle proposals;
+   `DS4_DSPARK_FAKE_ARGMAX_PROPOSAL` is the control that isolates the drafter from
+   the verifier. If our drafter's proposals differ from what the same support GGUF
+   produces under llama.cpp, no model swap fixes that.
+3. **Draft length 3 instead of 5.** Directly tests Unsloth's own guidance. Not a
+   one-liner: `block_size` is support-GGUF metadata, and a TP2 deferred-history
+   optimisation is gated on `dspark_block_size == 5u` (`ds4.c:27438`), so capping
+   proposals would disable it. Scope before implementing.
+4. **Only then the Unsloth drafter / quant.** Capacity looks feasible but tight —
+   they state 128 GB machines need IQ3_XXS plus a Q8_0 drafter, and Q8_K_XL is
+   179 GB with DSpark, i.e. ~90 GB/rank under TP2 plus ~10 GB drafter against a
+   120000 MiB wired limit. **Check first** that its routed-expert quant is one TP
+   accepts — ds4 refuses Q4_K routed under TP today, and that is exactly the class
+   of blocker that has cost this project a week before.
+
 ### R1 needs a re-run, and the build it ran on is why
 
 R1's pass-1 result is sound and confirms the instrument: all 9 labels collapse
