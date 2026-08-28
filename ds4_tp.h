@@ -104,6 +104,14 @@ uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
 
+/* Hold/release the control-plane lock across a whole (send command -> wait
+ * ack) round trip so at most one command is in flight per rank and each
+ * COMMAND_ACK is consumed by the waiter that sent it.  Safe to hold across
+ * GPU encode (gate exchanges run on the service thread over data_fd/RDMA and
+ * never take this lock).  Recursive. */
+void ds4_tp_control_lock(ds4_tp *tp);
+void ds4_tp_control_unlock(ds4_tp *tp);
+
 /* Gate slab.  The engine allocates one shared GPU-visible block and hands
  * its base VA here; ds4_tp registers it with the NIC (RDMA) and exchanges
  * remote keys.  Layout, all offsets from base, S = n_layer * 2 slots:
@@ -155,6 +163,9 @@ int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token);
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
+/* Abort the mirrored prefill the worker is currently running for this session.
+ * Only meaningful between a SYNC and its COMMAND_ACK; see DS4_TP_FRAME_CANCEL. */
+int ds4_tp_send_cancel(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
                            uint32_t count);
 int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
@@ -164,6 +175,13 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status);
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen);
+/* As above, but reports the worker's status so a caller can distinguish a
+ * coordinated stop from a genuine failure.  *status_out is 0 on success, the
+ * worker's non-zero status when it acked one, and -1 when no well-formed ack
+ * for this session arrived at all. */
+int ds4_tp_wait_command_ack_status(ds4_tp *tp, uint64_t session_id,
+                                   const char *operation, int *status_out,
+                                   char *err, size_t errlen);
 int ds4_tp_send_stop(ds4_tp *tp);
 
 /* Worker: blocks for the next mirrored command.  Frame types below; for
@@ -188,6 +206,13 @@ typedef enum {
     DS4_TP_FRAME_EVAL_BATCH = 15,
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
+    /* Leader -> worker, valid only while the worker is executing a mirrored
+     * SYNC.  The prefill cancel predicate is host-side and leader-only, so
+     * without this the worker keeps prefilling chunks whose gates the leader
+     * has already stopped sending and eats a bounded fence timeout per chunk.
+     * On receipt the worker stops at its next chunk boundary, leaving its
+     * checkpoint at the pre-sync length the leader also holds. */
+    DS4_TP_FRAME_CANCEL = 18,
 } ds4_tp_frame_type;
 
 typedef struct {
@@ -195,6 +220,7 @@ typedef struct {
     uint64_t session_id;
     uint64_t seq;
     int value;
+    uint32_t flags;
     int *tokens;
     uint32_t n_tokens;
     ds4_tp_batch_item *items;
@@ -219,13 +245,28 @@ int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count);
 
 /* Speculative verify mirroring.  The leader announces a draft block right
  * before both ranks run the expert-split batch verify; the worker then blocks
- * on the commit frame, which carries the leader's decision: full_accept keeps
- * the pushed rows, otherwise both sides roll back and replay replay_n tokens
- * through the gated single-token decode in lockstep. */
+ * on the commit frame.  commit_n keeps exactly that many verifier rows
+ * (draft_n is the full-accept fast path, a shorter nonzero prefix restores a
+ * captured compressor frontier).  commit_n == 0 rolls the verifier back and
+ * optionally replays replay_n tokens through gated single-token decode. */
 int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
-                       const int *drafts, uint32_t n);
-int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t full_accept, int32_t replay_n);
-int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *full_accept, int32_t *replay_n);
+                       const int *drafts, uint32_t n, uint32_t flags);
+int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t commit_n, int32_t replay_n);
+int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *commit_n, int32_t *replay_n);
+
+/* Leader bring-up for frontends: derives the identity from the loaded engine,
+ * connects to the worker, and binds the engine to the transport. Call after
+ * the engine is open and before the first ds4_session_create(). On success
+ * *out owns the transport; tear down with ds4_tp_send_stop(), then
+ * ds4_engine_close(), then ds4_tp_free() (the gate service thread holds the
+ * raw pointer until the engine is closed). */
+int ds4_tp_leader_bind(
+        ds4_tp **out,
+        ds4_engine *engine,
+        const ds4_tp_options *opt,
+        int ctx_size,
+        char *err,
+        size_t errlen);
 
 /* Standalone worker mode entry. Loads nothing itself: the engine is already
  * open. */
