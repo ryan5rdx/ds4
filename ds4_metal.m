@@ -18214,44 +18214,20 @@ int ds4_gpu_indexer_score_one_tensor(
              * inside one process. */
             const bool score_llt =
                 getenv("DS4_METAL_DISABLE_INDEXER_LLT") == NULL;
-            /* U7: simdgroups per threadgroup.  Staging is NK=8*NSG keys, so
-             * NSG picks a point on a residency curve -- 20512 B at 8 (one
-             * threadgroup per 32 KiB core), 11296 at 4 (two), 6688 at 2
-             * (four).  Default 8 is the shipped behaviour.  NSG4 kept as an
-             * alias so the earlier T3 arm still reproduces. */
-            int score_nsg = 8;
-            const char *nsg_env = getenv("DS4_METAL_INDEXER_LLT_NSG");
-            if (nsg_env && nsg_env[0]) {
-                const int v = atoi(nsg_env);
-                if (v == 2 || v == 4 || v == 8) score_nsg = v;
-            } else if (getenv("DS4_METAL_INDEXER_LLT_NSG4") != NULL) {
-                score_nsg = 4;
-            }
-            /* U10, DEFAULT ON: sq/sw/sqk aliased over the dead sk staging
-             * buffer -- same NK=64, 16384 B instead of 20512, so 2
-             * threadgroups resident per 32 KiB core instead of 1.  U10a showed
-             * NSG=4 beating the default by +5-13% on the Ultra, but NSG=4 buys
-             * that residency by halving NK; this buys it for free.
-             *
-             * Measured +19.3% on an M1 Max (4 alternating rounds) and +17.4%
-             * on the rig (3 runs, 1717.2 -> 2015.6 GFLOP/s), where it also
-             * beats NSG=4 by 14.6%.  Byte-identical output at n_comp 32768 and
-             * 65536, and it does not change the grid -- only the threadgroup
-             * memory allocation -- so it carries none of the T3 nsg4 risk,
-             * which came from doubling the threadgroup count.
+            /* Tight shared-memory alias for the low-latency scorer: the staged
+             * K rows and the score scratch have disjoint lifetimes, so allocate
+             * the maximum of the two rather than their sum.  That halves
+             * threadgroup memory and lifts residency from one threadgroup per
+             * core to two, on a kernel whose limit is occupancy rather than
+             * bandwidth.  The grid is unchanged and the output is byte-identical.
              *
              * DS4_METAL_INDEXER_LLT_TIGHT=0 rolls it back. */
             const char *tight_env = getenv("DS4_METAL_INDEXER_LLT_TIGHT");
-            const bool score_tight =
-                score_nsg == 8 && !(tight_env && tight_env[0] == '0');
+            const bool score_tight = !(tight_env && tight_env[0] == '0');
             id<MTLComputePipelineState> direct_pipeline = score_llt
                 ? ds4_gpu_get_pipeline(score_tight
                         ? "kernel_dsv4_indexer_scores_llt_tight"
-                        : (score_nsg == 2
-                                ? "kernel_dsv4_indexer_scores_llt_nsg2"
-                                : (score_nsg == 4
-                                        ? "kernel_dsv4_indexer_scores_llt_nsg4"
-                                        : "kernel_dsv4_indexer_scores_llt")))
+                        : "kernel_dsv4_indexer_scores_llt")
                 : ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_direct_pipeline,
                                         "kernel_dsv4_indexer_score_one_direct");
             if (!direct_pipeline) return 0;
@@ -18283,22 +18259,17 @@ int ds4_gpu_indexer_score_one_tensor(
             [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
             if (score_llt) {
                 /* sk[NK*128]half + sq[8*128]half + sw[8]f32 + sqk[NK*8]f32,
-                 * NK = 8*NSG.  Reproduces the previous constants exactly at
-                 * NSG=8 (20512 B) and NSG=4 (11296 B). */
-                const NSUInteger nk = 8u * (NSUInteger)score_nsg;
+                 * with NK = 8 keys per simdgroup across eight simdgroups. */
+                const NSUInteger nk = 64u;
                 const NSUInteger sk_b  = nk * 128u * sizeof(uint16_t);
                 const NSUInteger rest_b = 8u * 128u * sizeof(uint16_t) +
                                           (8u + nk * 8u) * sizeof(float);
-                /* Aliased: the allocation is the max of the two lifetimes,
-                 * not their sum. */
                 [enc setThreadgroupMemoryLength:(score_tight
                         ? (sk_b > rest_b ? sk_b : rest_b)
                         : sk_b + rest_b) atIndex:0];
-                ds4_gpu_trace_push(enc, score_nsg == 2 ? "indexer_score_llt_nsg2"
-                                        : (score_nsg == 4 ? "indexer_score_llt_nsg4"
-                                                          : "indexer_score_llt"));
+                ds4_gpu_trace_push(enc, "indexer_score_llt");
                 [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_comp + nk - 1u) / nk, 1, 1)
-                     threadsPerThreadgroup:MTLSizeMake(32u * (NSUInteger)score_nsg, 1, 1)];
+                     threadsPerThreadgroup:MTLSizeMake(32u * 8u, 1, 1)];
                 ds4_gpu_trace_pop(enc);
             } else {
                 /* Legacy direct scorer.  Keeps our threadgroup sizing, which
