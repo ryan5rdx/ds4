@@ -1039,17 +1039,6 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
  * signalled completion or the gate timeout still surfaces, just later. */
 #define DS4_TP_GATE_SIGNAL_EVERY 16u
 
-static int tp_gate_fastpath(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_TP_GATE_FASTPATH");
-        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
-    }
-    return cached;
-}
-
-/* One decode gate: ensure the receive window is armed, send our partial,
- * wait for the peer's receive completion, and advance the window. */
 static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_tp_rdma *r = &tp->rdma;
     const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
@@ -1066,7 +1055,6 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         (uintptr_t)(tp->slab + tp->out_off + (uint64_t)slot * tp->vec_bytes);
     pthread_mutex_lock(&r->post_lock);
     int ok = 1;
-    const int fast = tp_gate_fastpath();
     if (!r->recv_window_active) {
         for (uint64_t s = seq; ok && s < seq + DS4_TP_RDMA_RECV_WINDOW; s++)
             ok = tp_rdma_post_gate_recv(tp, s);
@@ -1085,25 +1073,16 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         wr.sg_list = &sge;
         wr.num_sge = 1;
         wr.opcode = IBV_WR_SEND;
-        const int signal_send =
-            !fast || ++r->send_since_signal >= DS4_TP_GATE_SIGNAL_EVERY;
-        wr.send_flags = signal_send ? IBV_SEND_SIGNALED : 0;
+        wr.send_flags = IBV_SEND_SIGNALED;
         ok = ibv_post_send(r->qp, &wr, &bad) == 0;
         if (!ok) {
             fprintf(stderr, "ds4-tp: rdma post_send: %s\n", strerror(errno));
-        } else if (signal_send) {
-            r->send_since_signal = 0;
+        } else {
             r->send_outstanding++;
         }
         off += len;
     }
 
-    /* T1a: arm the next receive here, before the wait, rather than after it. */
-    int rearmed = 0;
-    if (fast && ok) {
-        ok = tp_rdma_post_gate_recv(tp, seq + DS4_TP_RDMA_RECV_WINDOW);
-        rearmed = 1;
-    }
     double deadline = 0.0;
     uint32_t peer_poll = 0;
     while (ok && r->recv_done < seq) {
@@ -1119,7 +1098,7 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
             ok = 0;
         }
     }
-    if (ok && !rearmed) ok = tp_rdma_post_gate_recv(tp, seq + DS4_TP_RDMA_RECV_WINDOW);
+    if (ok) ok = tp_rdma_post_gate_recv(tp, seq + DS4_TP_RDMA_RECV_WINDOW);
     if (ok) r->last_gate_seq = seq;
     pthread_mutex_unlock(&r->post_lock);
     return ok;

@@ -1000,9 +1000,7 @@ static void ds4_gpu_trace_label_encoder(id<MTLComputeCommandEncoder> enc) {
     enc.label = [NSString stringWithUTF8String:g_trace_tag];
 }
 
-static void ds4_gpu_ts_label(const char *label);
 static void ds4_gpu_trace_push(id<MTLComputeCommandEncoder> enc, const char *name) {
-    if (name) ds4_gpu_ts_label(name);
     if (!ds4_gpu_trace_labels() || !enc || !name) return;
     [enc pushDebugGroup:[NSString stringWithUTF8String:name]];
 }
@@ -1023,518 +1021,22 @@ static uint64_t g_dispatch_cbs;
 
 #define DS4_DISP(enc) (g_dispatch_count++, (enc))
 
-/* ---- GPU timestamp profiler (DS4_METAL_GPU_ENCODER_TIMESTAMPS=1) ----------
- *
- * The existing DS4_METAL_GPU_STAGE_TIMESTAMPS path prices a stage by ENDING the
- * command buffer at each boundary and reading cb.GPUStartTime/GPUEndTime.  That
- * costs a full submit round trip per boundary -- measured at ~0.18 ms per marker,
- * inflating the token 13% at 32k and 18% at 2k -- and at decode, where stages
- * are microseconds, the round trip IS the measurement.  It is why the flash-attn
- * split reported per-call figures 6x larger than the stage they belonged to.
- *
- * This samples the GPU timestamp counter at encoder boundaries instead, inside
- * ONE command buffer.  Probed on this hardware: atStageBoundary is supported,
- * atDispatchBoundary is not, so per-encoder is the finest granularity available
- * -- which is enough, since the engine already creates encoder boundaries where
- * it needs them.  Validated against known workloads: 4x work measured 3.82x,
- * 2x measured 1.92x, and the encoder sum tracked the command-buffer span to 4%.
- */
-#define DS4_GPU_TS_MAX_ENCODERS 512
-/* Slot capacity is several ranges deep so a range starting now does not reuse
- * slots that a still-executing command buffer will write into.  Reserving the
- * range happens at ENCODE time but the counter writes happen at GPU EXECUTION
- * time, and committed buffers sit in g_pending_cbs while later ones encode, so
- * a single 512-slot arena let an in-flight buffer scribble over the range being
- * measured.  That is the same class of corruption as the global-slot bug, just
- * narrower, and it is context-dependent: at 2k the buffers are short and many,
- * so overlap is likeliest exactly where the budget failed to reconcile. */
-#define DS4_GPU_TS_CAPACITY (DS4_GPU_TS_MAX_ENCODERS * 4u)
-
-static id<MTLCounterSampleBuffer> g_ts_buffer;
-static const char *g_ts_labels[DS4_GPU_TS_MAX_ENCODERS];
-/* The batch reuses ONE encoder across many dispatches (ds4_gpu_end_compute_encoder
- * is a no-op there, ds4_metal.m:1389), so every stage label in a batch segment
- * lands in the SAME slot.  The old code let the last writer win silently, which is
- * why the four flash-attn labels -- gather, packed, fa_core, reduce -- all resolved
- * to "reduce": the span reported as `reduce` was the whole batch segment, not the
- * reduce dispatch.  That is what made 27 x 157 us = 4.25 ms outweigh the 3.64 ms
- * stage containing it.  Keep the first and last label plus a hit count so a
- * composite span is visible as one instead of masquerading as its last stage. */
-static const char *g_ts_label_last[DS4_GPU_TS_MAX_ENCODERS];
-static uint16_t g_ts_label_hits[DS4_GPU_TS_MAX_ENCODERS];
-/* Whether the encoder most recently created actually got a sample slot.
- * False once the range is capped, so labels stop attaching to a stale slot. */
-static int g_ts_slot_open;
-static uint32_t g_ts_n;
-/* First slot of the range owned by g_ts_cb; labels stay range-local. */
-static uint32_t g_ts_base;
-/* Ranges that were reserved and sampled but never reported, because their
- * command buffer never reached ds4_gpu_ts_report before another one started
- * encoding.  This loss used to be silent, which is how `calls/token` became a
- * property of the instrument rather than of the graph: the figure read 41 at 2k
- * before slot-scoping and 27 after, for an engine that builds exactly the same
- * encoders either way.  A budget multiplies that count, so it has to be known. */
-static uint64_t g_ts_dropped_ranges;
-static uint64_t g_ts_dropped_encoders;
-static uint64_t g_ts_capped;          /* encoders left unsampled at the range cap */
-static uint64_t g_ts_reported_ranges;
-static int g_ts_enabled = -1;
-static const char *g_ts_pending_label;
-/* Which command buffer currently owns slots [0, g_ts_n).  Compared only, never
- * dereferenced or retained.  Slots were previously global, so encoders from a
- * second in-flight command buffer appended to the first one's range: hi-lo then
- * spanned two buffers while the report divided by one buffer's wall clock,
- * producing a bogus sub-nanosecond "tick" and ~200% coverage together.  A
- * hardware tick cannot vary with context length, and the first arm-B run read
- * 0.63 ns at 2k against 1.00 at 131k -- which is what gave the artefact away. */
-static void *g_ts_cb;
-
-static int ds4_gpu_ts_active(void) {
-    if (g_ts_enabled < 0) {
-        g_ts_enabled = getenv("DS4_METAL_GPU_ENCODER_TIMESTAMPS") != NULL;
-        if (g_ts_enabled) {
-            id<MTLCounterSet> set = nil;
-            for (id<MTLCounterSet> c in g_device.counterSets) {
-                if ([c.name isEqualToString:MTLCommonCounterSetTimestamp]) { set = c; break; }
-            }
-            if (!set || ![g_device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
-                fprintf(stderr, "ds4: encoder timestamps unavailable on this device\n");
-                g_ts_enabled = 0;
-            } else {
-                MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
-                d.counterSet = set;
-                d.sampleCount = DS4_GPU_TS_CAPACITY * 2u;
-                d.storageMode = MTLStorageModeShared;
-                NSError *err = nil;
-                g_ts_buffer = [g_device newCounterSampleBufferWithDescriptor:d error:&err];
-                if (!g_ts_buffer) {
-                    fprintf(stderr, "ds4: counter sample buffer failed: %s\n",
-                            err ? [[err localizedDescription] UTF8String] : "?");
-                    g_ts_enabled = 0;
-                }
-            }
-        }
-    }
-    return g_ts_enabled > 0;
-}
-
-/* Name the encoder currently being timestamped.  Call sites open the encoder
- * first and label it immediately after, so back-filling the most recent sample
- * slot is equivalent to pre-labelling and touches no call site. */
-/* Attach `label` to the encoder span currently open.  Every label that lands on a
- * span is counted, so a span covering several stages reports as a composite rather
- * than as whichever stage happened to write last. */
-/* Per-label call counts, DELIBERATELY independent of the timestamp slots.
- *
- * Arm R1 asks which branches fire, and reading that off the enc-ts log conflates
- * three things: whether a branch ran, whether its encoder got one of the 512
- * slots, and whether SPLIT mode gave it its own span.  A branch that never runs
- * and a branch whose slots were capped look identical.  These counters answer
- * only the first question, cost an increment, and need neither timestamps nor
- * SPLIT.  Labels are static literals, so pointer identity is the key. */
-#define DS4_GPU_PATH_SLOTS 64
-static const char *g_path_names[DS4_GPU_PATH_SLOTS];
-static uint64_t g_path_counts[DS4_GPU_PATH_SLOTS];
-static uint32_t g_path_n;
-
-static int ds4_gpu_path_counts_active(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("DS4_METAL_PATH_COUNTS") != NULL;
-    return v;
-}
-
-static void ds4_gpu_path_count_report(void) {
-    if (!g_path_n) return;
-    fprintf(stderr, "ds4: path counts (calls, not spans):\n");
-    for (uint32_t i = 0; i < g_path_n; i++) {
-        fprintf(stderr, "ds4:   %-20s %10llu\n",
-                g_path_names[i], (unsigned long long)g_path_counts[i]);
-    }
-}
-
-static void ds4_gpu_path_count(const char *label) {
-    for (uint32_t i = 0; i < g_path_n; i++) {
-        if (g_path_names[i] == label) { g_path_counts[i]++; return; }
-    }
-    if (g_path_n >= DS4_GPU_PATH_SLOTS) return;
-    if (g_path_n == 0) atexit(ds4_gpu_path_count_report);
-    g_path_names[g_path_n] = label;
-    g_path_counts[g_path_n] = 1;
-    g_path_n++;
-}
-
-static void ds4_gpu_ts_note_label(const char *label) {
-    if (!label) return;
-    if (ds4_gpu_path_counts_active()) ds4_gpu_path_count(label);
-    if (g_ts_enabled <= 0) return;
-    if (g_ts_n == 0) { g_ts_pending_label = label; return; }
-    /* Once the range hits the slot cap, ds4_gpu_ts_pass_descriptor stops
-     * reserving slots but callers keep labelling.  Without this guard every
-     * later label piled onto slot MAX-1, which is what produced a lone span
-     * reported as "1 composite of 512": a real overflow masquerading as a
-     * single fused stage.  A capped encoder has no span, so it gets no label. */
-    if (!g_ts_slot_open) return;
-    const uint32_t i = g_ts_n - 1;
-    if (!g_ts_labels[i]) g_ts_labels[i] = label;
-    g_ts_label_last[i] = label;
-    if (g_ts_label_hits[i] < UINT16_MAX) g_ts_label_hits[i]++;
-}
-
-static void ds4_gpu_ts_label(const char *label) { ds4_gpu_ts_note_label(label); }
-
-void ds4_gpu_ts_tag(const char *label) { ds4_gpu_ts_note_label(label); }
-
-/* Force a real encoder boundary wherever a caller ends an encoder, so each stage
- * gets its own timestamped span instead of sharing the batch segment's.  Off by
- * default because it perturbs the schedule it is measuring. */
-static int ds4_gpu_ts_split_encoders(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("DS4_METAL_GPU_ENCODER_TIMESTAMPS_SPLIT") != NULL;
-    return v > 0 && ds4_gpu_ts_active();
-}
-
-/* Name the encoder that just closed.  Used where a caller knows the phase name
- * only after encoding it.  In the batch the encoder has NOT actually closed
- * (ds4_metal.m:1389 returns without ending it), so several of these can land on
- * one span -- they are counted, not overwritten.  Set
- * DS4_METAL_GPU_ENCODER_TIMESTAMPS_SPLIT=1 to force a real boundary at each site
- * and get one span per stage, at the cost of perturbing the schedule. */
-static void ds4_gpu_ts_name_last(const char *label) { ds4_gpu_ts_note_label(label); }
-
-/* Name a dispatch cluster inside the `compressor_indexer` -> `attn_inv_rope`
- * bracket (ds4.c:23330 to :23582).
- *
- * B6 split that bracket for the first time and found only a third of it: at 2k
- * `fa_core` 0.560 ms + `reduce` 0.66 ms = 1.22 of 3.64 ms.  The other 2.42 ms --
- * 10% of the whole decode token, and larger than every surviving optimization
- * candidate combined -- was invisible because the only four label sites in the
- * bracket are the flash-attn phases.  Launch accounts for 0.461 ms of it
- * (133 dispatches x 3.464 us) and KV staging traffic for 0.038 ms, leaving
- * ~1.9 ms that nobody can name.
- *
- * These sites cover the two calls that were entirely unlabelled --
- * ds4_gpu_attention_indexed_mixed_batch_heads_tensor (four clusters) and
- * ds4_gpu_rope_tail_tensor (one) -- taking bracket coverage from 4 sites to 9.
- * Same mechanism as DS4_METAL_PROFILE_DECODE_FA_STAGE, and subject to the same
- * caveat: in the batch these collapse onto one span unless
- * DS4_METAL_GPU_ENCODER_TIMESTAMPS_SPLIT=1 forces a real encoder boundary.  The
- * composite counter makes that visible rather than silent. */
-#define DS4_METAL_PROFILE_BRACKET_STAGE(name) ds4_gpu_ts_name_last((name))
-
-/* Counter timestamps are in a GPU tick unit that is NOT guaranteed to be
- * nanoseconds, and it differs by part: assuming ns validated on an M1 Max
- * (encoder sum within 4% of the command-buffer span) and over-reported by ~1.85x
- * on an M2 Ultra.  So calibrate every report against the command buffer's own
- * GPUStartTime/GPUEndTime, which are documented seconds, instead of trusting the
- * unit.
- *
- * Reporting coverage (span sum / cb span) alongside is deliberate: encoder spans
- * can overlap where the GPU pipelines encoder setup against the previous
- * encoder's drain, and a sum that quietly exceeds the wall clock is exactly the
- * kind of silent error this project keeps getting caught by.  Over 100% means
- * the spans overlap and per-encoder figures are upper bounds. */
-
-/* Sweep-line event for the fair-share decomposition below. */
-typedef struct { uint64_t t; int delta; uint32_t idx; } ds4_ts_event;
-
-static int ds4_ts_event_cmp(const void *pa, const void *pb) {
-    const ds4_ts_event *a = (const ds4_ts_event *)pa, *b = (const ds4_ts_event *)pb;
-    if (a->t < b->t) return -1;
-    if (a->t > b->t) return 1;
-    /* Close before open at a tie so a zero-length gap does not read as concurrency. */
-    return a->delta - b->delta;
-}
-
-void ds4_gpu_ts_fair_share(const uint64_t *starts, const uint64_t *ends, uint32_t n,
-                           double spt, double *fair_us, double *union_us,
-                           double *conc_mean, uint32_t *max_conc) {
-    if (union_us) *union_us = 0.0;
-    if (conc_mean) *conc_mean = 0.0;
-    if (max_conc) *max_conc = 0;
-    for (uint32_t i = 0; i < n; i++) if (fair_us) fair_us[i] = 0.0;
-    if (!starts || !ends || n == 0) return;
-
-    ds4_ts_event *ev = (ds4_ts_event *)calloc((size_t)n * 2u, sizeof(ds4_ts_event));
-    uint32_t *active = (uint32_t *)calloc((size_t)n, sizeof(uint32_t));
-    if (!ev || !active) { free(ev); free(active); return; }
-
-    uint32_t ne = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        if (ends[i] <= starts[i]) continue;   /* empty or malformed span */
-        ev[ne].t = starts[i]; ev[ne].delta = +1; ev[ne].idx = i; ne++;
-        ev[ne].t = ends[i];   ev[ne].delta = -1; ev[ne].idx = i; ne++;
-    }
-    qsort(ev, ne, sizeof(ds4_ts_event), ds4_ts_event_cmp);
-
-    double u = 0.0, wsum = 0.0;
-    uint32_t na = 0, peak = 0;
-    uint64_t prev = ne ? ev[0].t : 0;
-    for (uint32_t e = 0; e < ne; e++) {
-        if (na > 0 && ev[e].t > prev) {
-            const double dt_us = (double)(ev[e].t - prev) * spt * 1e6;
-            u += dt_us;
-            wsum += dt_us * (double)na;
-            if (fair_us) for (uint32_t k = 0; k < na; k++) fair_us[active[k]] += dt_us / (double)na;
-        }
-        prev = ev[e].t;
-        if (ev[e].delta > 0) {
-            active[na++] = ev[e].idx;
-            if (na > peak) peak = na;
-        } else {
-            for (uint32_t k = 0; k < na; k++) {
-                if (active[k] == ev[e].idx) { active[k] = active[--na]; break; }
-            }
-        }
-    }
-
-    if (union_us) *union_us = u;
-    if (conc_mean) *conc_mean = (u > 0.0) ? wsum / u : 0.0;
-    if (max_conc) *max_conc = peak;
-    free(ev); free(active);
-}
-
-/* Abandon the current range without reporting it.  Both of ds4_gpu_ts_report's
- * failure exits used to just zero g_ts_n: that under-counted the LOSS line (so a
- * reported 66% was a lower bound) and, worse, left g_ts_cb pointing at a dead
- * range, so a recycled command-buffer address could append to it -- exactly the
- * hazard the slot banking exists to close. */
-static void ds4_gpu_ts_abandon_range(void) {
-    if (g_ts_n > 0) { g_ts_dropped_ranges++; g_ts_dropped_encoders += g_ts_n; }
-    g_ts_base += g_ts_n;
-    if (g_ts_base + DS4_GPU_TS_MAX_ENCODERS > DS4_GPU_TS_CAPACITY) g_ts_base = 0;
-    g_ts_n = 0;
-    g_ts_cb = NULL;
-}
-
-static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
-    if (!ds4_gpu_ts_active() || g_ts_n == 0) return;
-    if (cb && (__bridge void *)cb != g_ts_cb) {
-        /* These slots belong to a different command buffer; reporting them
-         * against this one's clock is what produced the sub-nanosecond tick. */
-        return;
-    }
-    NSData *rd = [g_ts_buffer resolveCounterRange:NSMakeRange(g_ts_base * 2u, g_ts_n * 2u)];
-    if (!rd) { ds4_gpu_ts_abandon_range(); return; }
-    const MTLCounterResultTimestamp *t = (const MTLCounterResultTimestamp *)rd.bytes;
-
-    uint64_t lo = UINT64_MAX, hi = 0;
-    for (uint32_t i = 0; i < g_ts_n; i++) {
-        const uint64_t a = t[i * 2].timestamp, b = t[i * 2 + 1].timestamp;
-        if (b <= a) continue;
-        if (a < lo) lo = a;
-        if (b > hi) hi = b;
-    }
-    if (hi <= lo) { ds4_gpu_ts_abandon_range(); return; }
-
-    const double cb_s = cb ? (cb.GPUEndTime - cb.GPUStartTime) : 0.0;
-    /* seconds per tick, from this command buffer's own clock */
-    const double spt = (cb_s > 0.0) ? cb_s / (double)(hi - lo) : 1e-9;
-    const double cal = (cb_s > 0.0) ? (spt / 1e-9) : 1.0;
-
-    /* Spans overlap -- confirmed ~197% on the rig once the slot-reuse bug was
-     * fixed, i.e. the GPU pipelines each encoder against roughly one neighbour.
-     * A raw span is therefore an UPPER BOUND, and the raw column summing to ~2x
-     * the wall clock is useless as a budget.  Normalising by cb/sum distributes
-     * the overlap proportionally and yields a column that sums to the command
-     * buffer, which is what a per-stage budget needs.  It assumes overlap is
-     * uniform across encoders; where it is not, the error is redistributed
-     * rather than removed.  Both columns are printed so the assumption stays
-     * visible. */
-    double total_us = 0.0;
-    for (uint32_t i = 0; i < g_ts_n; i++) {
-        const uint64_t a = t[i * 2].timestamp, b = t[i * 2 + 1].timestamp;
-        if (b > a) total_us += (double)(b - a) * spt * 1e6;
-    }
-    const double cb_us_pre = (cb_s > 0.0) ? cb_s * 1e6 : 0.0;
-    const double norm = (total_us > 0.0 && cb_us_pre > 0.0) ? cb_us_pre / total_us : 1.0;
-
-    /* FAIR SHARE -- the column that replaces `norm`.
-     *
-     * `norm` divides every span by the same cb/sum factor, i.e. it assumes each
-     * encoder overlaps its neighbours equally.  Arm B4 showed that assumption
-     * breaking in exactly the way that matters: at 2k all 27 `reduce` spans land
-     * in ONE command buffer (26.4 per reported buffer) while at 131k they are
-     * spread 1.55 per buffer over 12.3 buffers.  A cb-wide divisor therefore
-     * lands on `reduce` completely differently at the two contexts -- and 2k is
-     * the one that failed to reconcile (27 x 159.5 us = 4.31 ms against an
-     * attn_inv_rope of 3.64 ms that CONTAINS it).
-     *
-     * So stop assuming and decompose.  Sweep the interval set: wherever k
-     * encoders are in flight, each is credited dt/k.  Overlap is then priced
-     * per-encoder from the timestamps instead of being smeared uniformly, and
-     * the column sums to the UNION of the spans by construction.
-     *
-     * The union is also the self-check the instrument has been missing.  Because
-     * `spt` is calibrated so that hi-lo maps onto the cb wall clock, union/cb can
-     * never exceed 100% -- so what it measures is the fraction of the buffer in
-     * which any encoder is running:
-     *   union ~= cb  -> no gaps; every microsecond is inside some encoder, which
-     *                   is what arm E's 100% GPU residency predicts.
-     *   union <  cb  -> real idle gaps between encoders, and (cb - union) is the
-     *                   size of the stall pool -- directly the thing we are
-     *                   hunting, and NOT visible in either other column.
-     * `conc` (mean encoders in flight, weighted by time) is the honest version of
-     * the ~2x "coverage" figure: coverage counts a span twice when two overlap,
-     * conc says how deep the pipelining actually runs. */
-    uint64_t *starts = (uint64_t *)calloc((size_t)g_ts_n, sizeof(uint64_t));
-    uint64_t *ends   = (uint64_t *)calloc((size_t)g_ts_n, sizeof(uint64_t));
-    double   *fair_us = (double *)calloc((size_t)g_ts_n, sizeof(double));
-    double union_us = 0.0, conc_mean = 0.0;
-    uint32_t max_conc = 0;
-    if (starts && ends && fair_us) {
-        for (uint32_t i = 0; i < g_ts_n; i++) {
-            starts[i] = t[i * 2].timestamp;
-            ends[i]   = t[i * 2 + 1].timestamp;
-        }
-        ds4_gpu_ts_fair_share(starts, ends, g_ts_n, spt, fair_us,
-                              &union_us, &conc_mean, &max_conc);
-    }
-
-    uint32_t composite_spans = 0;
-    for (uint32_t i = 0; i < g_ts_n; i++) {
-        const uint64_t a = t[i * 2].timestamp, b = t[i * 2 + 1].timestamp;
-        if (b <= a) continue;
-        const double us = (double)(b - a) * spt * 1e6;
-        const double fair = fair_us ? fair_us[i] : 0.0;
-        /* A span carrying more than one label covers more than one stage, and
-         * attributing it to any single one of them is how `reduce` came to
-         * outweigh the stage containing it.  Show the range and the count. */
-        char lbl[40];
-        const char *first = g_ts_labels[i], *last = g_ts_label_last[i];
-        const unsigned hits = g_ts_label_hits[i];
-        if (hits > 1) {
-            composite_spans++;
-            if (first && last && first != last) snprintf(lbl, sizeof lbl, "%s..%s+%u", first, last, hits);
-            else snprintf(lbl, sizeof lbl, "%s+%u", first ? first : "?", hits);
-        } else {
-            snprintf(lbl, sizeof lbl, "%s", first ? first : "(unlabelled)");
-        }
-        fprintf(stderr,
-                "ds4: enc-ts %-28s raw %8.1f us   norm %8.1f us   fair %8.1f us  %5.1f%%\n",
-                lbl, us, us * norm, fair,
-                cb_us_pre > 0.0 ? fair / cb_us_pre * 100.0 : 0.0);
-    }
-    const double cb_us = cb_s * 1e6;
-    fprintf(stderr,
-            "ds4: enc-ts %s: %u encoders, %.3f ms spans over a %.3f ms cb "
-            "(coverage %.0f%%%s, tick=%.3f ns)\n",
-            tag ? tag : "", g_ts_n, total_us / 1000.0, cb_us / 1000.0,
-            cb_us > 0.0 ? total_us / cb_us * 100.0 : 0.0,
-            (cb_us > 0.0 && total_us > cb_us * 1.05) ? " OVERLAPPING" : "",
-            cal);
-    fprintf(stderr,
-            "ds4: enc-ts %s: union %.3f ms = %.1f%% of cb (gap %.3f ms), "
-            "conc mean %.2f max %u\n",
-            tag ? tag : "", union_us / 1000.0,
-            cb_us > 0.0 ? union_us / cb_us * 100.0 : 0.0,
-            (cb_us - union_us) / 1000.0, conc_mean, max_conc);
-    if (composite_spans) {
-        fprintf(stderr,
-                "ds4: enc-ts %s: %u of %u spans carry MULTIPLE stage labels -- "
-                "per-stage attribution is not available%s\n",
-                tag ? tag : "", composite_spans, g_ts_n,
-                ds4_gpu_ts_split_encoders() ? "" :
-                " (set DS4_METAL_GPU_ENCODER_TIMESTAMPS_SPLIT=1 to force one span per stage)");
-    }
-    free(starts); free(ends); free(fair_us);
-    g_ts_reported_ranges++;
-    /* Multiplying a per-call figure by a calls/token count read off this log is
-     * only sound if the log covers every range.  Print what it does not. */
-    if (g_ts_dropped_ranges || g_ts_capped) {
-        fprintf(stderr,
-                "ds4: enc-ts LOSS (cumulative): %llu of %llu ranges never reported "
-                "(%llu encoders), %llu encoders unsampled at the %u-slot range cap\n",
-                (unsigned long long)g_ts_dropped_ranges,
-                (unsigned long long)(g_ts_dropped_ranges + g_ts_reported_ranges),
-                (unsigned long long)g_ts_dropped_encoders,
-                (unsigned long long)g_ts_capped, DS4_GPU_TS_MAX_ENCODERS);
-    }
-    g_ts_n = 0;
-    /* Command-buffer addresses get recycled -- observed directly while
-     * debugging this -- so pointer identity alone would let a NEW buffer that
-     * happens to reuse a freed address append to a stale range.  Disowning here
-     * means the next encoder always starts a fresh range. */
-    g_ts_cb = NULL;
-}
-
-/* Hand slots [g_ts_base, g_ts_base + g_ts_n) to `cb`, advancing past whatever
- * the previous range used so an in-flight buffer's counter writes cannot land
- * in them.  Whatever the previous owner left unreported is counted, not
- * silently forgotten. */
-static void ds4_gpu_ts_begin_range(id<MTLCommandBuffer> cb) {
-    if ((__bridge void *)cb == g_ts_cb) return;
-    if (g_ts_n > 0) { g_ts_dropped_ranges++; g_ts_dropped_encoders += g_ts_n; }
-    g_ts_base += g_ts_n;
-    if (g_ts_base + DS4_GPU_TS_MAX_ENCODERS > DS4_GPU_TS_CAPACITY) g_ts_base = 0;
-    g_ts_cb = (__bridge void *)cb;
-    g_ts_n = 0;
-    g_ts_slot_open = 0;
-}
-
-/* Reserve one slot pair for the encoder about to be created, or count the
- * overflow.  Returns nil when sampling is off or the range is full, so the
- * caller falls back to an untimestamped encoder. */
-static MTLComputePassDescriptor *ds4_gpu_ts_pass_descriptor(void) {
-    if (g_ts_n >= DS4_GPU_TS_MAX_ENCODERS) { g_ts_capped++; g_ts_slot_open = 0; return nil; }
-    MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
-    pd.sampleBufferAttachments[0].sampleBuffer = g_ts_buffer;
-    pd.sampleBufferAttachments[0].startOfEncoderSampleIndex = (g_ts_base + g_ts_n) * 2u;
-    pd.sampleBufferAttachments[0].endOfEncoderSampleIndex = (g_ts_base + g_ts_n) * 2u + 1u;
-    g_ts_labels[g_ts_n] = g_ts_pending_label;
-    g_ts_label_last[g_ts_n] = g_ts_pending_label;
-    g_ts_label_hits[g_ts_n] = g_ts_pending_label ? 1u : 0u;
-    g_ts_pending_label = NULL;
-    g_ts_n++;
-    g_ts_slot_open = 1;
-    return pd;
-}
-
-
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
         if (!g_batch_enc) {
-            /* The batch reuses one encoder until something ends it, so each
-             * recreation is one timestamped span -- which lands exactly on the
-             * encoder boundaries the engine already creates (~172 per token). */
-            if (ds4_gpu_ts_active()) ds4_gpu_ts_begin_range(cb);
-            if (!g_batch_encoder_concurrent && ds4_gpu_ts_active()) {
-                MTLComputePassDescriptor *pd = ds4_gpu_ts_pass_descriptor();
-                if (pd) g_batch_enc = [cb computeCommandEncoderWithDescriptor:pd];
-            }
-            if (!g_batch_enc) {
-                g_batch_enc = g_batch_encoder_concurrent
-                    ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
-                    : [cb computeCommandEncoder];
-            }
-            ds4_gpu_trace_label_encoder(g_batch_enc);
+            g_batch_enc = g_batch_encoder_concurrent
+                ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
+                : [cb computeCommandEncoder];
         }
         return g_batch_enc;
     }
-    id<MTLComputeCommandEncoder> enc = nil;
-    if (ds4_gpu_ts_active()) {
-        ds4_gpu_ts_begin_range(cb);
-        MTLComputePassDescriptor *pd = ds4_gpu_ts_pass_descriptor();
-        if (pd) enc = [cb computeCommandEncoderWithDescriptor:pd];
-    }
-    if (!enc) enc = [cb computeCommandEncoder];
-    ds4_gpu_trace_label_encoder(enc);
-    return enc;
+    return [cb computeCommandEncoder];
 }
-
-static void ds4_gpu_close_batch_encoder(void);
 
 static void ds4_gpu_end_compute_encoder(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc) {
     if (!enc) return;
-    if (g_batch_cb && cb == g_batch_cb && enc == g_batch_enc) {
-        /* Normally a no-op: the batch keeps one encoder alive across many
-         * dispatches, which is why per-stage labels collapse onto one span.
-         * Under split mode, close it so the next dispatch opens a fresh
-         * timestamped span.  Ending an encoder is a stronger barrier than
-         * reusing one, so this can only over-serialise, never mis-order. */
-        if (ds4_gpu_ts_split_encoders()) ds4_gpu_close_batch_encoder();
-        return;
-    }
+    if (g_batch_cb && cb == g_batch_cb && enc == g_batch_enc) return;
     [enc endEncoding];
 }
 
@@ -1794,7 +1296,6 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
         ds4_gpu_invalidate_zero_prefix_prefill_block_maps();
     }
     ds4_gpu_stream_expert_cache_note_owned_completed();
-    ds4_gpu_ts_report(cb, label);
     [g_transient_buffers removeAllObjects];
     ds4_gpu_model_buffer_cache_maybe_evict(label);
     return ok;
@@ -1812,59 +1313,8 @@ static int ds4_gpu_use_m5_private_scratch(void) {
     return enabled;
 }
 
-/* Calibration ballast, DS4_METAL_DISPATCH_BALLAST=N.
- *
- * Every fusion estimate in this tree is priced as (dispatches removed) x (a
- * marginal per-dispatch cost), and that cost has only ever been back-derived
- * from landed changes. ba132ba put it between 4.4 us for a one-threadgroup
- * launch and 10.6 us where an intermediate buffer round trip also disappeared,
- * a 2.4x band -- wide enough that a candidate list can land anywhere from
- * "worth a campaign" to "inside the noise floor". 7331e3d records that budgets
- * built on the derived number "mispredicted four times, always optimistically".
- *
- * Measure it instead. This emits N extra one-thread dispatches per decode
- * layer, which do nothing at all, so d(ms per token)/d(43N) is the marginal
- * launch cost in situ, at the decode shape regime, on the machine under test.
- * Sweep N over 0, 1, 2, 4 and fit the slope.
- *
- * Zero cost when unset: one memoized getenv and an integer test. */
-static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name);
 
-void ds4_gpu_decode_dispatch_ballast(void) {
-    static int ballast_n = -1;
-    if (ballast_n < 0) {
-        const char *env = getenv("DS4_METAL_DISPATCH_BALLAST");
-        const long v = env && env[0] ? strtol(env, NULL, 10) : 0;
-        ballast_n = (v > 0 && v <= 64) ? (int)v : 0;
-    }
-    if (ballast_n == 0) return;
-    if (!g_initialized && !ds4_gpu_init()) return;
 
-    static id<MTLComputePipelineState> ballast_pipeline;
-    static id<MTLBuffer> ballast_sink;
-    if (!ballast_pipeline) {
-        ballast_pipeline = ds4_gpu_get_pipeline("kernel_ds4_dispatch_ballast");
-        if (!ballast_pipeline) { ballast_n = 0; return; }
-    }
-    if (!ballast_sink) {
-        ballast_sink = [g_device newBufferWithLength:sizeof(uint32_t)
-                                             options:MTLResourceStorageModeShared];
-        if (!ballast_sink) { ballast_n = 0; return; }
-    }
-
-    int owned = 0;
-    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
-    if (!cb) return;
-    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:ballast_pipeline];
-    [enc setBuffer:ballast_sink offset:0 atIndex:0];
-    for (int i = 0; i < ballast_n; i++) {
-        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-    }
-    ds4_gpu_end_compute_encoder(cb, enc);
-    (void)ds4_gpu_finish_command_buffer(cb, owned, "dispatch ballast");
-}
 
 static int ds4_gpu_scratch_needs_cpu_access(const char *label) {
     if (!label) return 0;
@@ -26941,38 +26391,8 @@ int ds4_gpu_attention_output_q8_tp_tensor(
          * Re-opening this means changing the pipeline nsg, the
          * threadsPerThreadgroup and the threadgroup_bytes together, and gating
          * on top-1 preserved rather than on t/s. */
-        int16_t out_low_nsg = 4;
-        {
-            const char *e = getenv("DS4_METAL_ATTN_OUT_LOW_NSG");
-            if (e && e[0]) {
-                const int v = atoi(e);
-                /* Only 4 is safe: the dispatch below passes a hardcoded 4 while
-                 * this sets a BAKED function constant, so any other value makes
-                 * the kernel reduce over more simdgroups than are launched and
-                 * read uninitialised threadgroup memory.  It shipped once, it
-                 * measured FASTER because it skipped half the weight stream, and
-                 * it produced complete gibberish (reverted in da63283).  Refuse
-                 * it loudly rather than let another throughput sweep pick it. */
-                if (v == 4) {
-                    out_low_nsg = 4;
-                } else {
-                    static int warned;
-                    if (!warned) {
-                        warned = 1;
-                        fprintf(stderr,
-                                "ds4: DS4_METAL_ATTN_OUT_LOW_NSG=%d ignored -- only 4 is "
-                                "correct here. nsg is a baked function constant and the "
-                                "dispatch passes 4; any other value reduces over "
-                                "unlaunched simdgroups and silently corrupts output "
-                                "(see da63283). Changing it means moving the pipeline "
-                                "nsg, threadsPerThreadgroup and threadgroup_bytes "
-                                "together, gated on top-1 preserved.\n", v);
-                    }
-                }
-            }
-        }
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", out_low_nsg);
+            ds4_gpu_get_mul_mv_pipeline("kernel_dsv4_attn_out_low_q8_0_f32", 4);
         int ok = ds4_gpu_encode_attn_out_low_q8_direct(cb,
                 pipeline,
                 &args,
@@ -29565,7 +28985,6 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
      *
      * Caveat: the timestamp path is gated on !g_batch_encoder_concurrent, so
      * this instrument and any concurrent-encoder work are mutually blind. */
-#define DS4_METAL_PROFILE_DECODE_FA_STAGE(name) ds4_gpu_ts_name_last((name))
 
     id<MTLBuffer> qbuf = ds4_gpu_tensor_buffer(q);
     id<MTLBuffer> rawbuf = ds4_gpu_tensor_buffer(raw_kv);
@@ -29721,7 +29140,6 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         if (!ds4_gpu_encode_fill_f16_1d(cb, flash_mask_buffer, 0, n_keys, 0.0f)) {
             return 0;
         }
-        DS4_METAL_PROFILE_DECODE_FA_STAGE("mask_fill");
     }
     if (use_mask && n_comp) {
         if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
@@ -29732,7 +29150,6 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
                                            n_comp)) {
             return 0;
         }
-        DS4_METAL_PROFILE_DECODE_FA_STAGE("mask_cpy");
     }
 
     bool pad_fused = false;
@@ -29759,7 +29176,6 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
             &pad_fused)) {
         return 0;
     }
-    DS4_METAL_PROFILE_DECODE_FA_STAGE("kv_stage");
 
     id<MTLComputePipelineState> pad_pipeline = nil;
     if (has_kvpad && !pad_fused) {
@@ -29796,7 +29212,6 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        DS4_METAL_PROFILE_DECODE_FA_STAGE("fa_pad");
     }
 
     ds4_gpu_flash_attn_vec_args vec_args = {
@@ -29857,7 +29272,6 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         [DS4_DISP(packed_enc) dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
                       threadsPerThreadgroup:MTLSizeMake(packed_threads, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, packed_enc);
-        DS4_METAL_PROFILE_DECODE_FA_STAGE("packed");
         g_decode_attn_rope_fuse = 0;
         g_decode_attn_rope_fuse_used = 1;
         return 1;
@@ -29877,7 +29291,6 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, n_head, nwg)
          threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
-    DS4_METAL_PROFILE_DECODE_FA_STAGE("fa_core");
 
     ds4_gpu_flash_attn_reduce_args reduce_args = {
         .nrows = (int32_t)nrows,
@@ -29905,10 +29318,8 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
     [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(nrows, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32u * nwg, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
-    DS4_METAL_PROFILE_DECODE_FA_STAGE("reduce");
 
     return 1;
-#undef DS4_METAL_PROFILE_DECODE_FA_STAGE
 }
 
 static int ds4_gpu_encode_flash_attention_decode_raw_batch_heads(
@@ -30849,7 +30260,6 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(top_k, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
-            DS4_METAL_PROFILE_BRACKET_STAGE("idx_sort");
         }
 
         if (split_decode) {
@@ -30885,7 +30295,6 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                 decode_splits)
                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
-            DS4_METAL_PROFILE_BRACKET_STAGE("idx_attn_split");
 
             enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:split_reduce_pipeline];
@@ -30896,7 +30305,6 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)nrows, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
-            DS4_METAL_PROFILE_BRACKET_STAGE("idx_split_red");
         } else {
             enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:attn_pipeline];
@@ -30919,7 +30327,6 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
-            DS4_METAL_PROFILE_BRACKET_STAGE("idx_attn");
         }
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "graph indexed mixed attention heads")) return 0;
@@ -31176,7 +30583,6 @@ int ds4_gpu_attention_decode_heads_tensor(
                 return 0;
             }
 
-            ds4_gpu_ts_note_label("raw_attn");
             if (!ds4_gpu_finish_command_buffer(cb, owned, "graph raw attention heads")) return 0;
             return 1;
         }

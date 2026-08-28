@@ -22148,11 +22148,6 @@ static bool metal_graph_encode_decode_layer_phase(
 
     bool ok = true;
 #if defined(__APPLE__)
-    /* Calibration only, no-op unless DS4_METAL_DISPATCH_BALLAST is set. Placed
-     * at the head of the layer so the extra launches sit in the same command
-     * buffer and the same dependency position as the dispatches a fusion would
-     * remove. See ds4_gpu_decode_dispatch_ballast(). */
-    ds4_gpu_decode_dispatch_ballast();
 #endif
     const bool decode_stage_profile = metal_graph_decode_stage_profile_enabled(il);
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
@@ -23578,7 +23573,6 @@ static bool metal_graph_encode_decode_layer_phase(
                                       attn_factor,
                                       DS4_ROPE_YARN_BETA_FAST,
                                       DS4_ROPE_YARN_BETA_SLOW) != 0;
-        ds4_gpu_ts_tag("inv_rope");
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_inv_rope");
     if (ok && !cuda_tp_attn_heads_active) {
@@ -53248,73 +53242,6 @@ const ds4_tokens *ds4_session_tokens(ds4_session *s) {
     return s ? &s->checkpoint : NULL;
 }
 
-/* Record every committed decode token to DS4_NGRAM_TRACE=<path>, one id per
- * line.  Purely passive: it does not enable speculation and does not touch the
- * decode path beyond an fputs.
- *
- * Why a trace and not a live meter.  Whether MTP is worth funding turns on one
- * number nobody has ever measured on this rig -- the n-gram commit rate on a
- * real workload.  ds4_ngram_propose (ds4.c:69749) is a pure function of token
- * history, so that number can be computed offline, which keeps it clear of the
- * four known defects in the live speculative path (stale s->logits, drafts[0]
- * pushed without an eval, the bound returning 0 on the ideal periodic case).
- * A trace also lets one rig session answer the question for every (k, depth)
- * pair instead of one pair per run.  tests/bench_ngram_accept consumes it. */
-static void ds4_ngram_trace_sync(const ds4_session *s) {
-    static FILE *fp;
-    static int checked;
-    static int written;
-    if (!checked) {
-        checked = 1;
-        const char *path = getenv("DS4_NGRAM_TRACE");
-        if (path && path[0]) {
-            fp = fopen(path, "we");
-            if (!fp) fprintf(stderr, "ds4: DS4_NGRAM_TRACE: cannot open %s\n", path);
-        }
-    }
-    if (!fp || !s) return;
-    /* ds4-server rewinds the checkpoint on cancel, tool-error recovery and
-     * truncation (ds4_session_rewind, ds4.c:70925).  `written` is monotonic, so a
-     * rewind silently drops every regenerated token below the old high-water mark
-     * and the file resumes mid-stream -- plausible-but-wrong statistics under a
-     * normal-looking heartbeat.  Invalidate loudly instead.  Re-emitting from 0 is
-     * NOT an option: the analyser skips non-numeric lines, so a marker would let
-     * the re-emitted prefix concatenate onto the pre-rewind tail. */
-    if (s->checkpoint.len < written) {
-        fprintf(stderr,
-                "ds4: ngram trace: INVALID -- checkpoint rewound %d -> %d. "
-                "Discard this trace; capture one with no cancel, tool call or "
-                "truncation.\n", written, s->checkpoint.len);
-        fclose(fp);
-        fp = NULL;
-        return;
-    }
-    /* Flush whatever the checkpoint has gained since the last call.  Syncing the
-     * CHECKPOINT rather than appending at one commit site matters twice over:
-     * it captures the prompt as well as the generated tokens -- and the prompt
-     * is part of what ds4_ngram_propose searches, so a decode-only trace would
-     * under-report matches -- and it is reached from every eval entry point
-     * instead of only ds4_session_eval_argmax, which ds4-bench never calls. */
-    for (int i = written; i < s->checkpoint.len; i++) {
-        fprintf(fp, "%d\n", s->checkpoint.v[i]);
-    }
-    if (s->checkpoint.len > written) {
-        static int announced;
-        const int prev = written;
-        written = s->checkpoint.len;
-        fflush(fp);
-        /* Say something the first time and then periodically.  A trace that
-         * silently stays empty is the failure mode this facility already had
-         * once -- the hook sat in ds4_session_eval_argmax while ds4-bench calls
-         * ds4_session_eval -- and it cost a rig session to notice. */
-        if (!announced) {
-            announced = 1;
-            fprintf(stderr, "ds4: ngram trace: writing (%d tokens so far)\n", written);
-        } else if (written / 512 != prev / 512) {
-            fprintf(stderr, "ds4: ngram trace: %d tokens\n", written);
-        }
-    }
-}
 
 #ifndef DS4_NO_GPU
 static void spec_frontier_free(ds4_spec_frontier *f) {
@@ -54947,7 +54874,6 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
-    ds4_ngram_trace_sync(s);
     if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
@@ -59349,13 +59275,6 @@ uint32_t ds4_test_compressor_rewind_align(void) {
     return ds4_compressor_rewind_align();
 }
 
-static int ds4_ngram_propose(const int *hist, int hist_len, int k,
-                             int max_draft, int *out);
-
-int ds4_test_ngram_propose(const int *hist, int hist_len, int k,
-                           int max_draft, int *out) {
-    return ds4_ngram_propose(hist, hist_len, k, max_draft, out);
-}
 
 uint32_t ds4_test_layer_compress_ratio(uint32_t il) {
     return il < DS4_N_LAYER ? g_ds4_compress_ratios[il] : 0u;
@@ -64767,23 +64686,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         if (logits_profile < 0) {
             logits_profile = getenv("DS4_TP_LOGITS_PROFILE") != NULL ? 1 : 0;
         }
-        /* Diagnostic payload divisor, DS4_TP_LOGITS_PROBE_DIV=N. Separates the
-         * two things the recv timer cannot tell apart: wire time, which scales
-         * with bytes, and rank skew, which does not. Send returns once the
-         * kernel has buffered the frame, so the send timer bounds neither.
-         *
-         * Output is WRONG while this is set - rank 0 keeps stale logits above
-         * the transferred prefix - and both ranks must use the same value or
-         * the frame length check rejects. Timing probe only, like
-         * DS4_TP_ABLATE. */
-        static uint32_t logits_probe_div = 0u;
-        if (logits_probe_div == 0u) {
-            const char *div_env = getenv("DS4_TP_LOGITS_PROBE_DIV");
-            const long div_v = div_env ? strtol(div_env, NULL, 10) : 1;
-            logits_probe_div = (div_v >= 1 && div_v <= 4096) ? (uint32_t)div_v : 1u;
-        }
-        uint32_t logits_xfer = vhalf / logits_probe_div;
-        if (logits_xfer == 0u) logits_xfer = 1u;
+        const uint32_t logits_xfer = vhalf;
         const double logits_t0 = logits_profile ? now_sec() : 0.0;
         if (s->engine->tp.rank == 0) {
             if (!ds4_tp_recv_logits_half(s->engine->tp.ctx, s->logits + vhalf, logits_xfer)) {
@@ -64818,7 +64721,6 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
-    ds4_ngram_trace_sync(s);
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     const bool dspark_owner = ds4_session_dspark_support_owner(s);
@@ -69770,227 +69672,6 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
     return rc;
 }
 
-/* N-gram speculative decoding (upstream PR #846, adapted for TP).
- *
- * Unlike MTP and DSpark this needs no draft model and runs no draft forward
- * pass: it looks for the most recent earlier occurrence of the current
- * k-token suffix in the session's own history and proposes whatever followed
- * it.  Proposals are therefore free, and the only cost is the batch verify --
- * which is precisely why the DSpark null result does not carry over.  DSpark
- * measured net-negative here and on the PR author's M1 Ultra ("83.65%
- * acceptance", killed by fixed verifier overhead); n-gram pays that same
- * verifier but nothing else.
- *
- * Expect it to win on repetitive text (the PR: +13% rewrite/edit, +40%
- * effective on an agentic coding eval) and to lose slightly on novel prose
- * (-4%), because there the proposals miss and the verify is wasted.
- *
- * TP: the proposal is a pure function of the token array and two integer
- * constants, and ds4_session_sync() mirrors that array exactly, so both ranks
- * derive an identical draft block without exchanging it.  Verification rides
- * the existing speculative mirroring (DS4_TP_FRAME_VERIFY / _VERIFY_COMMIT)
- * that DSpark already uses. */
-static int ds4_ngram_min_match(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_NGRAM_MIN_MATCH");
-        const long v = env && env[0] ? strtol(env, NULL, 10) : 0;
-        cached = (v >= 2 && v <= 16) ? (int)v : 3;
-    }
-    return cached;
-}
-
-/* Max drafted tokens per cycle; 0 disables n-gram speculation entirely. */
-static int ds4_ngram_spec_depth(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *env = getenv("DS4_NGRAM_SPEC");
-        const long v = env && env[0] ? strtol(env, NULL, 10) : 0;
-        cached = (v > 0 && v <= DS4_SPEC_PREFIX_SLOTS) ? (int)v : 0;
-    }
-    return cached;
-}
-
-/* Propose up to max_draft continuation tokens for `hist` by finding the most
- * recent earlier occurrence of its last k tokens.  Returns the count written.
- *
- * Scanning backwards makes "most recent match wins" the rule, which matters
- * for determinism as much as for quality: both TP ranks must pick the same
- * match, and "most recent" is well defined where "any match" is not. */
-static int ds4_ngram_propose(const int *hist, int hist_len, int k,
-                             int max_draft, int *out) {
-    if (!hist || !out || max_draft <= 0 || k < 2) return 0;
-    /* Need the pattern plus at least one earlier token to have followed it. */
-    if (hist_len < k + 1) return 0;
-    const int *pat = hist + hist_len - k;
-    for (int start = hist_len - k - 1; start >= 0; start--) {
-        int m = 0;
-        while (m < k && hist[start + m] == pat[m]) m++;
-        if (m != k) continue;
-        int n = 0;
-        while (n < max_draft && start + k + n < hist_len - k) {
-            out[n] = hist[start + k + n];
-            n++;
-        }
-        return n;
-    }
-    return 0;
-}
-
-#ifndef DS4_NO_GPU
-/* One n-gram speculative cycle.  `first_token` is already sampled but not yet
- * evaluated; on return `accepted` holds the committed tokens.
- *
- * Structure mirrors the DSpark cycle deliberately, including the TP frame
- * order (verify announce -> both ranks verify -> commit announce), so the two
- * paths cannot drift on the wire protocol. */
-static int ds4_session_eval_ngram_speculative_argmax(
-        ds4_session *s, int first_token, int max_tokens, int eos_token,
-        int *accepted, int accepted_cap, char *err, size_t errlen) {
-    ds4_engine *e = s->engine;
-    int n_accept = 0;
-    if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
-    accepted[n_accept++] = first_token;
-    if (first_token == eos_token) return n_accept;
-
-    const int depth = ds4_ngram_spec_depth();
-    int budget = max_tokens - n_accept;
-    if (budget > accepted_cap - n_accept) budget = accepted_cap - n_accept;
-    if (budget > s->ctx_size - s->checkpoint.len - 1) {
-        budget = s->ctx_size - s->checkpoint.len - 1;
-    }
-    if (depth <= 0 || budget <= 0) return n_accept;
-
-    /* drafts[0] is the target's own argmax for the position just decoded, so
-     * it is verified for free by the logits ds4_session_eval() just produced.
-     * The n-gram continuation starts after it. */
-    int drafts[DS4_SPEC_PREFIX_SLOTS + 1];
-    drafts[0] = sample_argmax(s->logits, DS4_N_VOCAB);
-    int draft_n = 1;
-    if (budget > 1 && drafts[0] != eos_token) {
-        int probe_len = s->checkpoint.len + 1;
-        int *probe = xmalloc((size_t)probe_len * sizeof(probe[0]));
-        memcpy(probe, s->checkpoint.v,
-               (size_t)s->checkpoint.len * sizeof(probe[0]));
-        probe[probe_len - 1] = drafts[0];
-        int want = budget - 1;
-        if (want > depth) want = depth;
-        if (want > DS4_SPEC_PREFIX_SLOTS) want = DS4_SPEC_PREFIX_SLOTS;
-        draft_n += ds4_ngram_propose(probe, probe_len, ds4_ngram_min_match(),
-                                     want, drafts + 1);
-        free(probe);
-    }
-    if (draft_n <= 1) {
-        /* Nothing proposed: commit the free argmax and stop.  Costs one push,
-         * never a verify. */
-        if (n_accept < accepted_cap && n_accept < max_tokens) {
-            token_vec_push(&s->checkpoint, drafts[0]);
-            accepted[n_accept++] = drafts[0];
-            s->checkpoint_valid = true;
-        }
-        return n_accept;
-    }
-    for (int i = 1; i < draft_n; i++) {
-        if (drafts[i] == eos_token) { draft_n = i + 1; break; }
-    }
-
-    ds4_spec_frontier frontier;
-    memset(&frontier, 0, sizeof(frontier));
-    int row_tops[DS4_SPEC_PREFIX_SLOTS + 1];
-    const int start = s->checkpoint.len;
-    bool have_frontier = spec_frontier_snapshot(&frontier, s);
-    bool ok = have_frontier;
-    bool tp_verify_sent = false;
-    if (ok && ds4_session_tp_leader(s)) {
-        if (!ds4_tp_send_verify(e->tp.ctx, s->tp_session_id,
-                                drafts, (uint32_t)draft_n,
-                                metal_graph_dspark_tp_verify_flags())) {
-            snprintf(err, errlen, "tp: ngram verify send failed");
-            spec_frontier_free(&frontier);
-            return -1;
-        }
-        tp_verify_sent = true;
-    }
-    if (ok) {
-        for (int i = 0; i < draft_n; i++) token_vec_push(&s->checkpoint, drafts[i]);
-        ok = metal_graph_verify_suffix_tops(
-                &s->graph, &e->model, &e->weights, &s->checkpoint,
-                (uint32_t)start, (uint32_t)draft_n,
-                draft_n > 1 && draft_n <= (int)DS4_SPEC_PREFIX_SLOTS + 1,
-                false, row_tops, NULL, NULL);
-    }
-
-    int commit = 0;
-    if (ok) {
-        commit = 1;   /* drafts[0] was free-verified above */
-        for (int i = 1; i < draft_n; i++) {
-            if (row_tops[i - 1] != drafts[i]) break;
-            commit++;
-        }
-    }
-    /* Acceptance accounting.  A t/s delta from speculation is uninterpretable
-     * without it -- the same throughput can mean "drafts rarely fire" or
-     * "drafts fire constantly and are usually rejected", and those call for
-     * opposite responses.  DS4_NGRAM_SPEC_STATS=1 reports it. */
-    if (getenv("DS4_NGRAM_SPEC_STATS") != NULL) {
-        static uint64_t st_steps, st_drafted, st_accepted, st_with_draft;
-        st_steps++;
-        st_drafted += (uint64_t)(draft_n > 1 ? draft_n - 1 : 0);
-        st_accepted += (uint64_t)(ok && commit > 1 ? commit - 1 : 0);
-        if (draft_n > 1) st_with_draft++;
-        if ((st_steps % 128u) == 0u) {
-            fprintf(stderr,
-                    "ds4: ngram spec %llu steps, %llu with a draft (%.1f%%), "
-                    "%llu drafted / %llu accepted (%.1f%% acceptance), "
-                    "%.3f extra tokens/step\n",
-                    (unsigned long long)st_steps,
-                    (unsigned long long)st_with_draft,
-                    100.0 * (double)st_with_draft / (double)st_steps,
-                    (unsigned long long)st_drafted,
-                    (unsigned long long)st_accepted,
-                    st_drafted ? 100.0 * (double)st_accepted / (double)st_drafted : 0.0,
-                    (double)st_accepted / (double)st_steps);
-        }
-    }
-    if (!ok) {
-        /* Verifier failed or mutated state: restore and fall back to the
-         * single free token, exactly as the MTP path does. */
-        s->checkpoint.len = start;
-        if (have_frontier) (void)spec_frontier_restore(&frontier, s);
-        spec_frontier_free(&frontier);
-        if (tp_verify_sent &&
-            !ds4_tp_send_verify_commit(e->tp.ctx, 0, 0)) {
-            snprintf(err, errlen, "tp: ngram verify commit send failed");
-            s->checkpoint_valid = false;
-            return -1;
-        }
-        s->checkpoint_valid = false;
-        snprintf(err, errlen, "ngram speculative verify failed");
-        return -1;
-    }
-    if (commit > accepted_cap - n_accept) commit = accepted_cap - n_accept;
-    if (commit > max_tokens - n_accept) commit = max_tokens - n_accept;
-    if (tp_verify_sent &&
-        !ds4_tp_send_verify_commit(e->tp.ctx, commit, 0)) {
-        snprintf(err, errlen, "tp: ngram verify commit send failed");
-        s->checkpoint_valid = false;
-        spec_frontier_free(&frontier);
-        return -1;
-    }
-    if (commit < draft_n) {
-        /* Partial accept: drop the rejected tail and rewind the compressor
-         * frontiers the verifier advanced past it. */
-        s->checkpoint.len = start + commit;
-        if (have_frontier) (void)spec_frontier_restore(&frontier, s);
-        s->mtp_draft_valid = false;
-        ds4_session_dspark_capture_invalidate(s);
-    }
-    spec_frontier_free(&frontier);
-    for (int i = 0; i < commit; i++) accepted[n_accept++] = drafts[i];
-    s->checkpoint_valid = true;
-    return n_accept;
-}
-#endif /* DS4_NO_GPU */
 
 static int ds4_session_eval_speculative_argmax_impl(
         ds4_session *s, int first_token, int max_tokens, int eos_token,
@@ -70059,17 +69740,6 @@ static int ds4_session_eval_speculative_argmax_impl(
         return ds4_session_glm_spec_cycle(s, first_token,
                                           accepted, cycle_cap,
                                           err, errlen);
-    }
-
-    /* N-gram speculation replaces the support-model drafter rather than
-     * stacking with it: both end in the same batch verify, and running two
-     * proposers per cycle would pay that verifier twice to commit one prefix.
-     * Opt-in, so the default path below is untouched. */
-    if (ds4_ngram_spec_depth() > 0 && accepted && accepted_cap > 0 &&
-        !ds4_session_is_glm(s)) {
-        return ds4_session_eval_ngram_speculative_argmax(
-                s, first_token, max_tokens, eos_token,
-                accepted, accepted_cap, err, errlen);
     }
 
     /*
@@ -70826,7 +70496,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 int ds4_session_eval_speculative_argmax_excluding(
         ds4_session *s, int first_token, int max_tokens, int excluded_token,
         int *accepted, int accepted_cap, char *err, size_t errlen) {
-    ds4_ngram_trace_sync(s);
     return ds4_session_eval_speculative_argmax_impl(
             s, first_token, max_tokens, -1, excluded_token,
             accepted, accepted_cap, err, errlen);
@@ -70838,7 +70507,6 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  float top_p, float min_p, uint64_t *rng,
                                  int *accepted, int accepted_cap,
                                  char *err, size_t errlen) {
-    ds4_ngram_trace_sync(s);
     if (temperature <= 0.0f) {
         return ds4_session_eval_speculative_argmax(
             s, first_token, max_tokens, eos_token,

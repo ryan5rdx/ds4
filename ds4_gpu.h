@@ -188,10 +188,6 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
 int ds4_gpu_device_is_m5_apple_silicon(void);
 int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
-/* Calibration only: emits DS4_METAL_DISPATCH_BALLAST extra one-thread
- * dispatches so the marginal per-dispatch cost can be measured in situ rather
- * than back-derived. No-op unless the variable is set. */
-void ds4_gpu_decode_dispatch_ballast(void);
 /* Strict test oracle for the fixed decode mul_mv pipeline lookup cache. */
 int ds4_gpu_test_decode_pipeline_fast_lookup(void);
 /* Strict test oracle for the extended decode mul_mv_ext (nsg + nxpsg) cache. */
@@ -2930,27 +2926,6 @@ int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
 
-/* Fair-share decomposition of a set of encoder spans (DS4_METAL_GPU_ENCODER_TIMESTAMPS).
- * Wherever k spans are in flight, each is credited dt/k, so overlap is priced per
- * encoder from the timestamps instead of being smeared by a uniform divisor.
- * `fair_us` receives n values summing to `*union_us`, the wall time in which any
- * span is active.  Exposed (rather than kept static) so tests/test_ts_fairshare.c
- * can check it against hand-computed interval sets -- the uniform divisor it
- * replaces was wrong in a way that only showed up as a stage exceeding the stage
- * that contains it, which is far too late to notice.  Requires no GPU. */
-void ds4_gpu_ts_fair_share(const uint64_t *starts, const uint64_t *ends, uint32_t n,
-                           double spt, double *fair_us, double *union_us,
-                           double *conc_mean, uint32_t *max_conc);
-
-/* Name the encoder span most recently created, from a CALL SITE rather than from
- * inside the helper that created it.  ds4_gpu_rope_tail_tensor has six callers
- * across q_path, kv_path, the indexer and three points inside the
- * compressor_indexer -> attn_inv_rope bracket, so a label placed inside it
- * cannot distinguish the pre-attention RoPE from the post-attention inverse
- * RoPE -- which is the whole question the bracket accounting is asking.
- * `label` must have static lifetime; it is stored, not copied.  No-op unless
- * DS4_METAL_GPU_ENCODER_TIMESTAMPS is set. */
-void ds4_gpu_ts_tag(const char *label);
 
 #ifdef __cplusplus
 }
