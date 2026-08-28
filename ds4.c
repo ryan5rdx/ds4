@@ -53282,7 +53282,22 @@ static void ds4_ngram_trace_sync(const ds4_session *s) {
     for (int i = written; i < s->checkpoint.len; i++) {
         fprintf(fp, "%d\n", s->checkpoint.v[i]);
     }
-    if (s->checkpoint.len > written) { written = s->checkpoint.len; fflush(fp); }
+    if (s->checkpoint.len > written) {
+        static int announced;
+        const int prev = written;
+        written = s->checkpoint.len;
+        fflush(fp);
+        /* Say something the first time and then periodically.  A trace that
+         * silently stays empty is the failure mode this facility already had
+         * once -- the hook sat in ds4_session_eval_argmax while ds4-bench calls
+         * ds4_session_eval -- and it cost a rig session to notice. */
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "ds4: ngram trace: writing (%d tokens so far)\n", written);
+        } else if (written / 512 != prev / 512) {
+            fprintf(stderr, "ds4: ngram trace: %d tokens\n", written);
+        }
+    }
 }
 
 #ifndef DS4_NO_GPU

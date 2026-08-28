@@ -1319,13 +1319,51 @@ an eval, the bound returning 0 on the ideal periodic case). Those break the
   depth ∈ {2,3,4,5,8} in one pass and reports offered%, mean commit, tokens/step,
   speedup and the commit-length distribution.
 
-**Run:**
+**Run — TP2 is supported; set the variable on the COORDINATOR only.**
 
 ```
-DS4_NGRAM_TRACE=/tmp/toks.txt ./ds4-bench ...        # any real workload; coding is the one that matters
+# coordinator node, alongside the usual --tensor-parallel --role coordinator flags
+DS4_NGRAM_TRACE=/tmp/toks.txt ./ds4-bench ... --tensor-parallel --role coordinator --listen HOST PORT
+
+# worker node: launch as usual, do NOT set DS4_NGRAM_TRACE
+```
+
+You should see on the coordinator, within the first token:
+
+```
+ds4: ngram trace: writing (N tokens so far)
+ds4: ngram trace: 512 tokens
+```
+
+**No line means it is not capturing — stop and say so rather than analysing an
+empty file.** Requires a build at or after `5a8077b`: before that the hook sat in
+`ds4_session_eval_argmax`, and `ds4-bench` calls `ds4_session_eval`
+(`ds4_bench.c:883`), so the trace was silently empty.
+
+The TP chain, verified against the code:
+
+| step | site |
+|---|---|
+| `--tensor-parallel` zeroes the distributed options | `ds4_tp.c:581` `memset(dist, 0, …)` |
+| so `s->distributed` is NULL under TP | — |
+| bench decode calls the hooked entry point | `ds4_bench.c:883` |
+| trace sync fires | `ds4.c:64790` |
+| leader tells the worker, then evals locally | `ds4.c:64702`, `:64708` |
+| distributed branch **not** taken | `ds4.c:64533` |
+| checkpoint advances on the Metal path | `ds4.c:64616`, `:64682` |
+
+The checkpoint has to advance regardless, since `pos` is `s->checkpoint.len`
+(`ds4.c:64796`) — decode could not step otherwise. Syncing the checkpoint rather
+than appending at one commit site is what makes the facility path-independent,
+and it captures the prompt too, which `ds4_ngram_propose` also searches.
+
+**Then analyse:**
+
+```
 make tests/bench_ngram_accept
-./tests/bench_ngram_accept /tmp/toks.txt --vt 4.459  # today's 5-row verify
-./tests/bench_ngram_accept /tmp/toks.txt --vt 2.06   # corrected ~50 ms verify floor
+./tests/bench_ngram_accept /tmp/toks.txt                                  # corrected V(k) model
+./tests/bench_ngram_accept /tmp/toks.txt --vfixed 19.85 --vmarg 6.62      # explicit
+./tests/bench_ngram_accept /tmp/toks.txt --vt 4.459                       # legacy flat, for comparison
 ```
 
 Use a **real coding session**, not a synthetic prompt — n-gram drafting lives or
