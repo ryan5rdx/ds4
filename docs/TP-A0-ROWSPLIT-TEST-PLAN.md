@@ -7,6 +7,165 @@ Branch: `upstream-metal-wins`
 Rig: 2× M2 Ultra 60-core 128GB, tensor-parallel over Thunderbolt RDMA
 Model: DeepSeek V4 Flash MXFP4, 145.26 GiB (76.73 GiB shard per rank)
 
+## ▶ RUN QUEUE — 2026-08-27
+
+**Build required: `51198b5` or later.** Everything below depends on fixes that
+post-date the last rig run. `git log --oneline -1` on the rig before starting.
+
+Arm R1 ran on `179c105` and therefore **predates three commits that change what
+it measures** — see "R1 needs a re-run" at the end of this block. Arm S is the
+priority: it is the only measurement here that can move the ceiling rather than
+the estimate.
+
+---
+
+### S — n-gram commit rate (PRIORITY, one session)
+
+Never measured on this rig on any fixture. It is the gate on whether MTP — the
+only remaining route to 50 t/s — is worth weeks.
+
+**Coordinator** (add one variable to the standard TP launch; nothing else changes):
+
+```
+DS4_NGRAM_TRACE=/tmp/toks.txt \
+DS4_METAL_FAST_SYNC=1 ./ds4-bench -m <MODEL> --role coordinator \
+  --tensor-parallel --transport rdma --listen 0.0.0.0 1234 \
+  --rdma-device rdma_en6 --prompt-file ~/Downloads/promessi_sposi.txt \
+  --ctx-start 2048 --ctx-max 2048 --gen-tokens 4096 --csv /tmp/ngram.csv
+```
+
+**Worker: launch exactly as usual. Do NOT set `DS4_NGRAM_TRACE`** — the worker's
+session is driven by control messages and has no checkpoint, so it would write a
+near-empty file that is easy to mistake for the real one.
+
+**Check within the first few seconds:**
+
+```
+ds4: ngram trace: writing (N tokens so far)
+ds4: ngram trace: 512 tokens
+```
+
+**No heartbeat means it is not capturing — stop and report that**, do not analyse
+the file. (This exact failure already cost one session: before `9685613` the hook
+sat in `ds4_session_eval_argmax` while `ds4-bench` calls `ds4_session_eval`.)
+
+**Why `--gen-tokens 4096` and one context.** The trace only needs length and
+realism, not a sweep — a sweep re-prefills and wastes the session. The harness
+refuses under 64 tokens and wants a few thousand.
+
+**The workload matters more than the length.** n-gram drafting lives on
+repetition. `promessi_sposi.txt` is prose and will understate a coding workload
+badly — closer to the random control (1.000×, zero offers) than to anything
+real. **If a trace can be captured from the PI coding harness through
+`ds4-server` instead, that is worth far more than a longer prose trace**;
+`ds4-server` uses the same eval entry points and is already covered. Ideally
+capture both and report both.
+
+**Then analyse (dev box, no GPU, seconds):**
+
+```
+make tests/bench_ngram_accept
+./tests/bench_ngram_accept /tmp/toks.txt                              # corrected V(k) model
+./tests/bench_ngram_accept /tmp/toks.txt --vt 4.459                   # legacy flat, for comparison
+```
+
+**Read, in order:**
+
+1. **`offered%`** — how often the drafter proposes anything. If this is near zero
+   the workload has no exploitable repetition and nothing else matters.
+2. **`mean_cmt` and `speedup` at depth 4** (production caps drafts at
+   `DS4_SPEC_PREFIX_SLOTS = 4`, `ds4.c:2577`; the harness no longer reports 5 or 8).
+3. **The commit-length distribution.** A bimodal trace — long runs inside repeated
+   code, nothing elsewhere — behaves very differently under a fixed depth than a
+   uniform one with the same mean, and argues for adaptive depth.
+
+**Decision rule.** Clearing ~2.0 mean commit at the default cost model makes MTP
+fundable *conditional on* fixing the verify floor first — chiefly `ds4.c:37202`
+setting `tp_batch_rows = n_tokens`, which disables the row split at `ds4.c:29237`
+and costs 10.88 ms of the 108 ms verify. Not clearing it means **speculation is
+dead on this workload** and the low-context ceiling stands, which is worth one
+session to know rather than a week.
+
+**Controls already run here, for calibration:** a uniform-random trace reads
+exactly 1.000× (zero offers, no verify charged); a period-8 synthetic reads
+1.716× at depth 4. A real trace between those is the expected outcome.
+
+---
+
+### D-slope — firm up item C (15 min, coordinator only)
+
+Item C is the largest surviving low-context candidate at **0.510 ms / +0.88 t/s**,
+but that rests on a two-point single-run delta (41.22 vs 40.72) scaled by a ratio
+measured on the dev box. The plan called for a fitted slope and it was never run.
+
+```
+i=0
+for N in 0 2 8 16 0 2 8 16 0 2 8 16; do
+  i=$((i+1))
+  DS4_METAL_DISPATCH_BALLAST="$N" DS4_METAL_FAST_SYNC=1 ./ds4-bench -m <MODEL> \
+    --role coordinator --tensor-parallel --transport rdma --listen 0.0.0.0 1234 \
+    --rdma-device rdma_en6 --prompt-file ~/Downloads/promessi_sposi.txt \
+    --ctx-start 2048 --ctx-max 2048 --gen-tokens 128 \
+    --csv "/tmp/ballast_${N}_${i}.csv"
+done
+```
+
+Interleaved, three repeats each — sequential blocks are worthless here (the same
+arm has varied 56–124 ms across repeats). The worker restarts with each run, as
+with any arm; if twelve pair restarts is too costly, three interleaved repeats of
+{0, 16} alone give the same answer. Fit t/s against N. At 3.464 µs/dispatch,
+N=16 predicts `688 × 3.4638 = 2.383 ms` → 37.53 t/s, a **3.69 t/s drop = 7.4× the
+current signal**.
+
+---
+
+### R1 needs a re-run, and the build it ran on is why
+
+R1's pass-1 result is sound and confirms the instrument: all 9 labels collapse
+into one composite (`rope_tail..reduce`), gap ≈ 0, conc 1.97–1.98, throughput at
+baseline. Pass 2 fired the pre-registered falsifier exactly as written (131k
+`idx_attn` 38511 µs, total 212 ms ≫ 4.24 ms).
+
+But it ran on `179c105`, before three fixes that change what it measures:
+
+| what R1 measured | why it is not clean | fixed in |
+|---|---|---|
+| `rope_tail` 0.222 ms | the label was **inside** `ds4_gpu_rope_tail_tensor`, which has **six callers** — q_path, kv_path, the indexer and three in-bracket sites. That 0.222 ms is a sum over all of them, not the inverse RoPE. | `9685613` — moved to the call site via `ds4_gpu_ts_tag` |
+| `gather` | was on the optional **padding** dispatch, not any gather | `9685613` — renamed `fa_pad` |
+| three unlabelled clusters | `fill_f16_1d`, `cpy_f32_f16_1d`, `flash_kv_stage_f16` had no labels at all | `9685613` — `mask_fill`, `mask_cpy`, `kv_stage` |
+| "1 composite of 512" | once a range hit the slot cap, every later label piled onto slot 511 | `9685613` — labels now require an open slot |
+| "`idx_*` stay fused at 2k" | **they never ran.** Indexed attention needs >1024 *compressed* rows (`ds4.c:19947`); ratio-4 at 2k gives 2048/4 = 512. Crossover is ctx > 4096. | `51198b5` — path counters make this visible in one line |
+
+**Re-run R1 only after arm S**, and add the counters, which cost nothing and
+remove the branch ambiguity entirely:
+
+```
+DS4_METAL_PATH_COUNTS=1 DS4_METAL_GPU_ENCODER_TIMESTAMPS=1 ...            # pass 1
+DS4_METAL_PATH_COUNTS=1 DS4_METAL_GPU_ENCODER_TIMESTAMPS=1 \
+  DS4_METAL_GPU_ENCODER_TIMESTAMPS_SPLIT=1 ...                            # pass 2, 2k only
+```
+
+At exit the coordinator prints `ds4: path counts (calls, not spans):` with a line
+per label. **Read that first**: it separates "this branch never ran" from "its
+encoder was capped" from "SPLIT did not give it a span" — three things the
+encoder log conflates, and the reason R1's verdict was ambiguous. Skip pass 2 at
+131k; it is known to inflate 50×.
+
+If the 9 labels still do not reconcile to 3.64 ms on the fixed build, the
+encoder instrument has gone as far as it can and the residual moves to the
+`ds4.c` call site, per read-order #4.
+
+---
+
+### Do not run
+
+- **Any `DS4_METAL_ATTN_OUT_LOW_NSG` sweep.** Only 4 is correct; the flag now
+  refuses other values and says why. nsg is a baked function constant while the
+  dispatch passes a hardcoded 4, so 8 reduces over unlaunched simdgroups —
+  measured *faster* because it skipped half the weight stream, and shipped
+  gibberish (`da63283`).
+- **Pass 2 SPLIT at 131k** — 50× inflation, established.
+
 ## Status (2026-08-25)
 
 This doc is the **request** side of a loop: results go into
