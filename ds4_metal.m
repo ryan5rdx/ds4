@@ -29710,21 +29710,30 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         if (!vec_pipeline || !reduce_pipeline) return 0;
     }
 
-    if (!use_persistent_zero_mask &&
-        !ds4_gpu_encode_fill_f16_1d(cb, flash_mask_buffer, 0, n_keys, 0.0f)) {
-        return 0;
+    /* Both labels must sit INSIDE their guard.  Left outside they fired even when
+     * the && short-circuited and no dispatch happened -- and on this rig neither
+     * ever dispatches at decode (use_persistent_zero_mask is true on M2 Ultra, and
+     * every decode call site passes comp_mask=NULL/use_mask=0), so the path-count
+     * report would have shown both with counts equal to the gathered-attention
+     * calls.  Under SPLIT the stray label lands on the previously closed span and
+     * prints as a composite carrying the compressor's time. */
+    if (!use_persistent_zero_mask) {
+        if (!ds4_gpu_encode_fill_f16_1d(cb, flash_mask_buffer, 0, n_keys, 0.0f)) {
+            return 0;
+        }
+        DS4_METAL_PROFILE_DECODE_FA_STAGE("mask_fill");
     }
-    DS4_METAL_PROFILE_DECODE_FA_STAGE("mask_fill");
-    if (use_mask && n_comp &&
-        !ds4_gpu_encode_cpy_f32_f16_1d(cb,
-                                         maskbuf,
-                                         ds4_gpu_tensor_offset(comp_mask),
-                                         flash_mask_buffer,
-                                         (NSUInteger)n_raw * sizeof(uint16_t),
-                                         n_comp)) {
-        return 0;
+    if (use_mask && n_comp) {
+        if (!ds4_gpu_encode_cpy_f32_f16_1d(cb,
+                                           maskbuf,
+                                           ds4_gpu_tensor_offset(comp_mask),
+                                           flash_mask_buffer,
+                                           (NSUInteger)n_raw * sizeof(uint16_t),
+                                           n_comp)) {
+            return 0;
+        }
+        DS4_METAL_PROFILE_DECODE_FA_STAGE("mask_cpy");
     }
-    DS4_METAL_PROFILE_DECODE_FA_STAGE("mask_cpy");
 
     bool pad_fused = false;
     if (!ds4_gpu_encode_flash_kv_stage_f16(

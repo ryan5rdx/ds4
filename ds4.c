@@ -53273,6 +53273,22 @@ static void ds4_ngram_trace_sync(const ds4_session *s) {
         }
     }
     if (!fp || !s) return;
+    /* ds4-server rewinds the checkpoint on cancel, tool-error recovery and
+     * truncation (ds4_session_rewind, ds4.c:70925).  `written` is monotonic, so a
+     * rewind silently drops every regenerated token below the old high-water mark
+     * and the file resumes mid-stream -- plausible-but-wrong statistics under a
+     * normal-looking heartbeat.  Invalidate loudly instead.  Re-emitting from 0 is
+     * NOT an option: the analyser skips non-numeric lines, so a marker would let
+     * the re-emitted prefix concatenate onto the pre-rewind tail. */
+    if (s->checkpoint.len < written) {
+        fprintf(stderr,
+                "ds4: ngram trace: INVALID -- checkpoint rewound %d -> %d. "
+                "Discard this trace; capture one with no cancel, tool call or "
+                "truncation.\n", written, s->checkpoint.len);
+        fclose(fp);
+        fp = NULL;
+        return;
+    }
     /* Flush whatever the checkpoint has gained since the last call.  Syncing the
      * CHECKPOINT rather than appending at one commit site matters twice over:
      * it captures the prompt as well as the generated tokens -- and the prompt
@@ -70822,6 +70838,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  float top_p, float min_p, uint64_t *rng,
                                  int *accepted, int accepted_cap,
                                  char *err, size_t errlen) {
+    ds4_ngram_trace_sync(s);
     if (temperature <= 0.0f) {
         return ds4_session_eval_speculative_argmax(
             s, first_token, max_tokens, eos_token,

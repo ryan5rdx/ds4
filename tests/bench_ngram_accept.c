@@ -102,11 +102,17 @@ typedef struct {
 
 /* One pass over the trace, running the real cycle: propose at i, commit the
  * longest matching prefix, jump past it. */
-static accept_stats simulate(const int *tok, int n, int k, int depth) {
+/* `skip` is the first position to speculate FROM.  Production runs prefill as one
+ * batched sync and only speculates during decode, so counting prompt positions as
+ * cycles dilutes both offered% and mean commit -- on a 2048-prompt/4096-gen trace
+ * a third of the steps are ones the engine would never have run.  The prompt stays
+ * in the array either way: it is history the proposer searches (ds4.c:69856-69862),
+ * so trimming the file instead of skipping would remove real matches. */
+static accept_stats simulate(const int *tok, int n, int k, int depth, int skip) {
     accept_stats st;
     memset(&st, 0, sizeof st);
     int draft[MAX_DRAFT_CAP];
-    int i = 1;                                /* need >=1 token of history */
+    int i = skip > 1 ? skip : 1;              /* need >=1 token of history */
     while (i < n) {
         /* drafts[0] is the target's own argmax for the position just decoded --
          * free, always correct by construction.  The n-gram continuation starts
@@ -143,7 +149,9 @@ int main(int argc, char **argv) {
         fprintf(stderr,
                 "usage: %s <token-trace|-> [--vt BREAKEVEN] [--k K] [--depth D]\n"
                 "  trace: one token id per line (DS4_NGRAM_TRACE=<path> on a rig run)\n"
-                "  --vt : verify/decode cost ratio; a cycle wins iff mean commit > this\n",
+                "  --vt : legacy flat verify/decode ratio (prefer --vfixed/--vmarg)\n"
+                "  --skip-first N : start measuring at position N; use the prompt length,\n"
+                "                   since production never speculates during prefill\n",
                 argv[0]);
         return 2;
     }
@@ -156,7 +164,7 @@ int main(int argc, char **argv) {
      * MoE 4.44 + attention 2.18 = 6.62 per row. */
     double t_ms = 24.260, v_fixed = 19.85, v_marg = 6.62;
     double vt = 0.0;                          /* legacy single-ratio override */
-    int only_k = 0, only_depth = 0;
+    int only_k = 0, only_depth = 0, skip_first = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "--vt") && i + 1 < argc) vt = atof(argv[++i]);
         else if (!strcmp(argv[i], "--t") && i + 1 < argc) t_ms = atof(argv[++i]);
@@ -164,6 +172,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--vmarg") && i + 1 < argc) v_marg = atof(argv[++i]);
         else if (!strcmp(argv[i], "--k") && i + 1 < argc) only_k = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--depth") && i + 1 < argc) only_depth = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--skip-first") && i + 1 < argc) skip_first = atoi(argv[++i]);
     }
 
     int n = 0;
@@ -174,7 +183,18 @@ int main(int argc, char **argv) {
         free(tok);
         return 1;
     }
+    if (skip_first < 0) skip_first = 0;
+    if (skip_first >= n - 64) {
+        fprintf(stderr, "--skip-first %d leaves under 64 positions of a %d-token trace\n",
+                skip_first, n);
+        free(tok);
+        return 1;
+    }
     printf("trace: %d tokens from %s\n", n, argv[1]);
+    if (skip_first) {
+        printf("measuring positions %d..%d (%d cycles); the first %d are prompt and stay as "
+               "proposer history\n", skip_first, n - 1, n - skip_first, skip_first);
+    }
     if (vt > 0.0) {
         printf("cost model: FLAT override, V/T = %.3f (use --vfixed/--vmarg instead)\n\n", vt);
     } else {
@@ -195,7 +215,7 @@ int main(int argc, char **argv) {
         if (only_k && ks[a] != only_k) continue;
         for (size_t b = 0; b < sizeof depths / sizeof *depths; b++) {
             if (only_depth && depths[b] != only_depth) continue;
-            const accept_stats st = simulate(tok, n, ks[a], depths[b]);
+            const accept_stats st = simulate(tok, n, ks[a], depths[b], skip_first);
             if (!st.steps) continue;
             const double mean_commit = (double)(st.emitted - st.steps) / (double)st.steps;
             const double tok_per_step = (double)st.emitted / (double)st.steps;
@@ -206,9 +226,12 @@ int main(int argc, char **argv) {
              * ratio were the two things that made a zero-offer trace look like a
              * 3x slowdown instead of the exact baseline it is. */
             const double offer_rate = (double)st.verified / (double)st.steps;
+            /* Production verifies 1 + n_proposals rows: drafts[0] rides the batch
+             * even though its logits are already known (ds4.c:69853, :69900-69903),
+             * which is why the measured verify was a FIVE-row one at depth 4. */
             const double v_step = vt > 0.0
                     ? t_ms * vt                       /* legacy flat override */
-                    : v_fixed + (double)depths[b] * v_marg;
+                    : v_fixed + (double)(depths[b] + 1) * v_marg;
             const double cost_per_step = t_ms + offer_rate * v_step;
             const double speedup = (tok_per_step * t_ms) / cost_per_step;
             if (speedup > best) { best = speedup; best_k = ks[a]; best_d = depths[b]; }
@@ -221,14 +244,15 @@ int main(int argc, char **argv) {
     if (best_k) {
         printf("\nbest: k=%d depth=%d -> %.3fx  (%s)\n", best_k, best_d, best,
                best > 1.0 ? "fundable at this verify cost" : "NOT fundable at this verify cost");
-        printf("re-run with --vt to test other verify costs; the decision is whether\n"
-               "mean commit clears V/T, so a cheaper verify moves the bar, not the trace.\n");
+        printf("the bar is NOT a flat mean commit: V is charged only on cycles that offer,\n"
+               "so break-even is (V(k)/T) x offered%%, which at 10%% offer is 0.20, not 2.0.\n"
+               "Read the speedup column -- >1.000x is fundable at this verify cost.\n");
     }
 
     /* The distribution matters as much as the mean: a bimodal trace (long runs
      * inside repeated code, nothing elsewhere) behaves very differently under a
      * fixed depth than a uniform one with the same mean. */
-    const accept_stats st = simulate(tok, n, best_k ? best_k : 3, best_d ? best_d : 4);
+    const accept_stats st = simulate(tok, n, best_k ? best_k : 3, best_d ? best_d : 4, skip_first);
     printf("\ncommit-length distribution at k=%d depth=%d:\n",
            best_k ? best_k : 3, best_d ? best_d : 4);
     for (int c = 0; c <= MAX_DRAFT_CAP; c++) {
