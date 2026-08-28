@@ -200,6 +200,24 @@ tests/bench_decode_rows: tests/bench_decode_rows.o ds4_metal.o
 bench-decode-rows: tests/bench_decode_rows
 	./tests/bench_decode_rows
 
+tests/bench_stage_marker_tax.o: tests/bench_stage_marker_tax.m
+	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
+
+tests/bench_stage_marker_tax: tests/bench_stage_marker_tax.o
+	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
+
+bench-stage-marker-tax: tests/bench_stage_marker_tax
+	./tests/bench_stage_marker_tax
+
+tests/bench_flagset_tax.o: tests/bench_flagset_tax.m
+	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
+
+tests/bench_flagset_tax: tests/bench_flagset_tax.o
+	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
+
+bench-flagset-tax: tests/bench_flagset_tax
+	./tests/bench_flagset_tax
+
 tests/bench_membw.o: tests/bench_membw.m
 	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
 

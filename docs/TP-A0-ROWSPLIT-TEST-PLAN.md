@@ -1233,6 +1233,75 @@ calibrated `reduce` figures of 199 µs/call at 2k and 311 at 131k. The
 instrument's *distortion* claim is unaffected and still holds: throughput came
 back at baseline (42.04 / 29.70 t/s) on both runs.
 
+### Model-free probes run here — item C roughly doubles, and the tax constant holds — 2026-08-27
+
+Two harnesses (`tests/bench_stage_marker_tax.m`, `tests/bench_flagset_tax.m`),
+both model-free, run on the M1 Max dev box. Absolute µs are M1 Max; the
+**ratios** are what transfer to the rig.
+
+**1. `DS4_METAL_DISPATCH_BALLAST` is not representative of item C — it under-prices
+it by 71%.** Ballast dispatches `kernel_ds4_dispatch_ballast`
+(`metal/unary.metal:320`), a pure no-op. The real dispatch under
+`DS4_METAL_FAST_SYNC` is `kernel_dsv4_tp_flag_set_coherent`
+(`metal/dsv4_misc.metal:7403`), which brackets a single 4-byte store with **two
+system-scope seq_cst device fences**. Slope fit over N = 43…430:
+
+| shape | no-op | relaxed store | **coherent** | fences alone |
+|---|---|---|---|---|
+| same encoder | 2.698 | 2.726 (+1.0%) | **3.384 (+25.4%)** | 0.658 µs (19%) |
+| **encoder per dispatch — the live gate** | 2.281 | 2.364 (+3.6%) | **3.904 (+71.2%)** | **1.540 µs (39%)** |
+
+**Two things fall out.**
+
+- **Item C is worth about twice what arm D priced.** Scaling the rig's ballast
+  figure by the live-gate ratio `3.904/2.281 = 1.712` gives
+  `3.4638 × 1.712 =` **`5.93 µs/dispatch`**, so `86 × 5.93 =` **`0.510 ms/token`**
+  — 2.1% of the token, **+0.88 t/s** — against 0.298 ms priced off ballast. Margin
+  over the 2.907 µs threshold goes from 1.19× to **2.04×**. Item C is comfortably
+  alive, and this settles the "is 3.46 µs an upper or lower bound" question with a
+  measurement rather than an argument: **lower, by 71%.**
+- **NEW candidate, independent of item C: the cost is the fences, not the store.**
+  A relaxed atomic store is within 3.6% of a no-op; the two system-scope seq_cst
+  fences are **39% of the coherent dispatch**. Weakening them — one fence instead
+  of two, or device scope instead of system scope — is worth
+  `2.34 µs × 86 = 0.201 ms` = **+0.34 t/s** *without removing a single dispatch*,
+  and is far cheaper to implement than item C. **Do not ship this on the number
+  alone.** Those fences exist to make the TP gate flag visible across the pair;
+  weakening them risks exactly the race the gate prevents. It needs a
+  memory-model argument first, then the top-1 + bounded-Δlogit gate, then a
+  soak. Flagged, not queued.
+
+**2. The 0.18 ms/marker tax constant is independently corroborated — and one
+1.0–1.3 ms phantom is killed.**
+
+The harness was built to test whether `ds4_gpu_flush_commands`
+(`ds4_metal.m:9813`) committing **unconditionally** — even when
+`g_batch_has_work == NO` — charges a stage that encoded nothing with one command
+buffer per layer. **It does not, in the busy accounting: an empty command buffer
+reports 0.026 µs busy.** So there is no 1.0–1.3 ms instrument floor hiding in the
+stage profile. (It does cost ~2.85 µs of *wall* per empty buffer, so anything
+reading wall rather than busy would still see it.)
+
+What the arm pairs do show is the per-command-buffer tax, which is what a stage
+marker actually costs:
+
+| work | separate cb each | batched in one cb | **per-cb busy tax** |
+|---|---|---|---|
+| no-op | 5.200 µs | 2.448 µs | **2.75 µs** |
+| pool-shaped | 11.586 µs | 6.262 µs | **5.32 µs** |
+
+At 43 layers that is **0.118–0.229 ms per marker**, and the standing 0.18 ms/marker
+constant sits inside that range. The audit flagged the constant as soft — derived
+from one 32k pair comparing a profiled stage *sum* against an unprofiled *wall*
+clock. It now has independent support from a different method on different
+hardware. **Keep 0.18, and keep the ±0.18 error bar.**
+
+**Caveat on both:** M1 Max is 32 cores on one die, the rig is 60 cores over two.
+Command-buffer submission overhead is driver/queue-dominated so it should transfer,
+but the absolute microseconds should be re-measured on the rig before anything is
+banked on them. The *ratios* — 1.712× for coherent-vs-noop, fences at 39% — are the
+durable results.
+
 ### Arm B6 — the label was the bug: `reduce` was never a reduce — 2026-08-27
 
 B5's falsifier fired exactly as pre-registered, and the answer it points to is
