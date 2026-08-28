@@ -300,6 +300,55 @@ is one composite; pass 2 perturbs). The encoder instrument has gone as far as
 it can. The unnamed ~1.9-2.4 ms inside `attn_inv_rope` is not separable at the
 GPU-encoder boundary and must be chased where the stages are distinct code paths.
 
+### Arm V-residual — the verify's unattributed 44 ms — 2026-08-28
+
+Build `d8536ed` (latest `99601ca`). Three `--dspark --mtp SUPPORT` runs at 2k,
+gen 512, each with `DS4_DSPARK_VERIFY_PROFILE=1 DS4_DSPARK_STATS=1`:
+
+| run | force | cycles | proposed | accepted | verify ms | t/s |
+|---|---|---|---|---|---|---|
+| 1 | (production policy) | 502 | 6 | 0 | 0.000 | 40.33 |
+| 2 | `LOW_YIELD_POLICY=0` | 482 | 56 | 20 (35.7%) | 917.9 | 35.89 |
+| 3 | `LOW_YIELD=0 SCHEDULER=0` | 468 | 181 | 42 (23.2%) | 1794.2 | 29.14 |
+| 4 | + `FAKE_ARGMAX_PROPOSAL=1` | 468 | 498 | 42 (8.4%) | 1771.0 | 28.99 |
+
+**Run 1 is a null by design**: the production low-yield policy backs off
+(`no_draft=498, backoffs=4`) because prose acceptance is ~0%, so no verifier
+ever launches. The plan's plain command measures nothing on prose — it needs
+`DS4_DSPARK_TP_LOW_YIELD_POLICY=0` (and scheduler off for volume).
+
+**V(k) fit (consolidated n=50 @d2, n=7 @d3):**
+
+```
+V(2) = 76.12 ms/verify    V(3) = 96.76 ms/verify
+fit  V(k) = 34.83 + 20.64·k
+V(5) extrapolated = 138 ms  (vs 108.18 measured in tp_mtp_hunt)
+intercept fraction of V(5) ≈ 25%  (plan guessed ~42.5 ms / 39%)
+```
+
+**Intercept is real but smaller than the plan's guess** (~35 ms, not 42.5),
+and the extrapolation to V(5) overshoots the measured 108 ms — the fit is
+nonlinear across d5 (d5 uses the native 5-row tile, a different path from
+d2/d3, per tp_mtp_hunt). The fixed term is not 39% of V(5).
+
+**The decisive read — verify is GPU-layer-encode-bound, not transport-bound:**
+`verify_layer` = **99.97%** of verify in every run (1793.7/1794.2, etc.);
+`verify_upload` 0.26-0.5 ms, `verify_read` 0.26-0.4 ms — negligible. The 44 ms
+unattributed by the byte model lives **inside `verify_layer`** (the 43-layer
+batch), not in any per-row bucket the byte model can see. The fixed term is the
+43-layer fixed launch/encode overhead, not a data movement cost.
+
+**Propose now dominates the budget** (run 3/4: propose 3859/3945 ms vs verify
+1794/1771 ms), and `prop_chain` = 86% of propose — consistent with the
+`8df84c3` correction that propose is **latency-bound**, not a 5.99 GB
+bandwidth wall. The two cost terms to attack are `prop_chain` (latency) and
+`verify_layer` (fixed 43-layer encode overhead).
+
+**Draft-length ceiling on prose:** even fake-argmax forces only d1 (441/498)
+and d2 (24) — the Markov chain stops early on prose, so d4/d5 verify samples
+are structurally hard to get on this fixture. A coding fixture would produce
+longer drafts but the verify cost per row is what this arm set out to measure.
+
 ### Arm S — n-gram commit rate, first measurement on this rig — 2026-08-27
 
 Build `d8536ed` (trace hook now in `ds4_session_eval`, the path ds4-bench and

@@ -169,6 +169,21 @@ lengths observed. If the intercept `a` lands near 42.5 ms, that fixed term is 39
 of V(5) and no per-row bucket in the byte model accounts for it — that is the
 thing to attack, not the acceptance rate.
 
+**RESULT 2026-08-28** (build `d8536ed`/`99601ca`): **the plain command measures
+nothing on prose** — the production low-yield policy backs off (no_draft=498,
+backoffs=4) so no verifier runs (throughput 40.33 = baseline). Force verifies
+with `DS4_DSPARK_TP_LOW_YIELD_POLICY=0` (+ `DS4_DSPARK_SCHEDULER=0` for
+volume). Consolidated across 3 forced runs: V(2)=76.1 ms (n=50), V(3)=96.8 ms
+(n=7) → fit V(k)=34.8+20.6k, **intercept ≈ 35 ms ≈ 25% of V(5)** — smaller than
+the 42.5 ms/39% guess, and V(5) extrapolation (138 ms) overshoots the measured
+108 ms, so the fit is nonlinear across d5 (d5 uses the native 5-row tile).
+**Decisive read: `verify_layer` = 99.97% of verify** (upload 0.26-0.5 ms, read
+0.26-0.4 ms negligible) — the 44 ms unattributed lives *inside* the 43-layer
+batch encode, a fixed launch overhead, not per-row data movement. Propose now
+dominates (3859 vs 1794 ms) with prop_chain 86% — confirms `8df84c3`: propose
+is latency-bound, not a bandwidth wall. Full data in
+`BENCHMARKS-TP-PP.md` §Arm V-residual.
+
 ### Why we do not see Unsloth's dspark numbers — three causes, one of them ours
 
 Their published figure is **120 t/s against a 60 t/s baseline on a single B200**
