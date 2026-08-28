@@ -1124,8 +1124,49 @@ static int ds4_gpu_ts_active(void) {
 /* Attach `label` to the encoder span currently open.  Every label that lands on a
  * span is counted, so a span covering several stages reports as a composite rather
  * than as whichever stage happened to write last. */
+/* Per-label call counts, DELIBERATELY independent of the timestamp slots.
+ *
+ * Arm R1 asks which branches fire, and reading that off the enc-ts log conflates
+ * three things: whether a branch ran, whether its encoder got one of the 512
+ * slots, and whether SPLIT mode gave it its own span.  A branch that never runs
+ * and a branch whose slots were capped look identical.  These counters answer
+ * only the first question, cost an increment, and need neither timestamps nor
+ * SPLIT.  Labels are static literals, so pointer identity is the key. */
+#define DS4_GPU_PATH_SLOTS 64
+static const char *g_path_names[DS4_GPU_PATH_SLOTS];
+static uint64_t g_path_counts[DS4_GPU_PATH_SLOTS];
+static uint32_t g_path_n;
+
+static int ds4_gpu_path_counts_active(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_METAL_PATH_COUNTS") != NULL;
+    return v;
+}
+
+static void ds4_gpu_path_count_report(void) {
+    if (!g_path_n) return;
+    fprintf(stderr, "ds4: path counts (calls, not spans):\n");
+    for (uint32_t i = 0; i < g_path_n; i++) {
+        fprintf(stderr, "ds4:   %-20s %10llu\n",
+                g_path_names[i], (unsigned long long)g_path_counts[i]);
+    }
+}
+
+static void ds4_gpu_path_count(const char *label) {
+    for (uint32_t i = 0; i < g_path_n; i++) {
+        if (g_path_names[i] == label) { g_path_counts[i]++; return; }
+    }
+    if (g_path_n >= DS4_GPU_PATH_SLOTS) return;
+    if (g_path_n == 0) atexit(ds4_gpu_path_count_report);
+    g_path_names[g_path_n] = label;
+    g_path_counts[g_path_n] = 1;
+    g_path_n++;
+}
+
 static void ds4_gpu_ts_note_label(const char *label) {
-    if (!label || g_ts_enabled <= 0) return;
+    if (!label) return;
+    if (ds4_gpu_path_counts_active()) ds4_gpu_path_count(label);
+    if (g_ts_enabled <= 0) return;
     if (g_ts_n == 0) { g_ts_pending_label = label; return; }
     /* Once the range hits the slot cap, ds4_gpu_ts_pass_descriptor stops
      * reserving slots but callers keep labelling.  Without this guard every
@@ -26905,7 +26946,29 @@ int ds4_gpu_attention_output_q8_tp_tensor(
             const char *e = getenv("DS4_METAL_ATTN_OUT_LOW_NSG");
             if (e && e[0]) {
                 const int v = atoi(e);
-                if (v == 1 || v == 2 || v == 4 || v == 8) out_low_nsg = (int16_t)v;
+                /* Only 4 is safe: the dispatch below passes a hardcoded 4 while
+                 * this sets a BAKED function constant, so any other value makes
+                 * the kernel reduce over more simdgroups than are launched and
+                 * read uninitialised threadgroup memory.  It shipped once, it
+                 * measured FASTER because it skipped half the weight stream, and
+                 * it produced complete gibberish (reverted in da63283).  Refuse
+                 * it loudly rather than let another throughput sweep pick it. */
+                if (v == 4) {
+                    out_low_nsg = 4;
+                } else {
+                    static int warned;
+                    if (!warned) {
+                        warned = 1;
+                        fprintf(stderr,
+                                "ds4: DS4_METAL_ATTN_OUT_LOW_NSG=%d ignored -- only 4 is "
+                                "correct here. nsg is a baked function constant and the "
+                                "dispatch passes 4; any other value reduces over "
+                                "unlaunched simdgroups and silently corrupts output "
+                                "(see da63283). Changing it means moving the pipeline "
+                                "nsg, threadsPerThreadgroup and threadgroup_bytes "
+                                "together, gated on top-1 preserved.\n", v);
+                    }
+                }
             }
         }
         id<MTLComputePipelineState> pipeline =
@@ -31104,6 +31167,7 @@ int ds4_gpu_attention_decode_heads_tensor(
                 return 0;
             }
 
+            ds4_gpu_ts_note_label("raw_attn");
             if (!ds4_gpu_finish_command_buffer(cb, owned, "graph raw attention heads")) return 0;
             return 1;
         }

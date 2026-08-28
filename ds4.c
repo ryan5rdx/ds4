@@ -70810,6 +70810,7 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 int ds4_session_eval_speculative_argmax_excluding(
         ds4_session *s, int first_token, int max_tokens, int excluded_token,
         int *accepted, int accepted_cap, char *err, size_t errlen) {
+    ds4_ngram_trace_sync(s);
     return ds4_session_eval_speculative_argmax_impl(
             s, first_token, max_tokens, -1, excluded_token,
             accepted, accepted_cap, err, errlen);
