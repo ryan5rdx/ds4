@@ -1398,10 +1398,43 @@ constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_A
 
 // Reduces split-K decode FlashAttention partials. It combines each workgroup's
 // output vector and softmax (sum,max) pair into the final attention result.
-/* Shared and deliberately noinline so the split-K reduction is compiled once and
- * every caller gets identical codegen. The RoPE-fused sibling in dsv4_rope.metal
- * calls this same body, which is what keeps the fusion bit-exact. */
-static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
+/* Preserve the established NWG-32 body as a separate function.  Besides
+ * keeping world-1 codegen unchanged, this gives the target-rig NWG=32 control
+ * a genuine legacy reduction rather than charging both A/B arms for compact
+ * lane predicates. */
+static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row_legacy(
+        constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
+        device  const char * htmp,
+        device        char * dst,
+        uint   tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        short  NWG_,
+        short  DV_) {
+    const uint64_t rid = tgpig;
+    const short iwg = tiisg;
+
+    device const float * ss =
+        (device const float *)htmp + (uint64_t)args.nrows*DV_*NWG_;
+    float S = ss[rid*(2*NWG_) + 2*iwg + 0];
+    float M = ss[rid*(2*NWG_) + 2*iwg + 1];
+    const float m = simd_max(M);
+    const float ms = exp(M - m);
+    S = simd_sum(S*ms);
+    S = S == 0.0f ? 0.0f : 1.0f/S;
+
+    const short DV4 = DV_/4;
+    device const float4 * htmp4 =
+        (device const float4 *)htmp + rid*DV4*NWG_;
+    device float4 * dst4 = (device float4 *)dst + rid*DV4;
+    for (short i = sgitg; i < DV4; i += NWG_) {
+        const float4 v = simd_sum(htmp4[i*NWG_ + iwg]*ms);
+        if (iwg == 0) dst4[i] = v*S;
+    }
+}
+
+/* Shared compact body used by both the plain and inverse-RoPE reducers. */
+static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row_compact(
         constant ds4_metal_args_flash_attn_ext_vec_reduce & args,
         device  const char * htmp,
         device        char * dst,
@@ -1413,14 +1446,22 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
     const uint64_t rid = tgpig;
 
     const short iwg = tiisg;
+    const bool active = iwg < NWG_;
 
     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV_*NWG_;
 
-    float S = ss[rid*(2*NWG_) + 2*iwg + 0];
-    float M = ss[rid*(2*NWG_) + 2*iwg + 1];
+    /* One simdgroup reduces all split-K workgroups.  When NWG < 32, lanes
+     * beyond NWG must contribute the softmax identity and, critically, must
+     * not read beyond this row's compact partial buffer. */
+    float S = 0.0f;
+    float M = -FLT_MAX/2;
+    if (active) {
+        S = ss[rid*(2*NWG_) + 2*iwg + 0];
+        M = ss[rid*(2*NWG_) + 2*iwg + 1];
+    }
 
     const float m  = simd_max(M);
-    const float ms = exp(M - m);
+    const float ms = active ? exp(M - m) : 0.0f;
 
     S = simd_sum(S*ms);
     S = S == 0.0f ? 0.0f : 1.0f/S;
@@ -1431,7 +1472,11 @@ static __attribute__((noinline)) void ds4_flash_attn_vec_reduce_row(
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
     for (short i = sgitg; i < DV4; i += NWG_) {
-        const float4 v = simd_sum(htmp4[i*NWG_ + iwg]*ms);
+        float4 partial = float4(0.0f);
+        if (active) {
+            partial = htmp4[i*NWG_ + iwg]*ms;
+        }
+        const float4 v = simd_sum(partial);
 
         if (iwg == 0) {
             dst4[i] = v*S;
@@ -1446,9 +1491,17 @@ kernel void kernel_flash_attn_ext_vec_reduce(
         uint   tgpig[[threadgroup_position_in_grid]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-    ds4_flash_attn_vec_reduce_row(args, htmp, dst, tgpig, tiisg, sgitg,
-                                  (short)FC_flash_attn_ext_vec_reduce_NWG,
-                                  (short)FC_flash_attn_ext_vec_reduce_DV);
+    if (FC_flash_attn_ext_vec_reduce_NWG == 32) {
+        ds4_flash_attn_vec_reduce_row_legacy(
+            args, htmp, dst, tgpig, tiisg, sgitg,
+            (short)FC_flash_attn_ext_vec_reduce_NWG,
+            (short)FC_flash_attn_ext_vec_reduce_DV);
+    } else {
+        ds4_flash_attn_vec_reduce_row_compact(
+            args, htmp, dst, tgpig, tiisg, sgitg,
+            (short)FC_flash_attn_ext_vec_reduce_NWG,
+            (short)FC_flash_attn_ext_vec_reduce_DV);
+    }
 }
 
 // M5 decode specialization: time-slice all 32 split-K workgroups through eight
