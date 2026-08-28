@@ -259,6 +259,39 @@ that host — and it does **not** change the verdict (roof ~760+, not 400).
 > Full correction table with file:line evidence:
 > `docs/TP-A0-ROWSPLIT-TEST-PLAN.md`, "Corrections owed to BENCHMARKS-TP-PP.md".
 
+### Arm S — n-gram commit rate, first measurement on this rig — 2026-08-27
+
+Build `d8536ed` (trace hook now in `ds4_session_eval`, the path ds4-bench and
+ds4-server actually use). Coordinator-only `DS4_NGRAM_TRACE`; worker NOT set.
+Heartbeat confirmed ("writing (N tokens so far)") — the `9685613` fix works.
+
+**Two workloads traced and analysed offline** (`tests/bench_ngram_accept`, the
+shipped proposer, linked):
+
+| trace | tokens | best | best cfg | mean_cmt @depth4 | offered% @depth4 |
+|---|---|---|---|---|---|
+| **prose** (`promessi_sposi.txt`) | 6143 | **1.097×** | k=6 d=4 | 0.30 | 9.9% |
+| **coding** (hash-table C program) | 3938 | **1.034×** | k=8 d=4 | 0.15 | 4.0% |
+
+**Commit-length distribution is heavily dominated by zero-commit steps:**
+prose 91.4% commit=0 (6.4% commit=4); coding 96.5% commit=0 (2.1% commit=4).
+
+**Legacy flat V/T=4.459 comparison:** prose **0.907× (loss)**, coding **0.945×
+(loss)** — nothing fundable at the old verify cost either.
+
+**Verdict — speculation does NOT clear the bar.** The decision rule requires
+~2.0 mean commit; the best observed is **0.30 (prose) / 0.15 (coding)** — 6-13×
+short. Both traces land just above the uniform-random control (1.000×, zero
+offers) and far below the period-8 synthetic (1.716×). **At the corrected cost
+model the best case is ~1.03-1.10× — a rounding error, not a route to 50 t/s.**
+
+**Caveat.** Both traces are single-pass generations (prose prompt, one coding
+prompt). The plan's premise — that a *real* PI coding-harness session (editing,
+refactoring, repeated code across turns) carries far more repetition than a
+synthetic prompt — was not captured; `ds4-server` was built but no harness
+session was driven through it. If that premise holds, a harness trace could
+still move the number; as measured on these workloads, n-gram drafting is dead.
+
 ### Arm R1 — name the 2.42 ms inside `attn_inv_rope` — 2026-08-27
 
 Build `179c105` (5 new `DS4_METAL_PROFILE_BRACKET_STAGE` labels: `idx_sort`,

@@ -90,6 +90,17 @@ session to know rather than a week.
 exactly 1.000× (zero offers, no verify charged); a period-8 synthetic reads
 1.716× at depth 4. A real trace between those is the expected outcome.
 
+**RESULT 2026-08-27** (build `d8536ed`): **speculation does not clear the bar.**
+Heartbeat confirmed; two traces captured and analysed. Prose (`promessi_sposi`,
+6143 tok): best **1.097×** (k=6 d=4), mean_cmt 0.30, 91.4% commit=0. Coding
+(hash-table C, 3938 tok): best **1.034×** (k=8 d=4), mean_cmt 0.15, 96.5%
+commit=0. Decision rule needs ~2.0 mean commit — best observed 0.30/0.15 is
+6-13× short. Both land just above the uniform-random control. Legacy
+V/T=4.459: prose 0.907×, coding 0.945× (loss). **MTP is not fundable on these
+workloads as measured; the low-context ceiling stands.** Caveat: single-pass
+traces, not a real PI-harness editing session; a harness trace could still
+move it. Full data in `BENCHMARKS-TP-PP.md` §Arm S.
+
 ---
 
 ### D-slope — firm up item C (15 min, coordinator only)
