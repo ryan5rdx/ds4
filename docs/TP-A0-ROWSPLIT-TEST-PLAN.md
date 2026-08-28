@@ -1170,9 +1170,31 @@ n-gram inherits.
 | full-fat MXFP4 support after the F32-HC fix | 19.91 | 157/1767 = **8.89%** |
 | low-yield production policy | 41.57 | verifier never launched |
 
-**DSpark's pass cost ~3× a decode step, and that is dominated by a 5.99 GB
-support-model forward every cycle.** n-gram's draft is a hash lookup — free. The
-last row is the tell: with no verifier launched, drafting alone costs ~1%.
+**DSpark's pass cost ~3× a decode step.** n-gram's draft is a hash lookup — free.
+The last row is the tell: with no verifier launched, drafting alone costs ~1%.
+
+> **CORRECTION 2026-08-27 — it is NOT "a 5.99 GB support-model forward every
+> cycle".** That framing implies ~560 GB/s, a rate the rig does not reach at
+> these shapes, and it is wrong by ~5× on the routed side: only the experts the
+> 5 draft rows actually route to are read, **~30 of 256 per stage (~12%)**.
+> Byte model per propose, from the shipped IQ2_XXS gate/up + Q2_K down support
+> GGUF (`speed-bench/README.md:326-327`, shapes at
+> `gguf-tools/deepseek4-quantize.c:2795-2833`):
+>
+> | term | MB |
+> |---|---|
+> | 3 stages × (routed ~212 + shared 27 + attn 114 + hc 3) | 1067 |
+> | `main_proj` Q8_0 (stage 0 only) | 54 |
+> | target vocab head Q8_0, ONE read for all 5 rows | 563 |
+> | `markov_w2` Q8_0 256×129280 × 5 sequential steps | 176 |
+> | readbacks | 3 |
+> | **total** | **~1.86 GB** |
+>
+> At 760 GB/s that is **2.4 ms**, against **10.7 ms measured** (3411.8 ms over
+> ~319 forced-d5 cycles) — **4.4× off roofline, ~174 GB/s effective.** That is
+> essentially the ~192 GB/s decode figure: **the propose is latency-bound exactly
+> like decode, not bandwidth-bound.** So it has the same headroom decode has, and
+> the same disease.
 
 **So the open question is verify cost alone, which nobody has isolated.** If a
 verify pass with N rows costs ~1× a decode step (weights are read once per pass
