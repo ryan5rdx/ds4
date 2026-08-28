@@ -1052,6 +1052,16 @@ static uint64_t g_dispatch_cbs;
 
 static id<MTLCounterSampleBuffer> g_ts_buffer;
 static const char *g_ts_labels[DS4_GPU_TS_MAX_ENCODERS];
+/* The batch reuses ONE encoder across many dispatches (ds4_gpu_end_compute_encoder
+ * is a no-op there, ds4_metal.m:1389), so every stage label in a batch segment
+ * lands in the SAME slot.  The old code let the last writer win silently, which is
+ * why the four flash-attn labels -- gather, packed, fa_core, reduce -- all resolved
+ * to "reduce": the span reported as `reduce` was the whole batch segment, not the
+ * reduce dispatch.  That is what made 27 x 157 us = 4.25 ms outweigh the 3.64 ms
+ * stage containing it.  Keep the first and last label plus a hit count so a
+ * composite span is visible as one instead of masquerading as its last stage. */
+static const char *g_ts_label_last[DS4_GPU_TS_MAX_ENCODERS];
+static uint16_t g_ts_label_hits[DS4_GPU_TS_MAX_ENCODERS];
 static uint32_t g_ts_n;
 /* First slot of the range owned by g_ts_cb; labels stay range-local. */
 static uint32_t g_ts_base;
@@ -1108,20 +1118,36 @@ static int ds4_gpu_ts_active(void) {
 /* Name the encoder currently being timestamped.  Call sites open the encoder
  * first and label it immediately after, so back-filling the most recent sample
  * slot is equivalent to pre-labelling and touches no call site. */
-static void ds4_gpu_ts_label(const char *label) {
-    if (!label) return;
-    if (g_ts_enabled > 0 && g_ts_n > 0 && !g_ts_labels[g_ts_n - 1]) {
-        g_ts_labels[g_ts_n - 1] = label;
-    } else {
-        g_ts_pending_label = label;
-    }
+/* Attach `label` to the encoder span currently open.  Every label that lands on a
+ * span is counted, so a span covering several stages reports as a composite rather
+ * than as whichever stage happened to write last. */
+static void ds4_gpu_ts_note_label(const char *label) {
+    if (!label || g_ts_enabled <= 0) return;
+    if (g_ts_n == 0) { g_ts_pending_label = label; return; }
+    const uint32_t i = g_ts_n - 1;
+    if (!g_ts_labels[i]) g_ts_labels[i] = label;
+    g_ts_label_last[i] = label;
+    if (g_ts_label_hits[i] < UINT16_MAX) g_ts_label_hits[i]++;
 }
 
-/* Name the encoder that just closed, overriding any generic trace label.  Used
- * where a caller knows the phase name only after encoding it. */
-static void ds4_gpu_ts_name_last(const char *label) {
-    if (label && g_ts_enabled > 0 && g_ts_n > 0) g_ts_labels[g_ts_n - 1] = label;
+static void ds4_gpu_ts_label(const char *label) { ds4_gpu_ts_note_label(label); }
+
+/* Force a real encoder boundary wherever a caller ends an encoder, so each stage
+ * gets its own timestamped span instead of sharing the batch segment's.  Off by
+ * default because it perturbs the schedule it is measuring. */
+static int ds4_gpu_ts_split_encoders(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_METAL_GPU_ENCODER_TIMESTAMPS_SPLIT") != NULL;
+    return v > 0 && ds4_gpu_ts_active();
 }
+
+/* Name the encoder that just closed.  Used where a caller knows the phase name
+ * only after encoding it.  In the batch the encoder has NOT actually closed
+ * (ds4_metal.m:1389 returns without ending it), so several of these can land on
+ * one span -- they are counted, not overwritten.  Set
+ * DS4_METAL_GPU_ENCODER_TIMESTAMPS_SPLIT=1 to force a real boundary at each site
+ * and get one span per stage, at the cost of perturbing the schedule. */
+static void ds4_gpu_ts_name_last(const char *label) { ds4_gpu_ts_note_label(label); }
 
 /* Counter timestamps are in a GPU tick unit that is NOT guaranteed to be
  * nanoseconds, and it differs by part: assuming ns validated on an M1 Max
@@ -1279,14 +1305,28 @@ static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
                               &union_us, &conc_mean, &max_conc);
     }
 
+    uint32_t composite_spans = 0;
     for (uint32_t i = 0; i < g_ts_n; i++) {
         const uint64_t a = t[i * 2].timestamp, b = t[i * 2 + 1].timestamp;
         if (b <= a) continue;
         const double us = (double)(b - a) * spt * 1e6;
         const double fair = fair_us ? fair_us[i] : 0.0;
+        /* A span carrying more than one label covers more than one stage, and
+         * attributing it to any single one of them is how `reduce` came to
+         * outweigh the stage containing it.  Show the range and the count. */
+        char lbl[40];
+        const char *first = g_ts_labels[i], *last = g_ts_label_last[i];
+        const unsigned hits = g_ts_label_hits[i];
+        if (hits > 1) {
+            composite_spans++;
+            if (first && last && first != last) snprintf(lbl, sizeof lbl, "%s..%s+%u", first, last, hits);
+            else snprintf(lbl, sizeof lbl, "%s+%u", first ? first : "?", hits);
+        } else {
+            snprintf(lbl, sizeof lbl, "%s", first ? first : "(unlabelled)");
+        }
         fprintf(stderr,
                 "ds4: enc-ts %-28s raw %8.1f us   norm %8.1f us   fair %8.1f us  %5.1f%%\n",
-                g_ts_labels[i] ? g_ts_labels[i] : "(unlabelled)", us, us * norm, fair,
+                lbl, us, us * norm, fair,
                 cb_us_pre > 0.0 ? fair / cb_us_pre * 100.0 : 0.0);
     }
     const double cb_us = cb_s * 1e6;
@@ -1303,6 +1343,14 @@ static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
             tag ? tag : "", union_us / 1000.0,
             cb_us > 0.0 ? union_us / cb_us * 100.0 : 0.0,
             (cb_us - union_us) / 1000.0, conc_mean, max_conc);
+    if (composite_spans) {
+        fprintf(stderr,
+                "ds4: enc-ts %s: %u of %u spans carry MULTIPLE stage labels -- "
+                "per-stage attribution is not available%s\n",
+                tag ? tag : "", composite_spans, g_ts_n,
+                ds4_gpu_ts_split_encoders() ? "" :
+                " (set DS4_METAL_GPU_ENCODER_TIMESTAMPS_SPLIT=1 to force one span per stage)");
+    }
     free(starts); free(ends); free(fair_us);
     g_ts_reported_ranges++;
     /* Multiplying a per-call figure by a calls/token count read off this log is
@@ -1347,10 +1395,13 @@ static MTLComputePassDescriptor *ds4_gpu_ts_pass_descriptor(void) {
     pd.sampleBufferAttachments[0].startOfEncoderSampleIndex = (g_ts_base + g_ts_n) * 2u;
     pd.sampleBufferAttachments[0].endOfEncoderSampleIndex = (g_ts_base + g_ts_n) * 2u + 1u;
     g_ts_labels[g_ts_n] = g_ts_pending_label;
+    g_ts_label_last[g_ts_n] = g_ts_pending_label;
+    g_ts_label_hits[g_ts_n] = g_ts_pending_label ? 1u : 0u;
     g_ts_pending_label = NULL;
     g_ts_n++;
     return pd;
 }
+
 
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
     if (g_batch_cb && cb == g_batch_cb) {
@@ -1384,9 +1435,19 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
     return enc;
 }
 
+static void ds4_gpu_close_batch_encoder(void);
+
 static void ds4_gpu_end_compute_encoder(id<MTLCommandBuffer> cb, id<MTLComputeCommandEncoder> enc) {
     if (!enc) return;
-    if (g_batch_cb && cb == g_batch_cb && enc == g_batch_enc) return;
+    if (g_batch_cb && cb == g_batch_cb && enc == g_batch_enc) {
+        /* Normally a no-op: the batch keeps one encoder alive across many
+         * dispatches, which is why per-stage labels collapse onto one span.
+         * Under split mode, close it so the next dispatch opens a fresh
+         * timestamped span.  Ending an encoder is a stronger barrier than
+         * reusing one, so this can only over-serialise, never mis-order. */
+        if (ds4_gpu_ts_split_encoders()) ds4_gpu_close_batch_encoder();
+        return;
+    }
     [enc endEncoding];
 }
 
