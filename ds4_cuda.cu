@@ -3658,8 +3658,8 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
     uint64_t out_elems = 0;
     if (!out || !slots || n_rows == 0 || width == 0 || n_slots == 0 ||
         slot_cap == 0 || n_rows > slot_cap ||
-        (uint64_t)n_slots > UINT64_MAX / slot_cap ||
-        (slot_rows = (uint64_t)n_slots * slot_cap) > UINT64_MAX / width ||
+        (slot_rows = (uint64_t)(n_slots - 1u) * slot_cap + n_rows) >
+            UINT64_MAX / width ||
         (slot_elems = slot_rows * width) > UINT64_MAX / sizeof(float) ||
         (uint64_t)n_rows > UINT64_MAX / n_slots ||
         (out_rows = (uint64_t)n_rows * n_slots) > UINT64_MAX / width ||
@@ -3682,6 +3682,11 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+extern "C" int ds4_gpu_stage_flush(const char *part, const char *stage, uint32_t layer, uint32_t pos0, uint32_t n_tokens) {
+    (void)part; (void)stage; (void)layer; (void)pos0; (void)n_tokens;
+    return ds4_gpu_flush_commands();
+}
+extern "C" void ds4_gpu_stage_report(const char *what, uint32_t pos0, uint32_t n_tokens) { (void)what; (void)pos0; (void)n_tokens; }
 extern "C" int ds4_gpu_end_commands(void) {
     if (g_cuda_end_stream_sync) {
         return cuda_ok(cudaStreamSynchronize(0), "end commands stream");

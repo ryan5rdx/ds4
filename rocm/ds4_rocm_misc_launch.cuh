@@ -12,11 +12,14 @@ extern "C" int ds4_gpu_pack_slot_rows_f32_tensor(
         uint32_t                width,
         uint32_t                n_slots,
         uint32_t                slot_cap) {
+    uint64_t slot_rows = 0;
     uint64_t slot_elems = 0;
     uint64_t out_elems = 0;
     if (n_rows == 0 || width == 0 || n_slots == 0 || slot_cap == 0 ||
         n_rows > slot_cap ||
-        !cuda_u64_mul3_checked(n_slots, slot_cap, width, &slot_elems) ||
+        (slot_rows = (uint64_t)(n_slots - 1u) * slot_cap + n_rows) >
+            UINT64_MAX / width ||
+        (slot_elems = slot_rows * width) > UINT64_MAX / sizeof(float) ||
         !cuda_u64_mul3_checked(n_rows, n_slots, width, &out_elems) ||
         !cuda_tensor_has_f32(slots, slot_elems) ||
         !cuda_tensor_has_f32(out, out_elems)) {
