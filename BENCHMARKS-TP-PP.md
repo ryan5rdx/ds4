@@ -243,6 +243,45 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### Arm B6 — the label was the bug: `reduce` was never a reduce — 2026-08-27
+
+Build `eb90b5f` (labels counted per span, composites printed; `SPLIT` mode
+opt-in). Two passes × 2k + 131k, gen 128.
+
+**Pass 1 (default) — the falsifier fired: the collapse is real and total.**
+
+| ctx | composite spans | of total | label |
+|---|---|---|---|
+| 2k | **3456** | 27 of 109 per cb | `fa_core..reduce` |
+| 131k | **2432** | 19 of 157 per cb | `fa_core..reduce` |
+
+**`reduce` was never a reduce.** In the batch, `ds4_gpu_end_compute_encoder` is
+a no-op and `ds4_gpu_compute_encoder` reuses the same encoder without a new slot,
+so all four FA label sites (`gather`/`packed`/`fa_core`/`reduce`) wrote the SAME
+slot and `ds4_gpu_ts_name_last` overwrote unconditionally — `reduce`, last, won.
+The span reported as `reduce` was the **whole batch segment**, and the 27/token
+(2k) / 19/token (131k) count was the number of segments whose last label was
+`reduce` — which is why it matched no partition of the 43 layers. **Everything
+per-encoder from arm B through B5 is retired** (µs/call figures). What survives:
+tick 1.000 ns, conc ≈ 2, union 100%, gap ≈ 0, and the throughput baselines.
+
+**Pass 2 (SPLIT=1) — true per-stage spans, perturbed (ratio, not absolute):**
+
+| ctx | fa_core | reduce | reduce product | `attn_inv_rope` | t/s (perturbed) |
+|---|---|---|---|---|---|
+| 2k | 25.8 µs | 30.5 µs | **0.66 ms** (×21.7/token) | 3.64 ms | 32.34 (-23%) |
+| 131k | 59.6 µs | 69.2 µs | **0.60 ms** (×8.7/token) | 4.24 ms | 25.12 |
+
+**`reduce` alone is ~30-69 µs/call and ~0.6 ms/token — tiny against
+`attn_inv_rope` (3.64/4.24 ms).** The 2k overshoot is fully explained: it was a
+composite span, not a paradox. FA split @2k ≈ fa_core 46% : reduce 54%.
+Residual composites in pass 2 are minimal (1 of 512 spans, prefill/boundary).
+Pass 2 perturbs as designed (over-serialisation): conc 1.78-1.79, gap opened to
+2.7-6.3 ms, throughput −23%/-15%.
+
+**Correction to arm C's layer table:** ratio-128 is **20** layers, not 21
+(2 raw + 20 ratio-128 + 21 ratio-4 = 43).
+
 ### Arm B5 — fair-share decomposition; the falsifier fires — 2026-08-27
 
 Build `a59d3af` (fair-share interval decomposition replaces the uniform

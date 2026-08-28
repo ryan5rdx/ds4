@@ -1329,6 +1329,18 @@ the call site rather than the encoder.
 **Standing correction.** Arm C's layer table reads `21` for ratio-128; it should be
 **20** (2 + 20 + 21 = 43). Its line-count divisor is per-class, not a uniform `/5`.
 
+**RESULT 2026-08-27** (build `eb90b5f`, two passes): **the collapse is real and
+total.** Pass 1 reports **3456 `fa_core..reduce` composite spans @2k (27/token)
+and 2432 @131k (19/token)** — exactly the mysterious counts from every run since
+B. `reduce` was the whole batch segment (all four FA labels wrote one slot;
+`reduce`, last, overwrote). **Everything per-encoder from arm B through B5 is
+retired.** Pass 2 (SPLIT) gives true spans: **reduce = 30.5 µs/call @2k →
+0.66 ms/token, 69.2 µs/call @131k → 0.60 ms/token** — tiny against
+`attn_inv_rope` 3.64/4.24 ms. The 2k overshoot was a composite-span artefact, not
+a paradox. FA split @2k ≈ fa_core 46% : reduce 54%. Pass 2 perturbs (−23% t/s,
+gap opens to 2.7-6.3 ms) as designed; conc 1.78. Full data in
+`BENCHMARKS-TP-PP.md` §Arm B6.
+
 ### Arm B5 — stop dividing, decompose: the `fair` column — 2026-08-27
 
 B4 did its job: the LOSS line went in, and the answer was **not** loss. The
