@@ -2547,7 +2547,8 @@ int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
  * RoPE specialisation. The three sites that select it, and the two fuse
  * predicates that mirror it, all tested the device name for "M3" or "M5". An
  * M3 Ultra satisfies both that name test and ds4_gpu_device_is_pre_m5_apple_
- * silicon(), so e6a6ab5's ported decode fusions were exercised there while
+ * silicon(), so the decode fusions ported in upstream PR #778 were exercised
+ * there while
  * every other pre-M5 part silently fell through to the unfused path: the gate
  * was a device-name test where the rest of the port used a family predicate.
  *

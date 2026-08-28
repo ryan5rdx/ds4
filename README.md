@@ -83,12 +83,32 @@
 > `make test-mxfp4-metal`, and the prefill chunk ladder inside
 > `tests/test_engine_mgpu_placement.c`.
 >
+> ### Credit
+>
+> Several of the kernels this fork builds on came from open pull requests
+> against [antirez/ds4](https://github.com/antirez/ds4) rather than from work
+> done here. They are carried, extended and measured on the two-node pair, but
+> the kernels are theirs:
+>
+> * **PR #831** and **PR #832**, Adrian Galilea — the register-resident prefill
+>   indexer scorer, and the streaming top-512 selector with its tie-break
+>   comparator. Between them these are the largest prefill kernel wins on this
+>   branch.
+> * **PR #778**, david — the M5 decode encoder and occupancy work, which this
+>   fork extends to earlier Apple silicon by replacing device-family gates with
+>   capability checks.
+> * **PR #846**, Tiziano Arena — M1-class decode tuning and the batch-verifier
+>   groundwork the tensor-parallel speculative path is built on. The n-gram
+>   speculation from that PR was measured on this rig and removed; the rest is
+>   carried.
+>
+> The tensor-parallel row splitting, the RDMA transport and fence, the prefill
+> watchdog ladder, and the serving-side live-KV work are this fork's.
+>
 > ### Documentation
 >
 > * [`fork/docs/benchmarks.md`](fork/docs/benchmarks.md) — the measurement
 >   record, including the closed avenues, so they are not re-investigated
-> * [`fork/docs/glm-5.3-flash-estimate.md`](fork/docs/glm-5.3-flash-estimate.md)
->   — projected performance for GLM-5.3-Flash on the same rig
 >
 > Everything below is the upstream README.
 
