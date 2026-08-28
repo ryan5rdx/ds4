@@ -128,6 +128,18 @@ with any arm; if twelve pair restarts is too costly, three interleaved repeats o
 N=16 predicts `688 × 3.4638 = 2.383 ms` → 37.53 t/s, a **3.69 t/s drop = 7.4× the
 current signal**.
 
+**RESULT 2026-08-27** (build `d8536ed`, 3 interleaved repeats of {0,2,8,16}):
+**the dev-box-scaled 3.464 µs/dispatch is falsified on the rig.** Fitted
+`t/s = 41.106 − 0.0694·N` (R² tight, sd ≤0.3). At N=16: **40.00 t/s, drop
+1.11 t/s** — the plan predicted 37.53 / 3.69, so the prediction is **3.3× too
+pessimistic**. Per no-op dispatch ≈ **0.98 µs at N=16** (688 no-ops → 0.676 ms),
+not 3.46. The slope is **nonlinear**: N=0→2 costs ~2.49 µs/dispatch, N=0→16
+only 0.98 µs — marginal cost falls as N grows, consistent with the established
+~2× encoder overlap hiding later no-ops. Item C's 0.510 ms cost (scaled off the
+dev box) is over-estimated; at the N=2 scale relevant to a small dispatch
+reduction it is ~2.5 µs/dispatch, at scale ~1 µs. Full data in
+`BENCHMARKS-TP-PP.md` §Arm D-slope.
+
 ---
 
 ### R1 needs a re-run, and the build it ran on is why

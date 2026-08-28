@@ -292,6 +292,33 @@ synthetic prompt — was not captured; `ds4-server` was built but no harness
 session was driven through it. If that premise holds, a harness trace could
 still move the number; as measured on these workloads, n-gram drafting is dead.
 
+### Arm D-slope — item C dispatch-ballast slope — 2026-08-27
+
+Build `d8536ed`. Three interleaved repeats of `DS4_METAL_DISPATCH_BALLAST ∈
+{0,2,8,16}` at 2k, gen 128, pair restart each. Fit t/s vs N.
+
+| N | t/s per repeat | mean | sd |
+|---|---|---|---|
+| 0 | 41.19, 41.20, 41.17 | **41.187** | 0.015 |
+| 2 | 40.48, 41.00, 41.00 | **40.827** | 0.300 |
+| 8 | 40.65, 40.66, 40.60 | **40.637** | 0.032 |
+| 16 | 40.06, 39.95, 39.90 | **39.970** | 0.082 |
+
+**Fitted: t/s = 41.106 − 0.0694·N.** Per-token time goes 24.327 → 25.003 ms
+(Δ0.676 ms) across N=0→16 = 688 no-ops → **0.98 µs/dispatch at N=16**.
+
+**Prediction check: falsified.** The plan predicted N=16 → 37.53 t/s (3.69
+drop = 7.4× signal). Observed **40.00 t/s (1.11 drop)** — the dev-box-scaled
+3.464 µs/dispatch is **3.3× too high on the rig**.
+
+**Nonlinearity.** Marginal cost per no-op falls with N: N=0→2 (86 no-ops, 0.214
+ms) ≈ **2.49 µs/dispatch**; N=0→16 ≈ **0.98 µs**. Later no-ops hide behind the
+established ~2× encoder overlap. **Item C's 0.510 ms / +0.88 t/s is
+over-estimated**; the true per-dispatch cost is ~2.5 µs at the small-N scale a
+dispatch reduction actually operates at, ~1 µs at scale. The earlier arm D
+(41.22 vs 40.72, Δ0.50 t/s for +86) is consistent with the N=0→2 leg (Δ0.36
+here, 0.214 ms) — both ~2.5 µs.
+
 ### Arm R1 — name the 2.42 ms inside `attn_inv_rope` — 2026-08-27
 
 Build `179c105` (5 new `DS4_METAL_PROFILE_BRACKET_STAGE` labels: `idx_sort`,
