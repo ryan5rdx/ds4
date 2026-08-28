@@ -119,6 +119,15 @@ tests/bench_amx_indexer: tests/bench_amx_indexer.o
 bench-amx-indexer: tests/bench_amx_indexer
 	./tests/bench_amx_indexer
 
+tests/test_indexer_scorer.o: tests/test_indexer_scorer.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_indexer_scorer: tests/test_indexer_scorer.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-indexer-scorer: tests/test_indexer_scorer
+	./tests/test_indexer_scorer
+
 tests/test_topk_stream512.o: tests/test_topk_stream512.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 

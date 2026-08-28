@@ -571,6 +571,13 @@ int ds4_gpu_dspark_markov_argmax_tensor(ds4_gpu_tensor *out_idx,
                                         uint32_t prev_token,
                                         uint32_t vocab,
                                         uint32_t rank);
+/* Name of the kernel the most recent indexer scorer / top-k call selected.
+ * Exists so an A/B test can assert it really compared two different paths: a
+ * bit-exactness test whose arms silently resolve to the same kernel passes
+ * vacuously, which is the failure mode these tests exist to avoid. */
+const char *ds4_gpu_last_indexer_scorer(void);
+const char *ds4_gpu_last_indexer_topk(void);
+
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,

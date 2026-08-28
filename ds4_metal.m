@@ -178,6 +178,12 @@ static id<MTLComputePipelineState> g_dsv4_softmax_pool_pipeline;
 static id<MTLComputePipelineState> g_soft_max_f32_pipeline;
 static id<MTLComputePipelineState> g_soft_max_f32_4_pipeline;
 static id<MTLComputePipelineState> g_argsort_f32_i32_desc_pipeline;
+
+static const char *g_last_indexer_scorer = "none";
+static const char *g_last_indexer_topk = "none";
+const char *ds4_gpu_last_indexer_scorer(void) { return g_last_indexer_scorer; }
+const char *ds4_gpu_last_indexer_topk(void) { return g_last_indexer_topk; }
+
 static id<MTLComputePipelineState> g_argsort_merge_f32_i32_desc_pipeline;
 static id<MTLComputePipelineState> g_sum_rows_f32_f32_pipeline;
 static id<MTLComputePipelineState> g_dsv4_topk_mask_pipeline;
@@ -18417,6 +18423,10 @@ static int ds4_gpu_indexer_scores_batch_tensor(
          * reduction order are unchanged, so the output is bit-identical. */
         const bool use_tiled5 = use_tiled2 &&
             getenv("DS4_METAL_DISABLE_INDEXER_SCORES_TILED5") == NULL;
+        g_last_indexer_scorer =
+            use_nax ? "nax" :
+            (g_quality_mode ? "tiled_f32" :
+             (use_tiled5 ? "tiled5" : (use_tiled2 ? "tiled2" : "tiled")));
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(
             use_nax ? "kernel_dsv4_indexer_scores_nax" :
             (g_quality_mode ? "kernel_dsv4_indexer_scores_tiled_f32" :
@@ -18620,6 +18630,7 @@ int ds4_gpu_indexer_topk_tensor(
          * monotone with context. */
                 if (top_k == 512u && n_tokens >= 32u &&
             getenv("DS4_METAL_DISABLE_TOPK_STREAM512") == NULL) {
+            g_last_indexer_topk = "stream512";
             static int logged_stream512;
             if (!logged_stream512) {
                 logged_stream512 = 1;
@@ -18665,6 +18676,7 @@ int ds4_gpu_indexer_topk_tensor(
                  * agree with the selector, because a batch below the selector's
                  * token threshold takes this path and the two must not disagree
                  * on a tie. */
+                g_last_indexer_topk = (top_k == 512u) ? "argsort_canon" : "argsort";
                 id<MTLComputePipelineState> sort_pipeline = (top_k == 512u)
                         ? ds4_gpu_get_pipeline("kernel_argsort_f32_i32_desc_canon")
                         : g_argsort_f32_i32_desc_pipeline;

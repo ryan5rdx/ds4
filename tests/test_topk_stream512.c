@@ -113,12 +113,18 @@ int main(void) {
           "argsort fallback topk");
     CHECK(ds4_gpu_tensor_read(sel, 0, sel_argsort, n_sel * sizeof(int32_t)),
           "read fallback");
+    const char *arm_a = ds4_gpu_last_indexer_topk();
 
     unsetenv("DS4_METAL_DISABLE_TOPK_STREAM512");
     CHECK(ds4_gpu_indexer_topk_tensor(sel, scores, n_comp, n_tokens, top_k),
           "stream512 topk");
     CHECK(ds4_gpu_tensor_read(sel, 0, sel_stream, n_sel * sizeof(int32_t)),
           "read stream512");
+    const char *arm_b = ds4_gpu_last_indexer_topk();
+    /* Prove two different kernels ran.  Below the selector's token threshold
+     * both arms take the fallback, so this test only compares paths when the
+     * shape admits the selector -- say so rather than reporting a vacuous pass. */
+    printf("arms: reference=%s candidate=%s\n", arm_a, arm_b);
 
     uint64_t diff_ab = 0, diff_cpu_stream = 0, diff_cpu_argsort = 0;
     for (uint32_t t = 0; t < n_tokens; t++) {
@@ -153,6 +159,8 @@ int main(void) {
     /* Every one of these is fatal.  An earlier version printed the CPU-reference
      * count and returned success regardless, which made the only arm that can
      * catch a shared error advisory. */
+    CHECK(strcmp(arm_a, arm_b) != 0,
+          "both arms selected the same kernel -- raise NT above the selector's threshold");
     CHECK(diff_ab == 0, "stream512 and the argsort fallback disagree");
     CHECK(diff_cpu_stream == 0, "stream512 disagrees with the CPU reference");
     CHECK(diff_cpu_argsort == 0, "argsort fallback disagrees with the CPU reference");
