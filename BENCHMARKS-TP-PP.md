@@ -302,6 +302,36 @@ GPU-encoder boundary and must be chased where the stages are distinct code paths
 
 ### Arm W1 — does prefill pay the batch-encode fixed cost? — 2026-08-28
 
+**Units corrected 2026-08-28 (`5d1f45d`): the table is in SECONDS, not ms.**
+Build `6d632c9`. Prefill 2048 tokens in 1/4/16/64 steps (additive path,
+`--step-incr 512/128/32`), gen 8, pair restart per arm. Total prefill time =
+Σ per-step (prefill_tokens / prefill_tps) from CSV.
+
+| batches | total prefill (s) |
+|---|---|
+| 1 | 4.522 s (452.9 t/s) |
+| 4 | 5.676 s |
+| 16 | 10.168 s |
+| 64 | 25.387 s |
+
+**Fit (R² = 0.9989): total = 4.45 + 0.329 × batches s** →
+**F = 329 ms/batch = 7.65 ms/layer** (per 43-layer batch).
+
+**Decision rule fires the OTHER way — F ≫ 35 ms-equivalent.** Prefill's
+per-batch cost is **7.65 ms/layer = 9.4× the verify's 810 µs/layer**, not 100×
+smaller. But **the arm cannot settle the question**: varying batch count at fixed
+total tokens varies encode overhead *and* expert re-streaming together (a
+32-token chunk routes to ~136 of 256 experts ≈ 39 GB ≈ 87 ms). The fit is real
+but confounded. This is why W1b exists (holds routed work constant).
+
+**What W1 does establish:** prefill carries a genuine per-batch cost with an
+excellent fit — **chunk size matters far more than a few percent** (at 64
+batches 2k prefill collapses 453 → 81 t/s). Prefill is safe because the work
+budget floors chunks at 512 tokens; the exposed case is multi-slot batching
+(W3).
+
+### Arm W1b — separate encode overhead from weight re-streaming — 2026-08-28
+
 Build `6d632c9`. Prefill 2048 tokens in 1/4/16/64 steps (additive path,
 `--step-incr 512/128/32`), gen 8, pair restart per arm. Total prefill time =
 Σ per-step (prefill_tokens / prefill_tps) from CSV.

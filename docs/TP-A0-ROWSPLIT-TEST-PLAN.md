@@ -303,16 +303,17 @@ what this measures. Sum the per-step prefill times from the CSV.
   bookkeeping, the spec-cycle wrapper) and prefill is unaffected. That is also a
   useful answer: it localises the cost to the speculative path and closes it.
 
-**RESULT 2026-08-28** (build `6d632c9`): **F ≪ 35 ms — the fixed term is
-verify-specific, prefill does not pay it.** Prefill 2048 in 1/4/16/64 steps:
-total 4.52/5.68/10.17/25.39 ms → fit `total = 4.45 + 0.329×batches` (R²=0.999),
-**F = 329 µs/batch = 7.6 µs/layer** against the verify's 810 µs/layer — ~100×
-smaller. The 34.83 ms fixed term is local to the speculative path (TP batch
-gates / capture bookkeeping / spec-cycle wrapper), not a general batch-encode
-overhead, and does not threaten prefill or any non-speculative multi-row batch.
-W2's proportionality question is moot (7.6 vs 810 µs/layer); W3's multi-slot
-exposure is bounded by the small F, not the verify's 34.83 ms. Full data in
-`BENCHMARKS-TP-PP.md` §Arm W1.
+**RESULT 2026-08-28** (build `6d632c9`, units corrected `5d1f45d`): prefill
+2048 in 1/4/16/64 steps: total **4.52/5.68/10.17/25.39 s** → fit
+`total = 4.45 + 0.329×batches` (R²=0.999), **F = 329 ms/batch = 7.65 ms/layer**
+= **9.4× the verify's 810 µs/layer** — the decision rule fires the other way.
+**But the arm is confounded:** varying batch count at fixed total tokens varies
+encode overhead *and* expert re-streaming together (a 32-token chunk routes to
+~136/256 experts ≈ 39 GB ≈ 87 ms), so W1 cannot say how much is encode. What W1
+establishes is a real per-batch cost — **chunk size matters** (64 batches: 453
+→ 81 t/s) — with prefill safe (work budget floors chunks at 512) and the exposed
+case being multi-slot batching (W3). The settle-the-question arm is **W1b**, not
+W1. Full data in `BENCHMARKS-TP-PP.md` §Arm W1 (corrected).
 
 **Confound to watch.** The engine re-chunks internally to a work budget
 (`DS4_PREFILL_CHUNK_WORK_BUDGET`, `ds4.c:12265`), so a 2048-token request may
