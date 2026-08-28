@@ -142,6 +142,54 @@ reduction it is ~2.5 µs/dispatch, at scale ~1 µs. Full data in
 
 ---
 
+### Arm W4 — is multi-session batching engaging at all?
+
+W3 concluded that concurrent slots "each take their own encode" from a flat
+aggregate. That is an inference, and the plan asked for the batching behaviour
+to be observed rather than inferred, because the two possible causes have very
+different consequences.
+
+Batched multi-session decode **is** supported under tensor parallelism by
+default — `ds4_sessions_eval_batch_metal_supported` (`ds4.c:64851`) refuses only
+when `DS4_METAL_TP_SESSION_BATCH=0`, so W3 should have used it. One run settles
+which happened.
+
+```
+# ds4-server TP pair, --batched-session 8, same 8 concurrent completions as W3
+                                  ... default
+DS4_METAL_TP_SESSION_BATCH=0      ... coordinator AND worker
+```
+
+**Read:** aggregate t/s at N=8, both arms.
+
+- **Identical** → batching is not engaging, and the per-row saving it should be
+  collecting is being left on the floor. Then find out why: `count < 2` at the
+  call site, a `checkpoint_valid` miss, or the server never grouping the
+  requests into one `ds4_sessions_eval_batch` call (`ds4_server.c:11438`).
+- **Disabled arm slower** → batching is working, and the small margin between
+  the arms is all it buys. W3's conclusion stands as measured and the thread
+  closes.
+
+**Expected margin, and why it is small.** The verify is itself a batched
+multi-row forward, and it measures **21.64 ms/row at five rows against 24.26 for
+a single token — 11%**. So batching on this engine is worth roughly a tenth per
+row, not the multiple a byte model suggests: dense and attention weights do
+amortise across rows, but the routed-expert union grows with row count and
+dominates. An 8-row batch would reach ~122 t/s aggregate on bytes alone against
+34.79 observed, and the verify says that model is optimistic by about 4× on
+exactly this shape.
+
+**Falsifier.** If the disabled arm is *faster*, batching is costing rather than
+saving and should be off by default under TP.
+
+**Note on W1b.** Its 256- and 128-token arms failed with a TP gate exchange
+error, which the write-up reads as a protocol floor on chunk granularity. Worth
+one retry before accepting that: `ds4-bench` parses `--prefill-chunk`
+(`ds4_bench.c:361`) and the worker is launched without sweep flags by
+convention, so the two ranks may simply have disagreed because only the
+coordinator was told. If it fails with the flag on **both** ranks, the floor is
+real. Low priority either way now that W3 has closed the question W1b served.
+
 ### Arm W1b — separate encode overhead from weight re-streaming
 
 W1 measured a real ~329 ms per-batch prefill cost (R² = 0.9989) but cannot say
