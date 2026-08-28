@@ -288,7 +288,8 @@ kernel void kernel_argsort_merge_f32_i32(
 template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge_t kernel_argsort_merge_f32_i32<DS4_SORT_ORDER_DESC>;
 
 // Exact streaming top-512 for wide prefill rows, the Metal port of the CUDA
-// stream selector: the threshold is the 512th-best key seen so
+// stream selector from upstream PR #832 (Adrian Galilea): the threshold is
+// the 512th-best key seen so
 // far, so it can only discard candidates that cannot belong to the final top
 // set.  Keys pack (score, idx) into one ulong with the same total order as
 // the canonical argsort — score descending, index ascending — so the output
