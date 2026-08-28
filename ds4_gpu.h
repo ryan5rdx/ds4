@@ -56,6 +56,18 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+/* Pipeline-parallel activation handoff.  The source tensor is CPU-visible
+ * shared storage whose ready word is published after the transport has filled
+ * the payload.  The GPU waits coherently, then copies the payload into the
+ * graph-owned destination without a post-receive CPU memcpy. */
+int ds4_gpu_pp_fence_wait_copy(ds4_gpu_tensor       *dst,
+                               const ds4_gpu_tensor *src,
+                               const ds4_gpu_tensor *sync,
+                               uint64_t              bytes,
+                               uint64_t              ready_offset,
+                               uint64_t              timeout_offset,
+                               uint32_t              ready_value);
+int ds4_gpu_pp_fast_fence_available(void);
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
@@ -77,6 +89,10 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
+/* Commit the active command buffer without waiting and without allocating its
+ * replacement.  Used by PP to pre-arm a coherent input wait before the
+ * activation has arrived; callers must begin the following command buffer. */
+int ds4_gpu_commit_commands_async(void);
 int ds4_gpu_commands_active(void);
 #ifdef __APPLE__
 int ds4_gpu_parallel_ffn_finish(void);
@@ -109,6 +125,12 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 #endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+/* DS4_METAL_GPU_STAGE_TIMESTAMPS: commit the command batch in flight without
+ * waiting and remember it under a stage tag; the report reads GPU start/end
+ * timestamps once the caller has waited for the whole layer or token.  Metal
+ * only: other backends flush and record nothing. */
+int ds4_gpu_stage_flush(const char *part, const char *stage, uint32_t layer, uint32_t pos0, uint32_t n_tokens);
+void ds4_gpu_stage_report(const char *what, uint32_t pos0, uint32_t n_tokens);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
@@ -166,6 +188,10 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 int ds4_gpu_device_is_pre_m5_apple_silicon(void);
 int ds4_gpu_device_is_m5_apple_silicon(void);
 int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled);
+/* Calibration only: emits DS4_METAL_DISPATCH_BALLAST extra one-thread
+ * dispatches so the marginal per-dispatch cost can be measured in situ rather
+ * than back-derived. No-op unless the variable is set. */
+void ds4_gpu_decode_dispatch_ballast(void);
 /* Strict test oracle for the fixed decode mul_mv pipeline lookup cache. */
 int ds4_gpu_test_decode_pipeline_fast_lookup(void);
 /* Strict test oracle for the extended decode mul_mv_ext (nsg + nxpsg) cache. */
@@ -183,6 +209,9 @@ enum {
     DS4_GPU_TEST_HC_RMS_SCALE_PROJ = 1u << 6,
 };
 void ds4_gpu_test_set_flags(uint32_t flags);
+/* Model-free Metal oracle: select a synthetic expert shard without starting
+ * the TP gate service. Passing world=1 restores ordinary unsharded behavior. */
+void ds4_gpu_test_set_tp_expert_shard(uint32_t rank, uint32_t world);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #else
 static inline int ds4_gpu_device_is_pre_m5_apple_silicon(void) { return 0; }
@@ -328,8 +357,33 @@ void ds4_gpu_tp_set_attn_head_split(int enabled);
  * owned ranges are warmed; the rest must never be paged in). Call before
  * the model is mapped. */
 void ds4_gpu_model_residency_skip(int skip);
-/* Nonzero after any gate exchange failed; the eval must abort. */
+/* Nonzero once a Metal command buffer returned an error -- typically the GPU
+ * watchdog killing a hung submission.  Sticky and process-wide: nothing
+ * submitted afterwards can be trusted, and there is no in-process way back. */
+int ds4_gpu_device_lost(void);
+/* Nonzero after any gate exchange failed, or after the bounded release fence
+ * timed out; the eval must abort.  These two causes have different lifetimes --
+ * see ds4_gpu_tp_clear_fence_timeout(). */
 int ds4_gpu_tp_failed(void);
+/* Nonzero when the cause is specifically a latched fence timeout (as opposed to
+ * a failed exchange).  For diagnostics; ds4_gpu_tp_failed() covers both. */
+int ds4_gpu_tp_fence_timed_out(void);
+/* Consume a latched fence timeout.
+ *
+ * The bounded spin in kernel_dsv4_tp_fence_wait latches this when it gives up
+ * before the service thread writes the release word, which means that step's
+ * kernels consumed stale peer rows -- so the host must reject that step.  It
+ * does NOT mean the transport died: the service thread writes the release
+ * unconditionally, and every wait is an exact match on a strictly increasing
+ * seq-derived value, so a stale word cannot satisfy a later step's wait.  The
+ * condition is therefore recoverable, and whoever rejects the step must clear
+ * it.  Leaving it latched makes one slow gate -- a long peer prefill chunk, a
+ * page fault, an RDMA retransmit -- fail every subsequent decode for the life
+ * of the process, which presents as an unexplained throughput collapse rather
+ * than as a fault.
+ *
+ * Genuine transport death stays sticky and is unaffected by this call. */
+void ds4_gpu_tp_clear_fence_timeout(void);
 
 /* Tensor-parallel sliced projections (Metal decode path only).
  *
@@ -462,6 +516,20 @@ int ds4_gpu_embed_tokens_quant_tensor(
         uint32_t                n_vocab,
         uint32_t                n_tokens,
         uint32_t                n_embd);
+
+/* Trace annotation for Metal System Trace. All no-ops unless
+ * DS4_METAL_TRACE_LABELS is set: encoders get labelled with the current tag
+ * and hot stages get nested debug groups, so metal-gpu-intervals attributes a
+ * token per layer and per stage with no measurement overhead when off. */
+/* Non-zero when a decode token may be flushed mid-graph under tensor
+ * parallelism, i.e. both gate directions use per-slot words rather than the
+ * monotonic shared event. gate_slots is the total slot count the token will
+ * use. Fails closed. */
+int ds4_gpu_tp_split_safe(uint32_t gate_slots);
+int ds4_gpu_tp_batch_split_safe(uint32_t gate_slots);
+
+void ds4_gpu_trace_tag(const char *tag);
+void ds4_gpu_trace_tag_layer(uint32_t layer, const char *stage);
 
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
@@ -2861,6 +2929,28 @@ int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
+
+/* Fair-share decomposition of a set of encoder spans (DS4_METAL_GPU_ENCODER_TIMESTAMPS).
+ * Wherever k spans are in flight, each is credited dt/k, so overlap is priced per
+ * encoder from the timestamps instead of being smeared by a uniform divisor.
+ * `fair_us` receives n values summing to `*union_us`, the wall time in which any
+ * span is active.  Exposed (rather than kept static) so tests/test_ts_fairshare.c
+ * can check it against hand-computed interval sets -- the uniform divisor it
+ * replaces was wrong in a way that only showed up as a stage exceeding the stage
+ * that contains it, which is far too late to notice.  Requires no GPU. */
+void ds4_gpu_ts_fair_share(const uint64_t *starts, const uint64_t *ends, uint32_t n,
+                           double spt, double *fair_us, double *union_us,
+                           double *conc_mean, uint32_t *max_conc);
+
+/* Name the encoder span most recently created, from a CALL SITE rather than from
+ * inside the helper that created it.  ds4_gpu_rope_tail_tensor has six callers
+ * across q_path, kv_path, the indexer and three points inside the
+ * compressor_indexer -> attn_inv_rope bracket, so a label placed inside it
+ * cannot distinguish the pre-attention RoPE from the post-attention inverse
+ * RoPE -- which is the whole question the bracket accounting is asking.
+ * `label` must have static lifetime; it is stored, not copied.  No-op unless
+ * DS4_METAL_GPU_ENCODER_TIMESTAMPS is set. */
+void ds4_gpu_ts_tag(const char *label);
 
 #ifdef __cplusplus
 }

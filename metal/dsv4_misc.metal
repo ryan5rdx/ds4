@@ -417,8 +417,8 @@ kernel void kernel_dsv4_indexer_score_one_direct(
         return;
     }
 
-    threadgroup float *ktg = shared;        // [128]
-    threadgroup float *psum = ktg + 128u;   // [4]
+    threadgroup float *ktg = shared;          // [128]
+    threadgroup float *dotbuf = ktg + 128u;   // [64], one slot per head
 
     if (tid < 128u) {
         device const float *krow = (device const float *)(index_comp +
@@ -426,9 +426,13 @@ kernel void kernel_dsv4_indexer_score_one_direct(
         ktg[tid] = krow[tid];
     }
 
-    float acc = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    /* One slot per head instead of a four-entry scratch that every iteration
+     * reused: the writes never collide, so the two barriers that guarded that
+     * reuse disappear and a row costs 2 threadgroup barriers instead of 33.
+     * The final accumulation still walks heads in ascending order with the
+     * same max(s,0)*(w*scale) grouping, so scores stay bit-identical. */
     for (uint head0 = 0; head0 < 64u; head0 += 4u) {
         const uint head = head0 + (uint)sg;
         device const float4 *q4 = (device const float4 *)(q +
@@ -439,19 +443,16 @@ kernel void kernel_dsv4_indexer_score_one_direct(
         s = simd_sum(s);
         if (lane == 0) {
             device const float *w = (device const float *)weights;
-            psum[sg] = max(s, 0.0f) * (w[head] * args.scale);
+            dotbuf[head] = max(s, 0.0f) * (w[head] * args.scale);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid == 0) {
-            acc += psum[0];
-            acc += psum[1];
-            acc += psum[2];
-            acc += psum[3];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid == 0) {
+        float acc = 0.0f;
+        for (uint head = 0; head < 64u; head++) {
+            acc += dotbuf[head];
+        }
         device float *dst = (device float *)scores;
         dst[row] = acc;
     }
@@ -6173,6 +6174,522 @@ kernel void kernel_dsv4_indexer_scores_tiled_f32(
     }
 }
 
+// Wide-tile variant of kernel_dsv4_indexer_scores_tiled fed by half-packed
+// Q and K (packed once per call by the host with the exact half(float)
+// rounding this kernel used to apply during staging, so every staged value
+// is bit-identical). TN doubles to 64, which halves the number of comp
+// tiles and with it the dominant device-traffic term: the legacy kernel
+// re-reads the full f32 Q tile from device once per head per 32-row comp
+// tile (~8 GB per layer per 2048-token chunk at 64k context). Per (token,
+// comp) pair the reduction is unchanged: heads ascending, sixteen 8x8
+// simdgroup MACs per head in the same order, relu(dot)*w accumulated in
+// float. Outputs are bit-identical to the legacy kernel.
+kernel void kernel_dsv4_indexer_scores_tiled2_f16(
+        constant ds4_metal_args_dsv4_indexer_scores_fused & args,
+        device const char *q16,
+        device const char *weights,
+        device const char *index_comp16,
+        device       char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 8;
+    constexpr uint TN = 64;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint NT = 256;
+
+    const uint c0 = tgpig.x * TN;
+    const uint t0 = tgpig.y * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared; // [8][128]
+    threadgroup half *ktg = qtg + TM*D;                 // [64][128]
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D); // [8][64]
+
+    const uint last_token = min(t0 + TM, args.n_tokens);
+    const uint max_visible = last_token > t0 ?
+        min((args.pos0 + last_token) / args.ratio, args.n_comp) : 0u;
+
+    if (c0 >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += NT) {
+            const uint r = i / TN;
+            const uint cc = i - r*TN;
+            const uint token = t0 + r;
+            const uint comp = c0 + cc;
+            if (token < args.n_tokens && comp < args.n_comp) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + comp;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += NT) {
+        const uint cc = i / D;
+        const uint d = i - cc*D;
+        const uint comp = c0 + cc;
+        half v = half(0.0f);
+        if (comp < args.n_comp) {
+            device const half *row = (device const half *)(index_comp16 +
+                (uint64_t)comp * (D * sizeof(half)));
+            v = row[d];
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = tid;
+    const uint cell1 = tid + NT;
+    const uint row0 = cell0 / TN;
+    const uint row1 = cell1 / TN;
+    const uint col0 = cell0 - row0*TN;
+    const uint col1 = cell1 - row1*TN;
+    const uint token0 = t0 + row0;
+    const uint token1 = t0 + row1;
+    const uint comp0 = c0 + col0;
+    const uint comp1 = c0 + col1;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint head = 0; head < args.n_head; head++) {
+        for (uint i = tid; i < TM*D; i += NT) {
+            const uint r = i / D;
+            const uint d = i - r*D;
+            const uint token = t0 + r;
+            half v = half(0.0f);
+            if (token < args.n_tokens) {
+                device const half *qrow = (device const half *)(q16 +
+                    ((uint64_t)token * args.n_head + head) * (D * sizeof(half)));
+                v = qrow[d];
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 mdot = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        for (uint db = 0; db < D/TS; db++) {
+            simdgroup_half8x8 mq;
+            simdgroup_half8x8 mk;
+            simdgroup_load(mq, qtg + db*TS, D, 0, false);
+            simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+            simdgroup_multiply_accumulate(mdot, mq, mk, mdot);
+        }
+
+        simdgroup_store(mdot, dot + (uint)sg * TS, TN, 0, false);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (token0 < args.n_tokens && comp0 < args.n_comp) {
+            device const float *w = (device const float *)(weights +
+                (uint64_t)token0 * args.weights_token_stride);
+            const float sc = dot[row0*TN + col0];
+            acc0 += max(sc, 0.0f) * (w[head] * args.scale);
+        }
+        if (token1 < args.n_tokens && comp1 < args.n_comp) {
+            device const float *w = (device const float *)(weights +
+                (uint64_t)token1 * args.weights_token_stride);
+            const float sc = dot[row1*TN + col1];
+            acc1 += max(sc, 0.0f) * (w[head] * args.scale);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (token0 < args.n_tokens && comp0 < args.n_comp) {
+        const uint visible = min((args.pos0 + token0 + 1u) / args.ratio, args.n_comp);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + comp0;
+        *dst = comp0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && comp1 < args.n_comp) {
+        const uint visible = min((args.pos0 + token1 + 1u) / args.ratio, args.n_comp);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + comp1;
+        *dst = comp1 < visible ? acc1 : -INFINITY;
+    }
+}
+
+// Register-blocked variant of kernel_dsv4_indexer_scores_tiled2_f16.  tiled2
+// feeds each 8x8 MMA with two fresh threadgroup loads (one Q tile, one K
+// tile) — zero register reuse, which is why it runs at ~14 TFLOPS while the
+// register-blocked dense GEMMs in this engine reach 19-23.  Here the token
+// tile doubles to TM=16: each simdgroup keeps two accumulators and shares
+// every staged K tile between them, cutting threadgroup loads per MMA from
+// 2.0 to 1.5.  The CUDA backend took the same step in 08fecd9 ("cuda:
+// register-block the prefill indexer scorer").  Staging, barrier structure
+// (two per head) and the per-pair reduction are exactly tiled2's: per
+// (token, comp) pair still sixteen 8x8 simdgroup MACs in db order, then
+// relu(dot)*w accumulated in float, heads ascending, one add per accumulator
+// per barrier region — bit-identical outputs.
+kernel void kernel_dsv4_indexer_scores_tiled4_f16(
+        constant ds4_metal_args_dsv4_indexer_scores_fused & args,
+        device const char *q16,
+        device const char *weights,
+        device const char *index_comp16,
+        device       char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 16;
+    constexpr uint TN = 64;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint NT = 256;
+    constexpr uint RB = TM/TS;   // token row blocks per simdgroup
+
+    const uint c0 = tgpig.x * TN;
+    const uint t0 = tgpig.y * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;          // [16][128]
+    threadgroup half *ktg = qtg + TM*D;                          // [64][128]
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D);  // [16][64]
+
+    const uint last_token = min(t0 + TM, args.n_tokens);
+    const uint max_visible = last_token > t0 ?
+        min((args.pos0 + last_token) / args.ratio, args.n_comp) : 0u;
+
+    if (c0 >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += NT) {
+            const uint r = i / TN;
+            const uint cc = i - r*TN;
+            const uint token = t0 + r;
+            const uint comp = c0 + cc;
+            if (token < args.n_tokens && comp < args.n_comp) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + comp;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += NT) {
+        const uint cc = i / D;
+        const uint d = i - cc*D;
+        const uint comp = c0 + cc;
+        half v = half(0.0f);
+        if (comp < args.n_comp) {
+            device const half *row = (device const half *)(index_comp16 +
+                (uint64_t)comp * (D * sizeof(half)));
+            v = row[d];
+        }
+        ktg[i] = v;
+    }
+
+    /* Four output cells per thread, spelled out as scalars: a loop over an
+     * accumulator array lets the compiler contract each cell's
+     * relu(dot)*w*scale term differently from tiled2's scalar form (a ~1 ULP
+     * difference per head that compounds over the 64-head chain).  The
+     * hand-unrolled scalar shape below compiles identically to tiled2's
+     * apply and keeps the outputs bit-exact. */
+    const uint cell0 = (uint)tid;
+    const uint cell1 = (uint)tid + NT;
+    const uint cell2 = (uint)tid + 2u*NT;
+    const uint cell3 = (uint)tid + 3u*NT;
+    const uint row0 = cell0 / TN;
+    const uint row1 = cell1 / TN;
+    const uint row2 = cell2 / TN;
+    const uint row3 = cell3 / TN;
+    const uint col0 = cell0 - row0*TN;
+    const uint col1 = cell1 - row1*TN;
+    const uint col2 = cell2 - row2*TN;
+    const uint col3 = cell3 - row3*TN;
+    const uint token0 = t0 + row0;
+    const uint token1 = t0 + row1;
+    const uint token2 = t0 + row2;
+    const uint token3 = t0 + row3;
+    const uint comp0 = c0 + col0;
+    const uint comp1 = c0 + col1;
+    const uint comp2 = c0 + col2;
+    const uint comp3 = c0 + col3;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint head = 0; head < args.n_head; head++) {
+        for (uint i = tid; i < TM*D; i += NT) {
+            const uint r = i / D;
+            const uint d = i - r*D;
+            const uint token = t0 + r;
+            half v = half(0.0f);
+            if (token < args.n_tokens) {
+                device const half *qrow = (device const half *)(q16 +
+                    ((uint64_t)token * args.n_head + head) * (D * sizeof(half)));
+                v = qrow[d];
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 mdot0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 mdot1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        for (uint db = 0; db < D/TS; db++) {
+            simdgroup_half8x8 mk;
+            simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+            simdgroup_half8x8 mq0;
+            simdgroup_half8x8 mq1;
+            simdgroup_load(mq0, qtg + db*TS, D, 0, false);
+            simdgroup_load(mq1, qtg + TS*D + db*TS, D, 0, false);
+            simdgroup_multiply_accumulate(mdot0, mq0, mk, mdot0);
+            simdgroup_multiply_accumulate(mdot1, mq1, mk, mdot1);
+        }
+
+        simdgroup_store(mdot0, dot + (uint)sg * TS, TN, 0, false);
+        simdgroup_store(mdot1, dot + TS*TN + (uint)sg * TS, TN, 0, false);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (token0 < args.n_tokens && comp0 < args.n_comp) {
+            device const float *w = (device const float *)(weights +
+                (uint64_t)token0 * args.weights_token_stride);
+            const float sc = dot[row0*TN + col0];
+            acc0 += max(sc, 0.0f) * (w[head] * args.scale);
+        }
+        if (token1 < args.n_tokens && comp1 < args.n_comp) {
+            device const float *w = (device const float *)(weights +
+                (uint64_t)token1 * args.weights_token_stride);
+            const float sc = dot[row1*TN + col1];
+            acc1 += max(sc, 0.0f) * (w[head] * args.scale);
+        }
+        if (token2 < args.n_tokens && comp2 < args.n_comp) {
+            device const float *w = (device const float *)(weights +
+                (uint64_t)token2 * args.weights_token_stride);
+            const float sc = dot[row2*TN + col2];
+            acc2 += max(sc, 0.0f) * (w[head] * args.scale);
+        }
+        if (token3 < args.n_tokens && comp3 < args.n_comp) {
+            device const float *w = (device const float *)(weights +
+                (uint64_t)token3 * args.weights_token_stride);
+            const float sc = dot[row3*TN + col3];
+            acc3 += max(sc, 0.0f) * (w[head] * args.scale);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (token0 < args.n_tokens && comp0 < args.n_comp) {
+        const uint visible = min((args.pos0 + token0 + 1u) / args.ratio, args.n_comp);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + comp0;
+        *dst = comp0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && comp1 < args.n_comp) {
+        const uint visible = min((args.pos0 + token1 + 1u) / args.ratio, args.n_comp);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + comp1;
+        *dst = comp1 < visible ? acc1 : -INFINITY;
+    }
+    if (token2 < args.n_tokens && comp2 < args.n_comp) {
+        const uint visible = min((args.pos0 + token2 + 1u) / args.ratio, args.n_comp);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token2 * args.score_token_stride) + comp2;
+        *dst = comp2 < visible ? acc2 : -INFINITY;
+    }
+    if (token3 < args.n_tokens && comp3 < args.n_comp) {
+        const uint visible = min((args.pos0 + token3 + 1u) / args.ratio, args.n_comp);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token3 * args.score_token_stride) + comp3;
+        *dst = comp3 < visible ? acc3 : -INFINITY;
+    }
+}
+
+// K-register-resident variant of tiled4.  The staged K tile is invariant
+// across the head loop, yet tiled2/tiled4 reload it from threadgroup memory
+// for every head.  Here each simdgroup loads its sixteen 8x8 K tiles into
+// simdgroup registers once, before the head loop; per head only the two Q
+// tiles are loaded — threadgroup loads per MMA drop from tiled4's 1.5 to
+// 1.0.  Staging, barriers and the per-pair reduction are exactly tiled4's
+// (and therefore tiled2's): bit-identical outputs.  The cost is ~16 live
+// matrix registers per simdgroup across the head loop — Apple9 allocates
+// registers as a cache, so the occupancy effect is measured, not assumed.
+kernel void kernel_dsv4_indexer_scores_tiled5_f16(
+        constant ds4_metal_args_dsv4_indexer_scores_fused & args,
+        device const char *q16,
+        device const char *weights,
+        device const char *index_comp16,
+        device       char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint TM = 16;
+    constexpr uint TN = 64;
+    constexpr uint TS = 8;
+    constexpr uint D  = 128;
+    constexpr uint NT = 256;
+
+    const uint c0 = tgpig.x * TN;
+    const uint t0 = tgpig.y * TM;
+
+    threadgroup half *qtg = (threadgroup half *)shared;          // [16][128]
+    threadgroup half *ktg = qtg + TM*D;                          // [64][128]
+    threadgroup float *dot = (threadgroup float *)(ktg + TN*D);  // [16][64]
+
+    const uint last_token = min(t0 + TM, args.n_tokens);
+    const uint max_visible = last_token > t0 ?
+        min((args.pos0 + last_token) / args.ratio, args.n_comp) : 0u;
+
+    if (c0 >= max_visible) {
+        for (uint i = tid; i < TM*TN; i += NT) {
+            const uint r = i / TN;
+            const uint cc = i - r*TN;
+            const uint token = t0 + r;
+            const uint comp = c0 + cc;
+            if (token < args.n_tokens && comp < args.n_comp) {
+                device float *dst = (device float *)(scores +
+                    (uint64_t)token * args.score_token_stride) + comp;
+                *dst = -INFINITY;
+            }
+        }
+        return;
+    }
+
+    for (uint i = tid; i < TN*D; i += NT) {
+        const uint cc = i / D;
+        const uint d = i - cc*D;
+        const uint comp = c0 + cc;
+        half v = half(0.0f);
+        if (comp < args.n_comp) {
+            device const half *row = (device const half *)(index_comp16 +
+                (uint64_t)comp * (D * sizeof(half)));
+            v = row[d];
+        }
+        ktg[i] = v;
+    }
+
+    const uint cell0 = (uint)tid;
+    const uint cell1 = (uint)tid + NT;
+    const uint cell2 = (uint)tid + 2u*NT;
+    const uint cell3 = (uint)tid + 3u*NT;
+    const uint row0 = cell0 / TN;
+    const uint row1 = cell1 / TN;
+    const uint row2 = cell2 / TN;
+    const uint row3 = cell3 / TN;
+    const uint col0 = cell0 - row0*TN;
+    const uint col1 = cell1 - row1*TN;
+    const uint col2 = cell2 - row2*TN;
+    const uint col3 = cell3 - row3*TN;
+    const uint token0 = t0 + row0;
+    const uint token1 = t0 + row1;
+    const uint token2 = t0 + row2;
+    const uint token3 = t0 + row3;
+    const uint comp0 = c0 + col0;
+    const uint comp1 = c0 + col1;
+    const uint comp2 = c0 + col2;
+    const uint comp3 = c0 + col3;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_half8x8 mk[D/TS];
+    for (uint db = 0; db < D/TS; db++) {
+        simdgroup_load(mk[db], ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+    }
+
+    for (uint head = 0; head < args.n_head; head++) {
+        for (uint i = tid; i < TM*D; i += NT) {
+            const uint r = i / D;
+            const uint d = i - r*D;
+            const uint token = t0 + r;
+            half v = half(0.0f);
+            if (token < args.n_tokens) {
+                device const half *qrow = (device const half *)(q16 +
+                    ((uint64_t)token * args.n_head + head) * (D * sizeof(half)));
+                v = qrow[d];
+            }
+            qtg[i] = v;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 mdot0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        simdgroup_float8x8 mdot1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        for (uint db = 0; db < D/TS; db++) {
+            simdgroup_half8x8 mq0;
+            simdgroup_half8x8 mq1;
+            simdgroup_load(mq0, qtg + db*TS, D, 0, false);
+            simdgroup_load(mq1, qtg + TS*D + db*TS, D, 0, false);
+            simdgroup_multiply_accumulate(mdot0, mq0, mk[db], mdot0);
+            simdgroup_multiply_accumulate(mdot1, mq1, mk[db], mdot1);
+        }
+
+        simdgroup_store(mdot0, dot + (uint)sg * TS, TN, 0, false);
+        simdgroup_store(mdot1, dot + TS*TN + (uint)sg * TS, TN, 0, false);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (token0 < args.n_tokens && comp0 < args.n_comp) {
+            device const float *w = (device const float *)(weights +
+                (uint64_t)token0 * args.weights_token_stride);
+            const float sc = dot[row0*TN + col0];
+            acc0 += max(sc, 0.0f) * (w[head] * args.scale);
+        }
+        if (token1 < args.n_tokens && comp1 < args.n_comp) {
+            device const float *w = (device const float *)(weights +
+                (uint64_t)token1 * args.weights_token_stride);
+            const float sc = dot[row1*TN + col1];
+            acc1 += max(sc, 0.0f) * (w[head] * args.scale);
+        }
+        if (token2 < args.n_tokens && comp2 < args.n_comp) {
+            device const float *w = (device const float *)(weights +
+                (uint64_t)token2 * args.weights_token_stride);
+            const float sc = dot[row2*TN + col2];
+            acc2 += max(sc, 0.0f) * (w[head] * args.scale);
+        }
+        if (token3 < args.n_tokens && comp3 < args.n_comp) {
+            device const float *w = (device const float *)(weights +
+                (uint64_t)token3 * args.weights_token_stride);
+            const float sc = dot[row3*TN + col3];
+            acc3 += max(sc, 0.0f) * (w[head] * args.scale);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (token0 < args.n_tokens && comp0 < args.n_comp) {
+        const uint visible = min((args.pos0 + token0 + 1u) / args.ratio, args.n_comp);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token0 * args.score_token_stride) + comp0;
+        *dst = comp0 < visible ? acc0 : -INFINITY;
+    }
+    if (token1 < args.n_tokens && comp1 < args.n_comp) {
+        const uint visible = min((args.pos0 + token1 + 1u) / args.ratio, args.n_comp);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token1 * args.score_token_stride) + comp1;
+        *dst = comp1 < visible ? acc1 : -INFINITY;
+    }
+    if (token2 < args.n_tokens && comp2 < args.n_comp) {
+        const uint visible = min((args.pos0 + token2 + 1u) / args.ratio, args.n_comp);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token2 * args.score_token_stride) + comp2;
+        *dst = comp2 < visible ? acc2 : -INFINITY;
+    }
+    if (token3 < args.n_tokens && comp3 < args.n_comp) {
+        const uint visible = min((args.pos0 + token3 + 1u) / args.ratio, args.n_comp);
+        device float *dst = (device float *)(scores +
+            (uint64_t)token3 * args.score_token_stride) + comp3;
+        *dst = comp3 < visible ? acc3 : -INFINITY;
+    }
+}
+
 kernel void kernel_dsv4_indexer_scores_tiled(
         constant ds4_metal_args_dsv4_indexer_scores_fused & args,
         device const char *q,
@@ -6313,6 +6830,169 @@ kernel void kernel_dsv4_indexer_scores_tiled(
         *dst = comp1 < visible ? acc1 : -INFINITY;
     }
 }
+
+/* DS4 ratio-4 indexer score builder, lightning-indexer organization
+ * (ported from llama.cpp's Metal kernel_lightning_indexer):
+ *
+ * Each 256-thread threadgroup owns NK=64 compressed rows.  Those rows are
+ * staged to threadgroup memory once and transposed into per-simdgroup
+ * register matrices (mk) ONCE; the whole head loop then reuses
+ * register-resident K instead of re-reading threadgroup K per head (the
+ * structural tax in kernel_dsv4_indexer_scores_tiled* and
+ * kernel_dsv4_indexer_score_one_direct).  Heads are processed in
+ * NHPTG=8-head tiles (Q staged per tile, head weights pre-scaled), with
+ * one score register per key accumulated over all tiles and a single
+ * store per key.  Prefill iterates NBPTG=8 tokens inside the kernel
+ * against the same resident K; decode passes n_tokens=1.
+ *
+ * Per-cell math is preserved: f32 rows staged to half, 8x8 simdgroup
+ * matrix steps over depth 128 in ascending order, relu then w*scale per
+ * head in ascending head order, and ds4's causal (-inf) epilogue for
+ * multi-token (prefill) calls / all-rows pass-through for decode. */
+template <int NBPTG, int T_NSG, bool TIGHT_SMEM = false>
+kernel void kernel_dsv4_indexer_scores_llt_impl(
+        constant ds4_metal_args_dsv4_indexer_scores_fused & args,
+        device const char *q,
+        device const char *weights,
+        device const char *index_comp,
+        device       char *scores,
+        threadgroup float *sharedf [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint DK     = 128;   // indexer key depth
+    constexpr uint NH     = 64;    // indexer heads
+    constexpr uint NHPTG  = 8;     // heads per tile
+    constexpr uint NKPSG  = 8;     // keys per simdgroup
+    constexpr uint NSG    = T_NSG; // simdgroups per threadgroup
+    constexpr uint NK     = NKPSG*NSG;   // keys per threadgroup
+    constexpr uint NTG    = 32*NSG;      // threads per threadgroup
+    constexpr uint DK8    = DK/8;
+
+    if (args.n_head != NH || args.head_dim != DK) return;
+    const bool causal = args.n_tokens > 1u;
+
+    /* U10: sk is written once and read once -- every simdgroup transposes its
+     * 8 keys into the mk registers immediately below, after which the buffer is
+     * dead for the rest of the kernel.  Under TIGHT_SMEM sq/sw/sqk are aliased
+     * back over it, so the allocation is max(sk, sq+sw+sqk) = 16384 B instead
+     * of their sum, 20512.  On a 32 KiB core that is 2 threadgroups resident
+     * instead of 1, at *unchanged* NK -- which is what separates this from the
+     * NSG=4 arm, where the extra residency was paid for by halving NK.
+     * Requires the barrier after the mk load, below. */
+    threadgroup half  *sk  = (threadgroup half *)sharedf;        // [NK][DK]
+    threadgroup half  *sq  = TIGHT_SMEM ? (threadgroup half *)sharedf
+                                        : sk + NK*DK;            // [NHPTG][DK]
+    threadgroup float *sw  = TIGHT_SMEM ? (threadgroup float *)(sharedf + (NHPTG*DK)/2)
+                                        : sharedf + (NK*DK + NHPTG*DK)/2;  // [NHPTG]
+    threadgroup float *sqk = sw + NHPTG;                         // [NSG*NHPTG*NKPSG]
+
+    const uint i_kv_0 = tgpig.x * NK;
+
+    // Stage this threadgroup's K rows once (f32 device -> half, edges zeroed).
+    for (uint i = tiitg; i < NK*DK; i += NTG) {
+        const uint ik = i / DK;
+        const uint d  = i - ik*DK;
+        const uint comp = i_kv_0 + ik;
+        half v = half(0.0h);
+        if (comp < args.n_comp) {
+            device const float *row = (device const float *)(index_comp +
+                (uint64_t)comp * args.index_row_stride);
+            v = half(row[d]);
+        }
+        sk[i] = v;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // K tile of this simdgroup transposed into registers: [DK][NKPSG].
+    simdgroup_half8x8 mk[DK8];
+    for (uint i = 0; i < DK8; i++) {
+        simdgroup_load(mk[i], sk + (uint)sgitg*NKPSG*DK + 8*i, DK, 0, true);
+    }
+
+    /* sk is dead from here.  Under TIGHT_SMEM sq/sw/sqk overlap it, so every
+     * simdgroup must have finished reading before the first sq write below. */
+    if (TIGHT_SMEM) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const uint i_kv = i_kv_0 + (uint)sgitg*NKPSG;   // first key of this simdgroup
+    const uint i_batch_0 = tgpig.y * NBPTG;
+    const uint n_batch = min((uint)NBPTG, args.n_tokens - i_batch_0);
+    threadgroup float *pqk = sqk + (uint)sgitg*NHPTG*NKPSG;
+
+    for (uint ib = 0; ib < n_batch; ib++) {
+        const uint i_batch = i_batch_0 + ib;
+        device const char *pq = q + (uint64_t)i_batch * args.q_token_stride;
+        device const float *pw = (device const float *)(weights +
+            (uint64_t)i_batch * args.weights_token_stride);
+
+        float score = 0.0f;
+
+        for (uint i_head = 0; i_head < NH; i_head += NHPTG) {
+            // Stage Q for this head tile: [NHPTG][DK] half.
+            for (uint i = tiitg; i < NHPTG*DK; i += NTG) {
+                const uint ih = i / DK;
+                const uint d  = i - ih*DK;
+                device const float *qh = (device const float *)(pq +
+                    (uint64_t)(i_head + ih) * args.q_head_stride);
+                sq[i] = half(qh[d]);
+            }
+            if (tiitg < NHPTG) {
+                sw[tiitg] = pw[i_head + tiitg] * args.scale;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            for (uint i = 0; i < DK8; i++) {
+                simdgroup_half8x8 mq;
+                simdgroup_load(mq, sq + 8*i, DK, 0, false);
+                simdgroup_multiply_accumulate(mqk, mq, mk[i], mqk);
+            }
+            simdgroup_store(mqk, pqk, NKPSG, 0, false);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            // One lane per key: ReLU, pre-scaled head weight, accumulate
+            // over this head tile (ascending head order across tiles).
+            if (tiisg < NKPSG) {
+                for (uint ih = 0; ih < NHPTG; ih++) {
+                    score += max(pqk[ih*NKPSG + tiisg], 0.0f) * sw[ih];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tiisg < NKPSG) {
+            const uint comp = i_kv + tiisg;
+            if (comp < args.n_comp) {
+                const uint visible = causal ?
+                    min((args.pos0 + i_batch + 1u) / args.ratio, args.n_comp)
+                    : args.n_comp;
+                device float *dst = (device float *)(scores +
+                    (uint64_t)i_batch * args.score_token_stride) + comp;
+                *dst = comp < visible ? score : -INFINITY;
+            }
+        }
+    }
+}
+
+typedef decltype(kernel_dsv4_indexer_scores_llt_impl<1,1>) kernel_dsv4_llt_t;
+/* Default NBPTG=8; 16 and 32 trade grid occupancy for amortized K staging. */
+template [[host_name("kernel_dsv4_indexer_scores_llt")]]   kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 8>;
+template [[host_name("kernel_dsv4_indexer_scores_llt16")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<16, 8>;
+template [[host_name("kernel_dsv4_indexer_scores_llt32")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<32, 8>;
+/* T_NSG trades threadgroup memory against residency.  Staging is
+ * sk[NK*128]half + sq[8*128]half + sw[8]f32 + sqk[NK*8]f32 with NK = 8*T_NSG,
+ * so NSG=8 needs 20512 B and only ONE threadgroup fits a 32 KiB core, NSG=4
+ * needs 11296 (two), NSG=2 needs 6688 (four).  NSG=16 would need 38944 and
+ * does not fit at all.  Select with DS4_METAL_INDEXER_LLT_NSG. */
+template [[host_name("kernel_dsv4_indexer_scores_llt_nsg4")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 4>;
+template [[host_name("kernel_dsv4_indexer_scores_llt_nsg2")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 2>;
+/* U10: same NK=64 shape, sq/sw/sqk aliased over the dead sk staging buffer.
+ * 16384 B instead of 20512 -> 2 threadgroups resident per 32 KiB core. */
+template [[host_name("kernel_dsv4_indexer_scores_llt_tight")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 8, true>;
 
 #ifdef DS4_METAL_HAS_TENSOR
 // Retained full-512 prefill indexer score path.  This is the part of sparse
@@ -6632,6 +7312,107 @@ kernel void kernel_dsv4_tp_flag_set(
     }
 }
 
+// Tensor-parallel gate release fence (CPU->GPU): the GPU spins on a word the
+// service thread writes instead of blocking the command processor on a shared
+// event, whose resume costs ~186us per gate here.  After MLX ml-explore/mlx#1773.
+// coherent(system) is required for correctness -- weaker qualifiers drop
+// wakeups -- and reaching it needs the internals pragma.
+#pragma METAL internals : enable
+#ifndef __METAL_MEMORY_SCOPE_SYSTEM__
+#define __METAL_MEMORY_SCOPE_SYSTEM__ 3
+#endif
+namespace metal {
+constexpr constant metal::thread_scope thread_scope_system =
+    static_cast<thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);
+}
+
+// Bounded so a dead peer cannot wedge the command processor into a watchdog
+// kill; the service thread writes the release even on failure. A timeout is
+// latched in shared memory so the host rejects the graph instead of consuming
+// stale peer rows.
+kernel void kernel_dsv4_tp_fence_wait(
+        volatile coherent(system) device uint * release [[buffer(0)]],
+        constant uint & value [[buffer(1)]],
+        constant uint & max_iters [[buffer(2)]],
+        volatile coherent(system) device uint * timeout [[buffer(3)]]) {
+    for (uint i = 0; i < max_iters; i++) {
+        metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                   metal::memory_order_seq_cst,
+                                   metal::thread_scope_system);
+        if (release[0] == value) {
+            metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                       metal::memory_order_seq_cst,
+                                       metal::thread_scope_system);
+            return;
+        }
+    }
+    timeout[0] = 1u;
+}
+
+// Pipeline-parallel activation handoff. One SIMD group waits on a CPU-published
+// ready state, then copies the shared activation into graph-owned storage. A
+// separate timeout word makes bounded-wait failure observable to the host; the
+// copy is zeroed on failure so following kernels never consume stale state.
+kernel void kernel_dsv4_pp_fence_wait_copy(
+        device uint * dst [[buffer(0)]],
+        const device uint * src [[buffer(1)]],
+        volatile coherent(system) device uint * ready [[buffer(2)]],
+        volatile coherent(system) device uint * timeout [[buffer(3)]],
+        constant uint & words [[buffer(4)]],
+        constant uint & value [[buffer(5)]],
+        constant uint & max_iters [[buffer(6)]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup uint copy_ready;
+    if (tid == 0) {
+        copy_ready = 0;
+        for (uint i = 0; i < max_iters; i++) {
+            metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                       metal::memory_order_seq_cst,
+                                       metal::thread_scope_system);
+            const uint state = ready[0];
+            if (state == value) {
+                metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                           metal::memory_order_seq_cst,
+                                           metal::thread_scope_system);
+                copy_ready = 1;
+                break;
+            }
+            if (state != 0) break;
+        }
+        if (copy_ready == 0) {
+            timeout[0] = 1;
+            metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                       metal::memory_order_seq_cst,
+                                       metal::thread_scope_system);
+        }
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    if (copy_ready) {
+        metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                   metal::memory_order_seq_cst,
+                                   metal::thread_scope_system);
+    }
+    for (uint i = tid; i < words; i += 32) {
+        dst[i] = copy_ready ? src[i] : 0;
+    }
+}
+
+// Arrival publish for the fast-sync path.  kernel_dsv4_tp_flag_set relies on
+// the event block that follows it to flush the store; with no such stall the
+// write must carry system scope itself or the CPU spins on a stale word.
+kernel void kernel_dsv4_tp_flag_set_coherent(
+        volatile coherent(system) device uint * flag [[buffer(0)]],
+        constant uint & value [[buffer(1)]]) {
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+    flag[0] = value;
+    metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                               metal::memory_order_seq_cst,
+                               metal::thread_scope_system);
+}
+#pragma METAL internals : disable
+
 // Ratio-4 compressor pooling without materializing the [n_comp, 8, head_dim]
 // KV and score packs. The row mapping and both reduction loops deliberately
 // match kernel_dsv4_softmax_pool so the arithmetic order is unchanged.
@@ -6713,4 +7494,138 @@ kernel void kernel_dsv4_softmax_pool_ratio4_direct(
     }
 
     dst[ic * args.head_dim + id] = acc/sum;
+}
+
+// DSpark's Markov correction is a small Q8_0 matrix-vector product followed
+// by an argmax over the vocabulary:
+//
+//     argmax_i(logits[i] + W2[i] * W1[previous_token])
+//
+// Keep the vocabulary logits on the GPU.  The first kernel mirrors the
+// CUDA/ROCm row arithmetic and reduction shape, but writes one (value,index)
+// result per threadgroup instead of depending on 64-bit device atomics.  A
+// second tiny kernel performs the cross-threadgroup reduction and emits the
+// packed uint64 key consumed by the common DSpark code.
+struct ds4_metal_args_dspark_markov_argmax {
+    uint vocab;
+    uint rank_blocks;
+    uint groups;
+    uint pad;
+};
+
+struct ds4_metal_dspark_markov_candidate {
+    float value;
+    uint  index;
+};
+
+static inline bool dspark_markov_score_better(
+        float candidate_value,
+        uint candidate_index,
+        float current_value,
+        uint current_index) {
+    return candidate_value > current_value ||
+           (candidate_value == current_value &&
+            candidate_index < current_index);
+}
+
+kernel void kernel_dspark_markov_argmax_q8_0(
+        constant ds4_metal_args_dspark_markov_argmax & args [[buffer(0)]],
+        device const float                            * logits [[buffer(1)]],
+        device const block_q8_0                       * w1_row [[buffer(2)]],
+        device const uchar                            * w2 [[buffer(3)]],
+        device ds4_metal_dspark_markov_candidate      * candidates [[buffer(4)]],
+        uint tgid [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float state[256];
+    const uint rank = args.rank_blocks * 32u;
+    if (tid < rank) {
+        const uint block = tid >> 5u;
+        const uint lane = tid & 31u;
+        state[tid] = float(w1_row[block].d) *
+                     float(w1_row[block].qs[lane]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float best_value = -INFINITY;
+    uint best_index = 0u;
+    const uint stride = args.groups * 256u;
+    for (uint row_index = tgid * 256u + tid;
+         row_index < args.vocab;
+         row_index += stride) {
+        device const block_q8_0 * row =
+            (device const block_q8_0 *)(
+                w2 + (ulong)row_index * args.rank_blocks * 34ul);
+        float acc = 0.0f;
+        for (uint block = 0u; block < args.rank_blocks; ++block) {
+            float sum = 0.0f;
+#pragma clang loop unroll(full)
+            for (uint lane = 0u; lane < 32u; ++lane) {
+                sum += float(row[block].qs[lane]) *
+                       state[block * 32u + lane];
+            }
+            acc += float(row[block].d) * sum;
+        }
+        const float value = logits[row_index] + acc;
+        if (dspark_markov_score_better(value, row_index,
+                                       best_value, best_index)) {
+            best_value = value;
+            best_index = row_index;
+        }
+    }
+
+    threadgroup float values[256];
+    threadgroup uint indices[256];
+    values[tid] = best_value;
+    indices[tid] = best_index;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride2 = 128u; stride2 != 0u; stride2 >>= 1u) {
+        if (tid < stride2 &&
+            dspark_markov_score_better(values[tid + stride2],
+                                       indices[tid + stride2],
+                                       values[tid], indices[tid])) {
+            values[tid] = values[tid + stride2];
+            indices[tid] = indices[tid + stride2];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        candidates[tgid].value = values[0];
+        candidates[tgid].index = indices[0];
+    }
+}
+
+kernel void kernel_dspark_markov_argmax_reduce(
+        constant ds4_metal_args_dspark_markov_argmax & args [[buffer(0)]],
+        device const ds4_metal_dspark_markov_candidate * candidates [[buffer(1)]],
+        device ulong                                    * out_key [[buffer(2)]],
+        uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float values[128];
+    threadgroup uint indices[128];
+    if (tid < args.groups) {
+        values[tid] = candidates[tid].value;
+        indices[tid] = candidates[tid].index;
+    } else {
+        values[tid] = -INFINITY;
+        indices[tid] = 0u;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 64u; stride != 0u; stride >>= 1u) {
+        if (tid < stride &&
+            dspark_markov_score_better(values[tid + stride],
+                                       indices[tid + stride],
+                                       values[tid], indices[tid])) {
+            values[tid] = values[tid + stride];
+            indices[tid] = indices[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        // The high word is the monotonically ordered IEEE-754 score.  The
+        // complemented token in the low word makes smaller tokens win exact
+        // score ties and is decoded by ds4.c as ~(uint32_t)key.
+        const uint bits = as_type<uint>(values[0]);
+        const uint value_key =
+            (bits & 0x80000000u) != 0u ? ~bits : (bits | 0x80000000u);
+        out_key[0] = (ulong(value_key) << 32u) | ulong(~indices[0]);
+    }
 }

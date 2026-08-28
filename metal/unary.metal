@@ -310,3 +310,15 @@ kernel void kernel_dsv4_softplus_sqrt_f32_4(
 template [[host_name("kernel_unary_f32_f32")]]   kernel kernel_unary_t kernel_unary_impl<float,  float,  float>;
 template [[host_name("kernel_unary_f32_f32_4")]] kernel kernel_unary_t kernel_unary_impl<float4, float4, float4>;
 template [[host_name("kernel_unary_f16_f16")]]   kernel kernel_unary_t kernel_unary_impl<half,   half,   float>;
+
+/* Calibration ballast. Does nothing and is dispatched as one thread, so its
+ * only cost is a launch. Sweeping DS4_METAL_DISPATCH_BALLAST measures the
+ * marginal per-dispatch cost in situ, at the decode shape regime, on the
+ * machine under test -- the number every fusion estimate is built on. The
+ * guard is never true for a one-thread grid; it exists so the body is not
+ * dead-code eliminated. */
+kernel void kernel_ds4_dispatch_ballast(
+        device uint *sink [[buffer(0)]],
+        uint tid [[thread_position_in_grid]]) {
+    if (tid == 0xFFFFFFFFu) sink[0] = tid;
+}

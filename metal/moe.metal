@@ -6276,6 +6276,57 @@ static inline float2 ds4_mxfp4_accumulate_rows(
     return sums;
 }
 
+// Four-row sibling of ds4_mxfp4_accumulate_rows for the resident Flash decode
+// down projection.  Same K walk (ix, stride 16), same yl0..yl3 loads, same acc
+// grouping and same e8m0 scale, so every absolute row accumulates through an
+// identical sequence of operations; only the row-to-thread assignment differs.
+// That is what makes the r4 twin bit-identical to the NR2 kernel rather than
+// merely numerically close.
+static inline float4 ds4_mxfp4_accumulate_rows_r4(
+        device const char *src0,
+        uint64_t row_bytes,
+        device const float *y,
+        uint32_t n_cols,
+        uint32_t first_row,
+        uint32_t n_rows,
+        threadgroup const float *lut,
+        ushort tiisg) {
+    const int nb = (int)(n_cols / QK_MXFP4);
+    const int row_blocks = (int)(row_bytes / sizeof(block_mxfp4));
+    const short ix = tiisg / 2;
+    const short it = tiisg & 1;
+    device const block_mxfp4 *x =
+        (device const block_mxfp4 *)(src0 + (uint64_t)first_row * row_bytes);
+    device const float *yb = y + ix * QK_MXFP4 + it * 8;
+    float4 sums = 0.0f;
+
+    for (int ib = ix; ib < nb; ib += 16) {
+        device const float4 *y4 = (device const float4 *)yb;
+        const float4 yl0 = y4[0];
+        const float4 yl1 = y4[4];
+        const float4 yl2 = y4[1];
+        const float4 yl3 = y4[5];
+        FOR_UNROLL (short row = 0; row < 4; row++) {
+            if (first_row + row < n_rows) {
+                device const block_mxfp4 &b = x[row * row_blocks + ib];
+                device const uchar *q = b.qs + 8 * it;
+                float4 acc = yl0 * float4(lut[q[0] & 15], lut[q[1] & 15],
+                                          lut[q[2] & 15], lut[q[3] & 15]);
+                acc += yl1 * float4(lut[q[0] >> 4], lut[q[1] >> 4],
+                                    lut[q[2] >> 4], lut[q[3] >> 4]);
+                acc += yl2 * float4(lut[q[4] & 15], lut[q[5] & 15],
+                                    lut[q[6] & 15], lut[q[7] & 15]);
+                acc += yl3 * float4(lut[q[4] >> 4], lut[q[5] >> 4],
+                                    lut[q[6] >> 4], lut[q[7] >> 4]);
+                sums[row] += ds4_metal_e8m0_to_f32(b.e) *
+                             ((acc.x + acc.y) + (acc.z + acc.w));
+            }
+        }
+        yb += 16 * QK_MXFP4;
+    }
+    return sums;
+}
+
 // Exact-shape sibling for the resident Flash decode down projection.  Its
 // NR2/nsg1 grid covers all 4096 rows without a tail, so retain the established
 // per-lane K walk and arithmetic while omitting only the redundant row guard.
@@ -6358,6 +6409,61 @@ kernel void kernel_mul_mv_id_mxfp4_sum6_f32(
 
     device float *out = (device float *)(dst + (uint64_t)token * args.nb1);
     FOR_UNROLL (short row = 0; row < N_R0_MXFP4; row++) {
+        if (first_row + row < (uint32_t)args.ne0) {
+            const float value = simd_sum(sumf[row]);
+            if (tiisg == 0) {
+                out[first_row + row] = value +
+                    (args.tp_addend ? ((device const float *)add_in)[first_row + row] : 0.0f);
+            }
+        }
+    }
+    (void)tiitg;
+}
+
+// Four rows per thread for the routed down projection.  a12e73d measured
+// 36.41 -> 36.78 t/s with this width on the 2x M2 Ultra pair; it was reverted
+// by d9eba30 only because main rewrote these kernel bodies while the host-side
+// nr0 stayed behind, which halves the grid without widening the kernel and
+// leaves the upper half of every down projection unwritten.  The host must
+// therefore set args.nr0 = 4 exactly when it selects this pipeline -- see
+// ds4_gpu_mxfp4_moe_decode_down_r4_enabled() in ds4_metal.m.
+kernel void kernel_mul_mv_id_mxfp4_sum6_r4_f32(
+        constant ds4_metal_args_mul_mv_id &args,
+        device const char *src0s,
+        device const char *src1,
+        device char *dst,
+        device const char *ids,
+        device const char *add_in,
+        threadgroup char *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+    const uint32_t first_row = (uint32_t)((tgpig.x * NSG + sgitg) * 4);
+    const uint32_t token = tgpig.y;
+    device const int32_t *token_ids =
+        (device const int32_t *)(ids + (uint64_t)token * args.nbi1);
+    device const char *token_src1 = src1 + (uint64_t)token * args.nb12;
+    threadgroup float *lut = (threadgroup float *)shmem;
+    if (sgitg == 0) lut[tiisg] = ds4_metal_mxfp4_values[tiisg & 15];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float4 sumf = 0.0f;
+    for (int slot = 0; slot < args.nei0; slot++) {
+        const int32_t expert = token_ids[slot];
+        if (!ds4_tp_owns_expert(expert, args.ne02, args.tp_rank, args.tp_world)) continue;
+        device const char *expert_base = src0s +
+            (int64_t)(expert - args.tp_expert_base) * args.nb02;
+        device const float *y =
+            (device const float *)(token_src1 + (uint64_t)slot * args.nb11);
+        sumf += ds4_mxfp4_accumulate_rows_r4(expert_base, args.nb01, y,
+                                              args.ne00, first_row, args.ne0,
+                                              lut, tiisg);
+    }
+
+    device float *out = (device float *)(dst + (uint64_t)token * args.nb1);
+    FOR_UNROLL (short row = 0; row < 4; row++) {
         if (first_row + row < (uint32_t)args.ne0) {
             const float value = simd_sum(sumf[row]);
             if (tiisg == 0) {
@@ -8941,7 +9047,13 @@ kernel void kernel_mul_mm_id_mpp(
         + args.nb10*iy);
 
     auto tA = tensor(sa, dextents<int32_t, 2>(NK, NR0));
-    auto tB = tensor(sb, dextents<int32_t, 2>(NR1, NK));
+    /* The staged B tile stores element (n, k) at sb[n*NK + k]: dim0 is K
+     * (stride 1), dim1 is N (stride NK) — the same convention as tA above.
+     * The historical (NR1, NK) extents order only described it correctly
+     * because NR1 == NK == 32; spell it (NK, NR1) so narrower future
+     * instantiations keep the true layout. Identical extents and strides
+     * while NR1 == 32. */
+    auto tB = tensor(sb, dextents<int32_t, 2>(NK, NR1));
 
     matmul2d<
         matmul2d_descriptor(NR1, NR0, NK, false, true, false,

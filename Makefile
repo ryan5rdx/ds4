@@ -24,7 +24,7 @@ DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed_cpu.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= $(shell if [ -x /usr/local/cuda/bin/nvcc ]; then \
@@ -50,7 +50,7 @@ NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NA
 MMQ_INCLUDES := -Icuda/mmq
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
 CORE_OBJS = ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed_cpu.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
@@ -65,7 +65,7 @@ endif
 .PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
+.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-flash-attn-decode-bench check-mxfp4-half-lut check-dispatch-count
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
 
@@ -76,6 +76,7 @@ help:
 	@echo "  make test         Build and run tests"
 	@echo "  make metal-decode-schedule-bench  Build the balanced Metal decode schedule benchmark"
 	@echo "  make metal-prefill-variant-bench  Build the balanced Metal prefill variant benchmark"
+	@echo "  make metal-flash-attn-decode-bench  Build the model-free Metal decode-attention benchmark"
 	@echo "  make check-mxfp4-half-lut  Verify the checked-in MXFP4 half LUT matches the generator"
 	@echo "  make test-mxfp4-metal  Check the MXFP4 half LUT, then run Metal MXFP4 exactness tests"
 	@echo "  make dspark-verify-depth  Run DSpark speculative verification smoke if support GGUF is present"
@@ -109,6 +110,144 @@ tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
 
+tests/bench_amx_indexer.o: tests/bench_amx_indexer.c
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/bench_amx_indexer: tests/bench_amx_indexer.o
+	$(CC) $(CFLAGS) -o $@ $^ -framework Accelerate
+
+bench-amx-indexer: tests/bench_amx_indexer
+	./tests/bench_amx_indexer
+
+tests/bench_indexer_score.o: tests/bench_indexer_score.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/bench_indexer_score: tests/bench_indexer_score.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+bench-indexer-score: tests/bench_indexer_score
+	./tests/bench_indexer_score
+
+# #includes ds4.c directly so it can reach the STATIC matvec kernels decode uses
+# -- a copy of them would drift and would not be evidence about the shipped path.
+tests/bench_cpu_draft_cost.o: tests/bench_cpu_draft_cost.c ds4.c
+	$(CC) $(CFLAGS) -I. -DDS4_NO_GPU -Wno-unused-function -c -o $@ $<
+
+tests/bench_cpu_draft_cost: tests/bench_cpu_draft_cost.o ds4_distributed_cpu.o ds4_tp.o ds4_layer_pack.o ds4_ssd.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+bench-cpu-draft-cost: tests/bench_cpu_draft_cost
+	./tests/bench_cpu_draft_cost
+
+tests/bench_ngram_accept.o: tests/bench_ngram_accept.c
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+# Links the CPU core so the harness calls the SHIPPED ds4_ngram_propose rather
+# than a copy of it; no GPU and no model are needed.
+tests/bench_ngram_accept: tests/bench_ngram_accept.o ds4_cpu_test_hooks.o ds4_distributed_cpu.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+bench-ngram-accept: tests/bench_ngram_accept
+	./tests/bench_ngram_accept
+
+tests/test_ts_fairshare.o: tests/test_ts_fairshare.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_ts_fairshare: tests/test_ts_fairshare.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-ts-fairshare: tests/test_ts_fairshare
+	./tests/test_ts_fairshare
+
+tests/test_topk_ab.o: tests/test_topk_ab.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_topk_ab: tests/test_topk_ab.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-topk-ab: tests/test_topk_ab
+	./tests/test_topk_ab
+
+tests/bench_moe_mxfp4_decode.o: tests/bench_moe_mxfp4_decode.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/bench_moe_mxfp4_decode: tests/bench_moe_mxfp4_decode.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+bench-moe-mxfp4-decode: tests/bench_moe_mxfp4_decode
+	./tests/bench_moe_mxfp4_decode
+
+tests/bench_qkv_norm.o: tests/bench_qkv_norm.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/bench_qkv_norm: tests/bench_qkv_norm.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+bench-qkv-norm: tests/bench_qkv_norm
+	./tests/bench_qkv_norm
+
+tests/bench_q8_attn_shapes.o: tests/bench_q8_attn_shapes.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/bench_q8_attn_shapes: tests/bench_q8_attn_shapes.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+bench-q8-attn-shapes: tests/bench_q8_attn_shapes
+	./tests/bench_q8_attn_shapes
+
+tests/bench_encode_shape.o: tests/bench_encode_shape.m
+	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
+
+tests/bench_encode_shape: tests/bench_encode_shape.o
+	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
+
+bench-encode-shape: tests/bench_encode_shape
+	./tests/bench_encode_shape
+
+tests/bench_mv_concurrency.o: tests/bench_mv_concurrency.m
+	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
+
+tests/bench_mv_concurrency: tests/bench_mv_concurrency.o
+	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
+
+bench-mv-concurrency: tests/bench_mv_concurrency
+	./tests/bench_mv_concurrency
+
+tests/bench_decode_rows.o: tests/bench_decode_rows.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/bench_decode_rows: tests/bench_decode_rows.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+bench-decode-rows: tests/bench_decode_rows
+	./tests/bench_decode_rows
+
+tests/bench_stage_marker_tax.o: tests/bench_stage_marker_tax.m
+	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
+
+tests/bench_stage_marker_tax: tests/bench_stage_marker_tax.o
+	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
+
+bench-stage-marker-tax: tests/bench_stage_marker_tax
+	./tests/bench_stage_marker_tax
+
+tests/bench_flagset_tax.o: tests/bench_flagset_tax.m
+	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
+
+tests/bench_flagset_tax: tests/bench_flagset_tax.o
+	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
+
+bench-flagset-tax: tests/bench_flagset_tax
+	./tests/bench_flagset_tax
+
+tests/bench_membw.o: tests/bench_membw.m
+	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
+
+tests/bench_membw: tests/bench_membw.o
+	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
+
+bench-membw: tests/bench_membw
+	./tests/bench_membw
 speed-bench/metal_decode_schedule_bench.o: speed-bench/metal_decode_schedule_bench.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
@@ -125,6 +264,14 @@ speed-bench/metal_prefill_variant_bench: speed-bench/metal_prefill_variant_bench
 
 metal-prefill-variant-bench: speed-bench/metal_prefill_variant_bench
 
+speed-bench/metal_flash_attn_decode_bench.o: speed-bench/metal_flash_attn_decode_bench.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+speed-bench/metal_flash_attn_decode_bench: speed-bench/metal_flash_attn_decode_bench.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+metal-flash-attn-decode-bench: speed-bench/metal_flash_attn_decode_bench
+
 tests/test_mxfp4_metal.o: tests/test_mxfp4_metal.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
@@ -133,6 +280,23 @@ tests/test_mxfp4_metal: tests/test_mxfp4_metal.o ds4_metal.o
 
 check-mxfp4-half-lut:
 	python3 metal/generate_mxfp4_half_lut.py --check
+
+# 7331e3d added the per-dispatch counter so the decode budget would stop being
+# derived; the invariant that every dispatch site is counted has since rotted
+# twice (1a179ef fixed two sites, and 16 more had drifted by 90605b1 -- among
+# them the HC producer at 86 dispatches per token, so the counter under-reported
+# by ~186/token). A wrapped site reads [DS4_DISP(enc) dispatch...]; an unwrapped
+# one reads [enc dispatch...]. Adding 1 to the call count accounts for the macro
+# definition itself.
+check-dispatch-count:
+	@calls=$$(grep -c 'dispatchThreadgroups:\|dispatchThreads:' ds4_metal.m); \
+	 disp=$$(grep -c 'DS4_DISP(' ds4_metal.m); \
+	 if [ "$$disp" -ne "$$((calls + 1))" ]; then \
+	   echo "ds4: dispatch counter incomplete: $$calls dispatch sites, $$disp DS4_DISP (want $$((calls + 1)))"; \
+	   grep -n 'dispatchThreadgroups:\|dispatchThreads:' ds4_metal.m | grep -v 'DS4_DISP('; \
+	   exit 1; \
+	 fi; \
+	 echo "ds4: dispatch counter complete ($$calls sites wrapped)"
 
 test-mxfp4-metal: check-mxfp4-half-lut tests/test_mxfp4_metal
 	./tests/test_mxfp4_metal
@@ -251,11 +415,14 @@ ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
 
-ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
+ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
 
 ds4_distributed.o: ds4_distributed.c ds4_distributed.h ds4.h ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_distributed.c
+
+ds4_distributed_cpu.o: ds4_distributed.c ds4_distributed.h ds4.h ds4_ssd.h
+	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_distributed.c
 
 ds4_tp.o: ds4_tp.c ds4_tp.h ds4.h ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_tp.c
@@ -266,16 +433,16 @@ ds4_help.o: ds4_help.c ds4_help.h
 ds4_gpu_args.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_gpu_args.c
 
-ds4_server.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
+ds4_server.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_server.c
 
-ds4_bench.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
+ds4_bench.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_bench.c
 
-ds4_eval.o: ds4_eval.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
+ds4_eval.o: ds4_eval.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_eval.c
 
-ds4_agent.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
+ds4_agent.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_agent.c
 
 ds4_web.o: ds4_web.c ds4_web.h
@@ -284,10 +451,10 @@ ds4_web.o: ds4_web.c ds4_web.h
 ds4_kvstore.o: ds4_kvstore.c ds4_kvstore.h ds4.h ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_kvstore.c
 
-ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
+ds4_test.o: tests/ds4_test.c ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_test.c
 
-ds4_agent_test.o: tests/ds4_agent_test.c ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
+ds4_agent_test.o: tests/ds4_agent_test.c ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -Wno-unused-function -c -o $@ tests/ds4_agent_test.c
 
 tests/cuda_long_context_smoke.o: tests/cuda_long_context_smoke.c ds4_gpu.h
@@ -302,22 +469,22 @@ linenoise.o: linenoise.c linenoise.h
 ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ ds4.c
 
-ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
+ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_cli.c
 
 ds4_gpu_args_cpu.o: ds4_gpu_args.c ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_gpu_args.c
 
-ds4_server_cpu.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h rax.h
+ds4_server_cpu.o: ds4_server.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_kvstore.h rax.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_server.c
 
-ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
+ds4_bench_cpu.o: ds4_bench.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_bench.c
 
-ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h
+ds4_eval_cpu.o: ds4_eval.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_eval.c
 
-ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
+ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_help.h ds4_kvstore.h ds4_web.h linenoise.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4_agent.c
 
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
@@ -395,13 +562,13 @@ ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_distributed_cpu.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_sampling.o: tests/test_sampling.c ds4.h
 	$(CC) $(CFLAGS) -fno-finite-math-only -DDS4_TEST_HOOKS -I. -c -o $@ $<
 
-tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_distributed_cpu.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 ifneq ($(UNAME_S),Darwin)
@@ -523,4 +690,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/metal_flash_attn_decode_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

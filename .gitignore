@@ -12,6 +12,7 @@
 /gguf/
 /core
 /core.*
+/tests/bench_membw
 /tests/test_engine_mgpu_placement
 /tests/test_engine_mgpu_runtime
 /tests/test_engine_mgpu_refusal
@@ -30,6 +31,9 @@
 /tests/test_mxfp4_metal
 /tests/test_q4k_dot
 /tests/test_sampling
+/speed-bench/metal_flash_attn_decode_bench
+/gguf-tools/tests/test_dflash_import
+/gguf-tools/tests/test_dspark_mxfp4_plan
 *.o
 *.dSYM/
 __pycache__/
@@ -37,3 +41,7 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+/.claude/
+# Instruments captures; a single decode trace runs to tens of MB.
+*.trace/
+/tests/bench_cpu_draft_cost
