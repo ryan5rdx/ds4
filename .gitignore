@@ -44,3 +44,4 @@ __pycache__/
 /.claude/
 # Instruments captures; a single decode trace runs to tens of MB.
 *.trace/
+/tests/bench_cpu_draft_cost
