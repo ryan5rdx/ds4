@@ -182,6 +182,18 @@ exactly this shape.
 **Falsifier.** If the disabled arm is *faster*, batching is costing rather than
 saving and should be off by default under TP.
 
+**RESULT 2026-08-28** (build `92bba30`, `DS4_SERVER_BATCH_LOG=1`): **batching
+engages at full width and buys ~nothing.** Both arms log 51× `decode batch
+count=8` (the server groups all 8 slots into one eval_batch call).
+`DS4_METAL_TP_SESSION_BATCH=0` did **not** actually disable batching in the
+server path (both still batched at count=8), so the disable A/B was
+inconclusive — but the observation answers the question. Aggregate: default
+37.14 vs disabled 37.80 t/s vs W3 single-session 38.81 — **flat at ~37 either
+way**, no better than one session. Matches the predicted small margin (verify
+21.64 vs 24.26 ms/row, ~11%; routed-expert union grows with rows). Decode path
+itself is the ceiling; batching engages but the thread closes. Full data in
+`BENCHMARKS-TP-PP.md` §Arm W4.
+
 **Note on W1b.** Its 256- and 128-token arms failed with a TP gate exchange
 error, which the write-up reads as a protocol floor on chunk granularity. Worth
 one retry before accepting that: `ds4-bench` parses `--prefill-chunk`

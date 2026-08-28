@@ -300,6 +300,39 @@ is one composite; pass 2 perturbs). The encoder instrument has gone as far as
 it can. The unnamed ~1.9-2.4 ms inside `attn_inv_rope` is not separable at the
 GPU-encoder boundary and must be chased where the stages are distinct code paths.
 
+### Arm W4 — is multi-session batching engaging at all? — 2026-08-28
+
+Build `92bba30`. ds4-server TP pair, `--batched-session 8`, 8 concurrent
+completions, default vs `DS4_METAL_TP_SESSION_BATCH=0`, with
+`DS4_SERVER_BATCH_LOG=1` to observe per-call batch grouping.
+
+| arm | aggregate t/s | per-slot mean | batch log |
+|---|---|---|---|
+| default | **37.14** | 4.64 | 51× `count=8` |
+| `TP_SESSION_BATCH=0` | **37.80** | 4.72 | 51× `count=8` |
+| (W3 single-session ref) | 38.81 | — | — |
+
+**Batching engages at full width and buys NOTHING measurable.** Both arms log
+51 decode batches at `count=8` — the server groups all 8 slots into one
+ds4_sessions_eval_batch call. The `DS4_METAL_TP_SESSION_BATCH=0` flag did **not**
+actually disable batching in the server path (both arms still batched at
+count=8), so the disable A/B was inconclusive — but the observation is the
+answer: batching runs at full width and aggregate stays flat at ~37, identical
+to the disabled arm and to W3's single-session 38.81.
+
+**This confirms W3 directly and matches the predicted small margin.** The
+verify is itself a batched multi-row forward at 21.64 ms/row vs 24.26 for a
+single token — 11% — and the routed-expert union grows with row count and
+dominates. An 8-row batch would reach ~122 t/s on bytes alone against 34.79
+observed; the verify says that model is optimistic by ~4× on this shape. So
+batching is worth about a tenth per row here and the aggregate is pinned at the
+single-session decode ceiling either way.
+
+**Verdict.** Multi-session batching engages (51× count=8) but delivers ~0 —
+aggregate flat at ~37 t/s whether batched or not, and no better than a single
+session. The decode path itself, not batch grouping, is the ceiling. W3's
+conclusion stands as measured; the thread closes.
+
 ### Arm W3 — multi-slot batching vs the per-batch cost — 2026-08-28
 
 Build `6d632c9`. `ds4-server --tensor-parallel` TP pair (coordinator lanfear,
