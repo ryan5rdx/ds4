@@ -300,6 +300,38 @@ is one composite; pass 2 perturbs). The encoder instrument has gone as far as
 it can. The unnamed ~1.9-2.4 ms inside `attn_inv_rope` is not separable at the
 GPU-encoder boundary and must be chased where the stages are distinct code paths.
 
+### Arm W1b — separate encode overhead from weight re-streaming — 2026-08-28
+
+Build `6d632c9`. Goal: hold routed work constant (same `--step-incr 512`),
+vary only batch count via `--prefill-chunk 512/256/128`. **Blocked under TP2.**
+
+**Result: the arm cannot vary batch count on this rig.**
+
+| chunk | batches/step | result |
+|---|---|---|
+| 512 | 1 | 4 steps, total 5.648 s (275/409/407/401 t/s) |
+| 256 | 2 | **TP gate exchange failed (seq 2)**, 0 rows |
+| 128 | 4 | **TP gate exchange failed (seq 2)**, 0 rows |
+
+chunk256/128 fail **before any prefill** with `tp: transport marked failed;
+tp: gate exchange failed (layer 0 gate 1 seq 2)`. This is the TP chunk
+constraint the plan flagged (`ds4.c:12260`: both ranks must chunk identically
+or the per-layer gates stop). The first W1b attempt (gen 8) also hit a **GPU
+Timeout Error** on replay; `--gen-tokens 0` avoids the replay path but does not
+fix the sub-512-chunk gate failure.
+
+**The one usable point (chunk512 = 1 batch/step) is 5.648 s — matching W1's
+4-batch arm (5.676 s), confirming cross-run consistency.** But W1b's core
+question — encode overhead vs re-streaming at constant routed work — is
+**structurally unanswerable under TP2**, because small chunks that would split
+a step into multiple batches break the per-layer TP gate sync.
+
+**Verdict.** W1b is not runnable as specified on the TP2 rig. The
+encode-vs-restreaming split it sought remains open. W3's multi-slot exposure
+is similarly constrained (each slot is a session; the per-layer gate sync is
+the same mechanism). This is itself a finding: the per-layer TP gate exchange
+is the floor on chunk granularity, and it is why prefill uses large chunks.
+
 ### Arm X1 — argsort tie-break removal: neutral on hardware, top-1 preserved — 2026-08-28
 
 Build `e1da7b3`/`6d632c9`. Interleaved 3 repeats of

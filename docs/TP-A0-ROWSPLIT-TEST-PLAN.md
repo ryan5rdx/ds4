@@ -179,6 +179,18 @@ a reason the arm did not measure. If the slope stays in the hundreds of ms, the
 engine has a per-batch encode cost an order of magnitude above the verify's and
 it is the largest unexplained quantity after all.
 
+**RESULT 2026-08-28** (build `6d632c9`): **the arm cannot vary batch count under
+TP2.** `--prefill-chunk 512/256/128` at fixed step-incr 512: chunk512 runs
+(4 steps, total 5.648 s — matching W1's 4-batch arm 5.676 s, consistent);
+chunk256/128 fail **before any prefill** with `TP gate exchange failed
+(seq 2)` — the per-layer gate sync requires both ranks chunk identically
+(`ds4.c:12260`), and sub-512 chunks break it. A first attempt with gen 8 also
+hit a GPU Timeout on replay (`--gen-tokens 0` avoids replay but not the gate
+failure). **W1b's encode-vs-restreaming split is structurally unanswerable on
+this rig**; the per-layer TP gate exchange is the floor on chunk granularity
+and the reason prefill uses large chunks. Full data in `BENCHMARKS-TP-PP.md`
+§Arm W1b.
+
 **Note this is now low priority.** Speculation is closed on the k ≤ 4
 impossibility result, so the verify's fixed term gates nothing. The reason to run
 W1b is W3.
