@@ -1,6 +1,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_help.h"
+#include "ds4_tp.h"
 
 /* ds4-eval: small built-in benchmark integration test.
  *
@@ -1218,6 +1219,7 @@ typedef struct {
     int soft_limit_think_close_rank;
     ds4_think_mode think_mode;
     ds4_dist_options dist;
+    ds4_tp_options tp;
     bool plain;
     bool warm_weights;
     bool quality;
@@ -1550,6 +1552,23 @@ static eval_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg,
+                                 &i,
+                                 argc,
+                                 argv,
+                                 &c.tp,
+                                 tp_parse_err,
+                                 sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-eval: %s\n",
+                    tp_parse_err[0] ? tp_parse_err : "invalid tensor-parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
@@ -1665,6 +1684,11 @@ static eval_config parse_options(int argc, char **argv) {
     }
     if (c.self_test_extractors || c.regrade_trace_path) return c;
 
+    char tp_err[256];
+    if (!ds4_tp_adopt_distributed_options(&c.tp, &c.dist, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-eval: %s\n", tp_err);
+        exit(2);
+    }
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&c.dist, NULL, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-eval: %s\n", dist_err);
@@ -4048,6 +4072,18 @@ static void log_context_memory(ds4_backend backend,
             m.comp_cap);
 }
 
+/* Leader-side tensor-parallel transport, torn down with the engine: stop the
+ * worker before the session is freed above, and free the transport only after
+ * ds4_engine_close() has shut down the gate service thread that holds it. */
+static ds4_tp *g_eval_tp;
+
+static void eval_engine_close(ds4_engine *engine) {
+    if (g_eval_tp) ds4_tp_send_stop(g_eval_tp);
+    ds4_engine_close(engine);
+    ds4_tp_free(g_eval_tp);
+    g_eval_tp = NULL;
+}
+
 static int wait_distributed_route(ds4_session *session) {
     char err[256] = {0};
     char last[256] = {0};
@@ -4172,10 +4208,19 @@ int main(int argc, char **argv) {
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .distributed = cfg.dist,
+        .tp = cfg.tp,
     };
+    char tp_err[256];
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-eval: %s\n", dist_err);
+        if (trace) fclose(trace);
+        free(case_sequence);
+        return 2;
+    }
+
+    if (!ds4_tp_validate_engine_options(&opt, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-eval: %s\n", tp_err);
         if (trace) fclose(trace);
         free(case_sequence);
         return 2;
@@ -4186,6 +4231,13 @@ int main(int argc, char **argv) {
         if (trace) fclose(trace);
         free(case_sequence);
         return 1;
+    }
+    if (cfg.tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &cfg.tp);
+        ds4_engine_close(engine);
+        if (trace) fclose(trace);
+        free(case_sequence);
+        return rc;
     }
 
     int max_prompt_tokens = 0;
@@ -4215,11 +4267,23 @@ int main(int argc, char **argv) {
                        cfg.prefill_chunk,
                        cfg.ssd_streaming);
 
+    /* After the auto-sizing above: the identity carries ctx_size, and the
+     * worker adopts whatever the leader reports. */
+    if (cfg.tp.role == DS4_TP_LEADER &&
+        !ds4_tp_leader_bind(&g_eval_tp, engine, &cfg.tp, cfg.ctx_size,
+                            tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-eval: %s\n", tp_err);
+        ds4_engine_close(engine);
+        if (trace) fclose(trace);
+        free(case_sequence);
+        return 1;
+    }
+
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {
         fprintf(stderr, "ds4-eval: failed to create session\n");
         if (trace) fclose(trace);
-        ds4_engine_close(engine);
+        eval_engine_close(engine);
         free(case_sequence);
         return 1;
     }
@@ -4228,7 +4292,7 @@ int main(int argc, char **argv) {
     {
         ds4_session_free(session);
         if (trace) fclose(trace);
-        ds4_engine_close(engine);
+        eval_engine_close(engine);
         free(case_sequence);
         return 1;
     }
@@ -4305,7 +4369,7 @@ int main(int argc, char **argv) {
 
     tui_free(&ui);
     ds4_session_free(session);
-    ds4_engine_close(engine);
+    eval_engine_close(engine);
     if (trace) fclose(trace);
     free(case_sequence);
     return rc || failed ? 1 : 0;

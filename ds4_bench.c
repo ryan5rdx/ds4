@@ -2,6 +2,7 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
+#include "ds4_tp.h"
 
 /* Purpose-built throughput benchmark.
  *
@@ -27,6 +28,7 @@
 
 typedef struct {
     const char *model_path;
+    const char *mtp_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -49,10 +51,15 @@ typedef struct {
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     double step_mul;
+    float dspark_confidence_threshold;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
+    ds4_tp_options tp;
     bool warm_weights;
     bool quality;
+    bool dspark;
+    bool dspark_strict;
+    bool dspark_confidence_threshold_set;
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
@@ -234,8 +241,43 @@ static bench_config parse_options(int argc, char **argv) {
         }
         if (dist_parse == DS4_DIST_CLI_MATCHED) continue;
 
+        char tp_parse_err[256] = {0};
+        ds4_tp_cli_parse_result tp_parse =
+            ds4_tp_parse_cli_arg(arg,
+                                 &i,
+                                 argc,
+                                 argv,
+                                 &c.tp,
+                                 tp_parse_err,
+                                 sizeof(tp_parse_err));
+        if (tp_parse == DS4_TP_CLI_ERROR) {
+            fprintf(stderr,
+                    "ds4-bench: %s\n",
+                    tp_parse_err[0] ? tp_parse_err : "invalid tensor-parallel option");
+            exit(2);
+        }
+        if (tp_parse == DS4_TP_CLI_MATCHED) continue;
+
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp")) {
+            c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark")) {
+            c.dspark = true;
+        } else if (!strcmp(arg, "--dspark-confidence")) {
+            const double v = parse_double_arg(
+                    need_arg(&i, argc, argv, arg), arg);
+            if (v < 0.0 || v > 1.0) {
+                fprintf(stderr,
+                        "ds4-bench: --dspark-confidence must be between 0 and 1\n");
+                exit(2);
+            }
+            c.dspark = true;
+            c.dspark_confidence_threshold = (float)v;
+            c.dspark_confidence_threshold_set = true;
+        } else if (!strcmp(arg, "--dspark-strict")) {
+            c.dspark = true;
+            c.dspark_strict = true;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -335,8 +377,26 @@ static bench_config parse_options(int argc, char **argv) {
         }
     }
 
-    if (!!c.prompt_path == !!c.chat_prompt_path) {
+    /* Resolve the role before validating, because a tensor-parallel worker is
+     * not subject to most of these checks. It never reads a prompt and adopts
+     * the leader's context size (ds4_tp_worker_run leaves identity.ctx_size at
+     * 0), returning from ds4_tp_worker_run() long before the prompt is
+     * tokenized. Validating it as though it were the coordinator made
+     * `ds4-bench --tensor-parallel --role worker` demand a --prompt-file and a
+     * --ctx-alloc greater than a --ctx-max it never uses. */
+    char tp_err[256];
+    if (!ds4_tp_adopt_distributed_options(&c.tp, &c.dist, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-bench: %s\n", tp_err);
+        exit(2);
+    }
+    const int tp_worker = c.tp.role == DS4_TP_WORKER;
+
+    if (!tp_worker && !!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
+        exit(2);
+    }
+    if (c.dspark && (!c.mtp_path || !c.mtp_path[0])) {
+        fprintf(stderr, "ds4-bench: --dspark requires --mtp FILE\n");
         exit(2);
     }
     if (c.ctx_start > c.ctx_max) {
@@ -356,7 +416,7 @@ static bench_config parse_options(int argc, char **argv) {
         exit(2);
     }
     if (c.ctx_alloc == 0) c.ctx_alloc = c.ctx_max + c.gen_tokens + 1;
-    if (c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
+    if (!tp_worker && c.ctx_alloc <= c.ctx_max + c.gen_tokens) {
         fprintf(stderr, "ds4-bench: --ctx-alloc must be greater than ctx-max + gen-tokens\n");
         exit(2);
     }
@@ -370,6 +430,18 @@ static bench_config parse_options(int argc, char **argv) {
         exit(2);
     }
     return c;
+}
+
+/* Leader-side tensor-parallel transport, torn down with the engine: stop the
+ * worker first, and free the transport only after ds4_engine_close() has shut
+ * the gate service thread down (it holds this pointer raw). */
+static ds4_tp *g_bench_tp;
+
+static void bench_engine_close(ds4_engine *engine) {
+    if (g_bench_tp) ds4_tp_send_stop(g_bench_tp);
+    ds4_engine_close(engine);
+    ds4_tp_free(g_bench_tp);
+    g_bench_tp = NULL;
 }
 
 static void json_write_string(FILE *fp, const char *s) {
@@ -576,6 +648,7 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
@@ -588,16 +661,27 @@ int main(int argc, char **argv) {
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
+        .dspark = cfg.dspark,
+        .dspark_strict = cfg.dspark_strict,
+        .dspark_confidence_threshold = cfg.dspark_confidence_threshold,
+        .dspark_confidence_threshold_set =
+            cfg.dspark_confidence_threshold_set,
         .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .expert_profile_path = cfg.expert_profile_path,
         .distributed = cfg.dist,
+        .tp = cfg.tp,
     };
     char dist_err[256];
     if (ds4_dist_prepare_engine_options(&cfg.dist, &opt, dist_err, sizeof(dist_err)) != 0) {
         fprintf(stderr, "ds4-bench: %s\n", dist_err);
+        return 2;
+    }
+    char tp_err[256];
+    if (!ds4_tp_validate_engine_options(&opt, tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-bench: %s\n", tp_err);
         return 2;
     }
     ds4_engine *engine = NULL;
@@ -616,6 +700,19 @@ int main(int argc, char **argv) {
     } else if (ds4_engine_open(&engine, &opt) != 0) {
         return 1;
     }
+    if (cfg.tp.role == DS4_TP_WORKER) {
+        int rc = ds4_tp_worker_run(engine, &cfg.tp);
+        ds4_engine_close(engine);
+        return rc;
+    }
+    if (cfg.tp.role == DS4_TP_LEADER &&
+        !ds4_tp_leader_bind(&g_bench_tp, engine, &cfg.tp, cfg.ctx_alloc,
+                            tp_err, sizeof(tp_err))) {
+        fprintf(stderr, "ds4-bench: %s\n", tp_err);
+        ds4_engine_close(engine);
+        return 1;
+    }
+
     log_context_memory(opt.backend,
                        cfg.ctx_alloc,
                        ds4_engine_prefill_chunk(engine),
@@ -636,7 +733,7 @@ int main(int argc, char **argv) {
                 prompt.len,
                 cfg.ctx_max);
         ds4_tokens_free(&prompt);
-        ds4_engine_close(engine);
+        bench_engine_close(engine);
         return 1;
     }
 
@@ -644,7 +741,7 @@ int main(int argc, char **argv) {
     if (ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
         fprintf(stderr, "ds4-bench: failed to create session\n");
         ds4_tokens_free(&prompt);
-        ds4_engine_close(engine);
+        bench_engine_close(engine);
         return 1;
     }
     if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
@@ -652,7 +749,7 @@ int main(int argc, char **argv) {
     {
         ds4_session_free(session);
         ds4_tokens_free(&prompt);
-        ds4_engine_close(engine);
+        bench_engine_close(engine);
         return 1;
     }
     maybe_warn_distributed_step_shape(&cfg, session);
@@ -664,7 +761,7 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ds4-bench: failed to open %s: %s\n", cfg.csv_path, strerror(errno));
             ds4_session_free(session);
             ds4_tokens_free(&prompt);
-            ds4_engine_close(engine);
+            bench_engine_close(engine);
             return 1;
         }
     }
@@ -705,7 +802,11 @@ int main(int argc, char **argv) {
         const bool need_restore_after_generation =
             cfg.gen_tokens > 0 && frontier < cfg.ctx_max;
         bool have_snapshot = false;
+        /* ds4_session_save/load_snapshot round-trip the KV payload, which
+         * has no tensor-parallel branch: restoring would advance only the
+         * leader's checkpoint and deadlock the next sync. Replay instead. */
         if (need_restore_after_generation && !distributed &&
+            !ds4_engine_tp_active(engine) &&
             getenv("DS4_BENCH_DISABLE_SNAPSHOT") == NULL) {
             const uint64_t payload_bytes = ds4_session_payload_bytes(session);
             const bool large_snapshot_forced =
@@ -733,11 +834,13 @@ int main(int argc, char **argv) {
         double gen_first_sec = 0.0;
         double gen_steady_sec = 0.0;
         int gen_done = 0;
+        int gen_steady_tokens = 0;
         int *gen_token_buf = cfg.show_output && cfg.gen_tokens > 0
             ? malloc((size_t)cfg.gen_tokens * sizeof(gen_token_buf[0]))
             : NULL;
         int gen_token_count = 0;
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        bool generation_eos = false;
+        while (gen_done < cfg.gen_tokens && !generation_eos) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -750,16 +853,57 @@ int main(int argc, char **argv) {
                 break;
             }
             const double token_t0 = bench_now_sec();
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+            int accepted_block[17]; /* first target token + max 16 support rows */
+            int block_n = 1;
+            accepted_block[0] = token;
+            if (cfg.dspark && !cfg.dspark_strict) {
+                int block_cap = cfg.gen_tokens - gen_done;
+                if (block_cap > (int)(sizeof(accepted_block) /
+                                      sizeof(accepted_block[0]))) {
+                    block_cap = (int)(sizeof(accepted_block) /
+                                      sizeof(accepted_block[0]));
+                }
+                block_n = ds4_session_eval_speculative_argmax_excluding(
+                        session,
+                        token,
+                        block_cap,
+                        eos,
+                        accepted_block,
+                        block_cap,
+                        err,
+                        sizeof(err));
+                if (block_n <= 0) {
+                    fprintf(stderr,
+                            "ds4-bench: speculative decode at frontier %d failed: %s\n",
+                            frontier,
+                            err);
+                    rc = 1;
+                    break;
+                }
+            } else if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
                 rc = 1;
                 break;
             }
             const double token_t1 = bench_now_sec();
-            if (i == 0) gen_first_sec = token_t1 - token_t0;
-            else gen_steady_sec += token_t1 - token_t0;
-            if (gen_token_buf) gen_token_buf[gen_token_count++] = token;
-            gen_done++;
+            if (gen_done == 0) {
+                /* A speculative block becomes visible atomically, so this is
+                 * the real time-to-first-token even when it also returns more
+                 * accepted tokens.  Steady throughput excludes that complete
+                 * first block instead of pretending its cost belonged to one
+                 * token. */
+                gen_first_sec = token_t1 - token_t0;
+            } else {
+                gen_steady_sec += token_t1 - token_t0;
+                gen_steady_tokens += block_n;
+            }
+            for (int j = 0; j < block_n; j++) {
+                if (gen_token_buf && gen_token_count < cfg.gen_tokens) {
+                    gen_token_buf[gen_token_count++] = accepted_block[j];
+                }
+                if (accepted_block[j] == eos) generation_eos = true;
+            }
+            gen_done += block_n;
         }
         const double gen_t1 = bench_now_sec();
         if (cfg.show_output && gen_token_buf && gen_token_count > 0) {
@@ -795,7 +939,6 @@ int main(int argc, char **argv) {
         }
 
         const double gen_sec = gen_t1 - gen_t0;
-        const int gen_steady_tokens = gen_done > 1 ? gen_done - 1 : 0;
         fprintf(out,
                 "%d,%d,%.2f,%d,%.2f,%.3f,%d,%.2f,%llu\n",
                 frontier,
@@ -817,6 +960,6 @@ int main(int argc, char **argv) {
     ds4_session_snapshot_free(&snap);
     ds4_session_free(session);
     ds4_tokens_free(&prompt);
-    ds4_engine_close(engine);
+    bench_engine_close(engine);
     return rc;
 }

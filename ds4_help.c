@@ -175,14 +175,18 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
     if (full) {
-        if (tool != DS4_HELP_BENCH) {
+        if (tool != DS4_HELP_EVAL) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
         }
-        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT ||
+            tool == DS4_HELP_SERVER) {
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
             opt(fp, c, "--glm-mtp", "Enable integrated greedy GLM MTP speculation.");
             opt(fp, c, "--glm-mtp-timing", "Enable GLM MTP and print acceptance/timing counters.");
+        }
+        if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT ||
+            tool == DS4_HELP_SERVER || tool == DS4_HELP_BENCH) {
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp.");
             opt(fp, c, "--dspark-confidence F", "Enable DSpark with confidence pruning threshold 0..1. Greedy/opportunistic default: Metal 0.6, CUDA/ROCm 0.7; exact sampling: 0.8");
             opt(fp, c, "--mtp-exact-sampling", "DFlash: preserve the ordinary temperature distribution instead of accepting target-matching greedy drafts directly.");
@@ -334,6 +338,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
+    opt(fp, c, "--prefill-quantum N", "Prefill tokens per engine call when idle (batched mode only). Default: 2048");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
