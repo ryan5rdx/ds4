@@ -42,7 +42,7 @@ typedef void (argsort_t)(
 
 // Sort one float row into an index row. DS4 only exports the descending
 // instance because router and indexer selection both need top-k order.
-template<ds4_sort_order order>
+template<ds4_sort_order order, bool canon = false>
 kernel void kernel_argsort_f32_i32(
         constant   ds4_metal_args_argsort & args,
         device   const char * src0,
@@ -80,6 +80,12 @@ kernel void kernel_argsort_f32_i32(
         for (int j = k / 2; j > 0; j /= 2) {
             int ixj = col ^ j;
             if (ixj > col) {
+                /* canon: equal scores tie-break on the index (ascending), so
+                 * the permutation is a total order over (score, idx) — the
+                 * prerequisite for comparing against, or replacing with, any
+                 * streaming/partial top-k whose comparator is totally
+                 * ordered.  The merge kernel is already canonical (left run
+                 * first on ties = index-ascending across runs). */
                 const int32_t ia = shmem_i32[col];
                 const int32_t ib_ = shmem_i32[ixj];
                 const float va = ia < args.ne00 ? shmem_f32[ia - i00] : 0.0f;
@@ -87,16 +93,16 @@ kernel void kernel_argsort_f32_i32(
                 if ((col & k) == 0) {
                     if (ia >= args.ne00 ||
                        (ib_ <  args.ne00 && (order == DS4_SORT_ORDER_ASC ?
-                            (va > vb) :
-                            (va < vb)))
+                            (va > vb || (canon && va == vb && ia > ib_)) :
+                            (va < vb || (canon && va == vb && ia > ib_))))
                     ) {
                         SWAP(shmem_i32[col], shmem_i32[ixj]);
                     }
                 } else {
                     if (ib_ >= args.ne00 ||
                        (ia <  args.ne00 && (order == DS4_SORT_ORDER_ASC ?
-                            (va < vb) :
-                            (va > vb)))
+                            (va < vb || (canon && va == vb && ia < ib_)) :
+                            (va > vb || (canon && va == vb && ia < ib_))))
                     ) {
                         SWAP(shmem_i32[col], shmem_i32[ixj]);
                     }
@@ -121,6 +127,7 @@ kernel void kernel_argsort_f32_i32(
 template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC>;
 // Canonical total order over (score desc, idx asc); tie order among equal
 // scores is the only difference from the kernel above.
+template [[host_name("kernel_argsort_f32_i32_desc_canon")]] kernel argsort_t kernel_argsort_f32_i32<DS4_SORT_ORDER_DESC, true>;
 
 typedef void (argsort_merge_t)(
         constant   ds4_metal_args_argsort_merge & args,
@@ -283,9 +290,9 @@ template [[host_name("kernel_argsort_merge_f32_i32_desc")]] kernel argsort_merge
 // Exact streaming top-512 for wide prefill rows, the Metal port of the CUDA
 // stream selector (45f4ef9): the threshold is the 512th-best key seen so
 // far, so it can only discard candidates that cannot belong to the final top
-// set.  Keys pack (score, idx) into one ulong under a total order — score
-// descending, index ascending — so ties resolve deterministically without a
-// separate comparator pass.  Buffer compaction
+// set.  Keys pack (score, idx) into one ulong with the same total order as
+// the canonical argsort — score descending, index ascending — so the output
+// list is bit-identical to the canon comparator path.  Buffer compaction
 // uses ballot + prefix rank + one threadgroup atomic per simdgroup; the
 // atomic makes buffer ORDER nondeterministic, but every emitted result
 // passes through a full sort of totally-ordered keys, so the output is

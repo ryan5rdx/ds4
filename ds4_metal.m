@@ -18658,7 +18658,16 @@ int ds4_gpu_indexer_topk_tensor(
             ds4_gpu_end_compute_encoder(cb, enc);
             return ds4_gpu_finish_command_buffer(cb, owned, "indexer topk stream512");
         }
-                id<MTLComputePipelineState> sort_pipeline = g_argsort_f32_i32_desc_pipeline;
+                /* The streaming selector orders ties by index, and it only
+                 * handles top_k == 512.  Any other k -- expert routing, plain
+                 * sampling -- never reaches it, so those callers keep upstream's
+                 * comparator and pay nothing.  At k == 512 the fallback must
+                 * agree with the selector, because a batch below the selector's
+                 * token threshold takes this path and the two must not disagree
+                 * on a tie. */
+                id<MTLComputePipelineState> sort_pipeline = (top_k == 512u)
+                        ? ds4_gpu_get_pipeline("kernel_argsort_f32_i32_desc_canon")
+                        : g_argsort_f32_i32_desc_pipeline;
         if (!sort_pipeline) return 0;
         NSUInteger max_threads = sort_pipeline.maxTotalThreadsPerThreadgroup;
         if (max_threads == 0) max_threads = 256;
