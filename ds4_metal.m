@@ -20927,11 +20927,11 @@ int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
         uint32_t                ratio,
         uint32_t                pos) {
     if (!g_initialized && !ds4_gpu_init()) return -1;
-    /* Same device-name-vs-family mismatch 01a56db and ba132ba fixed elsewhere.
-     * test_metal_f16_compressor_pair_state_store_exact_case asserts this
-     * returns 1 with no hardware guard (tests/ds4_test.c:1093-1098), so on any
-     * part that is neither M3 nor M5 it failed at the first call and every
-     * comparison below it then read an unwritten destination. */
+    /* Gate on capability rather than device name.  The same
+     * name-versus-family mismatch has been fixed in several other places: a
+     * test asserts this returns 1 with no hardware guard, so on any part that
+     * is neither M3 nor M5 it failed at the first call and every comparison
+     * below it then read an unwritten destination. */
     const bool family_ok =
         ds4_gpu_device_name_contains("M3") ||
         ds4_gpu_device_name_contains("M5") ||
