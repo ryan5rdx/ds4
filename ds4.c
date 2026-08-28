@@ -23173,7 +23173,7 @@ static bool metal_graph_encode_decode_layer_phase(
     if (ok) {
         metal_graph_debug_dump_tensor("q_lora", metal_graph_qr(g), q_rank, il, pos);
     }
-    /* U12: split the q_path stage into its three parts.  At 131k the whole
+    /* Split the q_path stage into its three parts.  At 131k the whole
      * stage is 5.47 ms and context-invariant -- 15% of the token and the
      * largest non-indexer stage -- but 0.930 GB/token over 5.472 ms is only
      * 170 GB/s, 22% of the 760 GB/s roof, so it is not bandwidth-bound and the
@@ -23295,7 +23295,7 @@ static bool metal_graph_encode_decode_layer_phase(
     if (qkv_rms_fused && ok && !kv_rope_fused) {
         metal_graph_debug_dump_tensor("KVnorm", metal_graph_kv(g), DS4_N_HEAD_DIM, il, pos);
     }
-    /* U12: everything after this boundary is Phase B -- the q_b projection
+    /* Everything after this boundary is Phase B -- the q_b projection
      * plus the per-head RMS norm and RoPE tail.  The remaining `q_path` stage
      * therefore measures exactly that, and the suspect is the fused
      * head-norm/RoPE kernel, which dispatches n_head x n_tok threadgroups
