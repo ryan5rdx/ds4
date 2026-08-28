@@ -128,6 +128,17 @@ tests/bench_indexer_score: tests/bench_indexer_score.o ds4_metal.o
 bench-indexer-score: tests/bench_indexer_score
 	./tests/bench_indexer_score
 
+# #includes ds4.c directly so it can reach the STATIC matvec kernels decode uses
+# -- a copy of them would drift and would not be evidence about the shipped path.
+tests/bench_cpu_draft_cost.o: tests/bench_cpu_draft_cost.c ds4.c
+	$(CC) $(CFLAGS) -I. -DDS4_NO_GPU -Wno-unused-function -c -o $@ $<
+
+tests/bench_cpu_draft_cost: tests/bench_cpu_draft_cost.o ds4_distributed_cpu.o ds4_tp.o ds4_layer_pack.o ds4_ssd.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+bench-cpu-draft-cost: tests/bench_cpu_draft_cost
+	./tests/bench_cpu_draft_cost
+
 tests/bench_ngram_accept.o: tests/bench_ngram_accept.c
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
