@@ -1062,6 +1062,9 @@ static const char *g_ts_labels[DS4_GPU_TS_MAX_ENCODERS];
  * composite span is visible as one instead of masquerading as its last stage. */
 static const char *g_ts_label_last[DS4_GPU_TS_MAX_ENCODERS];
 static uint16_t g_ts_label_hits[DS4_GPU_TS_MAX_ENCODERS];
+/* Whether the encoder most recently created actually got a sample slot.
+ * False once the range is capped, so labels stop attaching to a stale slot. */
+static int g_ts_slot_open;
 static uint32_t g_ts_n;
 /* First slot of the range owned by g_ts_cb; labels stay range-local. */
 static uint32_t g_ts_base;
@@ -1124,6 +1127,12 @@ static int ds4_gpu_ts_active(void) {
 static void ds4_gpu_ts_note_label(const char *label) {
     if (!label || g_ts_enabled <= 0) return;
     if (g_ts_n == 0) { g_ts_pending_label = label; return; }
+    /* Once the range hits the slot cap, ds4_gpu_ts_pass_descriptor stops
+     * reserving slots but callers keep labelling.  Without this guard every
+     * later label piled onto slot MAX-1, which is what produced a lone span
+     * reported as "1 composite of 512": a real overflow masquerading as a
+     * single fused stage.  A capped encoder has no span, so it gets no label. */
+    if (!g_ts_slot_open) return;
     const uint32_t i = g_ts_n - 1;
     if (!g_ts_labels[i]) g_ts_labels[i] = label;
     g_ts_label_last[i] = label;
@@ -1131,6 +1140,8 @@ static void ds4_gpu_ts_note_label(const char *label) {
 }
 
 static void ds4_gpu_ts_label(const char *label) { ds4_gpu_ts_note_label(label); }
+
+void ds4_gpu_ts_tag(const char *label) { ds4_gpu_ts_note_label(label); }
 
 /* Force a real encoder boundary wherever a caller ends an encoder, so each stage
  * gets its own timestamped span instead of sharing the batch segment's.  Off by
@@ -1416,13 +1427,14 @@ static void ds4_gpu_ts_begin_range(id<MTLCommandBuffer> cb) {
     if (g_ts_base + DS4_GPU_TS_MAX_ENCODERS > DS4_GPU_TS_CAPACITY) g_ts_base = 0;
     g_ts_cb = (__bridge void *)cb;
     g_ts_n = 0;
+    g_ts_slot_open = 0;
 }
 
 /* Reserve one slot pair for the encoder about to be created, or count the
  * overflow.  Returns nil when sampling is off or the range is full, so the
  * caller falls back to an untimestamped encoder. */
 static MTLComputePassDescriptor *ds4_gpu_ts_pass_descriptor(void) {
-    if (g_ts_n >= DS4_GPU_TS_MAX_ENCODERS) { g_ts_capped++; return nil; }
+    if (g_ts_n >= DS4_GPU_TS_MAX_ENCODERS) { g_ts_capped++; g_ts_slot_open = 0; return nil; }
     MTLComputePassDescriptor *pd = [MTLComputePassDescriptor computePassDescriptor];
     pd.sampleBufferAttachments[0].sampleBuffer = g_ts_buffer;
     pd.sampleBufferAttachments[0].startOfEncoderSampleIndex = (g_ts_base + g_ts_n) * 2u;
@@ -1432,6 +1444,7 @@ static MTLComputePassDescriptor *ds4_gpu_ts_pass_descriptor(void) {
     g_ts_label_hits[g_ts_n] = g_ts_pending_label ? 1u : 0u;
     g_ts_pending_label = NULL;
     g_ts_n++;
+    g_ts_slot_open = 1;
     return pd;
 }
 
@@ -23067,7 +23080,6 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
                  1,
                  1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        DS4_METAL_PROFILE_BRACKET_STAGE("rope_tail");
 
         if (!ds4_gpu_finish_command_buffer(
                 cb, owned, "fused head norm/RoPE")) {
@@ -29639,6 +29651,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         !ds4_gpu_encode_fill_f16_1d(cb, flash_mask_buffer, 0, n_keys, 0.0f)) {
         return 0;
     }
+    DS4_METAL_PROFILE_DECODE_FA_STAGE("mask_fill");
     if (use_mask && n_comp &&
         !ds4_gpu_encode_cpy_f32_f16_1d(cb,
                                          maskbuf,
@@ -29648,6 +29661,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
                                          n_comp)) {
         return 0;
     }
+    DS4_METAL_PROFILE_DECODE_FA_STAGE("mask_cpy");
 
     bool pad_fused = false;
     if (!ds4_gpu_encode_flash_kv_stage_f16(
@@ -29673,6 +29687,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
             &pad_fused)) {
         return 0;
     }
+    DS4_METAL_PROFILE_DECODE_FA_STAGE("kv_stage");
 
     id<MTLComputePipelineState> pad_pipeline = nil;
     if (has_kvpad && !pad_fused) {
@@ -29709,7 +29724,7 @@ static int ds4_gpu_encode_flash_attention_gathered_heads(
         [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(ncpsg, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
-        DS4_METAL_PROFILE_DECODE_FA_STAGE("gather");
+        DS4_METAL_PROFILE_DECODE_FA_STAGE("fa_pad");
     }
 
     ds4_gpu_flash_attn_vec_args vec_args = {

@@ -2942,6 +2942,16 @@ void ds4_gpu_ts_fair_share(const uint64_t *starts, const uint64_t *ends, uint32_
                            double spt, double *fair_us, double *union_us,
                            double *conc_mean, uint32_t *max_conc);
 
+/* Name the encoder span most recently created, from a CALL SITE rather than from
+ * inside the helper that created it.  ds4_gpu_rope_tail_tensor has six callers
+ * across q_path, kv_path, the indexer and three points inside the
+ * compressor_indexer -> attn_inv_rope bracket, so a label placed inside it
+ * cannot distinguish the pre-attention RoPE from the post-attention inverse
+ * RoPE -- which is the whole question the bracket accounting is asking.
+ * `label` must have static lifetime; it is stored, not copied.  No-op unless
+ * DS4_METAL_GPU_ENCODER_TIMESTAMPS is set. */
+void ds4_gpu_ts_tag(const char *label);
+
 #ifdef __cplusplus
 }
 #endif

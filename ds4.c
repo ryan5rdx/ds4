@@ -23578,6 +23578,7 @@ static bool metal_graph_encode_decode_layer_phase(
                                       attn_factor,
                                       DS4_ROPE_YARN_BETA_FAST,
                                       DS4_ROPE_YARN_BETA_SLOW) != 0;
+        ds4_gpu_ts_tag("inv_rope");
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_inv_rope");
     if (ok && !cuda_tp_attn_heads_active) {
@@ -51393,6 +51394,7 @@ struct ds4_session {
     float *sample_probs;
     float *mtp_logits;
     int greedy_splitkv_anchor_len;
+
 #ifndef DS4_NO_GPU
     float *spec_row_logits;
     float *dspark_markov_bias;
@@ -53246,6 +53248,43 @@ const ds4_tokens *ds4_session_tokens(ds4_session *s) {
     return s ? &s->checkpoint : NULL;
 }
 
+/* Record every committed decode token to DS4_NGRAM_TRACE=<path>, one id per
+ * line.  Purely passive: it does not enable speculation and does not touch the
+ * decode path beyond an fputs.
+ *
+ * Why a trace and not a live meter.  Whether MTP is worth funding turns on one
+ * number nobody has ever measured on this rig -- the n-gram commit rate on a
+ * real workload.  ds4_ngram_propose (ds4.c:69749) is a pure function of token
+ * history, so that number can be computed offline, which keeps it clear of the
+ * four known defects in the live speculative path (stale s->logits, drafts[0]
+ * pushed without an eval, the bound returning 0 on the ideal periodic case).
+ * A trace also lets one rig session answer the question for every (k, depth)
+ * pair instead of one pair per run.  tests/bench_ngram_accept consumes it. */
+static void ds4_ngram_trace_sync(const ds4_session *s) {
+    static FILE *fp;
+    static int checked;
+    static int written;
+    if (!checked) {
+        checked = 1;
+        const char *path = getenv("DS4_NGRAM_TRACE");
+        if (path && path[0]) {
+            fp = fopen(path, "we");
+            if (!fp) fprintf(stderr, "ds4: DS4_NGRAM_TRACE: cannot open %s\n", path);
+        }
+    }
+    if (!fp || !s) return;
+    /* Flush whatever the checkpoint has gained since the last call.  Syncing the
+     * CHECKPOINT rather than appending at one commit site matters twice over:
+     * it captures the prompt as well as the generated tokens -- and the prompt
+     * is part of what ds4_ngram_propose searches, so a decode-only trace would
+     * under-report matches -- and it is reached from every eval entry point
+     * instead of only ds4_session_eval_argmax, which ds4-bench never calls. */
+    for (int i = written; i < s->checkpoint.len; i++) {
+        fprintf(fp, "%d\n", s->checkpoint.v[i]);
+    }
+    if (s->checkpoint.len > written) { written = s->checkpoint.len; fflush(fp); }
+}
+
 #ifndef DS4_NO_GPU
 static void spec_frontier_free(ds4_spec_frontier *f) {
     if (!f) return;
@@ -53370,32 +53409,6 @@ static bool spec_frontier_commit_prefix(ds4_session *s, uint32_t prefix_len) {
 
 static bool spec_frontier_commit_prefix1(ds4_session *s) {
     return spec_frontier_commit_prefix(s, 1);
-}
-
-/* Record every committed decode token to DS4_NGRAM_TRACE=<path>, one id per
- * line.  Purely passive: it does not enable speculation and does not touch the
- * decode path beyond an fputs.
- *
- * Why a trace and not a live meter.  Whether MTP is worth funding turns on one
- * number nobody has ever measured on this rig -- the n-gram commit rate on a
- * real workload.  ds4_ngram_propose (ds4.c:69749) is a pure function of token
- * history, so that number can be computed offline, which keeps it clear of the
- * four known defects in the live speculative path (stale s->logits, drafts[0]
- * pushed without an eval, the bound returning 0 on the ideal periodic case).
- * A trace also lets one rig session answer the question for every (k, depth)
- * pair instead of one pair per run.  tests/bench_ngram_accept consumes it. */
-static void ds4_ngram_trace_token(int token) {
-    static FILE *fp;
-    static int checked;
-    if (!checked) {
-        checked = 1;
-        const char *path = getenv("DS4_NGRAM_TRACE");
-        if (path && path[0]) {
-            fp = fopen(path, "we");
-            if (!fp) fprintf(stderr, "ds4: DS4_NGRAM_TRACE: cannot open %s\n", path);
-        }
-    }
-    if (fp) { fprintf(fp, "%d\n", token); fflush(fp); }
 }
 
 static void session_greedy_splitkv_reset(ds4_session *s) {
@@ -54903,6 +54916,7 @@ static bool ds4_session_greedy_splitkv_replay_exact(
 
 int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen) {
     if (!s) return -1;
+    ds4_ngram_trace_sync(s);
     if (ds4_session_is_cpu(s) || ds4_session_is_glm(s)) {
         if (ds4_session_eval(s, token, err, errlen) != 0) return -1;
         return ds4_session_argmax(s);
@@ -55063,7 +55077,6 @@ int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen)
         return -1;
     }
     token_vec_push(&s->checkpoint, token);
-    ds4_ngram_trace_token(token);
     if (approx_fallback && anchor_ready && !replayed_exact) {
         token_vec_push(&s->greedy_splitkv_segment, token);
     } else if (!approx_fallback || !anchor_ready) {
@@ -64774,6 +64787,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+    ds4_ngram_trace_sync(s);
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     const bool dspark_owner = ds4_session_dspark_support_owner(s);
