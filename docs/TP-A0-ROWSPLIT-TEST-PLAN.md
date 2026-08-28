@@ -1329,6 +1329,19 @@ point. In that case the next arm is to re-measure `attn_inv_rope` and the enc-ts
 `reduce` **in the same run**, and until then no per-encoder figure enters the
 budget at all.
 
+**RESULT 2026-08-27** (build `a59d3af`): **the falsifier fired.** conc mean
+1.97-1.99 / max 2 (pipelining depth is really ~2 — overlap conclusion stands),
+union = 100% of cb, **gap ≈ 0.000 ms** (no idle pool in the buffer; consistent
+with arm E's 100% residency — stalls are inside encoders). But `fair` for
+`reduce` barely moved from norm — **157.4 vs 159.1 µs/call @2k** — and the
+product is still **4.25 ms > `attn_inv_rope` 3.64 ms (1.17×)**. All three
+candidates (loss, slot aliasing, non-uniform overlap) are dead. Per the
+falsifier, the remaining suspect is the cross-instrument comparison: B runs at
+~23.7 ms/token vs the stage profile's 28.83 ms gpu_busy (~22% different
+operating point). **Next: re-measure `attn_inv_rope` and enc-ts `reduce` in the
+same run; no per-encoder figure enters the budget until then.** Throughput
+baseline (42.15 / 29.62 t/s). Full data in `BENCHMARKS-TP-PP.md` §Arm B5.
+
 ### Arm B4 — the tick is settled, the *call count* is not; one more run — 2026-08-27
 
 Run 3 closed the falsifier: **tick = 1.000 ns at both contexts**, so the counter

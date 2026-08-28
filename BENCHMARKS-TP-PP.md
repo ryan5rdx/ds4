@@ -243,6 +243,45 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### Arm B5 — fair-share decomposition; the falsifier fires — 2026-08-27
+
+Build `a59d3af` (fair-share interval decomposition replaces the uniform
+divisor). Same flags, 2k + 131k, gen 128.
+
+**New instruments — union/conc confirm the overlap conclusion and close the
+idle question:**
+
+| ctx | conc mean | conc max | union of cb | gap |
+|---|---|---|---|---|
+| 2k | 1.97-1.99 | 2 | 100.0% | **0.000 ms** |
+| 131k | 1.98 | 2 | 100.0% | **0.000 ms** |
+
+**`conc mean ≈ 2.0` — pipelining depth really is ~2**, so the banked "2×
+overlap" conclusion stands (not a span-endpoint artefact). **`gap ≈ 0` — no
+idle pool inside the command buffer** (union = 100% of cb), consistent with
+arm E's 100% residency/max clock. The stalls are **inside** the encoders, not
+in scheduling between them.
+
+**`fair` for `reduce` — the falsifier fires:**
+
+| ctx | calls/token | norm µs/call | **fair µs/call** | product | `attn_inv_rope` | ratio |
+|---|---|---|---|---|---|---|
+| 2k | 27 | 159.1 | **157.4** | **4.25 ms** | 3.64 ms | **1.17× — still over** |
+| 131k | 19 | 170.0 | **169.0** | 3.21 ms | 4.24 ms | 0.76× — plausible |
+
+**Fair barely moved from norm (157.4 vs 159.1 @2k) and the 2k product still
+exceeds its containing stage.** The fair-share decomposition — which corrects
+exactly the non-uniform-overlap error — did not fix the overshoot. Per the
+pre-registered falsifier, all three candidates are now dead (loss, slot
+aliasing, non-uniform overlap).
+
+**Remaining suspect: the cross-instrument comparison itself.** B's token is
+~23.7 ms (42.15 t/s) while the stage profile that produced
+`attn_inv_rope = 3.64 ms` ran at 28.83 ms gpu_busy — a ~22% different
+operating point (profiler tax). Per the plan, no per-encoder figure enters the
+budget until `attn_inv_rope` and the enc-ts `reduce` are re-measured **in the
+same run**. Throughput at baseline (42.15 / 29.62 t/s).
+
 ### Arm B4 — banked slots + LOSS counter; the 2k overshoot survives — 2026-08-27
 
 Build `c9e0f72` (carries `d645b29` banking fix). Same flags as run 3
