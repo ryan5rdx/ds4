@@ -300,6 +300,34 @@ is one composite; pass 2 perturbs). The encoder instrument has gone as far as
 it can. The unnamed ~1.9-2.4 ms inside `attn_inv_rope` is not separable at the
 GPU-encoder boundary and must be chased where the stages are distinct code paths.
 
+### Arm X1 — argsort tie-break removal: neutral on hardware, top-1 preserved — 2026-08-28
+
+Build `e1da7b3`/`6d632c9`. Interleaved 3 repeats of
+`DS4_METAL_DISABLE_ARGSORT_CANON` (off/on) at 2048→8192 step-mul 2, gen 8,
+pair restart, logits captured per frontier.
+
+| ctx | ctl t/s (3 reps) | dis t/s (3 reps) | delta |
+|---|---|---|---|
+| 2048 | 447.4 / 449.7 / 450.3 | 450.0 / 449.6 / 448.6 | **+0.06%** |
+| 4096 | 524.5 / 524.6 / 525.1 | 524.7 / 522.6 / 524.9 | **−0.13%** |
+| 8192 | 555.0 / 556.0 / 554.7 | 552.7 / 555.4 / 556.6 | **−0.06%** |
+
+**Falsifier fires — the removal is NEUTRAL.** Expected +5.6% @2048 / +2.5%
+@4096 from the pre-gate measurement; observed +0.06% / −0.13% — within the
+±1.4% anchor noise, no recovery at any context. The pre-gate measurement did
+not survive the gate (prefill never runs a chunk below 512 tokens, so the
+comparator's n_tokens>=32 gate is never exercised where the gain was measured).
+
+**Correctness: top-1 preserved everywhere.** `argmax_id` is byte-identical
+between control and disabled at every context and repeat (668 @2k, 201 @4k,
+77179 @8k). The comparator's tie-order change does not alter the live
+consumer's top-1 on this fixture.
+
+**Verdict.** Still correct to remove (an unmotivated, non-bit-identical output
+change with no measured benefit), but the **throughput claim should be dropped**
+from the commit message — the removal recovers nothing on hardware. Neutral,
+not a win.
+
 ### Arm W1 — does prefill pay the batch-encode fixed cost? — 2026-08-28
 
 **Units corrected 2026-08-28 (`5d1f45d`): the table is in SECONDS, not ms.**

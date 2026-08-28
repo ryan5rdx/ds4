@@ -242,6 +242,15 @@ not survive the gate and the removal is neutral — still correct to remove, sin
 it is an unmotivated output change, but the commit message should drop the
 throughput claim.
 
+**RESULT 2026-08-28** (build `6d632c9`): **falsifier fires — the removal is
+NEUTRAL.** Interleaved 3 repeats, logits captured: delta +0.06% @2048,
+−0.13% @4096, −0.06% @8192 (expected +5.6%/+2.5%). Within ±1.4% anchor noise,
+no recovery at any context — the pre-gate measurement did not survive the gate.
+**Top-1 is preserved** (argmax_id identical ctl-vs-dis at every ctx/rep: 668
+@2k, 201 @4k, 77179 @8k). Still correct to remove (unmotivated, non-bit-
+identical output change), but the throughput claim should be **dropped** —
+neutral, not a win. Full data in `BENCHMARKS-TP-PP.md` §Arm X1.
+
 ### Arms W1-W3 — the batch-encode fixed cost, and who else pays it
 
 **Why this replaces the speculation work.** The V-residual arm settled where the
