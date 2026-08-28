@@ -243,6 +243,71 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### Arms C-F — shape fields, dispatch ballast, powermetrics, compressor accounting — 2026-08-27
+
+One session, build `05f402d`, 2k context, gen 128. All four zero-code arms.
+
+**Arm C — flash-attn shape fields** (`DS4_METAL_FLASH_ATTN_STAGE_PROFILE=1`;
+timings are host round trips, read shapes only). Per-layer compression shape
+at 2k (heads=64, dim=512, window=128):
+
+| ratio | layers | n_comp | n_keys |
+|---|---|---|---|
+| 0 (raw) | ~2 | 0 | 2048 |
+| 128 | 21 | 16 | 2064 |
+| 4 | 21 | 512 | 2560 |
+
+(Line counts: 8 raw, 120 ratio-128, 105 ratio-4 — /5 stages per prefill
+chunk, 2 prefill chunks. The exact per-layer split is ratio-determined and
+context-invariant.)
+
+**Arm D — dispatch ballast ∈ {0,2}** (`DS4_METAL_DISPATCH_BALLAST`) at 2k,
+the dispatch price in the live graph:
+
+| ballast | gen_steady t/s |
+|---|---|
+| 0 | 41.22 |
+| 2 | 40.72 |
+
+Delta 0.50 t/s for +86 no-op dispatches (2/layer × 43) ≈ **0.28 ms/token ≈
+3.3 µs/dispatch** — above the 2.9 µs item-C kill threshold, so item C is not
+dropped by this arm alone (marginal; the R12a/ballast nulls say added
+dispatches hide in the ~2× pipeline overlap, so treat 3.3 µs as an upper
+bound).
+
+**Arm E — powermetrics, decode vs bench_membw** (`sudo powermetrics
+--samplers gpu_power -i 200`, coordinator host):
+
+| phase | mean power | peak | clock | residency |
+|---|---|---|---|---|
+| prefill (2k) | ~59-60 W | 68 W | 1394-1398 MHz | ~90-100% |
+| **decode** | **~33.4 W** | 34 W | **1398 MHz (max)** | **100%** |
+| idle | ~0.08 W | — | — | — |
+| bench_membw (760 GB/s) | 0.75 W all / 38 W active-burst | 66 W | DVFS ~950-1398 | bursty |
+
+**Retires the "30 W / 20% utilised" premise.** Decode draws ~33 W but at
+**1398 MHz max clock, 100% residency** — the GPU is not under-clocked or
+idle; it is busy at the top P-state drawing a modest 33 W because the work
+is latency/bandwidth-bound, not power-hungry. The 30 W figure was never
+evidence of headroom. DVFS is NOT the decode gap: decode sits at max clock.
+
+**Arm F — QKV pair quad fuse disable** (`DS4_METAL_DISABLE_PRE_M5_QKV_PAIR_QUAD_FUSE=1`
++ stage profiler) at 2k:
+
+| stage | fused (iter 3) | **unfused** |
+|---|---|---|
+| q_a_kv_proj | 2.138 ms | **1.441 ms** |
+| compressor_proj | (hidden) | **0.903 ms appears** |
+| compressor_update | 1.278 (attrib) | 1.278 |
+| total gpu_busy | 28.83 ms | 29.045 ms |
+
+**Confirms the 608 MB compressor accounting.** Unfusing moves the quad
+compressor out of q_a_kv_proj: q_a_kv_proj drops 2.138→1.441 (Δ0.697 ms) and
+a compressor_proj row appears at 0.903 ms. The compressor read work is real
+and lands where the corrected byte model put it. (F ran with stage
+timestamps, so 35.70 t/s is ~13-18% distorted; the stage deltas are the
+read.)
+
 ### Arm B — encoder-timestamp re-baseline (re-run 3, slot-scoped + normalised build `05f402d`) — 2026-08-27
 
 **Falsifier resolved.** The pre-registered falsifier said: if the inferred
