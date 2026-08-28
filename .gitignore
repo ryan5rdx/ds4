@@ -20,6 +20,8 @@
 /tests/test_gpu_lookup_cache_strict
 /tests/test_gpu_model_cache
 /tests/test_gpu_xdev
+/tests/test_indexer_scorer
+/tests/test_topk_stream512
 /tests/test_cuda_mixed_batch
 /tests/test_cuda_session_batch
 /tests/cuda_long_context_smoke
@@ -30,6 +32,9 @@
 /tests/test_mxfp4_metal
 /tests/test_q4k_dot
 /tests/test_sampling
+/speed-bench/metal_flash_attn_decode_bench
+/gguf-tools/tests/test_dflash_import
+/gguf-tools/tests/test_dspark_mxfp4_plan
 *.o
 *.dSYM/
 __pycache__/
@@ -37,3 +42,6 @@ __pycache__/
 /misc/
 .*.swp
 .DS_Store
+/.claude/
+# Instruments captures; a single decode trace runs to tens of MB.
+*.trace/

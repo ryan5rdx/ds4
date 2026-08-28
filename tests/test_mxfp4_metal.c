@@ -2,6 +2,7 @@
 
 #include "ds4_gpu.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -16,11 +17,28 @@
 #define N_EXPERT 6u
 #define DIM 256u
 #define BATCH_TOKENS 48u
+#define QK_Q8_0 32u
+#define ATTN_GROUPS 8u
+#define ATTN_RANK 32u
+#define TP_TEST_ROWS 5u
+/* The first 32768 rows fill the capped 128 x 256 dispatch.  Another 257 rows
+ * exercise the strided traversal in two different threadgroups. */
+#define MARKOV_VOCAB 33025u
+#define MARKOV_RANK 256u
+#define MARKOV_STEPS 3u
 
 typedef struct {
     uint8_t e;
     uint8_t qs[QK_MXFP4 / 2u];
 } block_mxfp4;
+
+typedef struct {
+    _Float16 d;
+    int8_t qs[QK_Q8_0];
+} block_q8_0;
+
+typedef char block_q8_0_must_be_34_bytes[
+    sizeof(block_q8_0) == 34u ? 1 : -1];
 
 static const float mxfp4_values[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -81,6 +99,39 @@ static void fill_matrix(block_mxfp4 *matrix, uint32_t salt) {
     }
 }
 
+static void fill_q8_matrix(block_q8_0 *matrix,
+                           uint32_t rows,
+                           uint32_t cols,
+                           uint32_t salt) {
+    const uint32_t blocks_per_row = cols / QK_Q8_0;
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint32_t block = 0; block < blocks_per_row; block++) {
+            block_q8_0 *b = matrix +
+                (uint64_t)row * blocks_per_row + block;
+            b->d = (_Float16)((float)(1u +
+                ((salt + row * 3u + block * 5u) % 7u)) / 512.0f);
+            for (uint32_t i = 0; i < QK_Q8_0; i++) {
+                b->qs[i] = (int8_t)((int32_t)(
+                    (salt + row * 11u + block * 7u + i * 5u) % 31u) - 15);
+            }
+        }
+    }
+}
+
+static float dot_q8(const block_q8_0 *row,
+                    const float *x,
+                    uint32_t cols) {
+    float sum = 0.0f;
+    for (uint32_t block = 0; block < cols / QK_Q8_0; block++) {
+        const block_q8_0 *b = row + block;
+        const float d = (float)b->d;
+        for (uint32_t i = 0; i < QK_Q8_0; i++) {
+            sum += d * (float)b->qs[i] * x[block * QK_Q8_0 + i];
+        }
+    }
+    return sum;
+}
+
 static int compare_values(const char *name, const float *actual,
                           const float *expected, uint64_t count,
                           float tolerance) {
@@ -116,7 +167,25 @@ int main(void) {
     const uint64_t gate_offset = 0;
     const uint64_t up_offset = align_up(tensor_bytes, page);
     const uint64_t down_offset = align_up(up_offset + tensor_bytes, page);
-    const uint64_t model_size = align_up(down_offset + tensor_bytes, page);
+    const uint64_t q8_attn_row_bytes =
+        (DIM / QK_Q8_0) * sizeof(block_q8_0);
+    const uint64_t q8_low_dim = (uint64_t)ATTN_GROUPS * ATTN_RANK;
+    const uint64_t attn_a_bytes = q8_low_dim * q8_attn_row_bytes;
+    const uint64_t attn_b_bytes = DIM *
+        (q8_low_dim / QK_Q8_0) * sizeof(block_q8_0);
+    const uint64_t markov_row_bytes =
+        (MARKOV_RANK / QK_Q8_0) * sizeof(block_q8_0);
+    const uint64_t markov_bytes = MARKOV_VOCAB * markov_row_bytes;
+    const uint64_t attn_a_offset =
+        align_up(down_offset + tensor_bytes, page);
+    const uint64_t attn_b_offset =
+        align_up(attn_a_offset + attn_a_bytes, page);
+    const uint64_t markov_w1_offset =
+        align_up(attn_b_offset + attn_b_bytes, page);
+    const uint64_t markov_w2_offset =
+        align_up(markov_w1_offset + markov_bytes, page);
+    const uint64_t model_size =
+        align_up(markov_w2_offset + markov_bytes, page);
     void *model = NULL;
     if (posix_memalign(&model, (size_t)page, (size_t)model_size) != 0) {
         fprintf(stderr, "MXFP4 Metal test model allocation failed\n");
@@ -126,6 +195,18 @@ int main(void) {
     fill_matrix((block_mxfp4 *)((uint8_t *)model + gate_offset), 1u);
     fill_matrix((block_mxfp4 *)((uint8_t *)model + up_offset), 5u);
     fill_matrix((block_mxfp4 *)((uint8_t *)model + down_offset), 9u);
+    fill_q8_matrix(
+        (block_q8_0 *)((uint8_t *)model + attn_a_offset),
+        ATTN_GROUPS * ATTN_RANK, DIM, 13u);
+    fill_q8_matrix(
+        (block_q8_0 *)((uint8_t *)model + attn_b_offset),
+        DIM, (uint32_t)q8_low_dim, 17u);
+    fill_q8_matrix(
+        (block_q8_0 *)((uint8_t *)model + markov_w1_offset),
+        MARKOV_VOCAB, MARKOV_RANK, 19u);
+    fill_q8_matrix(
+        (block_q8_0 *)((uint8_t *)model + markov_w2_offset),
+        MARKOV_VOCAB, MARKOV_RANK, 23u);
 
     float x[DIM];
     int32_t selected[N_EXPERT] = { 0, 2, 3, 5, 6, 7 };
@@ -347,6 +428,295 @@ int main(void) {
              compare_values("out", out_gpu, out_ref, DIM, 2.0e-4f);
     }
 
+    /* The TP verifier keeps every attention row but splits the eight output
+     * groups. Exercise both rank slices with a full-row-stride heads tensor,
+     * compact low rows, and the matching out_b K window. The two partials
+     * must reconstruct the unsplit projection for all five DSpark rows. */
+    enum { TP_GROUPS = ATTN_GROUPS / 2u };
+    const uint64_t heads_count =
+        (uint64_t)TP_TEST_ROWS * ATTN_GROUPS * DIM;
+    const uint64_t tp_low_count =
+        (uint64_t)TP_TEST_ROWS * TP_GROUPS * ATTN_RANK;
+    const uint64_t tp_heads_compact_count =
+        (uint64_t)TP_TEST_ROWS * TP_GROUPS * DIM;
+    const uint64_t tp_out_count = (uint64_t)TP_TEST_ROWS * DIM;
+    float *tp_heads_host = calloc((size_t)heads_count, sizeof(float));
+    float *tp_heads_compact_host = calloc(
+        (size_t)tp_heads_compact_count, sizeof(float));
+    float *tp_low_full_ref = calloc(
+        (size_t)TP_TEST_ROWS * (size_t)q8_low_dim, sizeof(float));
+    float *tp_low_expected = calloc((size_t)tp_low_count, sizeof(float));
+    float *tp_low_actual = calloc((size_t)tp_low_count, sizeof(float));
+    float *tp_out_expected = calloc((size_t)tp_out_count, sizeof(float));
+    float *tp_out_actual = calloc((size_t)tp_out_count, sizeof(float));
+    float *tp_out_sum = calloc((size_t)tp_out_count, sizeof(float));
+    float *tp_out_full_ref = calloc((size_t)tp_out_count, sizeof(float));
+    ds4_gpu_tensor *tp_heads_tensor = ds4_gpu_tensor_alloc(
+        heads_count * sizeof(float));
+    ds4_gpu_tensor *tp_heads_compact_tensor = ds4_gpu_tensor_alloc(
+        tp_heads_compact_count * sizeof(float));
+    ds4_gpu_tensor *tp_low_tensor = ds4_gpu_tensor_alloc(
+        tp_low_count * sizeof(float));
+    ds4_gpu_tensor *tp_out_tensor = ds4_gpu_tensor_alloc(
+        tp_out_count * sizeof(float));
+    ok = ok && tp_heads_host && tp_heads_compact_host &&
+         tp_low_full_ref && tp_low_expected &&
+         tp_low_actual && tp_out_expected && tp_out_actual && tp_out_sum &&
+         tp_out_full_ref && tp_heads_tensor && tp_heads_compact_tensor &&
+         tp_low_tensor && tp_out_tensor;
+    for (uint64_t i = 0; i < heads_count; i++) {
+        tp_heads_host[i] =
+            (float)((int32_t)((i * 17u + i / DIM * 7u) % 53u) - 26) /
+            128.0f;
+    }
+    const block_q8_0 *attn_a =
+        (const block_q8_0 *)((const uint8_t *)model + attn_a_offset);
+    const block_q8_0 *attn_b =
+        (const block_q8_0 *)((const uint8_t *)model + attn_b_offset);
+    const uint64_t attn_a_blocks_per_row = DIM / QK_Q8_0;
+    const uint64_t attn_b_blocks_per_row = q8_low_dim / QK_Q8_0;
+    for (uint32_t t = 0; t < TP_TEST_ROWS; t++) {
+        for (uint32_t group = 0; group < ATTN_GROUPS; group++) {
+            const float *head = tp_heads_host +
+                ((uint64_t)t * ATTN_GROUPS + group) * DIM;
+            for (uint32_t j = 0; j < ATTN_RANK; j++) {
+                tp_low_full_ref[(uint64_t)t * q8_low_dim +
+                                (uint64_t)group * ATTN_RANK + j] =
+                    dot_q8(attn_a +
+                               ((uint64_t)group * ATTN_RANK + j) *
+                                   attn_a_blocks_per_row,
+                           head,
+                           DIM);
+            }
+        }
+        for (uint32_t out = 0; out < DIM; out++) {
+            tp_out_full_ref[(uint64_t)t * DIM + out] =
+                dot_q8(attn_b + (uint64_t)out * attn_b_blocks_per_row,
+                       tp_low_full_ref + (uint64_t)t * q8_low_dim,
+                       (uint32_t)q8_low_dim);
+        }
+    }
+    ok = ok && ds4_gpu_tensor_write(
+        tp_heads_tensor, 0, tp_heads_host, heads_count * sizeof(float));
+    for (uint32_t rank_id = 0; rank_id < 2u && ok; rank_id++) {
+        const uint32_t group0 = rank_id * TP_GROUPS;
+        const uint64_t k0 = (uint64_t)group0 * ATTN_RANK;
+        for (uint32_t t = 0; t < TP_TEST_ROWS; t++) {
+            memcpy(tp_heads_compact_host +
+                       (uint64_t)t * TP_GROUPS * DIM,
+                   tp_heads_host +
+                       ((uint64_t)t * ATTN_GROUPS + group0) * DIM,
+                   (size_t)TP_GROUPS * DIM * sizeof(float));
+            memcpy(tp_low_expected +
+                       (uint64_t)t * TP_GROUPS * ATTN_RANK,
+                   tp_low_full_ref + (uint64_t)t * q8_low_dim + k0,
+                   (size_t)TP_GROUPS * ATTN_RANK * sizeof(float));
+            for (uint32_t out = 0; out < DIM; out++) {
+                tp_out_expected[(uint64_t)t * DIM + out] =
+                    dot_q8(attn_b +
+                               (uint64_t)out * attn_b_blocks_per_row +
+                               k0 / QK_Q8_0,
+                           tp_low_full_ref +
+                               (uint64_t)t * q8_low_dim + k0,
+                           TP_GROUPS * ATTN_RANK);
+            }
+        }
+        ok = ok && ds4_gpu_tensor_fill_f32(
+            tp_low_tensor, -111.0f, tp_low_count);
+        ok = ok && ds4_gpu_tensor_fill_f32(
+            tp_out_tensor, -112.0f, tp_out_count);
+        ok = ok && ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+            tp_low_tensor,
+            model,
+            model_size,
+            attn_a_offset,
+            DIM,
+            ATTN_RANK,
+            ATTN_GROUPS,
+            group0,
+            TP_GROUPS,
+            tp_heads_tensor,
+            TP_TEST_ROWS);
+        ok = ok && ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+            tp_out_tensor,
+            model,
+            model_size,
+            attn_b_offset,
+            q8_low_dim,
+            DIM,
+            k0,
+            (uint64_t)TP_GROUPS * ATTN_RANK,
+            tp_low_tensor,
+            TP_TEST_ROWS);
+        ok = ok && ds4_gpu_tensor_read(
+            tp_low_tensor, 0, tp_low_actual, tp_low_count * sizeof(float));
+        ok = ok && ds4_gpu_tensor_read(
+            tp_out_tensor, 0, tp_out_actual, tp_out_count * sizeof(float));
+        if (ok) {
+            char low_label[16];
+            char out_label[16];
+            snprintf(low_label, sizeof(low_label), "tp%u-low", rank_id);
+            snprintf(out_label, sizeof(out_label), "tp%u-out", rank_id);
+            ok = compare_values(low_label, tp_low_actual, tp_low_expected,
+                                tp_low_count, 3.0e-4f) &&
+                 compare_values(out_label, tp_out_actual, tp_out_expected,
+                                tp_out_count, 3.0e-3f);
+        }
+        for (uint64_t i = 0; i < tp_out_count; i++) {
+            tp_out_sum[i] += tp_out_actual[i];
+        }
+        /* The end-to-end verifier head split packs this rank's groups at the
+         * start of every row. Point the weight range at the global group and
+         * present both the logical group count and heads stride as compact. */
+        const uint64_t attn_a_row_bytes =
+            attn_a_blocks_per_row * sizeof(block_q8_0);
+        const uint64_t compact_attn_a_offset = attn_a_offset +
+            (uint64_t)group0 * ATTN_RANK * attn_a_row_bytes;
+        ok = ok && ds4_gpu_tensor_write(
+            tp_heads_compact_tensor, 0, tp_heads_compact_host,
+            tp_heads_compact_count * sizeof(float));
+        ok = ok && ds4_gpu_tensor_fill_f32(
+            tp_low_tensor, -113.0f, tp_low_count);
+        ok = ok && ds4_gpu_tensor_fill_f32(
+            tp_out_tensor, -114.0f, tp_out_count);
+        ok = ok && ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+            tp_low_tensor,
+            model,
+            model_size,
+            compact_attn_a_offset,
+            DIM,
+            ATTN_RANK,
+            TP_GROUPS,
+            0,
+            TP_GROUPS,
+            tp_heads_compact_tensor,
+            TP_TEST_ROWS);
+        ok = ok && ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+            tp_out_tensor,
+            model,
+            model_size,
+            attn_b_offset,
+            q8_low_dim,
+            DIM,
+            k0,
+            (uint64_t)TP_GROUPS * ATTN_RANK,
+            tp_low_tensor,
+            TP_TEST_ROWS);
+        ok = ok && ds4_gpu_tensor_read(
+            tp_low_tensor, 0, tp_low_actual, tp_low_count * sizeof(float));
+        ok = ok && ds4_gpu_tensor_read(
+            tp_out_tensor, 0, tp_out_actual, tp_out_count * sizeof(float));
+        if (ok) {
+            char low_label[24];
+            char out_label[24];
+            snprintf(low_label, sizeof(low_label), "tp%u-compact-low", rank_id);
+            snprintf(out_label, sizeof(out_label), "tp%u-compact-out", rank_id);
+            ok = compare_values(low_label, tp_low_actual, tp_low_expected,
+                                tp_low_count, 3.0e-4f) &&
+                 compare_values(out_label, tp_out_actual, tp_out_expected,
+                                tp_out_count, 3.0e-3f);
+        }
+    }
+    if (ok) {
+        ok = compare_values("tp-sum", tp_out_sum, tp_out_full_ref,
+                            tp_out_count, 4.0e-3f);
+    }
+
+    /* Keep the DSpark Markov correction resident too: validate a short greedy
+     * chain (including previous-token feedback, production rank, and a
+     * non-multiple-of-256 vocabulary tail) against a scalar Q8_0 reference. */
+    float markov_logits[MARKOV_VOCAB];
+    float markov_state[MARKOV_RANK];
+    const block_q8_0 *markov_w1 =
+        (const block_q8_0 *)((const uint8_t *)model + markov_w1_offset);
+    const block_q8_0 *markov_w2 =
+        (const block_q8_0 *)((const uint8_t *)model + markov_w2_offset);
+    ds4_gpu_tensor *markov_logits_tensor = ds4_gpu_tensor_alloc(
+        sizeof(markov_logits));
+    ds4_gpu_tensor *markov_key_tensor = ds4_gpu_tensor_alloc(sizeof(uint64_t));
+    ok = ok && markov_logits_tensor && markov_key_tensor;
+    uint32_t markov_prev = 7u;
+    for (uint32_t step = 0; ok && step < MARKOV_STEPS; step++) {
+        const block_q8_0 *markov_w1_row = markov_w1 +
+            (uint64_t)markov_prev * (MARKOV_RANK / QK_Q8_0);
+        for (uint32_t i = 0; i < MARKOV_RANK; i++) {
+            const block_q8_0 *b = markov_w1_row + i / QK_Q8_0;
+            markov_state[i] = (float)b->d * (float)b->qs[i % QK_Q8_0];
+        }
+        uint32_t markov_expected = 0;
+        float markov_best = -FLT_MAX;
+        for (uint32_t token = 0; token < MARKOV_VOCAB; token++) {
+            markov_logits[token] =
+                (float)((int32_t)((token * 29u + step * 17u + 3u) % 41u) - 20) /
+                32.0f;
+            if (step + 1u == MARKOV_STEPS &&
+                token + 1u == MARKOV_VOCAB) {
+                /* Force a winner in the second strided threadgroup; otherwise
+                 * a broken kernel that ignores rows >= 32768 can pass when
+                 * the deterministic weights favor an early vocabulary row. */
+                markov_logits[token] = 1.0e6f;
+            }
+            const float score = markov_logits[token] +
+                dot_q8(markov_w2 +
+                           (uint64_t)token * (MARKOV_RANK / QK_Q8_0),
+                       markov_state,
+                       MARKOV_RANK);
+            if (score > markov_best ||
+                (score == markov_best && token < markov_expected)) {
+                markov_best = score;
+                markov_expected = token;
+            }
+        }
+        uint64_t markov_key = 0;
+        ok = ds4_gpu_tensor_write(
+            markov_logits_tensor, 0, markov_logits, sizeof(markov_logits));
+        ok = ok && ds4_gpu_dspark_markov_argmax_tensor(
+            markov_key_tensor,
+            markov_logits_tensor,
+            model,
+            model_size,
+            markov_w1_offset,
+            markov_w2_offset,
+            markov_prev,
+            MARKOV_VOCAB,
+            MARKOV_RANK);
+        ok = ok && ds4_gpu_tensor_read(
+            markov_key_tensor, 0, &markov_key, sizeof(markov_key));
+        const uint32_t markov_actual = ~(uint32_t)markov_key;
+        if (ok && markov_actual != markov_expected) {
+            fprintf(stderr,
+                    "MXFP4 Metal DSpark Markov step=%u mismatch expected=%u actual=%u key=%016llx\n",
+                    step,
+                    markov_expected,
+                    markov_actual,
+                    (unsigned long long)markov_key);
+            ok = 0;
+        } else if (ok) {
+            fprintf(stderr,
+                    "MXFP4 Metal DSpark Markov step=%u expected=%u actual=%u key=%016llx PASS\n",
+                    step,
+                    markov_expected,
+                    markov_actual,
+                    (unsigned long long)markov_key);
+            markov_prev = markov_actual;
+        }
+    }
+    ds4_gpu_tensor_free(markov_key_tensor);
+    ds4_gpu_tensor_free(markov_logits_tensor);
+    ds4_gpu_tensor_free(tp_out_tensor);
+    ds4_gpu_tensor_free(tp_low_tensor);
+    ds4_gpu_tensor_free(tp_heads_compact_tensor);
+    ds4_gpu_tensor_free(tp_heads_tensor);
+    free(tp_out_full_ref);
+    free(tp_out_sum);
+    free(tp_out_actual);
+    free(tp_out_expected);
+    free(tp_low_actual);
+    free(tp_low_expected);
+    free(tp_low_full_ref);
+    free(tp_heads_compact_host);
+    free(tp_heads_host);
+
     /* The production large-prefill path stores its fused SwiGLU result as
      * FP16 before the down projection. Compare that independent grouped-MMA
      * path against the same scalar reference with the documented rounding. */
@@ -373,31 +743,46 @@ int main(void) {
         (size_t)batch_out_count * N_EXPERT, sizeof(float));
     uint8_t *batch_poison = malloc(
         (size_t)batch_out_count * N_EXPERT * sizeof(float));
-    float mid_half_ref[N_EXPERT * DIM];
-    float out_half_ref[DIM];
-    memset(out_half_ref, 0, sizeof(out_half_ref));
-    for (uint64_t pair = 0; pair < pair_count; pair++) {
-        mid_half_ref[pair] = (float)(_Float16)mid_ref[pair];
-    }
-    for (uint32_t row = 0; row < DIM; row++) {
-        for (uint32_t slot = 0; slot < N_EXPERT; slot++) {
-            const uint32_t expert = (uint32_t)selected[slot];
-            out_half_ref[row] += dot_mxfp4(
-                down_matrix + (uint64_t)expert * blocks_per_expert +
-                    (uint64_t)row * blocks_per_row,
-                mid_half_ref + (uint64_t)slot * DIM);
-        }
-    }
     for (uint32_t token = 0; token < BATCH_TOKENS; token++) {
-        memcpy(x_batch + (uint64_t)token * DIM, x, sizeof(x));
+        float *x_row = x_batch + (uint64_t)token * DIM;
+        float *mid_row = mid_batch_expected + (uint64_t)token * pair_count;
+        float *out_row = out_batch_expected + (uint64_t)token * DIM;
+        for (uint32_t i = 0; i < DIM; i++) {
+            const int32_t delta =
+                (int32_t)((token * 7u + i * 3u) % 9u) - 4;
+            x_row[i] = x[i] + (float)delta / 1024.0f;
+        }
         memcpy(selected_batch + (uint64_t)token * N_EXPERT,
                selected, sizeof(selected));
         memcpy(weights_batch + (uint64_t)token * N_EXPERT,
                weights, sizeof(weights));
-        memcpy(mid_batch_expected + (uint64_t)token * pair_count,
-               mid_half_ref, sizeof(mid_half_ref));
-        memcpy(out_batch_expected + (uint64_t)token * DIM,
-               out_half_ref, sizeof(out_half_ref));
+        for (uint32_t slot = 0; slot < N_EXPERT; slot++) {
+            const uint32_t expert = (uint32_t)selected[slot];
+            for (uint32_t row = 0; row < DIM; row++) {
+                const uint64_t pair = (uint64_t)slot * DIM + row;
+                const float gate_v = dot_mxfp4(
+                    gate_matrix + (uint64_t)expert * blocks_per_expert +
+                        (uint64_t)row * blocks_per_row,
+                    x_row);
+                const float up_v = dot_mxfp4(
+                    up_matrix + (uint64_t)expert * blocks_per_expert +
+                        (uint64_t)row * blocks_per_row,
+                    x_row);
+                const float g = fminf(gate_v, 7.0f);
+                const float u = fmaxf(-7.0f, fminf(up_v, 7.0f));
+                mid_row[pair] = (float)(_Float16)(
+                    (g / (1.0f + expf(-g))) * u * weights[slot]);
+            }
+        }
+        for (uint32_t row = 0; row < DIM; row++) {
+            for (uint32_t slot = 0; slot < N_EXPERT; slot++) {
+                const uint32_t expert = (uint32_t)selected[slot];
+                out_row[row] += dot_mxfp4(
+                    down_matrix + (uint64_t)expert * blocks_per_expert +
+                        (uint64_t)row * blocks_per_row,
+                    mid_row + (uint64_t)slot * DIM);
+            }
+        }
     }
 
     ds4_gpu_tensor *x_batch_tensor = ds4_gpu_tensor_alloc(
@@ -433,6 +818,114 @@ int main(void) {
     ok = ok && ds4_gpu_tensor_write(
         weights_batch_tensor, 0, weights_batch,
         BATCH_TOKENS * sizeof(weights));
+
+    /* DSpark verifies tiny suffixes rather than prefill-sized batches.  Keep
+     * every production block length (2..5) on the fused pair-SwiGLU/direct
+     * sum path covered by the model-free harness; in particular, five rows
+     * used to fall back to a large per-expert scratch and a separate sum. */
+    for (uint32_t tiny_tokens = 2u; tiny_tokens <= 5u && ok; tiny_tokens++) {
+        mid_is_f16 = true;
+        ok = ok && ds4_gpu_tensor_fill_f32(
+            out_batch_tensor, -105.0f, batch_out_count);
+        ok = ok && ds4_gpu_routed_moe_batch_tensor(
+            out_batch_tensor, gate_batch_tensor, up_batch_tensor,
+            mid_batch_tensor, experts_batch_tensor,
+            model, model_size, gate_offset, up_offset, down_offset,
+            MXFP4_TYPE, MXFP4_TYPE, expert_bytes, row_bytes,
+            expert_bytes, row_bytes, DIM, DIM, DIM,
+            selected_batch_tensor, weights_batch_tensor,
+            N_TOTAL_EXPERT, N_EXPERT, 7.0f, x_batch_tensor,
+            0u, tiny_tokens, &mid_is_f16, true);
+        ok = ok && !mid_is_f16;
+        ok = ok && ds4_gpu_tensor_read(
+            out_batch_tensor, 0, out_batch_actual,
+            (uint64_t)tiny_tokens * DIM * sizeof(float));
+        for (uint32_t token = 0; token < tiny_tokens && ok; token++) {
+            char label[32];
+            snprintf(label, sizeof(label), "tiny%u.%u", tiny_tokens, token);
+            ok = compare_values(label,
+                                out_batch_actual + (uint64_t)token * DIM,
+                                out_batch_expected + (uint64_t)token * DIM,
+                                DIM,
+                                4.0e-4f);
+        }
+    }
+
+    /* The verifier batch path runs the same call with one expert half resident
+     * on each rank.  Exercise both global-ID rebases and reconstruct the full
+     * result from their partials across five distinct input rows. */
+    const uint64_t tp_moe_count = (uint64_t)TP_TEST_ROWS * DIM;
+    float *tp_moe_expected = calloc(2u * (size_t)tp_moe_count, sizeof(float));
+    float *tp_moe_actual = calloc(2u * (size_t)tp_moe_count, sizeof(float));
+    float *tp_moe_sum = calloc((size_t)tp_moe_count, sizeof(float));
+    ok = ok && tp_moe_expected && tp_moe_actual && tp_moe_sum;
+    for (uint32_t rank_id = 0; rank_id < 2u && ok; rank_id++) {
+        const uint32_t expert0 = rank_id * (N_TOTAL_EXPERT / 2u);
+        const uint32_t expert1 = rank_id == 0u ?
+            N_TOTAL_EXPERT / 2u : N_TOTAL_EXPERT;
+        for (uint32_t token = 0; token < TP_TEST_ROWS; token++) {
+            const float *mid_row =
+                mid_batch_expected + (uint64_t)token * pair_count;
+            float *expected_row = tp_moe_expected +
+                ((uint64_t)rank_id * TP_TEST_ROWS + token) * DIM;
+            for (uint32_t row = 0; row < DIM; row++) {
+                for (uint32_t slot = 0; slot < N_EXPERT; slot++) {
+                    const uint32_t expert = (uint32_t)selected[slot];
+                    if (expert < expert0 || expert >= expert1) continue;
+                    expected_row[row] += dot_mxfp4(
+                        down_matrix + (uint64_t)expert * blocks_per_expert +
+                            (uint64_t)row * blocks_per_row,
+                        mid_row + (uint64_t)slot * DIM);
+                }
+            }
+        }
+
+        ds4_gpu_test_set_tp_expert_shard(rank_id, 2u);
+        mid_is_f16 = true;
+        ok = ok && ds4_gpu_tensor_fill_f32(
+            out_batch_tensor, -105.0f, batch_out_count);
+        ok = ok && ds4_gpu_routed_moe_batch_tensor(
+            out_batch_tensor, gate_batch_tensor, up_batch_tensor,
+            mid_batch_tensor, experts_batch_tensor,
+            model, model_size, gate_offset, up_offset, down_offset,
+            MXFP4_TYPE, MXFP4_TYPE, expert_bytes, row_bytes,
+            expert_bytes, row_bytes, DIM, DIM, DIM,
+            selected_batch_tensor, weights_batch_tensor,
+            N_TOTAL_EXPERT, N_EXPERT, 7.0f, x_batch_tensor,
+            0u, TP_TEST_ROWS, &mid_is_f16, true);
+        ok = ok && !mid_is_f16;
+        ok = ok && ds4_gpu_tensor_read(
+            out_batch_tensor, 0,
+            tp_moe_actual + (uint64_t)rank_id * tp_moe_count,
+            tp_moe_count * sizeof(float));
+        for (uint32_t token = 0; token < TP_TEST_ROWS && ok; token++) {
+            char label[32];
+            snprintf(label, sizeof(label), "tp-moe%u.%u", rank_id, token);
+            ok = compare_values(
+                label,
+                tp_moe_actual +
+                    ((uint64_t)rank_id * TP_TEST_ROWS + token) * DIM,
+                tp_moe_expected +
+                    ((uint64_t)rank_id * TP_TEST_ROWS + token) * DIM,
+                DIM,
+                4.0e-4f);
+        }
+    }
+    ds4_gpu_test_set_tp_expert_shard(0u, 1u);
+    if (tp_moe_sum && tp_moe_actual) {
+        for (uint64_t i = 0; i < tp_moe_count; i++) {
+            tp_moe_sum[i] =
+                tp_moe_actual[i] + tp_moe_actual[tp_moe_count + i];
+        }
+    }
+    if (ok) {
+        ok = compare_values("tp-moe-sum", tp_moe_sum,
+                            out_batch_expected, tp_moe_count, 6.0e-4f);
+    }
+    free(tp_moe_sum);
+    free(tp_moe_actual);
+    free(tp_moe_expected);
+
     if (batch_poison) {
         memset(batch_poison, 0xa5,
                (size_t)batch_out_count * N_EXPERT * sizeof(float));
