@@ -2,6 +2,123 @@
   <img src="logo.svg" alt="DwarfStar logo" width="220">
 </p>
 
+> ## Fork: tuned for a two-node Apple Silicon pair
+>
+> This branch is a fork of [antirez/ds4](https://github.com/antirez/ds4) tuned
+> for **DeepSeek V4 Flash across two Mac Studios over Thunderbolt RDMA**, in
+> tensor-parallel mode. Reference rig: 2× M2 Ultra, 60 GPU cores, 128 GB each.
+> Everything here also runs unchanged on a single machine and on the CUDA and
+> ROCm backends; the work is additive.
+>
+> ### Where it stands
+>
+> Full sweep against pipeline-parallel at the same commit, 128 generated tokens
+> per point. Prefill and decode are tokens/second.
+>
+> | ctx | TP prefill | PP prefill | TP decode | PP decode |
+> |---:|---:|---:|---:|---:|
+> | 2048 | **423.0** | 317.0 | **40.9** | 27.7 |
+> | 4096 | **417.5** | 310.5 | **36.5** | 26.3 |
+> | 8192 | **500.2** | 348.2 | **36.0** | 26.1 |
+> | 16384 | **480.8** | 459.4 | **35.4** | 25.5 |
+> | 32768 | 461.2 | **530.0** | **33.7** | 24.1 |
+> | 65536 | 427.1 | **520.4** | **31.5** | 22.5 |
+> | 131072 | 367.3 | **444.4** | **28.1** | 20.6 |
+>
+> Cold 131k prefill under tensor parallelism: **402.6 t/s**. Prefill at 131k is
+> **+65.8%** over the same branch with the splits disabled, and **+100%** over
+> the pre-fork baseline. Tensor parallelism wins prefill to 16k and decode at
+> every context; pipeline parallelism wins prefill from 32k up, so both are
+> worth keeping.
+>
+> ### What this fork changes
+>
+> **Prefill — tensor-parallel row splitting.** A prefill chunk's rows are
+> divided across the pair instead of replicated:
+>
+> * split attention rows at non-zero positions, not just the first chunk of a
+>   prompt — **+7.2% at 131k**
+> * split the indexer score and top-k alongside the rows each rank already owns,
+>   adding no cross-rank merge — **+19.5%, bit-identical**
+> * extend the split to chunks carrying a compressed-key mask — **+20.5%,
+>   bit-identical**
+> * four simdgroups rather than eight for the non-vec dk512 flash-attention
+>   kernel — **+7.3%, bit-identical**
+>
+> **Prefill — kernels.**
+>
+> * exact single-pass streaming top-512 for wide score rows, replacing a block
+>   argsort and merge cascade
+> * register-resident indexer scorer: the staged K tile stays in simdgroup
+>   registers across the head loop, halving threadgroup loads per matrix multiply
+> * chunk size bounded by a work budget so one prefill command buffer stays clear
+>   of the GPU watchdog, which under tensor parallelism is not survivable
+>
+> **Decode.** Honest summary: the individually measured decode changes are at or
+> below the measurement floor at short context, and the gains that do exist are
+> long-context. Decode is latency-bound here — it runs at maximum clock and full
+> residency at roughly 8% of peak arithmetic throughput.
+>
+> * shared-memory alias in the decode indexer scorer, lifting residency from one
+>   threadgroup per core to two — **+17.4% on the kernel**, worth little at short
+>   context because the indexed path is unreachable below ~4k
+> * four rows per thread in the routed MXFP4 down projection
+> * split-K reduce sized to the work groups that actually hold keys
+> * five decode fast paths admitted on earlier Apple silicon, where the gate was
+>   a device-family check rather than a capability check
+>
+> **Serving.**
+>
+> * a chat turn ending in a tool call, truncation or cancellation rewinds to the
+>   committed prefill frontier instead of discarding the live KV cache and
+>   re-prefilling from token zero
+> * cache-miss diagnostics that say how many tokens were lost, where the
+>   divergence began, and the token ids on each side
+> * slot routing by prefix match, and prefill issued in bounded quanta
+> * every frontend can lead a tensor-parallel pair, with ordered teardown and a
+>   worker that reports recoverable failures instead of stalling
+>
+> **Correctness.** Each default-on kernel change has a model-free gate that runs
+> on any Metal device: `make test-topk-stream512`, `make test-indexer-scorer`,
+> `make test-mxfp4-metal`, and the prefill chunk ladder inside
+> `tests/test_engine_mgpu_placement.c`.
+>
+> ### Credit
+>
+> Several of the kernels this fork builds on came from open pull requests
+> against [antirez/ds4](https://github.com/antirez/ds4) rather than from work
+> done here. They are carried, extended and measured on the two-node pair, but
+> the kernels are theirs:
+>
+> * **PR #831** and **PR #832**, Adrian Galilea — the register-resident prefill
+>   indexer scorer, and the streaming top-512 selector with its tie-break
+>   comparator. Between them these are the largest prefill kernel wins on this
+>   branch.
+> * **PR #778**, david — the M5 decode encoder and occupancy work, which this
+>   fork extends to earlier Apple silicon by replacing device-family gates with
+>   capability checks.
+> * **PR #846**, Tiziano Arena — M1-class decode tuning and the batch-verifier
+>   groundwork the tensor-parallel speculative path is built on. The n-gram
+>   speculation from that PR was measured on this rig and removed; the rest is
+>   carried.
+>
+> The tensor-parallel row splitting, the RDMA transport and fence, the prefill
+> watchdog ladder, and the serving-side live-KV work are this fork's.
+>
+> ### Documentation
+>
+> * [`fork/docs/optimizations.md`](fork/docs/optimizations.md) — every speedup,
+>   split by prefill and decode, with the measurement that justifies it and the
+>   environment variable that rolls it back
+> * [`fork/docs/fixes.md`](fork/docs/fixes.md) — correctness, robustness and
+>   serving fixes that make no throughput claim
+> * [`fork/docs/benchmarks.md`](fork/docs/benchmarks.md) — the measurement
+>   record, including the closed avenues, so they are not re-investigated
+>
+> Everything below is the upstream README.
+
+---
+
 **DwarfStar** is a small native inference engine optimized first for
 **DeepSeek V4 Flash**. It also supports **GLM 5.2** and, on very high-memory
 machines, **DeepSeek V4 PRO**. It is self-contained and deliberately narrow,
