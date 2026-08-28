@@ -465,6 +465,7 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1;
+static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_r4;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1_tg_multiple;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_tg_multiple;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_pipeline_nsg1;
@@ -8195,6 +8196,9 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_id_mxfp4_pair_swiglu_f32", 1);
         g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1 =
             ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_id_mxfp4_sum6_f32", 1);
+        g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_r4 =
+            ds4_gpu_new_mul_mv_tg_multiple_pipeline(
+                "kernel_mul_mv_id_mxfp4_sum6_r4_f32", 1);
         g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1_tg_multiple =
             ds4_gpu_new_mul_mv_tg_multiple_pipeline(
                 "kernel_mul_mv_id_mxfp4_pair_swiglu_f32", 1);
@@ -8224,6 +8228,7 @@ int ds4_gpu_init(void) {
                 "kernel_mul_mv_id_mxfp4_sum6_tp_full_rows_static_f32", 1);
         if (!g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1 ||
             !g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1 ||
+            !g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_r4 ||
             !g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1_tg_multiple ||
             !g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_tg_multiple ||
             !g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_pipeline_nsg1 ||
@@ -11763,6 +11768,7 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_id_mxfp4_sum6_pipeline = nil;
         g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1 = nil;
         g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1 = nil;
+        g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_r4 = nil;
         g_moe_mul_mv_id_mxfp4_pair_swiglu_pipeline_nsg1_tg_multiple = nil;
         g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_tg_multiple = nil;
         g_moe_mul_mv_id_mxfp4_pair_swiglu_fixed_route_pipeline_nsg1 = nil;
@@ -40483,6 +40489,15 @@ static bool ds4_gpu_mxfp4_moe_decode_nsg1_enabled(uint32_t n_tokens) {
            getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_NSG1") == NULL;
 }
 
+/* Four rows per thread for the routed down projection only; gate/up stays at
+ * two, where widening regressed throughput. The caller must update nr0 in the
+ * same branch that selects this pipeline: the encoder derives its grid from
+ * nr0 while the kernel carries its own row width. */
+static bool ds4_gpu_mxfp4_moe_decode_down_r4_enabled(void) {
+    return g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_r4 != nil &&
+           getenv("DS4_METAL_DISABLE_PRE_M5_MXFP4_MOE_DECODE_DOWN_R4") == NULL;
+}
+
 int ds4_gpu_routed_moe_one_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
@@ -40677,6 +40692,7 @@ int ds4_gpu_routed_moe_one_tensor(
         const bool down_rows_per_group_is_nr0 = ds4_gpu_routed_mv_rows_per_group_is_nr0(down_type);
         int pair_swiglu_nsg = 2;
         int down_sum6_nsg = 2;
+        bool down_sum6_r4 = false;
         int ok = 1;
         const bool write_clamped_moe =
             getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") != NULL;
@@ -40828,6 +40844,13 @@ int ds4_gpu_routed_moe_one_tensor(
                                 g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_tg_multiple :
                                 g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1));
                 down_sum6_nsg = 1;
+                if (down_sum6_pipeline ==
+                        g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1 &&
+                    ds4_gpu_mxfp4_moe_decode_down_r4_enabled()) {
+                    down_sum6_pipeline =
+                        g_moe_mul_mv_id_mxfp4_sum6_pipeline_nsg1_r4;
+                    down_sum6_r4 = true;
+                }
             }
         } else if (down_type == DS4_METAL_TENSOR_IQ2_XXS &&
                    g_tp_split_world == 2) {
@@ -43054,6 +43077,8 @@ int ds4_gpu_routed_moe_one_tensor(
                                                        2);
             }
         } else if (ok && direct_down_sum) {
+            /* Keep the host grid and the kernel's four-row width coupled. */
+            if (down_sum6_r4) down_args.nr0 = 4;
             ok = ds4_gpu_encode_mul_mv_id_sum6(cb,
                                                  down_sum6_pipeline,
                                                  &down_args,
