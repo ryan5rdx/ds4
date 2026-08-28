@@ -2930,6 +2930,18 @@ int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
 
+/* Fair-share decomposition of a set of encoder spans (DS4_METAL_GPU_ENCODER_TIMESTAMPS).
+ * Wherever k spans are in flight, each is credited dt/k, so overlap is priced per
+ * encoder from the timestamps instead of being smeared by a uniform divisor.
+ * `fair_us` receives n values summing to `*union_us`, the wall time in which any
+ * span is active.  Exposed (rather than kept static) so tests/test_ts_fairshare.c
+ * can check it against hand-computed interval sets -- the uniform divisor it
+ * replaces was wrong in a way that only showed up as a stage exceeding the stage
+ * that contains it, which is far too late to notice.  Requires no GPU. */
+void ds4_gpu_ts_fair_share(const uint64_t *starts, const uint64_t *ends, uint32_t n,
+                           double spt, double *fair_us, double *union_us,
+                           double *conc_mean, uint32_t *max_conc);
+
 #ifdef __cplusplus
 }
 #endif

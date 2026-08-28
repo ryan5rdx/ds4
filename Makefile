@@ -128,6 +128,15 @@ tests/bench_indexer_score: tests/bench_indexer_score.o ds4_metal.o
 bench-indexer-score: tests/bench_indexer_score
 	./tests/bench_indexer_score
 
+tests/test_ts_fairshare.o: tests/test_ts_fairshare.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_ts_fairshare: tests/test_ts_fairshare.o ds4_metal.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+test-ts-fairshare: tests/test_ts_fairshare
+	./tests/test_ts_fairshare
+
 tests/test_topk_ab.o: tests/test_topk_ab.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 

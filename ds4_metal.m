@@ -1135,6 +1135,66 @@ static void ds4_gpu_ts_name_last(const char *label) {
  * encoder's drain, and a sum that quietly exceeds the wall clock is exactly the
  * kind of silent error this project keeps getting caught by.  Over 100% means
  * the spans overlap and per-encoder figures are upper bounds. */
+
+/* Sweep-line event for the fair-share decomposition below. */
+typedef struct { uint64_t t; int delta; uint32_t idx; } ds4_ts_event;
+
+static int ds4_ts_event_cmp(const void *pa, const void *pb) {
+    const ds4_ts_event *a = (const ds4_ts_event *)pa, *b = (const ds4_ts_event *)pb;
+    if (a->t < b->t) return -1;
+    if (a->t > b->t) return 1;
+    /* Close before open at a tie so a zero-length gap does not read as concurrency. */
+    return a->delta - b->delta;
+}
+
+void ds4_gpu_ts_fair_share(const uint64_t *starts, const uint64_t *ends, uint32_t n,
+                           double spt, double *fair_us, double *union_us,
+                           double *conc_mean, uint32_t *max_conc) {
+    if (union_us) *union_us = 0.0;
+    if (conc_mean) *conc_mean = 0.0;
+    if (max_conc) *max_conc = 0;
+    for (uint32_t i = 0; i < n; i++) if (fair_us) fair_us[i] = 0.0;
+    if (!starts || !ends || n == 0) return;
+
+    ds4_ts_event *ev = (ds4_ts_event *)calloc((size_t)n * 2u, sizeof(ds4_ts_event));
+    uint32_t *active = (uint32_t *)calloc((size_t)n, sizeof(uint32_t));
+    if (!ev || !active) { free(ev); free(active); return; }
+
+    uint32_t ne = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (ends[i] <= starts[i]) continue;   /* empty or malformed span */
+        ev[ne].t = starts[i]; ev[ne].delta = +1; ev[ne].idx = i; ne++;
+        ev[ne].t = ends[i];   ev[ne].delta = -1; ev[ne].idx = i; ne++;
+    }
+    qsort(ev, ne, sizeof(ds4_ts_event), ds4_ts_event_cmp);
+
+    double u = 0.0, wsum = 0.0;
+    uint32_t na = 0, peak = 0;
+    uint64_t prev = ne ? ev[0].t : 0;
+    for (uint32_t e = 0; e < ne; e++) {
+        if (na > 0 && ev[e].t > prev) {
+            const double dt_us = (double)(ev[e].t - prev) * spt * 1e6;
+            u += dt_us;
+            wsum += dt_us * (double)na;
+            if (fair_us) for (uint32_t k = 0; k < na; k++) fair_us[active[k]] += dt_us / (double)na;
+        }
+        prev = ev[e].t;
+        if (ev[e].delta > 0) {
+            active[na++] = ev[e].idx;
+            if (na > peak) peak = na;
+        } else {
+            for (uint32_t k = 0; k < na; k++) {
+                if (active[k] == ev[e].idx) { active[k] = active[--na]; break; }
+            }
+        }
+    }
+
+    if (union_us) *union_us = u;
+    if (conc_mean) *conc_mean = (u > 0.0) ? wsum / u : 0.0;
+    if (max_conc) *max_conc = peak;
+    free(ev); free(active);
+}
+
 static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
     if (!ds4_gpu_ts_active() || g_ts_n == 0) return;
     if (cb && (__bridge void *)cb != g_ts_cb) {
@@ -1176,13 +1236,58 @@ static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
     }
     const double cb_us_pre = (cb_s > 0.0) ? cb_s * 1e6 : 0.0;
     const double norm = (total_us > 0.0 && cb_us_pre > 0.0) ? cb_us_pre / total_us : 1.0;
+
+    /* FAIR SHARE -- the column that replaces `norm`.
+     *
+     * `norm` divides every span by the same cb/sum factor, i.e. it assumes each
+     * encoder overlaps its neighbours equally.  Arm B4 showed that assumption
+     * breaking in exactly the way that matters: at 2k all 27 `reduce` spans land
+     * in ONE command buffer (26.4 per reported buffer) while at 131k they are
+     * spread 1.55 per buffer over 12.3 buffers.  A cb-wide divisor therefore
+     * lands on `reduce` completely differently at the two contexts -- and 2k is
+     * the one that failed to reconcile (27 x 159.5 us = 4.31 ms against an
+     * attn_inv_rope of 3.64 ms that CONTAINS it).
+     *
+     * So stop assuming and decompose.  Sweep the interval set: wherever k
+     * encoders are in flight, each is credited dt/k.  Overlap is then priced
+     * per-encoder from the timestamps instead of being smeared uniformly, and
+     * the column sums to the UNION of the spans by construction.
+     *
+     * The union is also the self-check the instrument has been missing.  Because
+     * `spt` is calibrated so that hi-lo maps onto the cb wall clock, union/cb can
+     * never exceed 100% -- so what it measures is the fraction of the buffer in
+     * which any encoder is running:
+     *   union ~= cb  -> no gaps; every microsecond is inside some encoder, which
+     *                   is what arm E's 100% GPU residency predicts.
+     *   union <  cb  -> real idle gaps between encoders, and (cb - union) is the
+     *                   size of the stall pool -- directly the thing we are
+     *                   hunting, and NOT visible in either other column.
+     * `conc` (mean encoders in flight, weighted by time) is the honest version of
+     * the ~2x "coverage" figure: coverage counts a span twice when two overlap,
+     * conc says how deep the pipelining actually runs. */
+    uint64_t *starts = (uint64_t *)calloc((size_t)g_ts_n, sizeof(uint64_t));
+    uint64_t *ends   = (uint64_t *)calloc((size_t)g_ts_n, sizeof(uint64_t));
+    double   *fair_us = (double *)calloc((size_t)g_ts_n, sizeof(double));
+    double union_us = 0.0, conc_mean = 0.0;
+    uint32_t max_conc = 0;
+    if (starts && ends && fair_us) {
+        for (uint32_t i = 0; i < g_ts_n; i++) {
+            starts[i] = t[i * 2].timestamp;
+            ends[i]   = t[i * 2 + 1].timestamp;
+        }
+        ds4_gpu_ts_fair_share(starts, ends, g_ts_n, spt, fair_us,
+                              &union_us, &conc_mean, &max_conc);
+    }
+
     for (uint32_t i = 0; i < g_ts_n; i++) {
         const uint64_t a = t[i * 2].timestamp, b = t[i * 2 + 1].timestamp;
         if (b <= a) continue;
         const double us = (double)(b - a) * spt * 1e6;
-        fprintf(stderr, "ds4: enc-ts %-28s raw %8.1f us   norm %8.1f us  %5.1f%%\n",
-                g_ts_labels[i] ? g_ts_labels[i] : "(unlabelled)", us, us * norm,
-                cb_us_pre > 0.0 ? us * norm / cb_us_pre * 100.0 : 0.0);
+        const double fair = fair_us ? fair_us[i] : 0.0;
+        fprintf(stderr,
+                "ds4: enc-ts %-28s raw %8.1f us   norm %8.1f us   fair %8.1f us  %5.1f%%\n",
+                g_ts_labels[i] ? g_ts_labels[i] : "(unlabelled)", us, us * norm, fair,
+                cb_us_pre > 0.0 ? fair / cb_us_pre * 100.0 : 0.0);
     }
     const double cb_us = cb_s * 1e6;
     fprintf(stderr,
@@ -1192,6 +1297,13 @@ static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
             cb_us > 0.0 ? total_us / cb_us * 100.0 : 0.0,
             (cb_us > 0.0 && total_us > cb_us * 1.05) ? " OVERLAPPING" : "",
             cal);
+    fprintf(stderr,
+            "ds4: enc-ts %s: union %.3f ms = %.1f%% of cb (gap %.3f ms), "
+            "conc mean %.2f max %u\n",
+            tag ? tag : "", union_us / 1000.0,
+            cb_us > 0.0 ? union_us / cb_us * 100.0 : 0.0,
+            (cb_us - union_us) / 1000.0, conc_mean, max_conc);
+    free(starts); free(ends); free(fair_us);
     g_ts_reported_ranges++;
     /* Multiplying a per-call figure by a calls/token count read off this log is
      * only sound if the log covers every range.  Print what it does not. */

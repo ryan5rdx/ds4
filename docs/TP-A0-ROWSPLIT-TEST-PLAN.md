@@ -1233,6 +1233,102 @@ calibrated `reduce` figures of 199 µs/call at 2k and 311 at 131k. The
 instrument's *distortion* claim is unaffected and still holds: throughput came
 back at baseline (42.04 / 29.70 t/s) on both runs.
 
+### Arm B5 — stop dividing, decompose: the `fair` column — 2026-08-27
+
+B4 did its job: the LOSS line went in, and the answer was **not** loss. The
+`reduce` count is identical to run 3 (3456 @2k, 2432 @131k — exactly 27×128 and
+19×128, so the per-token counts are real), banking did not move it, and the 2k
+overshoot survived at 1.18×. Cause 3 is what is left. Two corrections to B4's
+write-up before the fix:
+
+**1. `raw` is not a usable upper bound either.** B4 concludes "treat raw as the
+upper bound and stop quoting norm". Raw is 2.33× over at 2k:
+
+| ctx | raw product | norm product | `attn_inv_rope` | container bound on `reduce` |
+|---|---|---|---|---|
+| 2k | 27 × 314.0 = **8.48 ms** (2.33×) | 27 × 159.5 = 4.31 ms (1.18×) | 3.64 ms | **≤ 134.8 µs/call** |
+| 131k | 19 × 339.3 = 6.45 ms (1.52×) | 19 × 170.1 = 3.23 ms (0.76×) | 4.24 ms | ≤ 223.2 µs/call |
+
+Raw is an upper bound only in the vacuous sense. The one sound statement is the
+container bound: **`reduce` ≤ 134.8 µs/call at 2k**, so `norm` over-states by
+≥18% and `raw` by ≥133%. Neither column is a budget.
+
+**2. The LOSS line is not a red herring — it is the mechanism, read sideways.**
+B4 dismissed loss because the `reduce` count did not move. Correct, but the loss
+rate is a direct measure of *command-buffer structure*, and the structure differs
+enormously between the two contexts:
+
+| ctx | cbs/token | dropped | reported cbs/token | `reduce` per **reported** cb |
+|---|---|---|---|---|
+| 2k | 3.03 | 66% | 1.02 | **26.4** |
+| 131k | 13.27 | 8% | 12.26 | **1.55** |
+
+At 2k all 27 `reduce` spans land in **one** command buffer; at 131k they are
+spread 1.55 per buffer across twelve. `norm` divides by a **cb-wide** factor, so
+that factor lands on `reduce` in completely different ways at the two contexts —
+and 2k is precisely the one that fails to reconcile. That is cause 3 with a
+mechanism, and it says the fix is not a better divisor.
+
+**The fix, landed: a `fair` column.** Sweep the interval set; wherever *k*
+encoders are in flight, credit each *dt/k*. Overlap is then priced per encoder
+from its own timestamps instead of smeared uniformly, and the column sums to the
+**union** of the spans by construction. Two new outputs:
+
+```
+ds4: enc-ts <tag> ... raw <a> us   norm <b> us   fair <c> us   <share>%
+ds4: enc-ts <tag>: union <U> ms = <P>% of cb (gap <G> ms), conc mean <M> max <K>
+```
+
+`ds4_gpu_ts_fair_share` is exposed in `ds4_gpu.h` and unit-tested against
+hand-computed interval sets — `make test-ts-fairshare`, 8 cases, CPU-only, no GPU
+and no model. The nested case is the one that matters: for a 100-tick encoder with
+two 10-tick encoders inside it, fair bills the big one **93.3** while a uniform
+divide bills it **83.3** and over-bills each small one by 2.5×. That is the exact
+error shape `norm` has been making.
+
+**`union` and `conc` are the new instruments, and they answer a bigger question
+than `reduce`.** Because `spt` is calibrated so `hi−lo` maps onto the cb wall
+clock, `union/cb` can never exceed 100%; what it measures is the fraction of the
+buffer in which *any* encoder is running. So `gap = cb − union` is **the idle pool
+inside the command buffer** — and arm E says the GPU is at 100% residency and max
+clock, which predicts `gap ≈ 0`. If `gap` comes back large, arm E's residency and
+this instrument disagree and one of them is wrong. If `gap ≈ 0`, the stalls are
+*inside* the encoders, which points the remaining work at kernel occupancy rather
+than at scheduling — and that is the single most decision-relevant number left in
+the decode program.
+
+`conc mean` is the honest version of the "~197% coverage" figure: coverage
+double-counts a span whenever two overlap, `conc` says how deep the pipelining
+actually runs.
+
+**What to run.** Unchanged flags, same two contexts:
+
+```
+DS4_METAL_GPU_ENCODER_TIMESTAMPS=1     # 2k and 131k, gen 128
+```
+
+**Read in this order:**
+
+1. **`conc mean`.** If it is ~2.0 at both contexts, pipelining depth really is 2
+   and the banked "2× overlap" conclusion stands. If it is ~1.0 while coverage
+   still reads ~197%, the coverage figure is an artefact of the span endpoints and
+   **three banked nulls lose their explanation** (R12a's flat split schedule, the
+   cheap marginal ballast dispatch, dead dispatch-count reduction) — note that arm
+   D's 3.46 µs/dispatch is already in mild tension with "dispatches are free".
+2. **`gap`** (per the paragraph above). Report it as a fraction of cb.
+3. **`fair` for `reduce`**, × 27 @2k / × 19 @131k. It must come in under
+   `attn_inv_rope` (3.64 / 4.24 ms). At 2k it must be **≤ 134.8 µs/call**.
+4. **Throughput** — ~42 t/s @2k, ~29.7 @131k, else the instrument is distorting.
+
+**Pre-registered falsifier.** If `fair × count` still exceeds `attn_inv_rope` at
+2k, then non-uniform overlap was *not* the cause either, all three candidates are
+dead, and the remaining suspect is the cross-instrument comparison itself — B's
+token is 23.65 ms (42.29 t/s) while the stage profile that produced
+`attn_inv_rope = 3.64 ms` ran at 28.83 ms gpu_busy, a 22% different operating
+point. In that case the next arm is to re-measure `attn_inv_rope` and the enc-ts
+`reduce` **in the same run**, and until then no per-encoder figure enters the
+budget at all.
+
 ### Arm B4 — the tick is settled, the *call count* is not; one more run — 2026-08-27
 
 Run 3 closed the falsifier: **tick = 1.000 ns at both contexts**, so the counter
