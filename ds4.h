@@ -58,6 +58,19 @@ typedef struct {
 
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
+#ifndef DS4_GPU_TENSOR_DEFINED
+#define DS4_GPU_TENSOR_DEFINED
+typedef struct ds4_gpu_tensor ds4_gpu_tensor;
+#endif
+
+typedef struct {
+    const ds4_gpu_tensor *tensor;
+    const ds4_gpu_tensor *sync_tensor;
+    uint64_t bytes;
+    uint64_t ready_offset;
+    uint64_t timeout_offset;
+    uint32_t ready_value;
+} ds4_pp_staged_input;
 
 typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current, int total);
 typedef bool (*ds4_session_cancel_fn)(void *ud);
@@ -286,6 +299,14 @@ int ds4_chat_append_multimodal_message(ds4_engine *e,
                                        char *error,
                                        size_t error_cap);
 int ds4_engine_tp_vocab_split(ds4_engine *e);
+/* True once ds4_engine_tp_bind() has attached a tensor-parallel transport.
+ * Frontends use this to skip paths that are not mirrored to the worker. */
+int ds4_engine_tp_active(ds4_engine *e);
+/* Nonzero once the GPU backend has reported a command-buffer error (typically a
+ * watchdog timeout on a hung submission).  Sticky and unrecoverable in-process:
+ * a component that cannot produce correct results without the GPU should stop
+ * rather than keep serving.  Always 0 on CPU-only builds. */
+int ds4_backend_device_lost(void);
 bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
                                         uint32_t layer,
                                         uint32_t full_live,
@@ -512,16 +533,34 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  float top_p, float min_p, uint64_t *rng,
                                  int *accepted, int accepted_cap,
                                  char *err, size_t errlen);
+/* Fixed-length benchmark form: the excluded token is never accepted as the
+ * target top and does not terminate a speculative block. */
+int ds4_session_eval_speculative_argmax_excluding(
+        ds4_session *s, int first_token, int max_tokens, int excluded_token,
+        int *accepted, int accepted_cap, char *err, size_t errlen);
 /* TP worker side of a mirrored speculative-verify block: run its half of the
  * batch verify for KV side effects, then obey the leader's commit frame
- * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */
+ * (keep a captured prefix, or roll back and replay). Only called from
+ * ds4_tp_worker_run. */
+enum {
+    DS4_TP_SPEC_F_ATTN_OUT_SPLIT = 1u << 0,
+    DS4_TP_SPEC_F_ATTN_HEAD_SPLIT = 1u << 1,
+    /* Row and verifier arrivals use disjoint GPU-written flag banks. */
+    DS4_TP_GPU_FLAG_BANK_SLOTS = 1024u,
+};
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
+                              uint32_t flags, int *replay_n_out,
                               char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
+uint32_t ds4_session_raw_rewind_budget(const ds4_session *s);
+/* Granularity ds4_session_rewind() snaps to (a compressor-window boundary).
+ * A rewind can therefore land up to this many tokens below the requested
+ * position -- budget for it, and read the result back with ds4_session_pos(). */
+uint32_t ds4_session_rewind_align(const ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
@@ -543,6 +582,18 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                  float *logits,
                                  char *err,
                                  size_t errlen);
+int ds4_session_eval_layer_slice_staged(ds4_session *s,
+                                        const int *tokens,
+                                        uint32_t n_tokens,
+                                        uint32_t pos0,
+                                        uint32_t layer_start,
+                                        uint32_t layer_end,
+                                        const ds4_pp_staged_input *staged_input,
+                                        float *output_hc,
+                                        bool output_logits,
+                                        float *logits,
+                                        char *err,
+                                        size_t errlen);
 int ds4_session_eval_output_head_from_hc(ds4_session *s,
                                          const float *hidden_hc,
                                          uint32_t n_tokens,
