@@ -894,6 +894,26 @@ worse; nsg=1 worst. T4's "nsg=4 ~3% worse everywhere else" finding does
 **NOT reproduce** on the rig — higher nsg is monotonically better here.
 C2 candidate: raise attn_out_low_nsg to 8.
 
+> **CORRECTION — this sweep measured skipped work, and C2 is NOT banked.**
+> `nsg` is a **baked function constant** on the pipeline while the dispatch
+> passes a hardcoded 4. At nsg=8 the kernel reduces over 8 simdgroups with 4
+> launched, so it covers 8 of 16 k-chunks — **it skipped half the weight
+> stream**, and "faster" scaled with how much work was skipped. Shipped once,
+> produced complete gibberish, **reverted in `da63283`**. The tree today reads
+> `out_low_nsg = 4` (`ds4_metal.m:26870`). **Strike +1.7% from the banked list.**
+>
+> **Banked-list correction, all three entries.** Of U10 / T2 / C2 at 2k:
+> C2 is reverted; T2's `DS4_METAL_DECODE_SPLITS` only reaches the indexed branch,
+> which is unreachable at 2k (`ds4.c:23200-23202` gates on
+> `layer_n_comp[il] > decode_sparse_threshold`); U10 tunes the indexer and is
+> 0.02 ms net at 2k. **All three are ~0 at 2k.** The 41.22 t/s anchor already
+> reflects that — there is no banked 2.5% to add to it.
+>
+> The lesson is the process one: this arm was a throughput-only sweep with no
+> correctness gate, on the exact path where the standing bar is top-1 plus
+> bounded Δlogit. A pipeline constant and a dispatch argument are a paired
+> quantity and must move together.
+
 ### U15 — stage profile at 2k (first ever) + HC arms — 2026-08-27
 
 `DS4_METAL_GPU_STAGE_TIMESTAMPS=1` on the rig (build `c13e3bb`), gen 128,

@@ -1233,6 +1233,115 @@ calibrated `reduce` figures of 199 µs/call at 2k and 311 at 131k. The
 instrument's *distortion* claim is unaffected and still holds: throughput came
 back at baseline (42.04 / 29.70 t/s) on both runs.
 
+## The decode program after B6 — what survives, and where the next rig slot goes — 2026-08-27
+
+Output of a 41-agent enumeration against the corrected budget, every candidate
+attacked by an independent refuter. **The headline is negative and should be
+taken at face value: the new findings do not open a path to 50 t/s.** 50 needs
+4.26 ms (24.260 → 20.000); the entire surviving inventory is **1.22 ms best
+case = 29% of the gap.**
+
+### Ranked program
+
+Anchor 24.260 ms = 41.220 t/s.
+
+| candidate | stage | ms/token | +t/s | cum t/s | effort | first measurement |
+|---|---|---|---|---|---|---|
+| **item C** — remove 86 `flag_set_coherent` dispatches | TP gate | **0.510** (0.30–0.51) | +0.88 | 42.10 | days | rig ballast **slope** {0,2,8,16} interleaved — the absolute still rests on a 2-point delta |
+| **U16 / item A** — parallelise 7 serial FP8 amax blocks | q_lora_norm (1.50) | **0.35** (0.25–0.50) | +0.60 | 42.70 | days | `tests/bench_qkv_norm` block-count bisection on a rig node; model-free, minutes, no TP |
+| **U14′** — variable asymmetric shared-expert split | ffn_tp_gate straggler (0.59) | **0.30** (0.20–0.48) | +0.53 | 43.23 | days | **already satisfied**: gate profile gives +12.2–12.7 µs/layer |
+| **G-b** — H heads per `fa_core` threadgroup | attn_inv_rope / fa_core (0.560) | **0.15** (0.13–0.22) | +0.26 | 43.49 | week+ | rig head sweep H=4/8/16/32, 10 min, one node |
+| *fence-scope reduction* (not queued) | TP gate | 0.201 | +0.34 | — | days | needs a memory-model argument first |
+
+**Discounted for the measured reversal rate.** Eleven ex-ante estimates on this
+rig; **best realised +0.12%**: C2 +1.7%→reverted, packed32 −1.35 t/s, pr-778
++0.12%, U9 0.77×, M1 0.0%, T8 0 to −5%, T1 ±0.6%, R11 −8.4 to −11.8%, R12a within
+0.9%, 32ef898 +0.019 ms. Four of those (packed32, pr-778, U9, M1) are the
+grid-widening/occupancy class — **0-for-4** — which is exactly G-b's class. So
+U16 and U14′ (removal of a proven serial chain; correction of a *directly
+measured* imbalance) get 60% realisation and G-b gets 25%:
+`0.35×0.6 + 0.30×0.6 + 0.15×0.25 = 0.43 ms` → **41.97 t/s**.
+
+**Honest range 42.0–43.5 t/s, central ~42.0–42.4. The 43–45 belief should move
+down.** It rested on three supports that are all gone: a 1.10 ms `compressor_update`
+plug, a 3.63 ms bracket assumed to be mostly `fa_core`, and three banked wins
+worth ~0 at 2k.
+
+### The one thing bigger than the whole program
+
+B6 puts `fa_core` + `reduce` at `0.560 + 0.66 = 1.22 ms` of the 3.64 ms
+`attn_inv_rope` bracket — **33.5%. The other 2.42 ms (10.0% of the token) is
+unlabelled**, because only four FA label sites exist, so KV staging and
+`ds4_gpu_rope_tail_tensor` (`ds4.c:23570`) fall outside them. Launch accounts for
+`133 × 3.464 µs = 0.461 ms` and KV staging traffic for
+`16.97 MB / 449.2 GB/s = 0.038 ms`, leaving **~1.9 ms unexplained — more than the
+entire surviving program's best case, and nobody knows what it is.**
+
+**This is where the next rig slot goes.** Not on any candidate in the table.
+Add label sites across the whole bracket and re-run enc-ts; it eliminates the
+±0.18 ms/marker tax instead of re-weighting it. (Note `ds4_metal.m:1427` skips the
+timestamped descriptor when the encoder is concurrent, so this and any C1-class
+work can never validate each other.)
+
+### B6's own numbers are ceilings
+
+An independent dev-box replication under `SPLIT=1` swept `DS4_METAL_DECODE_NWG`
+2→32 — a **16× change in reduce traffic** (131 kB → 2.10 MB) — and **the reduce
+span did not move**. At forced NWG=32, where the reduce dispatch is byte-identical
+in every layer, spans alternated 40.5 / 82.3 / 41.3 / 78.1 / 40.3 / 88.8 µs,
+tracking the neighbouring `fa_core`. Treat **30.5 µs/call as an upper bound** on
+reduce and 25.8 as approximately right or high on `fa_core`. The 2.42 ms remainder
+is unaffected — it is a subtraction, so inflation inside the labels only makes it
+larger.
+
+### Newly dead (do not re-propose)
+
+- **`compressor_update` 1.10 ms — a PHANTOM.** True cost 0.021–0.046 ms. The
+  1.10 ms was bookkeeping. Kill: `DS4_METAL_GPU_STAGE_TIMESTAMPS=1 …_DETAIL=1`,
+  2 min, predict `buffers=41` never 43 and `gpu_ms ≈ 0` on 3 of 4 tokens.
+- **A1 reduce DV split** — reduce is 0.66 ms total; wave arithmetic caps the win
+  at 1.33× = 0.025–0.073 ms, 5–14× inside the ±0.34 ms anchor spread.
+- **G-a V-reuse** — a C=32 key block is `32×512×2 = 32,768 B`, exactly 100% of
+  `maxThreadgroupMemoryLength`, on top of an existing 3,328 B = **36,096 B against
+  a 32,768 B limit**. Dropping to C=16 changes the online-softmax blocking and
+  loses the bit-identity that was G-a's whole justification.
+- **CU-EMIT-FUSE** — the merge as specified is a **data race**: both pools share
+  `g_compressor_pool_softmax` at offset 0.
+- **W1/W2/pr-778 HC widening** — `d81a28f` already did it bit-identically, +0.12%.
+  W1's 60-TG grid-wide rendezvous is a hang class.
+- **R1 router top-6 fusion** — `ds4_metal.m:34020` already collapses the tail
+  3 dispatches → 1 on M2 Ultra; removable is 49, not 86.
+- **F1 store_one fold** — `state_already_stored = qkv_pair_quad_fused`
+  (`ds4.c:22881`) is already true; store_one fires zero times per token.
+- **R13c shared-kvpad**, **pool lane widening**, **M2 byte-indexed LUT**,
+  **attn_out_proj "anomaly"** (adopting the 2.867 ms re-baseline *adds* 0.32 ms to
+  the book), **marker-tax reweights** (re-rank nothing; tightest gap 0.010 ms).
+
+### MTP is the only route to 50, and it is not fundable yet
+
+A drafted step emits (1+commit) tokens for T+V, so it wins iff `commit > V/T`.
+Today `V = 12332.9/114 = 108.18 ms` per 5-row verify against `T = 24.260`, so
+break-even is **commit > 4.459 of a maximum 5** — near-perfect acceptance of four
+drafts every step. Dead as it stands.
+
+Corrected verify floor: 21.2 (MoE at a 4.77× expert union) + 10.88 (attention
+reads 4.886 GB because `ds4.c:37202` sets `tp_batch_rows = n_tokens`, which
+disables the row split at `ds4.c:29237`) + 15.9 (dense) + 2.7 (gates) + 1.25
+(unsplit output head) = **~50 ms**. At V=50, break-even is commit > 2.06; at a
+sustained commit of 3, `(24.26+50)/4 = 18.57 ms = ` **53.9 t/s**; at 2.5, 47.1 t/s.
+
+Cost: fix the three §13 causes, then four confirmed n-gram defects — `s->logits` is
+never refreshed on any exit path of `ds4.c:69770-69921` so the caller re-samples
+stale logits and emits a duplicate token every cycle; `drafts[0]` is pushed at
+`ds4.c:69812` with no eval so its KV row is never written; `ds4.c:69759`'s bound
+returns 0 on the ideal periodic case. The corpus's own post-fix estimate is
+**30–36 t/s — still below the 41.2 baseline.** Weeks, currently negative EV.
+
+**The single cheapest thing that would change this: no n-gram acceptance rate has
+ever been measured on this rig, on any fixture.** One session. It is the gate on
+whether MTP is worth weeks, and it is the only measurement in this document that
+could move the ceiling rather than the estimate.
+
 ### Model-free probes run here — item C roughly doubles, and the tax constant holds — 2026-08-27
 
 Two harnesses (`tests/bench_stage_marker_tax.m`, `tests/bench_flagset_tax.m`),
