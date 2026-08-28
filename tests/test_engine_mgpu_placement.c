@@ -76,6 +76,7 @@ uint32_t ds4_test_effective_prefill_chunk(bool cuda_tensor_parallel,
 uint32_t ds4_test_planner_prefill_cap(int prompt_len,
                                       uint32_t prefill_chunk);
 uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap);
+uint32_t ds4_test_prefill_watchdog_chunk(uint32_t prompt_len);
 size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size);
 size_t ds4_test_compute_glm_entry_bytes_sum_with_sessions(
                                          const ds4_test_fake_tensor *tensors,
@@ -666,6 +667,101 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
     restore_env_value("DS4_METAL_PREFILL_CHUNK", old_chunk);
 }
 
+/* Regression for the prefill chunk ladder that keeps a chunked-prefill command
+ * buffer clear of the GPU watchdog.
+ *
+ * The runtime bound shrinks as the prompt grows, on a work budget both ranks
+ * compute identically -- they must chunk the same way or the per-layer gates
+ * stop matching.  Allocation is deliberately NOT on that ladder: workspaces are
+ * sized from the context, so they stay at the variant ceiling while only the
+ * runtime bound moves.  This test pins both halves of that, plus the ladder's
+ * shape (monotone, bounded, power-of-two, floored at 512) and the boundary
+ * values observed on hardware.
+ *
+ * Model-free: it exercises the planner through its test hooks only. */
+static void test_prefill_watchdog_bound(void) {
+    fprintf(stderr, "RUN: test_prefill_watchdog_bound\n");
+
+    char *old_chunk = save_env_value("DS4_METAL_PREFILL_CHUNK");
+    unsetenv("DS4_METAL_PREFILL_CHUNK");
+
+    /* cap(8192) is the variant's long-prompt ceiling (4096, or 8192 for PRO). */
+    const uint32_t ceiling = ds4_test_planner_prefill_cap(8192, 0);
+
+    static const int ladder[] = {
+        8192, 65536, 131072, 154390, 163840, 232306, 262144, 327680,
+        393216, 524288, 655360, 1000000,
+        /* Past the point where the work budget alone would select a chunk
+         * below the floor, so the floor assertion below is actually
+         * exercised rather than vacuously true. */
+        2000000,
+    };
+    const int n_ladder = (int)(sizeof(ladder) / sizeof(ladder[0]));
+
+    /* ALLOCATION must NOT track the ladder: it is called with ctx_size. */
+    bool alloc_flat = true;
+    for (int i = 0; i < n_ladder; i++) {
+        if (ds4_test_planner_prefill_cap(ladder[i], 0) != ceiling) {
+            alloc_flat = false;
+        }
+    }
+    CHECK(alloc_flat,
+          "workspace sizing stays at the variant ceiling for every context");
+
+    /* RUNTIME bound must shrink, monotonically, powers of two, floored. */
+    bool monotone = true, bounded = true, floored = true, pow2 = true;
+    uint32_t prev = ceiling;
+    for (int i = 0; i < n_ladder; i++) {
+        const uint32_t c = ds4_test_prefill_watchdog_chunk((uint32_t)ladder[i]);
+        if (c > prev) monotone = false;
+        if (c > ceiling) bounded = false;
+        if (c < 512u) floored = false;
+        if ((c & (c - 1u)) != 0u) pow2 = false;
+        prev = c;
+    }
+    CHECK(monotone, "runtime bound never grows as the prompt grows");
+    CHECK(bounded, "runtime bound never exceeds the variant ceiling");
+    CHECK(floored, "runtime bound keeps its 512-token floor");
+    CHECK(pow2, "runtime bound only selects power-of-two chunks");
+    CHECK(prev < ceiling, "runtime bound has actually shrunk by 1M tokens");
+
+    /* Boundary values observed to complete on hardware.  Recompute them from
+     * DS4_PREFILL_CHUNK_WORK_BUDGET if the budget is retuned -- they are the
+     * only part of this test that encodes a measurement rather than an
+     * invariant. */
+    CHECK(ds4_test_prefill_watchdog_chunk(154390) == 4096,
+          "runtime bound keeps the hardware-proven 4096 at 154k tokens");
+    CHECK(ds4_test_prefill_watchdog_chunk(232306) == 2048,
+          "runtime bound reproduces the hardware-proven 2048 at 232k tokens");
+
+    /* And the configuration observed to be fatal must be rejected: a 4096
+     * chunk at ~271k tokens was killed on its first command buffer by the GPU
+     * watchdog, which under tensor parallelism aborts the in-flight bulk gate
+     * and is not recoverable. */
+    CHECK(ds4_test_prefill_watchdog_chunk(271180) < 4096,
+          "runtime bound rejects the 4096 chunk that was killed at 271k");
+
+    /* Short prompts are untouched, and the clamp to prompt_len still holds. */
+    CHECK(ds4_test_planner_prefill_cap(4096, 0) == 4096,
+          "prompts at the whole-batch threshold are not chunked");
+    CHECK(ds4_test_planner_prefill_cap(1000, 0) == 1000,
+          "short prompts are capped by prompt length");
+    CHECK(ds4_test_planner_prefill_cap(1000000, 1u << 30) == 1000000,
+          "an oversized explicit chunk still clamps to prompt length");
+
+    /* Precedence: an operator override must still win outright. */
+    CHECK(ds4_test_planner_prefill_cap(1000000, 2048) == 2048,
+          "an explicit prefill chunk wins over the default");
+    setenv("DS4_METAL_PREFILL_CHUNK", "2048", 1);
+    CHECK(ds4_test_planner_prefill_cap(1000000, 0) == 2048,
+          "DS4_METAL_PREFILL_CHUNK wins over the default");
+    CHECK(ds4_test_planner_prefill_cap(1000000, 4096) == 4096,
+          "an explicit prefill chunk wins over DS4_METAL_PREFILL_CHUNK");
+    unsetenv("DS4_METAL_PREFILL_CHUNK");
+
+    restore_env_value("DS4_METAL_PREFILL_CHUNK", old_chunk);
+}
+
 int main(void) {
     test_tensor_to_entry();
     test_null_config();
@@ -678,6 +774,7 @@ int main(void) {
     test_glm_per_layer_cache_accounting();
     test_glm_session_count_accounting();
     test_cuda_tp_prefill_default_accounting();
+    test_prefill_watchdog_bound();
     test_cuda_tp_output_head_moves_to_lower_half();
 
     fprintf(stderr, "\ntest_engine_mgpu_placement: %d/%d checks passed (%d failed)\n",
