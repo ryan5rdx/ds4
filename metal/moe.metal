@@ -6420,8 +6420,8 @@ kernel void kernel_mul_mv_id_mxfp4_sum6_f32(
     (void)tiitg;
 }
 
-// Four rows per thread for the routed down projection.  a12e73d measured
-// 36.41 -> 36.78 t/s with this width on the 2x M2 Ultra pair; it was reverted
+// Four rows per thread for the routed down projection.  Gate and up stay at
+// two, where widening measured as a regression.
 // The host-side row count and the kernel width are one quantity: raising one
 // without the other halves the grid without widening the kernel and
 // leaves the upper half of every down projection unwritten.  The host must
