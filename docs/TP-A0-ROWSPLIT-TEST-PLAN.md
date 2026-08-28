@@ -1286,6 +1286,17 @@ suspected, since a dev-box `DS4_METAL_DECODE_NWG` sweep of 2→32 (16× the redu
 traffic) did not move the reduce span. In that case treat every pass-2 number as
 a ceiling and read only the **ratios** between the nine.
 
+**RESULT 2026-08-27** (build `179c105`): **the falsifier fired; the residual is
+still not named.** Pass 1 collapses the whole 9-label bracket into one composite
+(`rope_tail..reduce` @2k, three `rope_tail..*` forms @131k); honest reads hold
+(gap ≈ 0, conc ~1.97, throughput baseline 42.03 / 29.37). Pass 2 @131k inflates
+pathologically (`idx_attn` 38511 µs, total 212 ms ≫ 4.24) — the exact
+pre-registered failure. Pass 2 @2k splits only three labels cleanly:
+rope_tail 0.222 + fa_core 0.537 + reduce 0.662 = **1.42 ms**; `idx_*` and
+gather/packed stay fused (2k) or inflate (131k). **The ~1.9 ms is still
+unexplained — next step is the call site in `ds4.c`, not the encoder.** Full
+data in `BENCHMARKS-TP-PP.md` §Arm R1.
+
 ### Arm S — the n-gram commit rate, never once measured on this rig
 
 **Why it is the highest-value single session available.** Speculation is the only

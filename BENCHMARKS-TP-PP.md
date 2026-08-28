@@ -259,6 +259,44 @@ that host — and it does **not** change the verdict (roof ~760+, not 400).
 > Full correction table with file:line evidence:
 > `docs/TP-A0-ROWSPLIT-TEST-PLAN.md`, "Corrections owed to BENCHMARKS-TP-PP.md".
 
+### Arm R1 — name the 2.42 ms inside `attn_inv_rope` — 2026-08-27
+
+Build `179c105` (5 new `DS4_METAL_PROFILE_BRACKET_STAGE` labels: `idx_sort`,
+`idx_attn_split`, `idx_split_red`, `idx_attn`, `rope_tail`, taking bracket
+coverage 4→9). Two passes × 2k + 131k, gen 128.
+
+**Pass 1 — the whole bracket collapses into one composite.**
+
+| ctx | composite | of total |
+|---|---|---|
+| 2k | `rope_tail..reduce` (9 labels in one segment) | 27 of 109 per cb |
+| 131k | `rope_tail..reduce` 2432, `rope_tail..idx_split_red` 2560, `rope_tail..idx_attn` 672 | — |
+
+Pass 1 honest reads hold: **gap ≈ 0.000 ms (union 100%), conc mean 1.97-1.98**
+— consistent with B5/B6 (no idle pool in the buffer; stalls inside encoders).
+Throughput baseline (42.03 / 29.37 t/s).
+
+**Pass 2 (SPLIT) — the falsifier fires; pass 2 is ceilings, ratios only.**
+Pass 2 @131k inflates pathologically: `idx_attn` 38511 µs, `rope_tail` 251 µs,
+total **212 ms ≫ attn_inv_rope 4.24 ms** — exactly the pre-registered failure
+mode (SPLIT perturbation inflates spans faster than it resolves them). At 2k
+pass 2, only three labels split out cleanly:
+
+| label (2k pass 2) | fair | product |
+|---|---|---|
+| rope_tail | 9.8 µs | 0.222 ms |
+| fa_core | 24.7 µs | 0.537 ms |
+| reduce | 30.5 µs | 0.662 ms |
+| **sum** | | **1.42 ms** |
+
+**Verdict.** The five new labels do **not** cleanly split the 2.42 ms residual:
+`idx_*` and `gather`/`packed` do not emerge as separate spans (they stay fused
+into the composite at 2k, and inflate pathologically at 131k). Per the
+pre-registered falsifier, pass 2 is a ceiling; the 9-label sum does not
+reconcile to 3.64 ms. **The ~1.9 ms unexplained residual is still not named by
+the encoder instrument.** Per the plan's read order #4, the next step is the
+call site in `ds4.c` rather than the encoder.
+
 ### Arm B6 — the label was the bug: `reduce` was never a reduce — 2026-08-27
 
 Build `eb90b5f` (labels counted per span, composites printed; `SPLIT` mode
