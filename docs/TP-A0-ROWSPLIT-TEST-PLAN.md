@@ -142,6 +142,69 @@ reduction it is ~2.5 µs/dispatch, at scale ~1 µs. Full data in
 
 ---
 
+### Arm W1b — separate encode overhead from weight re-streaming
+
+W1 measured a real ~329 ms per-batch prefill cost (R² = 0.9989) but cannot say
+how much of it is encode overhead, because varying batch count at fixed total
+tokens varies weight traffic too. A 32-token chunk routes to ~136 of 256 experts
+(~68 per rank) ≈ 39 GB ≈ 87 ms at the measured rate, so a large share of that
+329 ms is unavoidable work.
+
+**Hold the routed work constant and vary only the batch count.** Prefill the same
+2048 tokens at a fixed chunk size, but change how many command batches carry it,
+using the existing chunk control rather than the step increment:
+
+```
+# same --step-incr 512 in every arm, so each batch does identical routed work;
+# vary --prefill-chunk so the engine splits each step into 1, 2 or 4 batches
+--ctx-start 512 --ctx-max 2048 --step-mul 1 --step-incr 512 --prefill-chunk 512
+--ctx-start 512 --ctx-max 2048 --step-mul 1 --step-incr 512 --prefill-chunk 256
+--ctx-start 512 --ctx-max 2048 --step-mul 1 --step-incr 512 --prefill-chunk 128
+```
+
+**Read:** total prefill against batch count at *constant* per-batch token count.
+The slope is encode overhead with the re-streaming term held down — it does not
+vanish, since halving the chunk still re-routes, but it changes far less than
+under W1's design.
+
+**Cross-check that isolates it completely.** Compare two arms with the same
+number of batches and the same total tokens but different routed unions: a
+top-k-restricted arm (`DS4_TP_ABLATE` on the routed chain) removes the expert
+traffic while keeping the encode structure. The residual is encode overhead.
+
+**Falsifier.** If the slope collapses to a few ms per batch once routed work is
+held constant, W1's 329 ms was overwhelmingly weight traffic and the original
+conclusion — verify's fixed term is verify-specific — stands after all, just for
+a reason the arm did not measure. If the slope stays in the hundreds of ms, the
+engine has a per-batch encode cost an order of magnitude above the verify's and
+it is the largest unexplained quantity after all.
+
+**Note this is now low priority.** Speculation is closed on the k ≤ 4
+impossibility result, so the verify's fixed term gates nothing. The reason to run
+W1b is W3.
+
+### Arm W3 — multi-slot batching against the per-batch cost
+
+The case this branch exists for, and the one W1 makes *more* interesting: if a
+per-batch cost of any size is real, concurrent slots each carrying few rows pay
+it repeatedly, and prefill's amortisation over large chunks is unavailable to
+them.
+
+```
+ds4-server with --resident-sessions N, N ∈ {1, 2, 4, 8}
+fixed aggregate offered load; measure aggregate and per-slot throughput
+```
+
+**Read:** aggregate throughput against slot count. Flat or rising is the healthy
+result — slots share batches. A per-slot collapse that tracks W1b's slope means
+the per-batch cost is the ceiling on multi-slot serving, which matters more than
+anything speculation was ever going to buy.
+
+**Record the batching behaviour too**, not just throughput: whether concurrent
+slots actually coalesce into one batch encode or each take their own. That single
+fact decides whether the per-batch cost is paid once or N times, and it is
+cheaper to observe than to infer from a throughput curve.
+
 ### Arm X1 — confirm the argsort tie-break comparator was costing prefill
 
 Removed on `metal-fork` on the reasoning below; this arm confirms the recovery

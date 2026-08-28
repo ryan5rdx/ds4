@@ -325,6 +325,37 @@ unexplained quantity in the engine" question: it is not an engine-wide encode
 overhead, it is the spec-cycle machinery, and it does not threaten prefill or
 any non-speculative multi-row batch.
 
+> **CORRECTION 2026-08-28 — the table is in SECONDS, and the verdict inverts.**
+> The section's own cross-check gives it away: 2048 tokens in 4.522 **ms** would
+> be 452,897 t/s. The quoted 452.9 t/s is right, so the unit is **seconds** —
+> and every row confirms it (as ms they read 80,671 to 452,897 t/s).
+>
+> | batches | total | t/s |
+> |---|---|---|
+> | 1 | 4.522 s | 452.9 |
+> | 4 | 5.676 s | 360.8 |
+> | 16 | 10.168 s | 201.4 |
+> | 64 | 25.387 s | 80.7 |
+>
+> So **F = 329 ms/batch = 7.65 ms/layer**, not 329 µs / 7.6 µs — **9.4× the
+> verify's 810 µs/layer, not 100× smaller.** The stated decision rule
+> (`F ≪ 35 ms`) fires the other way: 329 ms ≫ 35 ms.
+>
+> **But the arm cannot answer the question either way, and that is a flaw in how
+> it was specified.** Varying batch count at fixed total tokens varies two things
+> at once: encode overhead *and* expert re-streaming. A 32-token chunk routes to
+> ~136 of 256 experts (~68 per rank) ≈ 39 GB of expert weight ≈ 87 ms at the
+> measured rate, so a large share of the 329 ms is real, unavoidable work — and
+> is exactly why prefill uses large chunks. Comparing a per-batch cost against
+> the verify's fixed term treats them as the same quantity; they are not.
+>
+> **What the data does establish**, and it is worth having: the fit is excellent
+> (R² = 0.9989) and prefill batching carries a genuine ~329 ms per-batch cost, so
+> chunk size matters far more than a few percent — at 64 batches, 2k prefill
+> collapses from 453 to 81 t/s. Prefill itself is not threatened, because the
+> internal work budget already floors chunks at 512 tokens. The exposed case is
+> multi-slot batching, which makes W3 more interesting rather than less.
+
 **Note on the 1-batch arm:** 2048-token single prefill = 4.522 ms = 452.9 t/s,
 consistent with the established 2k prefill. The 64-batch arm's 25.4 ms total is
 all fixed-cost accumulation (63 × 0.329 ms = 20.7 ms of overhead on a 4.45 ms
