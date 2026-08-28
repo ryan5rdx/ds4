@@ -206,9 +206,32 @@ Forced 5-row drafts, 512 tokens, against a 41.96 t/s no-speculation baseline:
 Where the time goes: proposal 3412 ms (14.2%), verify 12,333 ms (51.4%), target
 8237 ms (34.3%). Those tile the wall clock to 0.004%, so **nothing overlaps**.
 
-Fitted verify cost **V(k) = 42.55 + 13.13k ms** from the measured 5-row (108.18)
-and 2-row (68.8) points, against an expected ~19 + 6.9k from the byte model —
-**about half the verify is unexplained.**
+Fitted verify cost, from a dedicated profile run (n=50 at 2 rows, n=7 at 3):
+
+```
+V(2) = 76.12 ms    V(3) = 96.76 ms    ->  V(k) = 34.83 + 20.64k
+```
+
+The intercept is real but the fit does not extrapolate: V(5) predicts 138 ms
+against 108.18 measured, because a 5-row draft takes a native 5-row tile that
+d2/d3 do not. **Longer drafts are cheaper per row than the linear fit implies**,
+which is why the optimum here runs toward longer drafts rather than shorter.
+
+**The fixed term is GPU layer-encode overhead, not data movement.**
+`verify_layer` is **99.97%** of the verify in every run; upload and readback are
+0.26–0.5 ms each. So the cost the byte model cannot see lives inside the
+43-layer batch encode, as fixed launch overhead — the same latency-bound
+character as decode, and immune to quantisation or bandwidth.
+
+**Which term dominates depends on the workload.** Under a forced policy on prose
+the split inverts to propose 3859 ms against verify 1794 ms, with the proposal
+chain 86% of propose. Both terms are latency-bound; neither is a bandwidth wall.
+
+**The production policy correctly declines to speculate on prose.** Left at its
+defaults it backs off after four attempts, launches no verifier at all, and
+returns exactly the no-speculation baseline (40.33 t/s). Measuring the verify at
+all requires `DS4_DSPARK_TP_LOW_YIELD_POLICY=0`, and volume requires the
+scheduler off as well.
 
 Break-even is mean commit > V/T = 4.41 at 5 rows, against 1.658 observed. A
 *completely free* drafter would still reach only 24.89 t/s. Shorter drafts do
