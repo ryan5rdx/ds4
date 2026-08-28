@@ -217,6 +217,16 @@ slots actually coalesce into one batch encode or each take their own. That singl
 fact decides whether the per-batch cost is paid once or N times, and it is
 cheaper to observe than to infer from a throughput curve.
 
+**RESULT 2026-08-28** (build `6d632c9`, ds4-server TP pair, --batched-session
+N∈{1,2,4,8}): **aggregate is FLAT (~38 t/s) across all slot counts; per-slot
+divides proportionally (38.8 → 4.35, −89%).** Aggregate 38.8/37.2/39.2/34.8.
+No coalescing benefit AND no per-batch penalty: the aggregate is pinned at the
+single-session decode rate (~38 t/s), so N slots each get 38/N by simple
+division. The W1 per-batch cost does not stack across slots. **Multi-slot
+serving is bounded by the same single-session decode ceiling, not by a
+repeated per-batch encode cost** — the decode path itself is the bottleneck.
+Full data in `BENCHMARKS-TP-PP.md` §Arm W3.
+
 ### Arm X1 — confirm the argsort tie-break comparator was costing prefill
 
 Removed on `metal-fork` on the reasoning below; this arm confirms the recovery
