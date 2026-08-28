@@ -1233,6 +1233,102 @@ calibrated `reduce` figures of 199 µs/call at 2k and 311 at 131k. The
 instrument's *distortion* claim is unaffected and still holds: throughput came
 back at baseline (42.04 / 29.70 t/s) on both runs.
 
+### Arm B6 — the label was the bug: `reduce` was never a reduce — 2026-08-27
+
+B5's falsifier fired exactly as pre-registered, and the answer it points to is
+**not** the cross-instrument operating point I nominated. It is that the label
+has never meant what every arm since B assumed.
+
+**What B5 did settle, and it stands.** `conc mean ≈ 2.0` with `conc max = 2`, and
+`union = 100%` of cb with `gap = 0.000 ms` at both contexts. Pipelining depth
+really is ~2 (not a span-endpoint artefact), and **there is no idle pool between
+encoders** — consistent with arm E's 100% residency at max clock. The stalls are
+*inside* the encoders. That is the most useful thing this instrument has produced
+and it does not depend on any label being correct.
+
+**Why `fair` barely moved.** With `conc` identically 2, fair-share and the uniform
+divide are arithmetically the *same operation* — `fair = raw/2`, `norm = raw/1.97`.
+157.4 vs 159.1 was a null test by construction. B5 could not have separated cause
+3; that is a flaw in B5's design, not evidence about cause 3.
+
+**The actual defect, proven in code.** In the batch,
+`ds4_gpu_end_compute_encoder` is a **no-op** — it returns when
+`enc == g_batch_enc` (`ds4_metal.m:1389`, pre-fix) — and `ds4_gpu_compute_encoder`
+hands back the same encoder **without reserving a new timestamp slot**. The chain:
+
+1. Decode runs inside `begin_commands`, so `ds4_gpu_command_buffer(&owned)`
+   (`ds4_metal.m:963`) returns `g_batch_cb` with `owned = 0`.
+2. The four flash-attn label sites — `gather` (`:29617`), `packed` (`:29678`),
+   `fa_core` (`:29698`), `reduce` (`:29726`) — sit in
+   `ds4_gpu_encode_flash_attention_gathered_heads` with **no `close_batch_encoder`
+   anywhere between them**.
+3. So all four write `g_ts_labels[g_ts_n - 1]` — the same slot — and
+   `ds4_gpu_ts_name_last` overwrote unconditionally. **`reduce`, being last, won.**
+
+**The span reported as `reduce` is the whole batch segment**, not the reduce
+dispatch. Which also explains the count that never made sense: **27/token is the
+number of batch segments whose last label happened to be `reduce`**, not a number
+of reduce dispatches — which is why it matched no partition of the 43 layers
+(21 ratio-4 + 20 ratio-128 + 2 raw). And a segment-sized span outweighing
+`attn_inv_rope` is not a paradox at all; it is the expected result.
+
+**Everything per-encoder from arm B through B5 is retired.** The tick (1.000 ns),
+`conc ≈ 2`, `union = 100%`, `gap ≈ 0` and the throughput baselines all survive —
+none of them depend on a label. Every µs/call figure does not.
+
+**Landed (`9a9f6ce`).** Labels are counted per span rather than overwritten, and
+composites print as `first..last+n` with a summary line:
+
+```
+ds4: enc-ts <tag>: N of M spans carry MULTIPLE stage labels -- per-stage attribution is not available
+```
+
+Plus `DS4_METAL_GPU_ENCODER_TIMESTAMPS_SPLIT=1`, which forces a real encoder
+boundary at every `end_compute_encoder` so each stage gets its own span. It
+perturbs — on `bench_decode_rows` here it turns 1 span of 1.334 ms into 24 spans
+over a 1.988 ms buffer (+49%) — so it is opt-in and its **absolute** numbers are
+not a budget. Ending an encoder is a stronger barrier than reusing one, so split
+mode can only over-serialise, never mis-order.
+
+**What to run — two passes.**
+
+```
+# pass 1 -- honest default, tells us how bad the collapse is
+DS4_METAL_GPU_ENCODER_TIMESTAMPS=1                                            # 2k + 131k, gen 128
+
+# pass 2 -- true per-stage spans, perturbed
+DS4_METAL_GPU_ENCODER_TIMESTAMPS=1 DS4_METAL_GPU_ENCODER_TIMESTAMPS_SPLIT=1   # 2k + 131k, gen 128
+```
+
+**Read in this order:**
+
+1. **Pass 1, the composite line.** This is the falsifier for the whole diagnosis.
+   If it reports **0 composite spans**, the collapse does not fire on the rig, my
+   diagnosis is wrong, and B5's numbers stand as they were. If it reports a large
+   fraction, every per-call figure from B onward is confirmed dead.
+2. **Pass 1, the composite labels themselves.** Expect
+   `gather..reduce+4` (or `fa_core..reduce+2`) on the FA spans. The `+n` says how
+   many stages are fused into one measurement.
+3. **Pass 2, `reduce` alone.** Now a real span. Multiply by its own count from the
+   same run — *not* by 27, which was never a dispatch count. It must come in under
+   `attn_inv_rope`; note pass 2 is perturbed, so treat it as a **ratio** against
+   the other FA stages in the same run, not as an absolute.
+4. **Pass 2, the FA split.** `gather : packed : fa_core : reduce` as shares. This
+   is what the arm was originally for: which part of flash-attn to attack.
+5. **Both passes, `conc`/`gap`/throughput.** Pass 1 must still read ~42 / ~29.6 t/s
+   and `gap ≈ 0`. Pass 2 will read worse; record how much so we know the
+   perturbation size.
+
+**Pre-registered falsifier.** 0 composite spans in pass 1 refutes the diagnosis
+outright. If instead pass 2's `reduce` still exceeds `attn_inv_rope` after being
+given its own boundary, then the containment assumption itself is wrong — i.e.
+this FA path is reached from somewhere outside the
+`compressor_indexer`→`attn_inv_rope` bracket — and the next step is to instrument
+the call site rather than the encoder.
+
+**Standing correction.** Arm C's layer table reads `21` for ratio-128; it should be
+**20** (2 + 20 + 21 = 43). Its line-count divisor is per-class, not a uniform `/5`.
+
 ### Arm B5 — stop dividing, decompose: the `fair` column — 2026-08-27
 
 B4 did its job: the LOSS line went in, and the answer was **not** loss. The
