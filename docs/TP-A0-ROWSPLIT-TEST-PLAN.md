@@ -142,6 +142,43 @@ reduction it is ~2.5 µs/dispatch, at scale ~1 µs. Full data in
 
 ---
 
+### Arm X1 — confirm the argsort tie-break comparator was costing prefill
+
+Removed on `metal-fork` on the reasoning below; this arm confirms the recovery
+on hardware. **Zero code — the flag already exists on `upstream-metal-wins`.**
+
+The comparator added a (score desc, index asc) tie-break to the block argsort so
+it would agree with the streaming top-512 selector. It cannot serve that purpose:
+the selector returns before the argsort path is reached, so the comparator runs
+only on the fallback, and only when `n_tokens >= 32` — the same gate as the
+selector it was meant to agree with. Its stated beneficiary is absent exactly
+when it runs. It is also not bit-identical to upstream: it changes tie order for
+the live consumer, which on this model is MoE router expert selection.
+
+The only measurement predates the gate: disabling recovered **+5.6% prefill at
+2048** and **+2.5% at 4096**, neutral at 8192. The gate does not recover those
+points, because prefill never runs a chunk below 512 tokens
+(`DS4_PREFILL_CHUNK_MIN`, `ds4.c:12266`).
+
+```
+# interleaved, three repeats each, pair restart between
+DS4_METAL_DISABLE_ARGSORT_CANON=1 ... --ctx-start 2048 --ctx-max 8192 --step-mul 2
+                                  ... --ctx-start 2048 --ctx-max 8192 --step-mul 2
+```
+
+**Read:** prefill t/s at 2048 and 4096. Expect the disabled arm ahead by ~5.6%
+and ~2.5%. Neutral at 8192 either way.
+
+**Also capture output.** Add `--dump-frontier-logits-dir` to both arms and
+compare. The comparator changes router tie order, so a difference is expected —
+what matters is that top-1 is preserved. If it is not, the removal is a
+correctness fix as well as a throughput one, and that should be recorded.
+
+**Falsifier.** If the disabled arm is *not* faster, the pre-gate measurement did
+not survive the gate and the removal is neutral — still correct to remove, since
+it is an unmotivated output change, but the commit message should drop the
+throughput claim.
+
 ### Arms W1-W3 — the batch-encode fixed cost, and who else pays it
 
 **Why this replaces the speculation work.** The V-residual arm settled where the
