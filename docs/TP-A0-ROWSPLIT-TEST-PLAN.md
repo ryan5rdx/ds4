@@ -1326,8 +1326,67 @@ this FA path is reached from somewhere outside the
 `compressor_indexer`→`attn_inv_rope` bracket — and the next step is to instrument
 the call site rather than the encoder.
 
-**Standing correction.** Arm C's layer table reads `21` for ratio-128; it should be
-**20** (2 + 20 + 21 = 43). Its line-count divisor is per-class, not a uniform `/5`.
+**Zero-cost falsifier, already resolved — cause 4 confirmed.** Across all four
+enc-ts arms, `reduce` is the **only** FA label ever reported: 10 mentions in the
+arm-B write-ups, **zero** for `gather`, `packed` or `fa_core`. If the four phases
+had their own encoders, all four labels would appear. They do not.
+
+**Independent kill by arithmetic.** The reduce kernel's own traffic is
+`tmp = nrows·head_dim·nwg·4 + nrows·2·nwg·4` = 1,579,008 B at ratio-4 (nwg 24) and
+328,960 B at ratio-128 (nwg 5): `21×1,579,008 + 20×328,960 = 39,738,368 B / 41 =
+969 kB/call`, which at 760 GB/s is **1.28 µs/call** against a reported 157–160.
+**123× off.** No plausible inefficiency spans two orders of magnitude; the span is
+not the kernel.
+
+**Two refinements to the run matrix.**
+
+- **Do not co-run `DS4_METAL_DECODE_STAGE_PROFILE=1`.** It ends a command buffer
+  per marker, which shreds the enc-ts spans and moves the operating point to
+  28.83 ms. B5's "same run" requirement is better met by deriving `attn_inv_rope`
+  from **pass 2's own spans** — the sum of the FA phase spans between
+  `compressor_indexer` and `attn_inv_rope` — than by stacking two instruments.
+- **Bounded distortion.** Pass 2's perturbation is `172 × 3.464 µs = 0.596 ms`
+  = 2.5% of the token, so it is usable as a ratio between FA phases.
+
+**If pass 2's `reduce` reads near 1.28 µs/call**, item G's ceiling is the `fa_core`
+half, and the 46–48 t/s branch becomes fundable. That is the real prize here.
+
+### Corrections owed to `BENCHMARKS-TP-PP.md` (rig-owned — listed, not applied)
+
+From the arms C–F audit (50 agents, 27 findings survived adversarial refutation,
+31 refuted). Ordered by consequence.
+
+| # | claim as written | correction |
+|---|---|---|
+| 1 | Arm C's table is a **decode** shape | **It is prefill-only.** All four `DS4_METAL_PROFILE_FLASH_ATTN_STAGE` sites are prefill encoders (`ds4_metal.m:28387/28669/29018/29272`); the print string is literally "Metal FlashAttention prefill stage" (`:11345`); and `heads=64` is structurally impossible for TP2 decode, which passes 32. `n_keys = 2048/2064/2560` is a prefill tile extent and **must not size `attn_inv_rope`.** |
+| 2 | — | **Decode `n_keys` derived: 128 / 144 / 640.** `n_comp = 0/16/512` does transfer; with `n_raw = 128` fixed by `metal_graph_raw_span_for_batch` at `n_tokens=1`, window `DS4_N_SWA=128` (`ds4.c:19764-19780`). **640 lands inside the 512–700 PASS band, so item G is not killed.** |
+| 3 | ratio-128 = 21 layers | **20.** `2 + 21 + 21 = 44 > 43`. Line counts confirm exactly: `2×4 + 20×6 + 21×5 = 233`, and it is **one** chunk, not two. ratio-128 gets a 6th line because pad fires (`2064 % 64 = 16`); ratio-4 does not (`2560 % 64 = 0`), `ds4_metal.m:28305-28307`. |
+| 4 | `≈ 0.28 ms ≈ 3.3 µs/dispatch` | `= 0.2979 ms = **3.464 µs/dispatch**`. Threshold is `250/86 = 2.907`, so the margin is **1.19×**, not 1.14×. |
+| 5 | "treat 3.3 µs as an **upper** bound" | **Backwards on its own premise.** If added dispatches hide in the ~2× overlap, the marginal price is *depressed* — 3.46 µs is a **lower** bound. |
+| 6 | "Confirms the 608 MB compressor accounting" | **Confirms 440.40 of 608.17 MB (72.4%).** `DS4_METAL_DISABLE_PRE_M5_QKV_PAIR_QUAD_FUSE` gates only the `ratio==4` branch (`ds4.c:22478`); the 20 ratio-128 layers fuse behind a *different*, unset var `..._PAIR_COMPRESSOR_FUSE` (`ds4.c:22536`) and still fired. **Do not quote 608/0.903 = 673 GB/s.** Corrected, the books are *better*: 632 GB/s out vs 609 GB/s in, 3.8% agreement. |
+| 7 | `compressor_update` fused = 1.278 | **Unmeasured.** The value appears nowhere else in the corpus and Iteration 3 does not list the stage. The 0.009 ms residual is conditional on it. |
+| 8 | Arm E's reason: "busy at top P-state, modest power" | **Right verdict, weak reason.** The decisive fact is that **prefill runs at 1394–1398 MHz — at or 0.3% *below* decode's pinned 1398 — while drawing 1.78× the power.** A lower-clocked phase drawing more power excludes DVFS outright. 1398 MHz is also the clock the 21 TFLOP/s roof was measured at, so "2% of peak FLOPs" is not a DVFS artefact. |
+| 9 | Arm E's residency column | **Conflicts with `BENCHMARKS-TP-PP.md:1505`** ("the sampler on these boxes reports GPU *power*, not residency %"). One of the two is wrong. Attach the raw powermetrics stanza or strike one. Also record n ≈ 15 samples, one session, and that at `-i 200` one sample averages 8.24 tokens. |
+| 10 | Arm F "stage deltas are the read" | Safe only on rows with the **same marker count in both arms**. `q_a_kv_proj` is 43 in both (−0.697 quotable); `compressor_proj` exists in one arm only, so its +0.903 and the +0.215 total each carry ~0.18 ms of pure instrument. |
+
+**Latent defect, inert today.** `ds4_gpu_decode_dispatch_ballast` takes `owned`
+(`ds4_metal.m:1768`) and never tests it before
+`ds4_gpu_finish_command_buffer(cb, owned, …)` (`:1779`), unlike the real gate's
+`if (!cb || owned) return 0;`. Harmless while decode always has `g_batch_cb` open
+(`owned = 0`), but any future call outside an open batch would report a full
+command-buffer round trip as a "dispatch price".
+
+**The budget book is overdrawn.** Measured markers sum to 24.12 ms = 99.4% of the
+24.26 ms token, leaving 0.14 ms — but ~19 marker sites (`ds4.c:22417-25394`) plus
+the output head are unreported, and `output_norm` alone was priced at 0.52 ms.
+**Deficit ≥ 0.38 ms.** Either the flat 0.18 ms/marker over-corrects, or one of
+`attn_out_proj` (601 GB/s — above every Q8_0 rate on this rig) and `q_a_kv_proj`
+(455 GB/s, a byte-weighted average of two different streams) is wrong by ~0.4 ms.
+
+**New candidate.** `compressor_update` at **1.10 ms net (4.5%)** reads only 2.79 MB
+(`21×1024×4×2 + 20×512×128×2`), so it is **not** bandwidth-bound and has **no
+roofline defence** — the only stage in the table in that position besides
+`attn_inv_rope`.
 
 **RESULT 2026-08-27** (build `eb90b5f`, two passes): **the collapse is real and
 total.** Pass 1 reports **3456 `fa_core..reduce` composite spans @2k (27/token)
