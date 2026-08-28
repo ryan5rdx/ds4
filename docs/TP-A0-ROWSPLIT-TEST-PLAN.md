@@ -142,6 +142,99 @@ reduction it is ~2.5 µs/dispatch, at scale ~1 µs. Full data in
 
 ---
 
+### Arms W1-W3 — the batch-encode fixed cost, and who else pays it
+
+**Why this replaces the speculation work.** The V-residual arm settled where the
+verify's unattributed time lives: `verify_layer` is **99.97%** of it, upload and
+readback are under 0.5 ms each, so the cost is fixed layer-encode overhead inside
+the 43-layer batch, not data movement. Fitted `V(k) = 34.83 + 20.64k`.
+
+That fixed term is **34.83 ms over 43 layers = 810 µs per layer, before any
+row-dependent work.** A whole decode token costs 564 µs per layer *including* all
+its work. A batch encode paying more fixed cost per layer than a decode token
+costs in total is not "encoding is expensive" — it is an anomaly.
+
+**Speculation itself is closed.** Running the measured fit against the *ceiling*
+on commit, rather than against our drafter's rate:
+
+| k | V(k) ms | break-even | max possible commit | |
+|---|---|---|---|---|
+| 1 | 55.5 | 2.26 | 1 | **impossible** |
+| 2 | 76.1 | 3.10 | 2 | **impossible** |
+| 3 | 96.8 | 3.94 | 3 | **impossible** |
+| 4 | 117.4 | 4.79 | 4 | **impossible** |
+| 5 | 108.2 | 4.41 | 5 | needs 88% sustained acceptance |
+
+For every draft length but 5, break-even exceeds the number of tokens the cycle
+can emit — **a perfect drafter loses.** Only d5 escapes, and only because the
+native 5-row tile makes it 22% cheaper than the fit predicts. Zeroing the fixed
+term entirely still leaves break-even at 2.99 against an observed 1.658. Do not
+spend further rig time on drafters.
+
+**But the fixed cost should generalise, and that is worth a session.** The verify
+is a small multi-row batch through `metal_graph_encode_layer_batch` — and so is a
+prefill chunk (`ds4.c:36225`), and so is anything multi-slot. Prefill amortises it
+over thousands of rows; a small batch does not.
+
+#### W1 — does prefill pay the same fixed cost? (zero code)
+
+Prefill the same 2048 tokens in 1, 4, 16 and 64 batches by varying the step
+increment, and fit total prefill time against batch count.
+
+```
+# coordinator, worker as usual; one arm per line, pair restart between
+--ctx-start 2048 --ctx-max 2048                       --gen-tokens 8    # 1 batch
+--ctx-start  512 --ctx-max 2048 --step-mul 1 --step-incr  512 --gen-tokens 8
+--ctx-start  128 --ctx-max 2048 --step-mul 1 --step-incr  128 --gen-tokens 8
+--ctx-start   32 --ctx-max 2048 --step-mul 1 --step-incr   32 --gen-tokens 8
+```
+
+`--step-mul 1` selects the additive path (`ds4_bench.c:546-548`), so each step
+prefills exactly `--step-incr` tokens. Keep `--gen-tokens` small; decode is not
+what this measures. Sum the per-step prefill times from the CSV.
+
+**Read:** fit `total = base + F × batches`. **F is the per-batch fixed cost.**
+
+- **F ≈ 35 ms** → the verify's fixed term is the general batch-encode cost, it is
+  costing prefill too, and it is the single largest unexplained quantity in the
+  engine. Predicted: 64 batches would add ~2.2 s to a 4.84 s prefill, dropping
+  2k prefill from ~423 to ~290 t/s — a signal far outside the ±1.4% anchor noise.
+- **F ≪ 35 ms** → the fixed term is verify-specific (TP batch gates, capture-row
+  bookkeeping, the spec-cycle wrapper) and prefill is unaffected. That is also a
+  useful answer: it localises the cost to the speculative path and closes it.
+
+**Confound to watch.** The engine re-chunks internally to a work budget
+(`DS4_PREFILL_CHUNK_WORK_BUDGET`, `ds4.c:12265`), so a 2048-token request may
+already be split. If the 1-batch and 4-batch arms are indistinguishable, the
+internal chunker is already imposing a floor — report the knee rather than
+assuming the requested size was honoured. Note also the TP constraint recorded at
+`ds4.c:12260`: both ranks must chunk identically or the per-layer gates stop.
+
+#### W2 — is the fixed cost proportional to layer count? (analysis, no rig time)
+
+If 34.83 ms is 43 layers of per-layer encode overhead, then the DSpark stage
+chain — which runs **3** layers through the same helpers — should carry about
+`3/43 × 34.83 = 2.4 ms` of it. The propose profile already reports `prop_chain`
+(86% of propose). Extract the fixed component from the existing d2/d3 runs and
+compare. Proportional ⇒ it is genuinely per-layer and scales with any model's
+depth; flat ⇒ it is a per-batch setup cost paid once, which is a different and
+more tractable defect.
+
+#### W3 — the multi-slot exposure (the case this branch exists for)
+
+If the cost is per batch encode, concurrent slots each carrying few rows pay it
+repeatedly. Measure aggregate `ds4-server` throughput against slot count at a
+fixed total token rate. A per-slot collapse that tracks W1's F would confirm the
+fixed cost is the ceiling on multi-slot batching — which matters far more than
+speculation ever did.
+
+**What we do not have and would need.** There is no DS4F batch-path stage
+profiler; `DS4_METAL_PROFILE_DECODE_STAGE` covers the decode path only, and the
+GLM path has its own (`DS4_GLM_PROFILE_PREFILL_STAGE`, `ds4.c:46791`). If W1 shows
+F ≈ 35 ms, the next step is a batch-path equivalent so the 810 µs/layer can be
+attributed within the layer. That is implementation work on our side, and it is
+worth doing only after W1 says the cost is real outside the verify.
+
 ### V-residual — the 44 ms of the verify that no byte model explains
 
 Of the measured 108.18 ms/verifier (`speed-bench/tp_mtp_hunt.md:148-149`),
