@@ -1306,6 +1306,16 @@ banking is already in and only cause 3 can survive it.
 **Until this reconciles, `norm µs/call` stays out of the token budget.** The
 per-call figure may well be right; the count it gets multiplied by is not.
 
+**RESULT 2026-08-27** (build `c9e0f72`, run 4): the 2k overshoot **survives
+banking**. LOSS reads 257/388 = 66% @2k but only 8% @131k — yet `reduce`'s
+count is identical to run 3 (3456 / 2432) and norm unchanged (159.5 / 170.1),
+so loss drops other ranges, not `reduce`; the 41→27 drift is not a loss
+artifact. Product still **4.31 ms > attn_inv_rope 3.64 ms @2k (1.18×)**;
+131k reconciles (3.23 < 4.24, 0.76×). **Cause 3 (non-uniform overlap) is what
+remains — norm column is not a budget; treat raw as upper bound, stop quoting
+norm.** Throughput at baseline (42.29 / 29.71 t/s). Full data in
+`BENCHMARKS-TP-PP.md` §Arm B4.
+
 ### Arm B — the instrument runs clean but reports wrong; fixed, needs a re-run — 2026-08-27
 
 **What worked.** 42.08 t/s at 2k and 29.71 at 131k — **baseline throughput**, so

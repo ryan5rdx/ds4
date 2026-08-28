@@ -243,6 +243,41 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+### Arm B4 — banked slots + LOSS counter; the 2k overshoot survives — 2026-08-27
+
+Build `c9e0f72` (carries `d645b29` banking fix). Same flags as run 3
+(`DS4_METAL_GPU_ENCODER_TIMESTAMPS=1`), 2k + 131k, gen 128.
+
+**The LOSS line (new) — context-dependent, and it does not explain the
+overshoot:**
+
+| ctx | ranges never reported | encoders lost |
+|---|---|---|
+| 2k | **257/388 = 66%** | 8449 |
+| 131k | 129/1698 = 8% | 2177 |
+
+**Decisive: the `reduce` count is identical to run 3 (3456 @2k, 2432 @131k)
+and the norm is unchanged (159.5 / 170.1).** Banking changed which ranges get
+reported, yet `reduce`'s count did not move — so the loss is dropping *other*
+(unlabelled) spans, not `reduce`. The 41→27 calls/token drift is therefore
+NOT a loss artifact; the reported reduce count is trustworthy.
+
+**The product still overshoots at 2k:**
+
+| ctx | calls/token | norm µs/call | product | `attn_inv_rope` | ratio |
+|---|---|---|---|---|---|
+| 2k | 27 | 159.5 | **4.31 ms** | 3.64 ms | **1.18× — survives** |
+| 131k | 19 | 170.1 | 3.23 ms | 4.24 ms | 0.76× — plausible |
+
+**Verdict per the plan's read order.** Loss is present (66% @2k) but does not
+explain the 2k overshoot — the reduce count is unchanged by banking, so cause
+3 (non-uniform overlap) is what remains. **The normalised column is not a
+budget; treat raw as the upper bound and stop quoting norm.** The 131k row
+reconciles (0.76×), so the per-call figure is probably right and the
+uniform-overlap divide over-states `reduce` at 2k specifically.
+
+Throughput at baseline (42.29 / 29.71 t/s) — instrument not distorting.
+
 ### Arms C-F — shape fields, dispatch ballast, powermetrics, compressor accounting — 2026-08-27
 
 One session, build `05f402d`, 2k context, gen 128. All four zero-code arms.
