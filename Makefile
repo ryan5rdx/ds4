@@ -110,15 +110,6 @@ tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
 test-metal-session-batch: tests/test_metal_session_batch
 	DS4_TEST_MODEL="$(DS4_TEST_MODEL)" ./tests/test_metal_session_batch
 
-tests/bench_amx_indexer.o: tests/bench_amx_indexer.c
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
-
-tests/bench_amx_indexer: tests/bench_amx_indexer.o
-	$(CC) $(CFLAGS) -o $@ $^ -framework Accelerate
-
-bench-amx-indexer: tests/bench_amx_indexer
-	./tests/bench_amx_indexer
-
 tests/test_indexer_scorer.o: tests/test_indexer_scorer.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
@@ -137,138 +128,10 @@ tests/test_topk_stream512: tests/test_topk_stream512.o ds4_metal.o
 test-topk-stream512: tests/test_topk_stream512
 	./tests/test_topk_stream512
 
-tests/bench_indexer_score.o: tests/bench_indexer_score.c ds4_gpu.h
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
-
-tests/bench_indexer_score: tests/bench_indexer_score.o ds4_metal.o
-	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
-
-bench-indexer-score: tests/bench_indexer_score
-	./tests/bench_indexer_score
-
 # #includes ds4.c directly so it can reach the STATIC matvec kernels decode uses
 # -- a copy of them would drift and would not be evidence about the shipped path.
-tests/bench_cpu_draft_cost.o: tests/bench_cpu_draft_cost.c ds4.c
-	$(CC) $(CFLAGS) -I. -DDS4_NO_GPU -Wno-unused-function -c -o $@ $<
-
-tests/bench_cpu_draft_cost: tests/bench_cpu_draft_cost.o ds4_distributed_cpu.o ds4_tp.o ds4_layer_pack.o ds4_ssd.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
-
-bench-cpu-draft-cost: tests/bench_cpu_draft_cost
-	./tests/bench_cpu_draft_cost
-
-tests/bench_ngram_accept.o: tests/bench_ngram_accept.c
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
-
 # Links the CPU core so the harness calls the SHIPPED ds4_ngram_propose rather
 # than a copy of it; no GPU and no model are needed.
-tests/bench_ngram_accept: tests/bench_ngram_accept.o ds4_cpu_test_hooks.o ds4_distributed_cpu.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
-
-bench-ngram-accept: tests/bench_ngram_accept
-	./tests/bench_ngram_accept
-
-tests/test_ts_fairshare.o: tests/test_ts_fairshare.c ds4_gpu.h
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
-
-tests/test_ts_fairshare: tests/test_ts_fairshare.o ds4_metal.o
-	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
-
-test-ts-fairshare: tests/test_ts_fairshare
-	./tests/test_ts_fairshare
-
-tests/test_topk_ab.o: tests/test_topk_ab.c ds4_gpu.h
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
-
-tests/test_topk_ab: tests/test_topk_ab.o ds4_metal.o
-	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
-
-test-topk-ab: tests/test_topk_ab
-	./tests/test_topk_ab
-
-tests/bench_moe_mxfp4_decode.o: tests/bench_moe_mxfp4_decode.c ds4_gpu.h
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
-
-tests/bench_moe_mxfp4_decode: tests/bench_moe_mxfp4_decode.o ds4_metal.o
-	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
-
-bench-moe-mxfp4-decode: tests/bench_moe_mxfp4_decode
-	./tests/bench_moe_mxfp4_decode
-
-tests/bench_qkv_norm.o: tests/bench_qkv_norm.c ds4_gpu.h
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
-
-tests/bench_qkv_norm: tests/bench_qkv_norm.o ds4_metal.o
-	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
-
-bench-qkv-norm: tests/bench_qkv_norm
-	./tests/bench_qkv_norm
-
-tests/bench_q8_attn_shapes.o: tests/bench_q8_attn_shapes.c ds4_gpu.h
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
-
-tests/bench_q8_attn_shapes: tests/bench_q8_attn_shapes.o ds4_metal.o
-	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
-
-bench-q8-attn-shapes: tests/bench_q8_attn_shapes
-	./tests/bench_q8_attn_shapes
-
-tests/bench_encode_shape.o: tests/bench_encode_shape.m
-	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
-
-tests/bench_encode_shape: tests/bench_encode_shape.o
-	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
-
-bench-encode-shape: tests/bench_encode_shape
-	./tests/bench_encode_shape
-
-tests/bench_mv_concurrency.o: tests/bench_mv_concurrency.m
-	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
-
-tests/bench_mv_concurrency: tests/bench_mv_concurrency.o
-	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
-
-bench-mv-concurrency: tests/bench_mv_concurrency
-	./tests/bench_mv_concurrency
-
-tests/bench_decode_rows.o: tests/bench_decode_rows.c ds4_gpu.h
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
-
-tests/bench_decode_rows: tests/bench_decode_rows.o ds4_metal.o
-	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
-
-bench-decode-rows: tests/bench_decode_rows
-	./tests/bench_decode_rows
-
-tests/bench_stage_marker_tax.o: tests/bench_stage_marker_tax.m
-	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
-
-tests/bench_stage_marker_tax: tests/bench_stage_marker_tax.o
-	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
-
-bench-stage-marker-tax: tests/bench_stage_marker_tax
-	./tests/bench_stage_marker_tax
-
-tests/bench_flagset_tax.o: tests/bench_flagset_tax.m
-	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
-
-tests/bench_flagset_tax: tests/bench_flagset_tax.o
-	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
-
-bench-flagset-tax: tests/bench_flagset_tax
-	./tests/bench_flagset_tax
-
-tests/bench_membw.o: tests/bench_membw.m
-	$(CC) $(OBJCFLAGS) -I. -c -o $@ $<
-
-tests/bench_membw: tests/bench_membw.o
-	$(CC) $(OBJCFLAGS) -o $@ $^ -framework Foundation -framework Metal
-
-bench-membw: tests/bench_membw
-	./tests/bench_membw
-speed-bench/metal_decode_schedule_bench.o: speed-bench/metal_decode_schedule_bench.c ds4.h
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
-
 speed-bench/metal_decode_schedule_bench: speed-bench/metal_decode_schedule_bench.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
