@@ -1221,6 +1221,19 @@ void ds4_gpu_ts_fair_share(const uint64_t *starts, const uint64_t *ends, uint32_
     free(ev); free(active);
 }
 
+/* Abandon the current range without reporting it.  Both of ds4_gpu_ts_report's
+ * failure exits used to just zero g_ts_n: that under-counted the LOSS line (so a
+ * reported 66% was a lower bound) and, worse, left g_ts_cb pointing at a dead
+ * range, so a recycled command-buffer address could append to it -- exactly the
+ * hazard the slot banking exists to close. */
+static void ds4_gpu_ts_abandon_range(void) {
+    if (g_ts_n > 0) { g_ts_dropped_ranges++; g_ts_dropped_encoders += g_ts_n; }
+    g_ts_base += g_ts_n;
+    if (g_ts_base + DS4_GPU_TS_MAX_ENCODERS > DS4_GPU_TS_CAPACITY) g_ts_base = 0;
+    g_ts_n = 0;
+    g_ts_cb = NULL;
+}
+
 static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
     if (!ds4_gpu_ts_active() || g_ts_n == 0) return;
     if (cb && (__bridge void *)cb != g_ts_cb) {
@@ -1229,7 +1242,7 @@ static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
         return;
     }
     NSData *rd = [g_ts_buffer resolveCounterRange:NSMakeRange(g_ts_base * 2u, g_ts_n * 2u)];
-    if (!rd) { g_ts_n = 0; return; }
+    if (!rd) { ds4_gpu_ts_abandon_range(); return; }
     const MTLCounterResultTimestamp *t = (const MTLCounterResultTimestamp *)rd.bytes;
 
     uint64_t lo = UINT64_MAX, hi = 0;
@@ -1239,7 +1252,7 @@ static void ds4_gpu_ts_report(id<MTLCommandBuffer> cb, const char *tag) {
         if (a < lo) lo = a;
         if (b > hi) hi = b;
     }
-    if (hi <= lo) { g_ts_n = 0; return; }
+    if (hi <= lo) { ds4_gpu_ts_abandon_range(); return; }
 
     const double cb_s = cb ? (cb.GPUEndTime - cb.GPUStartTime) : 0.0;
     /* seconds per tick, from this command buffer's own clock */
