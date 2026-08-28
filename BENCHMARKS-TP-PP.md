@@ -259,6 +259,47 @@ that host — and it does **not** change the verdict (roof ~760+, not 400).
 > Full correction table with file:line evidence:
 > `docs/TP-A0-ROWSPLIT-TEST-PLAN.md`, "Corrections owed to BENCHMARKS-TP-PP.md".
 
+### Arm R1 re-run — path counts resolve the branch ambiguity; label-collapse persists — 2026-08-28
+
+Build `d8536ed` (post `9685613` label fixes + `51198b5` path counters). Pass 1
+at 2k + 131k; pass 2 SPLIT at 2k only (131k SPLIT known to inflate 50×).
+
+**Path counts (calls, not spans) — the decisive new signal:**
+
+| label | 2k | 131k |
+|---|---|---|
+| `raw_attn` | 256 | 256 |
+| `inv_rope` | 256 | 2944 |
+| `idx_sort` | **0** | 672 |
+| `idx_attn` | **0** | 672 |
+| `idx_attn_split` | **0** | 2688 |
+| `idx_split_red` | **0** | 2688 |
+| `indexer_score_llt` | 0 | 2688 |
+| `mask_fill` / `mask_cpy` / `kv_stage` / `fa_core` / `reduce` | 5248 each | 2560 each |
+
+**R1's "`idx_*` stay fused at 2k" reading was wrong: they never ran.** Indexed
+attention needs >1024 *compressed* rows (`ds4.c:19947`); ratio-4 at 2k gives
+2048/4 = 512, so the branch is structurally absent at 2k. At 131k the idx
+branches fire (672 sort/attn, 2688 split/red, 2688 score_llt). The path counter
+turns three lines of inference into one unambiguous line — the fix works.
+
+**Honest (pass 1) still collapses the 9-label bracket into ONE composite**
+(`mask_fill..reduce+5`), conc mean 1.95-1.99, max 2, union 100%, gap 0.000 ms.
+The whole FA bracket is one lump: **~4.31 ms @2k / ~3.24 ms @131k per token**
+(vs stage-profile `attn_inv_rope` 3.817/4.243 — same operating ballpark, not a
+clean match). Label-collapse persists in honest mode: all 9 FA labels pile onto
+one span per encoder; the instrument cannot sub-divide the bracket honestly.
+
+**Pass 2 SPLIT @2k** (perturbed, 32.96 t/s, conc 1.74-1.87, gap 3.3-4.4 ms):
+splits into `reduce` 36.1, `fa_core` 28.3, `kv_stage` 5.5, `mask_fill..mask_cpy`
+8.9 µs/call — ceilings/ratios only, as in B6.
+
+**Verdict — per plan read-order #4, the residual moves to the `ds4.c` call
+site.** The 9 labels still do not sub-divide honestly on the fixed build (pass 1
+is one composite; pass 2 perturbs). The encoder instrument has gone as far as
+it can. The unnamed ~1.9-2.4 ms inside `attn_inv_rope` is not separable at the
+GPU-encoder boundary and must be chased where the stages are distinct code paths.
+
 ### Arm S — n-gram commit rate, first measurement on this rig — 2026-08-27
 
 Build `d8536ed` (trace hook now in `ds4_session_eval`, the path ds4-bench and

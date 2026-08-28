@@ -178,6 +178,19 @@ If the 9 labels still do not reconcile to 3.64 ms on the fixed build, the
 encoder instrument has gone as far as it can and the residual moves to the
 `ds4.c` call site, per read-order #4.
 
+**RESULT 2026-08-28** (build `d8536ed`): **path counts resolve the ambiguity;
+label-collapse persists.** Path counts: at 2k `idx_*` = **0 calls** — R1's
+"idx_* stay fused" reading was wrong, they *never ran* (indexed attention needs
+>1024 compressed rows; ratio-4@2k = 512). At 131k idx fires (672 sort/attn,
+2688 split/red, 2688 score_llt). Honest pass 1 still collapses the whole FA
+bracket into one composite (`mask_fill..reduce+5`), conc 1.95-1.99, gap 0.000:
+the bracket is one lump **~4.31 ms @2k / ~3.24 ms @131k** vs stage-profile
+`attn_inv_rope` 3.817/4.243 — same ballpark, not sub-dividable. Pass 2 SPLIT
+@2k (perturbed, 32.96 t/s): reduce 36.1, fa_core 28.3, kv_stage 5.5,
+mask_fill 8.9 µs/call — ceilings only. **Per read-order #4 the residual moves to
+the `ds4.c` call site; the encoder instrument is exhausted.** Full data in
+`BENCHMARKS-TP-PP.md` §Arm R1 re-run.
+
 ---
 
 ### Do not run
