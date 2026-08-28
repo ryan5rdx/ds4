@@ -45,7 +45,7 @@ endif
 CFLAGS ?= -O3 -Wall -Wextra -std=c11 $(NATIVE_CPU_FLAG)
 CPPFLAGS ?= -D_GNU_SOURCE
 
-.PHONY: all clean quality-score quality-llama-score
+.PHONY: all clean test test-dspark-mxfp4-plan test-dflash-import quality-score quality-llama-score
 
 all: deepseek4-quantize $(QUANTS_SHARED)
 
@@ -54,6 +54,20 @@ deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 
 $(QUANTS_SHARED): quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(SHARED_FLAGS) -fPIC -o $@ quants.c -lm -pthread
+
+tests/test_dspark_mxfp4_plan: tests/test_dspark_mxfp4_plan.c deepseek4-quantize.c quants.c quants.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ tests/test_dspark_mxfp4_plan.c quants.c -lm -pthread
+
+tests/test_dflash_import: tests/test_dflash_import.c deepseek4-quantize.c quants.c quants.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ tests/test_dflash_import.c quants.c -lm -pthread
+
+test-dspark-mxfp4-plan: tests/test_dspark_mxfp4_plan
+	./tests/test_dspark_mxfp4_plan
+
+test-dflash-import: tests/test_dflash_import
+	./tests/test_dflash_import
+
+test: test-dspark-mxfp4-plan test-dflash-import
 
 quality-score:
 	$(MAKE) -C .. $(QUALITY_TARGETS)
@@ -64,4 +78,5 @@ quality-llama-score:
 
 clean:
 	rm -f deepseek4-quantize libds4quants.dylib libds4quants.so \
+		tests/test_dspark_mxfp4_plan tests/test_dflash_import \
 		quality-testing/score_official quality-testing/score_llama
