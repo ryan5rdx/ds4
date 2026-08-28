@@ -243,6 +243,22 @@ Metal allocations are the faster ones. It is a small (~2–4%), repeatable
 host-to-host effect — Metal's allocator placing buffers slightly better on
 that host — and it does **not** change the verdict (roof ~760+, not 400).
 
+> **CORRECTIONS APPLIED 2026-08-27** from the arms C–F audit (50 agents; 27
+> findings survived adversarial refutation, 31 refuted). Raw observations are
+> untouched; interpretations are annotated inline with `**CORRECTION:**`.
+>
+> 1. **Every per-encoder µs/call figure in arms B, B3, B4 and B5 is retired** —
+>    now confirmed on the rig by arm B6 below, not merely predicted. What
+>    survives: tick 1.000 ns, `conc ≈ 2`, `union = 100%`, `gap ≈ 0`, throughput.
+> 2. **Arm C is a PREFILL reading, not decode.** Decode `n_keys` = 128/144/640.
+>    640 is inside the 512–700 PASS band, so **item G is not killed**.
+> 3. **Arm F confirms 72.4% of the compressor accounting, not 100%.** Do not
+>    quote 608/0.903 = 673 GB/s.
+> 4. **Arm D's 3.464 µs/dispatch is a LOWER bound**, not an upper bound.
+>
+> Full correction table with file:line evidence:
+> `docs/TP-A0-ROWSPLIT-TEST-PLAN.md`, "Corrections owed to BENCHMARKS-TP-PP.md".
+
 ### Arm B6 — the label was the bug: `reduce` was never a reduce — 2026-08-27
 
 Build `eb90b5f` (labels counted per span, composites printed; `SPLIT` mode
@@ -321,6 +337,41 @@ operating point (profiler tax). Per the plan, no per-encoder figure enters the
 budget until `attn_inv_rope` and the enc-ts `reduce` are re-measured **in the
 same run**. Throughput at baseline (42.15 / 29.62 t/s).
 
+> **CORRECTION — it was cause 4, the label.** `reduce` was never the reduce
+> dispatch. In the batch, `ds4_gpu_end_compute_encoder` no-ops (`ds4_metal.m:1389`)
+> and `ds4_gpu_compute_encoder` reuses the open encoder **without reserving a
+> timestamp slot**; decode reaches the FA path with `owned = 0` and
+> `cb == g_batch_cb` (`ds4_metal.m:963`), and there is no `close_batch_encoder`
+> between the four label sites (`:29617/:29678/:29698/:29726`). All four named one
+> slot and the last writer won. **The span is the whole batch segment.**
+>
+> Two independent confirmations, both at zero rig cost:
+> - `reduce` is the **only** FA label ever reported across all four enc-ts arms —
+>   10 mentions, zero for `gather`, `packed`, `fa_core`. Separate encoders would
+>   show all four.
+> - The reduce kernel's own traffic is `21×1,579,008 + 20×328,960 = 39.7 MB / 41 =
+>   969 kB/call` → **1.28 µs/call** at 760 GB/s against a reported 157–160.
+>   **123× off.** No inefficiency spans two orders of magnitude.
+>
+> This also explains the count that never matched any partition of 43 layers:
+> **27/token is the number of batch segments whose last label was `reduce`.**
+>
+> **Why `fair` barely moved:** with `conc` identically 2, fair-share and the
+> uniform divide are the *same operation* (`raw/2` vs `raw/1.97`). B5 was a null
+> test by construction and could not have separated cause 3.
+>
+> **What survives from B5, unaffected by the label:** `conc mean ≈ 2.0` /
+> `max = 2` (pipelining depth really is 2), and `union = 100%` of cb with
+> `gap = 0.000 ms` — **no idle pool between encoders. The stalls are inside the
+> encoders.** That is the most consequential result the instrument has produced.
+>
+> Arm B6 (`5f573a6`, `6260e6f`) makes composites self-reporting and adds
+> `DS4_METAL_GPU_ENCODER_TIMESTAMPS_SPLIT=1` for true per-phase spans.
+> **It ran and confirmed all of the above on the rig** — 3456 `fa_core..reduce`
+> composites @2k / 2432 @131k, exactly the 27- and 19-per-token counts every arm
+> since B has reported, and a true `reduce` of 30.5 µs/call (0.66 ms/token). See
+> the Arm B6 section above.
+
 ### Arm B4 — banked slots + LOSS counter; the 2k overshoot survives — 2026-08-27
 
 Build `c9e0f72` (carries `d645b29` banking fix). Same flags as run 3
@@ -374,6 +425,31 @@ at 2k (heads=64, dim=512, window=128):
 chunk, 2 prefill chunks. The exact per-layer split is ratio-determined and
 context-invariant.)
 
+> **CORRECTION — this is a PREFILL reading and must not size `attn_inv_rope`.**
+> All four `DS4_METAL_PROFILE_FLASH_ATTN_STAGE` sites are prefill encoders
+> (`ds4_metal.m:28387/28669/29018/29272`), the print string is literally
+> "Metal FlashAttention **prefill** stage" (`:11345`), and `heads=64` is
+> structurally impossible for TP2 decode, which passes **32**. So
+> `n_keys = 2048/2064/2560` is a prefill tile extent.
+>
+> **`n_comp` does transfer.** With `n_raw = 128` — fixed by
+> `metal_graph_raw_span_for_batch` at `n_tokens=1`, window `DS4_N_SWA=128`
+> (`ds4.c:19764-19780`) — the decode shapes are:
+>
+> | ratio | layers | n_comp | **decode n_keys** |
+> |---|---|---|---|
+> | 0 (raw) | **2** | 0 | **128** |
+> | 128 | **20** | 16 | **144** |
+> | 4 | **21** | 512 | **640** |
+>
+> **640 lands inside the 512–700 PASS band, so item G is not killed.**
+>
+> **Layer counts corrected: 2 + 20 + 21 = 43** (the table's `2+21+21 = 44`
+> exceeds `n_layer`). The line counts confirm it exactly, and it is **one**
+> chunk, not two: `2×4 + 20×6 + 21×5 = 8 + 120 + 105 = 233`. The divisor is
+> per-class because pad fires on ratio-128 (`2064 % ncpsg(64) = 16`) and not on
+> ratio-4 (`2560 % 64 = 0`) — `ds4_metal.m:28305-28307`.
+
 **Arm D — dispatch ballast ∈ {0,2}** (`DS4_METAL_DISPATCH_BALLAST`) at 2k,
 the dispatch price in the live graph:
 
@@ -387,6 +463,28 @@ Delta 0.50 t/s for +86 no-op dispatches (2/layer × 43) ≈ **0.28 ms/token ≈
 dropped by this arm alone (marginal; the R12a/ballast nulls say added
 dispatches hide in the ~2× pipeline overlap, so treat 3.3 µs as an upper
 bound).
+
+> **CORRECTION — arithmetic, and the bound runs the other way.**
+> `1000/41.22 = 24.260068`, `1000/40.72 = 24.557957`, Δ `= 0.297889 ms`,
+> `/86 = ` **`3.4638 µs/dispatch`**. The 0.28/3.3 figures are a double rounding,
+> 5% low. Against the `250/86 = 2.9070 µs` threshold the margin is **1.19×**,
+> not 1.14×. Verdict sign unchanged: **item C is not dropped.**
+>
+> **"Upper bound" is backwards on its own premise.** If added dispatches partly
+> hide in the ~2× overlap, the marginal price reads *cheap* — so **3.464 µs is a
+> LOWER bound** on what a real dispatch costs. A real dispatch also carries
+> memory traffic and a dependency edge that a no-op ballast does not.
+>
+> **Design caveat.** Two points, single run, 1.21% signal, where the plan
+> specified a 4-point fitted slope (`ds4_metal.m:1568`). A slope over
+> {0, 2, 8, 16} interleaved would give 7.4× the signal.
+>
+> **Latent defect, inert today.** `ds4_gpu_decode_dispatch_ballast` takes `owned`
+> (`ds4_metal.m:1768`) and never tests it before
+> `ds4_gpu_finish_command_buffer(cb, owned, …)` (`:1779`), unlike the real gate's
+> `if (!cb || owned) return 0;`. Harmless while decode always has `g_batch_cb`
+> open (`owned = 0`), but a call outside an open batch would report a full
+> command-buffer round trip as a "dispatch price".
 
 **Arm E — powermetrics, decode vs bench_membw** (`sudo powermetrics
 --samplers gpu_power -i 200`, coordinator host):
@@ -403,6 +501,36 @@ bound).
 idle; it is busy at the top P-state drawing a modest 33 W because the work
 is latency/bandwidth-bound, not power-hungry. The 30 W figure was never
 evidence of headroom. DVFS is NOT the decode gap: decode sits at max clock.
+
+> **CORRECTION — right verdict, and there is a much stronger reason available.**
+> The decisive fact is not that decode sits at max clock; it is that **prefill
+> runs at 1394–1398 MHz — at or 0.3% *below* decode's pinned 1398 — while drawing
+> 1.78× the power (59.5 vs 33.4 W).** A *lower*-clocked phase drawing *more* power
+> excludes DVFS outright, with no appeal to what "residency" means. 1398 MHz is
+> also the clock the FLOP roof was measured at
+> (`60 × 128 × 2 × 1.398e9 = 21.47 TFLOP/s`), so "decode at ~2% of peak FLOPs" is
+> not a DVFS artefact either.
+>
+> **Second leg — power does not track bytes.** `bench_membw` is genuinely
+> bandwidth-saturated at 760 GB/s and draws 38 W active-burst; decode moves
+> ~244 GB/s and draws 33.4 W. **3.11× the bandwidth for 1.14× the power.** So the
+> 33 W reading was never evidence of headroom *or* of its absence.
+>
+> **Caveats to record, none load-bearing:**
+> - At `-i 200` one sample averages `200/24.26 = 8.24 tokens`, so this arm can
+>   never support a stage- or spin-level power claim.
+> - n ≈ `3.105 s / 0.2 = 15.5` samples, one session, no replicate.
+> - **The residency column conflicts with `BENCHMARKS-TP-PP.md:1505`** ("the
+>   sampler on these boxes reports GPU *power*, not residency %"). One of the two
+>   is wrong — attach the raw powermetrics stanza or strike one.
+> - Coordinator only. Worker decode power is unmeasured, and an asymmetry would be
+>   a direct readout of gate-wait imbalance — free, since the sampler is already
+>   being run.
+>
+> **What this does NOT touch:** the "99% busy / ~20% utilised" occupancy premise
+> behind U7/U9/U10. powermetrics residency is active-time fraction, not ALU
+> occupancy; that premise stands on its own evidence and on the roofline
+> (`2.26 / 27.6 FLOP/byte = 8.19%` max ALU utilisation).
 
 **Arm F — QKV pair quad fuse disable** (`DS4_METAL_DISABLE_PRE_M5_QKV_PAIR_QUAD_FUSE=1`
 + stage profiler) at 2k:
@@ -421,7 +549,49 @@ and lands where the corrected byte model put it. (F ran with stage
 timestamps, so 35.70 t/s is ~13-18% distorted; the stage deltas are the
 read.)
 
+> **CORRECTION — it confirms 440.40 of 608.17 MB (72.4%), and once corrected the
+> books are *better* than claimed.**
+>
+> `DS4_METAL_DISABLE_PRE_M5_QKV_PAIR_QUAD_FUSE` gates only the `ratio==4` branch
+> (`ds4.c:22478`). The 20 ratio-128 layers fuse behind a **different, unset** var
+> `DS4_METAL_DISABLE_PRE_M5_QKV_PAIR_COMPRESSOR_FUSE` (`ds4.c:22536`), and
+> `comp_state_already_stored = qkv_pair_quad_fused` (`ds4.c:22881`) suppresses
+> their re-emission. So:
+>
+> - **Movable:** `21×2×4096×1024×2 + 21×2×4096×256×2 = 352,321,536 + 88,080,384 =`
+>   **`440,401,920 B = 440.40 MB`** — 72.4% of 608.17 MB.
+> - **Immovable:** `20×2×4096×512×2 = 167,772,160 B = 167.77 MB`, still fused.
+>
+> **Do not quote `608/0.903 = 673 GB/s`.** The correct rates, net of one 0.18 ms
+> marker tax: `440.40/0.697 = 632 GB/s` out and `440.40/(0.903−0.18) = 609 GB/s`
+> in — **3.8% agreement**. At sum level `895.61/1.958 = 457` fused vs
+> `895.61/1.984 = 451` unfused, −1.3%.
+>
+> **`compressor_update` fused = 1.278 is UNMEASURED.** The value appears nowhere
+> else in the corpus and the Iteration-3 table does not list the stage. The
+> 0.009 ms residual is conditional on it.
+>
+> **Stage deltas are safe only on rows with the same marker count in both arms.**
+> `q_a_kv_proj` is 43 in both, so −0.697 is quotable. `compressor_proj` exists in
+> one arm only, so its +0.903 and the +0.215 total each carry ~0.18 ms of pure
+> instrument — the +0.215 "fusion is worth 0.21 ms" reading is **inside its own
+> marker tax and is not supported**.
+>
+> **The one genuine anomaly** is the retained side at `455.21/1.261 = 361 GB/s`,
+> explained by the +0.211 ms `gpu_busy` the deoptimised config itself costs
+> (21 layers × 3.464 µs dispatch = 0.073 ms, remainder lost fusion).
+>
+> The arm also missed its own pre-registered prediction (`PATH-TO-50TPS.md:769-771`
+> expected `q_a_kv_proj → 0.6–0.7`, `compressor_proj → 1.3–1.5`; observed 1.441 and
+> 0.903) and was still logged "Confirms it".
+
 ### Arm B — encoder-timestamp re-baseline (re-run 3, slot-scoped + normalised build `05f402d`) — 2026-08-27
+
+> **RETIRED 2026-08-27.** Every per-encoder µs/call figure below is void: the
+> enc-ts label `reduce` was a composite span covering the whole batch segment,
+> not the reduce dispatch (see the CORRECTION under Arm B5). The tick, the
+> coverage/overlap reading and the throughput baselines are unaffected.
+
 
 **Falsifier resolved.** The pre-registered falsifier said: if the inferred
 tick pins at ~1.000 ns at both contexts on the slot-scoped build, slot reuse
@@ -453,6 +623,12 @@ Normalised `reduce` ≈ **160-171 µs/call**, vs the hand-corrected table's
 confirms the instrument's ~1-3% distortion claim once more.
 
 ### Arm B — encoder-timestamp re-baseline (re-run, tick-calibrated build `0b987e5`) — 2026-08-27
+
+> **RETIRED 2026-08-27.** Every per-encoder µs/call figure below is void: the
+> enc-ts label `reduce` was a composite span covering the whole batch segment,
+> not the reduce dispatch (see the CORRECTION under Arm B5). The tick, the
+> coverage/overlap reading and the throughput baselines are unaffected.
+
 
 Re-run because the first arm-B run (build `fba4ef0`) predated the tick
 calibration (`d50bbaa`) and reported spans ~1.85× too large — it read the
@@ -490,6 +666,12 @@ are at most ~half the reported spans (overlap), so `reduce` is ~100-155 µs
 per call — still to be reconciled against `attn_inv_rope`'s 3.64 ms stage.
 
 ### Arm B — encoder-timestamp re-baseline — 2026-08-27
+
+> **RETIRED 2026-08-27.** Every per-encoder µs/call figure below is void: the
+> enc-ts label `reduce` was a composite span covering the whole batch segment,
+> not the reduce dispatch (see the CORRECTION under Arm B5). The tick, the
+> coverage/overlap reading and the throughput baselines are unaffected.
+
 
 Build `fba4ef0` (with `df0037e` `DS4_METAL_GPU_ENCODER_TIMESTAMPS`), rig,
 gen 128. The low-distortion instrument (GPU timestamp counter at encoder
