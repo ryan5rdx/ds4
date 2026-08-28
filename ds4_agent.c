@@ -4117,6 +4117,15 @@ static bool worker_cancel_session_cb(void *ud) {
     return worker_should_interrupt(ud);
 }
 
+/* Mid-prefill cancellation is not mirrored to a tensor-parallel worker: the
+ * leader aborts between chunks while the worker keeps waiting for chunks that
+ * never arrive, and both ranks then block forever in untimed reads. Under TP
+ * we simply do not arm it, so Ctrl-C acts between whole operations instead. */
+static void worker_arm_session_cancel(agent_worker *w) {
+    if (ds4_engine_tp_active(w->engine)) return;
+    ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
+}
+
 typedef struct {
     char *ptr;
     size_t len;
@@ -4430,6 +4439,11 @@ static bool agent_kv_load_path(agent_worker *w, const char *path,
         }
     }
 
+    /* ds4_session_load_payload() has no tensor-parallel branch: restoring it
+     * advances only the leader's checkpoint, so the next mirrored sync makes
+     * the two ranks prefill different chunk counts and both block forever in
+     * untimed reads. The rendered text is still valid, so replay it instead.
+     * Guarded here rather than at the call sites so every caller is covered. */
     char load_err[160] = {0};
     if (ok && agent_kv_payload_requires_rebuild(w, hdr.payload_bytes)) {
         /* A saved payload contains only the leader's graph state. Rebuild from
@@ -4794,7 +4808,7 @@ static int agent_worker_sync_tokens(agent_worker *w, const ds4_tokens *tokens,
     ds4_session_set_display_progress(w->session,
                                      publish_progress ? worker_progress_cb : NULL,
                                      publish_progress ? w : NULL);
-    ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
+    worker_arm_session_cancel(w);
     double t_sync0 = now_sec();
     int rc;
     if (w->image_count) {
@@ -8635,7 +8649,7 @@ static bool agent_worker_compact(agent_worker *w, const char *reason,
 
     ds4_session_set_progress(w->session, worker_progress_cb, w);
     ds4_session_set_display_progress(w->session, worker_progress_cb, w);
-    ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
+    worker_arm_session_cancel(w);
     int sync_rc;
     if (w->image_count) {
         sync_rc = ds4_session_sync_multimodal(w->session, &prompt,
@@ -9055,7 +9069,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         char err[160];
         ds4_session_set_progress(w->session, worker_progress_cb, w);
         ds4_session_set_display_progress(w->session, worker_progress_cb, w);
-        ds4_session_set_cancel(w->session, worker_cancel_session_cb, w);
+        worker_arm_session_cancel(w);
         double t_sync0 = now_sec();
         int sync_rc = w->image_count ?
             ds4_session_sync_multimodal(w->session, prompt_for_sync,
@@ -11117,7 +11131,12 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
         .cancel_privdata = w,
     };
     w->web = ds4_web_create(&web_cfg);
-    w->sysprompt_path = ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
+    /* ds4_session_load_payload() has no tensor-parallel branch, so restoring
+     * a cached KV payload advances only the leader's checkpoint; the next
+     * sync then prefills different chunk counts on the two ranks and both
+     * block forever. Under TP, replay the system prompt instead of caching. */
+    w->sysprompt_path = ds4_engine_tp_active(engine) ?
+        NULL : ds4_kvstore_path_join(w->cache_dir, "sysprompt.kv");
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
         if (!w->trace) {
@@ -11957,26 +11976,9 @@ int main(int argc, char **argv) {
     ds4_tp *tp_leader = NULL;
     if (cfg.engine.tp.role == DS4_TP_LEADER) {
         char tp_err[256] = "";
-        ds4_tp_identity tp_id = {
-            .gguf_bytes = ds4_engine_model_bytes(engine),
-            .model_id = (uint32_t)ds4_engine_model_id(engine),
-            .n_layer = (uint32_t)ds4_engine_layer_count(engine),
-            .n_embd = (uint32_t)ds4_engine_embd_dim(engine),
-            .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
-            .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
-            .ctx_size = (uint32_t)cfg.gen.ctx_size,
-        };
-        ds4_engine_tp_gate_schedule(engine,
-                                    &tp_id.gate_slot_start,
-                                    &tp_id.gate_slot_step,
-                                    &tp_id.gates_per_token,
-                                    tp_id.gate_slot_mask);
-        if (!ds4_tp_create(&tp_leader, &cfg.engine.tp, &tp_id,
-                           tp_err, sizeof(tp_err)) ||
-            !ds4_engine_tp_bind(engine, tp_leader,
-                                tp_err, sizeof(tp_err))) {
+        if (!ds4_tp_leader_bind(&tp_leader, engine, &cfg.engine.tp,
+                                cfg.gen.ctx_size, tp_err, sizeof(tp_err))) {
             fprintf(stderr, "ds4-agent: %s\n", tp_err);
-            ds4_tp_free(tp_leader);
             ds4_engine_close(engine);
             return 1;
         }
