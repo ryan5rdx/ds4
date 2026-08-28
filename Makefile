@@ -128,6 +128,17 @@ tests/bench_indexer_score: tests/bench_indexer_score.o ds4_metal.o
 bench-indexer-score: tests/bench_indexer_score
 	./tests/bench_indexer_score
 
+tests/bench_ngram_accept.o: tests/bench_ngram_accept.c
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+# Links the CPU core so the harness calls the SHIPPED ds4_ngram_propose rather
+# than a copy of it; no GPU and no model are needed.
+tests/bench_ngram_accept: tests/bench_ngram_accept.o ds4_cpu_test_hooks.o ds4_distributed_cpu.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+bench-ngram-accept: tests/bench_ngram_accept
+	./tests/bench_ngram_accept
+
 tests/test_ts_fairshare.o: tests/test_ts_fairshare.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 

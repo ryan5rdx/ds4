@@ -53372,6 +53372,32 @@ static bool spec_frontier_commit_prefix1(ds4_session *s) {
     return spec_frontier_commit_prefix(s, 1);
 }
 
+/* Record every committed decode token to DS4_NGRAM_TRACE=<path>, one id per
+ * line.  Purely passive: it does not enable speculation and does not touch the
+ * decode path beyond an fputs.
+ *
+ * Why a trace and not a live meter.  Whether MTP is worth funding turns on one
+ * number nobody has ever measured on this rig -- the n-gram commit rate on a
+ * real workload.  ds4_ngram_propose (ds4.c:69749) is a pure function of token
+ * history, so that number can be computed offline, which keeps it clear of the
+ * four known defects in the live speculative path (stale s->logits, drafts[0]
+ * pushed without an eval, the bound returning 0 on the ideal periodic case).
+ * A trace also lets one rig session answer the question for every (k, depth)
+ * pair instead of one pair per run.  tests/bench_ngram_accept consumes it. */
+static void ds4_ngram_trace_token(int token) {
+    static FILE *fp;
+    static int checked;
+    if (!checked) {
+        checked = 1;
+        const char *path = getenv("DS4_NGRAM_TRACE");
+        if (path && path[0]) {
+            fp = fopen(path, "we");
+            if (!fp) fprintf(stderr, "ds4: DS4_NGRAM_TRACE: cannot open %s\n", path);
+        }
+    }
+    if (fp) { fprintf(fp, "%d\n", token); fflush(fp); }
+}
+
 static void session_greedy_splitkv_reset(ds4_session *s) {
     if (!s) return;
     s->greedy_splitkv_segment.len = 0;
@@ -55037,6 +55063,7 @@ int ds4_session_eval_argmax(ds4_session *s, int token, char *err, size_t errlen)
         return -1;
     }
     token_vec_push(&s->checkpoint, token);
+    ds4_ngram_trace_token(token);
     if (approx_fallback && anchor_ready && !replayed_exact) {
         token_vec_push(&s->greedy_splitkv_segment, token);
     } else if (!approx_fallback || !anchor_ready) {

@@ -1149,6 +1149,26 @@ static int ds4_gpu_ts_split_encoders(void) {
  * and get one span per stage, at the cost of perturbing the schedule. */
 static void ds4_gpu_ts_name_last(const char *label) { ds4_gpu_ts_note_label(label); }
 
+/* Name a dispatch cluster inside the `compressor_indexer` -> `attn_inv_rope`
+ * bracket (ds4.c:23330 to :23582).
+ *
+ * B6 split that bracket for the first time and found only a third of it: at 2k
+ * `fa_core` 0.560 ms + `reduce` 0.66 ms = 1.22 of 3.64 ms.  The other 2.42 ms --
+ * 10% of the whole decode token, and larger than every surviving optimization
+ * candidate combined -- was invisible because the only four label sites in the
+ * bracket are the flash-attn phases.  Launch accounts for 0.461 ms of it
+ * (133 dispatches x 3.464 us) and KV staging traffic for 0.038 ms, leaving
+ * ~1.9 ms that nobody can name.
+ *
+ * These sites cover the two calls that were entirely unlabelled --
+ * ds4_gpu_attention_indexed_mixed_batch_heads_tensor (four clusters) and
+ * ds4_gpu_rope_tail_tensor (one) -- taking bracket coverage from 4 sites to 9.
+ * Same mechanism as DS4_METAL_PROFILE_DECODE_FA_STAGE, and subject to the same
+ * caveat: in the batch these collapse onto one span unless
+ * DS4_METAL_GPU_ENCODER_TIMESTAMPS_SPLIT=1 forces a real encoder boundary.  The
+ * composite counter makes that visible rather than silent. */
+#define DS4_METAL_PROFILE_BRACKET_STAGE(name) ds4_gpu_ts_name_last((name))
+
 /* Counter timestamps are in a GPU tick unit that is NOT guaranteed to be
  * nanoseconds, and it differs by part: assuming ns validated on an M1 Max
  * (encoder sum within 4% of the command-buffer span) and over-reported by ~1.85x
@@ -23047,6 +23067,7 @@ int ds4_gpu_head_rms_norm_rope_tail_tensor(
                  1,
                  1)];
         ds4_gpu_end_compute_encoder(cb, enc);
+        DS4_METAL_PROFILE_BRACKET_STAGE("rope_tail");
 
         if (!ds4_gpu_finish_command_buffer(
                 cb, owned, "fused head norm/RoPE")) {
@@ -30741,6 +30762,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(top_k, 1, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
+            DS4_METAL_PROFILE_BRACKET_STAGE("idx_sort");
         }
 
         if (split_decode) {
@@ -30776,6 +30798,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                 decode_splits)
                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
+            DS4_METAL_PROFILE_BRACKET_STAGE("idx_attn_split");
 
             enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:split_reduce_pipeline];
@@ -30786,6 +30809,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)nrows, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
+            DS4_METAL_PROFILE_BRACKET_STAGE("idx_split_red");
         } else {
             enc = ds4_gpu_compute_encoder(cb);
             [enc setComputePipelineState:attn_pipeline];
@@ -30808,6 +30832,7 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
+            DS4_METAL_PROFILE_BRACKET_STAGE("idx_attn");
         }
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "graph indexed mixed attention heads")) return 0;

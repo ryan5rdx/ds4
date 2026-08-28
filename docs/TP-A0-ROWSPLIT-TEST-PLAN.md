@@ -1233,6 +1233,114 @@ calibrated `reduce` figures of 199 µs/call at 2k and 311 at 131k. The
 instrument's *distortion* claim is unaffected and still holds: throughput came
 back at baseline (42.04 / 29.70 t/s) on both runs.
 
+## Arm R1 and Arm S — the two measurements that matter next, both built — 2026-08-27
+
+Everything below is implemented and building. Neither needs code from the rig.
+
+### Arm R1 — name the 2.42 ms inside `attn_inv_rope`
+
+**Why this and not a candidate.** B6 split the bracket for the first time and
+found only a third of it: `fa_core` 0.560 + `reduce` 0.66 = 1.22 of 3.64 ms.
+The other **2.42 ms is 10% of the decode token and larger than every surviving
+optimization candidate combined** (best case 1.22 ms). Launch explains 0.461 ms
+(133 dispatches × 3.464 µs) and KV staging traffic 0.038 ms. **~1.9 ms is
+unnamed.** No candidate is worth a rig slot before this is.
+
+**Built (`ds4_metal.m`).** The bracket had **4** label sites, all of them
+flash-attn phases, so the two calls that dominate the rest were invisible. Added
+**5** more via `DS4_METAL_PROFILE_BRACKET_STAGE`, taking coverage to **9**:
+
+| new label | call | site |
+|---|---|---|
+| `idx_sort` | `kernel_dsv4_sort_i32_rows_asc` | `ds4_metal.m:30745` |
+| `idx_attn_split` | indexed-mixed attention, split path | `:30781` |
+| `idx_split_red` | split reduce | `:30792` |
+| `idx_attn` | indexed-mixed attention, unsplit | `:30815` |
+| `rope_tail` | `kernel_dsv4_head_rms_norm_rope_tail_f32` | `:23050` |
+
+These cover `ds4_gpu_attention_indexed_mixed_batch_heads_tensor` (4 clusters) and
+`ds4_gpu_rope_tail_tensor` (1) — previously **zero** labels between them.
+
+**Run — two passes, same as B6:**
+
+```
+DS4_METAL_GPU_ENCODER_TIMESTAMPS=1                                            # 2k + 131k, gen 128
+DS4_METAL_GPU_ENCODER_TIMESTAMPS_SPLIT=1 DS4_METAL_GPU_ENCODER_TIMESTAMPS=1   # 2k + 131k, gen 128
+```
+
+**Read in order:**
+
+1. **Pass 1's composite line.** With 9 labels in one batch segment the collapse
+   is *worse*, not better — expect composites like `idx_sort..reduce+9`. That is
+   the instrument working; it is why pass 2 exists.
+2. **Pass 2, the five new spans × their per-token counts.** Sum with `fa_core`
+   (0.560) and `reduce` (0.66). **The residual against 3.64 ms is the answer.**
+3. **If the nine labels now sum to ≈3.64 ms**, the 2.42 ms is named and we have a
+   new target list ranked by span.
+4. **If a large residual persists**, the remaining work is not in these calls at
+   all, and the next step is the call site in `ds4.c` rather than the encoder.
+
+**Pre-registered falsifier.** If pass 2's nine spans sum to *more* than 3.64 ms,
+the SPLIT perturbation is inflating spans faster than it resolves them — already
+suspected, since a dev-box `DS4_METAL_DECODE_NWG` sweep of 2→32 (16× the reduce
+traffic) did not move the reduce span. In that case treat every pass-2 number as
+a ceiling and read only the **ratios** between the nine.
+
+### Arm S — the n-gram commit rate, never once measured on this rig
+
+**Why it is the highest-value single session available.** Speculation is the only
+route to 50 t/s left. A drafted step emits `1 + commit` tokens for `T + V`, so it
+wins iff `commit > V/T`. Everything turns on one number nobody has measured.
+
+**Built, and deliberately offline.** `ds4_ngram_propose` (`ds4.c:69749`) is a pure
+function of token history, so the commit rate is computable without a GPU, without
+a model, and — crucially — **without the four known defects in the live
+speculative path** (`s->logits` never refreshed on exit, `drafts[0]` pushed without
+an eval, the bound returning 0 on the ideal periodic case). Those break the
+*implementation*; this measures the *opportunity*, which is what gates the week.
+
+- **`DS4_NGRAM_TRACE=<path>`** (`ds4.c:53375`) — passive. Writes every committed
+  decode token id, one per line. Does **not** enable speculation and does not
+  touch the decode path beyond an `fputs`.
+- **`tests/bench_ngram_accept`** — replays the trace through the **shipped**
+  proposer (linked, not copied) simulating the real cycle: propose at *i*, commit
+  the longest matching prefix *c*, restart at *i+1+c*. Sweeps k ∈ {2,3,4,5,6,8} ×
+  depth ∈ {2,3,4,5,8} in one pass and reports offered%, mean commit, tokens/step,
+  speedup and the commit-length distribution.
+
+**Run:**
+
+```
+DS4_NGRAM_TRACE=/tmp/toks.txt ./ds4-bench ...        # any real workload; coding is the one that matters
+make tests/bench_ngram_accept
+./tests/bench_ngram_accept /tmp/toks.txt --vt 4.459  # today's 5-row verify
+./tests/bench_ngram_accept /tmp/toks.txt --vt 2.06   # corrected ~50 ms verify floor
+```
+
+Use a **real coding session**, not a synthetic prompt — n-gram drafting lives or
+dies on repetition, and the PI coding harness is the workload that matters.
+A few thousand tokens minimum; the harness refuses below 64.
+
+**Validated here** on two controls with known answers:
+- period-8 synthetic: commit saturates at depth (1.985 / 2.968 / 3.950 / 4.926)
+  and caps at period−k = 5, faithfully reproducing the shipped proposer's own
+  look-ahead bound;
+- uniform random: 0.0% offered, 0.000 commit, every configuration a loss.
+
+**What the controls already tell us, before any rig data.** At **today's** verify
+cost the *perfectly periodic* trace — 98.5% offer rate, 4.926 mean commit, the
+best case that can exist — reaches only **1.086×**, and only at depth 5. Every
+shallower depth loses. **So the binding constraint is the verify cost, not the
+drafter.** A real coding trace will land far below the periodic ceiling.
+
+**Decision rule.** If the real trace clears ~2.0 mean commit at `--vt 2.06`, MTP
+is fundable *conditional on* the verify floor being fixed first — chiefly
+`ds4.c:37202` setting `tp_batch_rows = n_tokens`, which disables the row split at
+`ds4.c:29237` and costs 10.88 ms of the 108 ms verify. If it does not clear 2.0
+even at the corrected floor, **speculation is dead on this workload** and 42–43.5
+t/s is the ceiling — which is worth knowing for one session's cost rather than a
+week's.
+
 ## The decode program after B6 — what survives, and where the next rig slot goes — 2026-08-27
 
 Output of a 41-agent enumeration against the corrected budget, every candidate
