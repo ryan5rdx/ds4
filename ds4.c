@@ -65677,6 +65677,15 @@ static int ds4_session_tp_register(ds4_session *s) {
         return 0;
     }
     s->tp_session_id = id;
+    /* The worker warms its prefill kernels before acking the create above
+     * (ds4_tp.c, DS4_TP_FRAME_SESSION_CREATE).  The leader has to do the same
+     * here or the pair starts every session with a one-sided ~1.1 s of
+     * first-submit cost: the worker reaches layer 0's gate that much earlier
+     * and sits at the arrival barrier waiting for a peer that is still
+     * compiling pipelines.  Only run_sampled_generation() used to warm up, so
+     * the chat, agent, and server frontends all paid it.  A no-op on the
+     * backends and model families the warmup does not cover. */
+    ds4_session_gpu_warmup(s);
     return 1;
 }
 

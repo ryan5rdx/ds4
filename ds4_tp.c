@@ -50,6 +50,21 @@
  * microseconds. Fail well before Metal's command-buffer watchdog if the peer
  * stalls while keeping its sockets open. */
 #define DS4_TP_DEFAULT_GATE_TIMEOUT_MS 750
+/* "Once both ranks enter" is the whole caveat, and it does not cover how they
+ * get there.  A batch or big gate opens with a header pair on data_fd, and that
+ * pair IS the barrier that puts both ranks inside the gate: until it completes
+ * the peer may still be an entire layer-0 encode behind.  On the first gate of a
+ * session that is first-use Metal pipeline compilation plus cold expert pages --
+ * ds4_session_gpu_warmup() prices it at ~1.1 s and only the ranks that call it
+ * are spared -- so budgeting the arrival barrier at the in-gate 750 ms fails the
+ * pair on its very first request, silently, before any token is produced.
+ *
+ * Still bounded, because a gate holds a committed command buffer open on both
+ * sides.  Ten seconds sits above every arrival skew measured here and an order
+ * of magnitude below nothing: single prefill command buffers of 7-11 s are
+ * measured to survive the watchdog (see ds4_prefill_watchdog_chunk in ds4.c), so
+ * a genuinely wedged peer is still reported by us rather than by the watchdog. */
+#define DS4_TP_DEFAULT_MEET_TIMEOUT_MS 10000
 
 typedef struct {
     uint32_t magic;
@@ -187,7 +202,8 @@ struct ds4_tp {
     uint64_t batch_out_off;     /* [layer][row] verify-block local partials */
     uint64_t batch_in_off;      /* [layer][row] verify-block peer partials */
     uint64_t timeout_sec;
-    uint64_t gate_timeout_ms;
+    uint64_t gate_timeout_ms;   /* exchange, both ranks already in the gate */
+    uint64_t meet_timeout_ms;   /* arrival barrier, peer may still be behind */
     atomic_bool failed;
     /* Serializes control-plane (control_fd) sends/receives and the paired
      * (send command -> wait ack) round trips.  Recursive so a caller may hold
@@ -210,6 +226,18 @@ static double tp_now_sec(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
+/* The two gate budgets, as absolute deadlines.  Which one a wait gets is the
+ * whole distinction drawn at DS4_TP_DEFAULT_MEET_TIMEOUT_MS: everything from the
+ * peer's gate header onwards is an exchange between two ranks that are both
+ * already inside the gate; the wait for that header is not. */
+static double tp_gate_deadline(const ds4_tp *tp) {
+    return tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
+}
+
+static double tp_meet_deadline(const ds4_tp *tp) {
+    return tp_now_sec() + (double)tp->meet_timeout_ms / 1000.0;
+}
+
 static void tp_set_err(char *err, size_t errlen, const char *fmt, ...) {
     if (!err || !errlen) return;
     va_list ap;
@@ -218,7 +246,43 @@ static void tp_set_err(char *err, size_t errlen, const char *fmt, ...) {
     va_end(ap);
 }
 
-static int tp_write_full(int fd, const void *buf, size_t len) {
+/* data_fd carries SO_SNDTIMEO/SO_RCVTIMEO (tp_socket_set_gate_timeout) so that
+ * no gate can wedge inside an uninterruptible read.  That makes EAGAIN a clock
+ * tick rather than an error, and only the caller knows which clock applies:
+ * waiting for the peer to ARRIVE at a gate is a different budget from finishing
+ * an exchange both ranks are already inside.  TP_IO_NO_DEADLINE means the
+ * socket is the only bound, which is what every control_fd caller wants -- that
+ * socket has no timeout set and can never report EAGAIN.
+ *
+ * Distinguishing the three failures matters more than it looks: collapsing them
+ * into a bare 0 is what let a 750 ms arrival timeout surface as an unexplained
+ * "TP gate exchange failed", with nothing in either rank's log to say why. */
+#define TP_IO_NO_DEADLINE 0.0
+
+typedef enum {
+    TP_IO_OK = 0,
+    TP_IO_TIMEOUT,  /* deadline passed with the transfer unfinished */
+    TP_IO_CLOSED,   /* orderly close, possibly mid-frame */
+    TP_IO_ERROR,    /* errno is set */
+} tp_io_status;
+
+/* A peer that trickles never returns EAGAIN, so the deadline has to be checked
+ * after progress too or a slow drip outlives any budget. */
+static int tp_io_expired(double deadline) {
+    return deadline > TP_IO_NO_DEADLINE && tp_now_sec() >= deadline;
+}
+
+static const char *tp_io_why(tp_io_status status) {
+    switch (status) {
+    case TP_IO_OK:      return "ok";
+    case TP_IO_TIMEOUT: return "timed out waiting for the peer";
+    case TP_IO_CLOSED:  return "peer closed the gate socket";
+    default:            return strerror(errno);
+    }
+}
+
+static tp_io_status tp_write_until(int fd, const void *buf, size_t len,
+                                   double deadline) {
     const char *p = buf;
     while (len) {
 #ifdef MSG_NOSIGNAL
@@ -228,28 +292,51 @@ static int tp_write_full(int fd, const void *buf, size_t len) {
 #endif
         if (w < 0) {
             if (errno == EINTR) continue;
-            return 0;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* The socket timeout already slept for us, so this loop costs
+                 * one iteration per SO_SNDTIMEO period, not a spin. */
+                if (deadline > TP_IO_NO_DEADLINE && !tp_io_expired(deadline))
+                    continue;
+                return TP_IO_TIMEOUT;
+            }
+            return TP_IO_ERROR;
         }
-        if (w == 0) return 0;
+        if (w == 0) return TP_IO_CLOSED;
         p += w;
         len -= (size_t)w;
+        if (len && tp_io_expired(deadline)) return TP_IO_TIMEOUT;
     }
-    return 1;
+    return TP_IO_OK;
 }
 
-static int tp_read_full(int fd, void *buf, size_t len) {
+static tp_io_status tp_read_until(int fd, void *buf, size_t len,
+                                  double deadline) {
     char *p = buf;
     while (len) {
         ssize_t r = read(fd, p, len);
         if (r < 0) {
             if (errno == EINTR) continue;
-            return 0;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                if (deadline > TP_IO_NO_DEADLINE && !tp_io_expired(deadline))
+                    continue;
+                return TP_IO_TIMEOUT;
+            }
+            return TP_IO_ERROR;
         }
-        if (r == 0) return 0;
+        if (r == 0) return TP_IO_CLOSED;
         p += r;
         len -= (size_t)r;
+        if (len && tp_io_expired(deadline)) return TP_IO_TIMEOUT;
     }
-    return 1;
+    return TP_IO_OK;
+}
+
+static int tp_write_full(int fd, const void *buf, size_t len) {
+    return tp_write_until(fd, buf, len, TP_IO_NO_DEADLINE) == TP_IO_OK;
+}
+
+static int tp_read_full(int fd, void *buf, size_t len) {
+    return tp_read_until(fd, buf, len, TP_IO_NO_DEADLINE) == TP_IO_OK;
 }
 
 static void tp_socket_tune(int fd) {
@@ -1010,7 +1097,10 @@ static int tp_rdma_drain_cq(ds4_tp *tp) {
     ds4_tp_rdma *r = &tp->rdma;
     struct ibv_wc wc[16];
     int n = ibv_poll_cq(r->cq, 16, wc);
-    if (n < 0) return 0;
+    if (n < 0) {
+        fprintf(stderr, "ds4-tp: rdma poll_cq failed: %s\n", strerror(errno));
+        return 0;
+    }
     for (int i = 0; i < n; i++) {
         if (wc[i].status != IBV_WC_SUCCESS) {
             fprintf(stderr, "ds4-tp: rdma completion error: %s (wr_id %llu)\n",
@@ -1114,6 +1204,15 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
         (uintptr_t)(tp->slab + tp->out_off + (uint64_t)slot * tp->vec_bytes);
     pthread_mutex_lock(&r->post_lock);
     int ok = 1;
+    /* Row gates keep the short in-gate budget even on the gate that arms the
+     * window.  They have no header rendezvous, so this recv wait IS their
+     * arrival barrier -- but the skew it absorbs is small: a decode gate is
+     * only ever entered from lockstep, either from the previous gate or from
+     * the bulk gate that drained the window.  Widening it to the meet budget
+     * would also catch every row gate that follows a speculative verify batch,
+     * which is a hot path with no skew to absorb and real watchdog margin to
+     * lose.  If a first-decode-gate timeout is ever observed, measure it with
+     * DS4_TP_GATE_TIMEOUT_MS before changing the default. */
     if (!r->recv_window_active) {
         for (uint64_t s = seq; ok && s < seq + DS4_TP_RDMA_RECV_WINDOW; s++)
             ok = tp_rdma_post_gate_recv(tp, s);
@@ -1156,7 +1255,7 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
             ok = 0;
         }
         if (deadline == 0.0) {
-            deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
+            deadline = tp_gate_deadline(tp);
         }
         else if (tp_now_sec() > deadline) {
             fprintf(stderr, "ds4-tp: timeout waiting gate seq %llu (recv_done %llu)\n",
@@ -1234,6 +1333,9 @@ static int tp_rdma_drain_decode_window(ds4_tp *tp) {
         int n = ibv_poll_cq(r->cq,
                            (int)(DS4_TP_RDMA_RECV_WINDOW * 2u + 1u), wc);
         if (n < 0) {
+            fprintf(stderr,
+                    "ds4-tp: rdma poll_cq failed draining the receive window: %s\n",
+                    strerror(errno));
             pthread_mutex_unlock(&r->post_lock);
             return 0;
         }
@@ -1281,7 +1383,17 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                                      void *in,
                                      uint64_t bytes) {
     ds4_tp_rdma *r = &tp->rdma;
-    if (!tp_rdma_big_gate_capable(tp) || r->recv_window_active) return 0;
+    if (!tp_rdma_big_gate_capable(tp) || r->recv_window_active) {
+        /* Both conditions are caller contracts: the capability is checked
+         * before this path is selected, and the decode window is drained by
+         * the header exchange that precedes it.  Neither is recoverable here,
+         * but silently failing the gate reads as a wire fault. */
+        fprintf(stderr,
+                "ds4-tp: bulk rdma gate unavailable (capable=%d, decode window %s)\n",
+                tp_rdma_big_gate_capable(tp) ? 1 : 0,
+                r->recv_window_active ? "still armed" : "clear");
+        return 0;
+    }
 
     /* Payloads already inside the registered slab (verify batches) can ride
      * directly. Ordinary prefill tensors use the idle verify regions as
@@ -1375,7 +1487,12 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             struct ibv_wc wc[DS4_TP_RDMA_BULK_SLOTS + 1u];
             int n = ibv_poll_cq(r->cq,
                                (int)(DS4_TP_RDMA_BULK_SLOTS + 1u), wc);
-            if (n < 0) return 0;
+            if (n < 0) {
+                fprintf(stderr,
+                        "ds4-tp: rdma poll_cq failed in a bulk round: %s\n",
+                        strerror(errno));
+                return 0;
+            }
             for (int i = 0; i < n; i++) {
                 if (wc[i].status != IBV_WC_SUCCESS) {
                     fprintf(stderr,
@@ -1551,6 +1668,20 @@ int ds4_tp_create(
         const long value = strtol(gate_tmo, NULL, 10);
         if (value > 0 && value <= 60000) tp->gate_timeout_ms = (uint64_t)value;
     }
+    tp->meet_timeout_ms = DS4_TP_DEFAULT_MEET_TIMEOUT_MS;
+    const char *meet_tmo = getenv("DS4_TP_MEET_TIMEOUT_MS");
+    if (meet_tmo) {
+        const long value = strtol(meet_tmo, NULL, 10);
+        /* Same 60 s ceiling as the in-gate override, and for a stronger reason:
+         * the barrier holds a committed command buffer open, so anything past
+         * the measured watchdog envelope hands the kill to macOS instead of
+         * reporting it here. */
+        if (value > 0 && value <= 60000) tp->meet_timeout_ms = (uint64_t)value;
+    }
+    /* Raising the in-gate budget past the arrival budget means "be more
+     * patient", never "be patient in the exchange but not at the barrier". */
+    if (tp->gate_timeout_ms > tp->meet_timeout_ms)
+        tp->meet_timeout_ms = tp->gate_timeout_ms;
     pthread_mutexattr_t ca;
     pthread_mutexattr_init(&ca);
     pthread_mutexattr_settype(&ca, PTHREAD_MUTEX_RECURSIVE);
@@ -1611,10 +1742,13 @@ int ds4_tp_create(
         }
     }
     if (listener >= 0) close(listener);
-    fprintf(stderr, "ds4-tp: %s connected, transport=%s gate-timeout=%llums\n",
+    fprintf(stderr,
+            "ds4-tp: %s connected, transport=%s gate-timeout=%llums "
+            "meet-timeout=%llums\n",
             tp->rank == 0 ? "worker" : "leader",
             tp->rdma_active ? "rdma" : "tcp",
-            (unsigned long long)tp->gate_timeout_ms);
+            (unsigned long long)tp->gate_timeout_ms,
+            (unsigned long long)tp->meet_timeout_ms);
     *out = tp;
     return 1;
 fail:
@@ -1698,31 +1832,53 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
     };
     size_t want = sizeof(h) + tp->vec_bytes;
     ssize_t w = writev(tp->data_fd, iov, 2);
-    if (w < 0 || (size_t)w != want) {
-        /* Short writev: finish with the plain path. */
-        if (w < 0) return 0;
+    /* SO_SNDTIMEO can report EAGAIN with nothing written; that is the same
+     * "finish with the plain path" case as a short writev, only at zero. */
+    if (w < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) w = 0;
+    tp_io_status io = TP_IO_OK;
+    if (w < 0) {
+        io = TP_IO_ERROR;
+    } else if ((size_t)w != want) {
+        const double send_by = tp_gate_deadline(tp);
         size_t done = (size_t)w;
         if (done < sizeof(h)) {
-            if (!tp_write_full(tp->data_fd, (char *)&h + done, sizeof(h) - done)) return 0;
+            io = tp_write_until(tp->data_fd, (char *)&h + done,
+                                sizeof(h) - done, send_by);
             done = sizeof(h);
         }
-        uint64_t payload_done = done - sizeof(h);
-        if (!tp_write_full(tp->data_fd,
-                           tp->slab + ds4_tp_slab_out_offset(tp, layer, gate) + payload_done,
-                           tp->vec_bytes - payload_done))
-            return 0;
+        if (io == TP_IO_OK) {
+            const uint64_t payload_done = done - sizeof(h);
+            io = tp_write_until(tp->data_fd,
+                                tp->slab + ds4_tp_slab_out_offset(tp, layer, gate) +
+                                    payload_done,
+                                tp->vec_bytes - payload_done, send_by);
+        }
+    }
+    if (io != TP_IO_OK) {
+        fprintf(stderr, "ds4-tp: gate l=%u g=%u seq=%llu send failed: %s\n",
+                layer, gate, (unsigned long long)seq, tp_io_why(io));
+        return 0;
     }
     ds4_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    io = tp_read_until(tp->data_fd, &ph, sizeof(ph), tp_meet_deadline(tp));
+    if (io != TP_IO_OK) {
+        fprintf(stderr, "ds4-tp: gate l=%u g=%u seq=%llu header: %s\n",
+                layer, gate, (unsigned long long)seq, tp_io_why(io));
+        return 0;
+    }
     if (ph.magic != DS4_TP_MAGIC || ph.layer != layer || ph.gate != gate || ph.seq != seq) {
         fprintf(stderr, "ds4-tp: gate desync: got l=%u g=%u seq=%llu, want l=%u g=%u seq=%llu\n",
                 ph.layer, ph.gate, (unsigned long long)ph.seq,
                 layer, gate, (unsigned long long)seq);
         return 0;
     }
-    if (!tp_read_full(tp->data_fd, tp->slab + ds4_tp_slab_in_offset(tp, layer, gate),
-                      tp->vec_bytes))
+    io = tp_read_until(tp->data_fd, tp->slab + ds4_tp_slab_in_offset(tp, layer, gate),
+                       tp->vec_bytes, tp_gate_deadline(tp));
+    if (io != TP_IO_OK) {
+        fprintf(stderr, "ds4-tp: gate l=%u g=%u seq=%llu payload: %s\n",
+                layer, gate, (unsigned long long)seq, tp_io_why(io));
         return 0;
+    }
     return 1;
 }
 
@@ -1731,15 +1887,35 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
  * TCP remains the symmetric write-then-read fallback. */
 int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                                uint64_t seq) {
-    if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
+    if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) {
+        /* Not reachable from the shipped callers -- they clamp rows against
+         * DS4_TP_BATCH_MAX_ROWS before encoding the gate -- but a wrong row
+         * count here fails the gate with the same signature as a dead wire,
+         * so say which one it was. */
+        fprintf(stderr,
+                "ds4-tp: batch gate refused: layer %u rows %u (max %d), fd %d\n",
+                layer, rows, (int)DS4_TP_BATCH_MAX_ROWS, tp->data_fd);
+        return 0;
+    }
     const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
                              (uint16_t)rows, seq };
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active && tp_rdma_big_gate_capable(tp)) {
-        if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
+        /* Header pair first: it is the arrival barrier, and only once it has
+         * completed are both ranks known to be inside this gate.  The RDMA
+         * rounds below can then run on the short in-gate budget. */
+        const double meet_by = tp_meet_deadline(tp);
         ds4_tp_gate_header ph;
-        if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+        tp_io_status io = tp_write_until(tp->data_fd, &h, sizeof(h), meet_by);
+        if (io == TP_IO_OK)
+            io = tp_read_until(tp->data_fd, &ph, sizeof(ph), meet_by);
+        if (io != TP_IO_OK) {
+            fprintf(stderr,
+                    "ds4-tp: batch gate l=%u rows=%u seq=%llu header: %s\n",
+                    layer, rows, (unsigned long long)seq, tp_io_why(io));
+            return 0;
+        }
         if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
             ph.gate != rows || ph.seq != seq) {
             fprintf(stderr,
@@ -1763,23 +1939,38 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
     };
     size_t want = sizeof(h) + bytes;
     ssize_t w = writev(tp->data_fd, iov, 2);
-    if (w < 0) return 0;
-    if ((size_t)w != want) {
+    if (w < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) w = 0;
+    tp_io_status io = TP_IO_OK;
+    if (w < 0) {
+        io = TP_IO_ERROR;
+    } else if ((size_t)w != want) {
+        const double send_by = tp_gate_deadline(tp);
         size_t done = (size_t)w;
         if (done < sizeof(h)) {
-            if (!tp_write_full(tp->data_fd, (char *)&h + done, sizeof(h) - done))
-                return 0;
+            io = tp_write_until(tp->data_fd, (char *)&h + done,
+                                sizeof(h) - done, send_by);
             done = sizeof(h);
         }
-        uint64_t payload_done = done - sizeof(h);
-        if (!tp_write_full(tp->data_fd,
-                           tp->slab + ds4_tp_slab_batch_out_offset(tp, layer) +
-                               payload_done,
-                           bytes - payload_done))
-            return 0;
+        if (io == TP_IO_OK) {
+            const uint64_t payload_done = done - sizeof(h);
+            io = tp_write_until(tp->data_fd,
+                                tp->slab + ds4_tp_slab_batch_out_offset(tp, layer) +
+                                    payload_done,
+                                bytes - payload_done, send_by);
+        }
+    }
+    if (io != TP_IO_OK) {
+        fprintf(stderr, "ds4-tp: batch gate l=%u rows=%u seq=%llu send failed: %s\n",
+                layer, rows, (unsigned long long)seq, tp_io_why(io));
+        return 0;
     }
     ds4_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    io = tp_read_until(tp->data_fd, &ph, sizeof(ph), tp_meet_deadline(tp));
+    if (io != TP_IO_OK) {
+        fprintf(stderr, "ds4-tp: batch gate l=%u rows=%u seq=%llu header: %s\n",
+                layer, rows, (unsigned long long)seq, tp_io_why(io));
+        return 0;
+    }
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != rows || ph.seq != seq) {
         fprintf(stderr,
@@ -1789,9 +1980,15 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                 layer, rows, (unsigned long long)seq);
         return 0;
     }
-    return tp_read_full(tp->data_fd,
-                        tp->slab + ds4_tp_slab_batch_in_offset(tp, layer),
-                        bytes);
+    io = tp_read_until(tp->data_fd,
+                       tp->slab + ds4_tp_slab_batch_in_offset(tp, layer),
+                       bytes, tp_gate_deadline(tp));
+    if (io != TP_IO_OK) {
+        fprintf(stderr, "ds4-tp: batch gate l=%u rows=%u seq=%llu payload: %s\n",
+                layer, rows, (unsigned long long)seq, tp_io_why(io));
+        return 0;
+    }
+    return 1;
 }
 
 /* Prefill batch gate: RDMA uses the pipelined registered-slab path above.
@@ -1802,11 +1999,29 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
 
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
-    if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
+    if (tp->data_fd < 0 || !out || !in || bytes == 0) {
+        fprintf(stderr,
+                "ds4-tp: big gate refused: layer %u seq %llu bytes %llu, fd %d\n",
+                layer, (unsigned long long)seq, (unsigned long long)bytes,
+                tp->data_fd);
+        return 0;
+    }
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer, 0xB16u, seq };
-    if (!tp_write_full(tp->data_fd, &h, sizeof(h))) return 0;
+    /* This header pair is the pair's only rendezvous for a prefill gate, and on
+     * the first gate of a session the peer can be a whole cold layer-0 encode
+     * away, so it gets the arrival budget rather than the in-gate one.  Getting
+     * that wrong fails the first request of every fresh pair -- see
+     * DS4_TP_DEFAULT_MEET_TIMEOUT_MS. */
+    const double meet_by = tp_meet_deadline(tp);
     ds4_tp_gate_header ph;
-    if (!tp_read_full(tp->data_fd, &ph, sizeof(ph))) return 0;
+    tp_io_status io = tp_write_until(tp->data_fd, &h, sizeof(h), meet_by);
+    if (io == TP_IO_OK)
+        io = tp_read_until(tp->data_fd, &ph, sizeof(ph), meet_by);
+    if (io != TP_IO_OK) {
+        fprintf(stderr, "ds4-tp: big gate l=%u seq=%llu header: %s\n",
+                layer, (unsigned long long)seq, tp_io_why(io));
+        return 0;
+    }
     if (ph.magic != DS4_TP_BATCH_MAGIC || ph.layer != layer ||
         ph.gate != 0xB16u || ph.seq != seq) {
         fprintf(stderr,
@@ -1825,8 +2040,17 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
     while (off < bytes) {
         const uint64_t n = bytes - off > DS4_TP_BIG_CHUNK ?
                            DS4_TP_BIG_CHUNK : bytes - off;
-        if (!tp_write_full(tp->data_fd, (const char *)out + off, n)) return 0;
-        if (!tp_read_full(tp->data_fd, (char *)in + off, n)) return 0;
+        const double round_by = tp_gate_deadline(tp);
+        io = tp_write_until(tp->data_fd, (const char *)out + off, n, round_by);
+        if (io == TP_IO_OK)
+            io = tp_read_until(tp->data_fd, (char *)in + off, n, round_by);
+        if (io != TP_IO_OK) {
+            fprintf(stderr,
+                    "ds4-tp: big gate l=%u seq=%llu round at %llu/%llu bytes: %s\n",
+                    layer, (unsigned long long)seq, (unsigned long long)off,
+                    (unsigned long long)bytes, tp_io_why(io));
+            return 0;
+        }
         off += n;
     }
     if (getenv("DS4_GLM_TP_DEBUG")) {

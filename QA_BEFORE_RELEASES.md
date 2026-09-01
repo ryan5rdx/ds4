@@ -334,12 +334,21 @@ or backend fallback selection changes.
   `DS4_TEST_TP_DISCONNECT_DELAY_MS=10000` and signal the worker as soon as
   `TP_DISCONNECT_READY` appears. Repeat over TCP and RDMA by sending `SIGSTOP`
   to the exact worker PID at that marker, then resume it after the leader
-  returns. Startup must report the default `gate-timeout=750ms`; both paused
-  runs must fail the gate and invalidate all affected sessions without a Metal
-  GPU watchdog error. Before accepting that deadline, run one normal
-  GLM-5.3 batch over each transport and one GLM-5.2 IQ2 RDMA prompt using the
-  larger 108 GiB shard. `DS4_TP_GATE_TIMEOUT_MS` is a diagnostic override, not
-  a setting required for normal inference.
+  returns. Startup must report the defaults `gate-timeout=750ms
+  meet-timeout=10000ms`; both paused runs must fail the gate and invalidate all
+  affected sessions without a Metal GPU watchdog error. The two budgets are not
+  interchangeable and a run that fails at the wrong one is a failure: 750 ms
+  bounds an exchange between two ranks already inside a gate, while the 10 s
+  meet timeout bounds the barrier that gets them there — the header pair a
+  batch or big gate opens with, and the first decode gate after a control round
+  trip. Charging the arrival barrier the in-gate budget kills the first request
+  of every fresh pair (a DeepSeek-4 worker warms its prefill kernels at session
+  create and the leader pays that ~1.1 s during its first prefill, so the worker
+  is reliably at layer 0 first). Before accepting either deadline, run one
+  normal GLM-5.3 batch over each transport and one GLM-5.2 IQ2 RDMA prompt using
+  the larger 108 GiB shard, plus one DeepSeek-4 RDMA prompt from a cold pair.
+  `DS4_TP_GATE_TIMEOUT_MS` and `DS4_TP_MEET_TIMEOUT_MS` are diagnostic
+  overrides, not settings required for normal inference.
 - Set `DS4_TEST_TP_IDENTITY_MISMATCH=1` on the test leader once and require both
   ranks to reject the hello before inference. Also reflect a leader hello from
   a test peer without changing its role; the leader must reject two peers that
