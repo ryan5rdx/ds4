@@ -45412,7 +45412,17 @@ int ds4_gpu_glm53_matmul_bf16_qkv(
         uint32_t              out_dim,
         const ds4_gpu_tensor *x) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    if (!ds4_gpu_device_name_contains("M3 Ultra")) return 0;
+    /* Family predicate, not a device name -- the same correction the DeepSeek
+     * decode ports needed (see ds4_gpu_decode_rope_pair_affine_pre_m5).  Nothing
+     * in this path is M3-specific: BF16 arrives as ushort and is widened with a
+     * shift rather than the native type, the reduction is simd_sum, and the
+     * fused kernel calls the identical row helper as the unfused one with the
+     * weight pointer chosen by the grid's z index, so the result is bit-identical
+     * to three separate calls and every M1-M4 part can run it.  A device-name
+     * test here left every machine except one model on the unfused path. */
+    if (getenv("DS4_METAL_DISABLE_PRE_M5_GLM53_BF16_QKV_FUSE") != NULL) return 0;
+    if (!ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        !ds4_gpu_device_is_m5_apple_silicon()) return 0;
     uint64_t weights = 0;
     if (in_dim == 0 || out_dim == 0 ||
         !glm53_gpu_mul_u64(in_dim, out_dim, &weights) ||

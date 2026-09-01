@@ -38659,11 +38659,18 @@ static uint32_t glm53_prefill_chunk_tokens(void) {
     return cached;
 }
 
-/* Tri-state: unset keeps whatever the hardware check decided. */
-static int glm53_prefill_attnout_kslice(int hardware_default) {
+/* Matches what the DeepSeek path does with k-slices under tensor parallelism:
+ * no hardware gate at all -- tp_split_shared k-slices the shared expert's down
+ * projection on any machine, and the attention output split is keyed only on
+ * tp_world.  The M5 device test this replaces marked where the win was
+ * measured, not where it stops: without the slice each rank projects the full
+ * head width through columns it has just zeroed, so a pair on any machine pays
+ * double on every DSA layer.  Set to 0 to restore the unsliced path for an
+ * A/B; both ranks must agree, because the slice changes a reduction order. */
+static int glm53_prefill_attnout_kslice(void) {
     const char *env = getenv("DS4_GLM_TP_PREFILL_ATTNOUT_KSLICE");
-    if (!env || !env[0]) return hardware_default;
-    return env[0] != '0';
+    if (env && env[0]) return env[0] != '0';
+    return 1;
 }
 
 static uint32_t glm53_prefill_score_scratch_mb(void) {
@@ -51608,14 +51615,11 @@ static bool glm_graph_forward_indexed_tokens(
             /* The k-slice is what stops each rank projecting the full head
              * width through columns it zeroed, so on a 2-rank pair it removes
              * half the attn_output work on every DSA layer.  It is gated to M5
-             * because that is where it was measured; the M2 Ultra pair pays the
-             * full width today.  DS4_GLM_TP_PREFILL_ATTNOUT_KSLICE=1 forces it
-             * on, =0 forces it off, unset keeps the measured-hardware default.
-             * Set it on both ranks: the kernel choice changes the reduction
-             * order, and the pair must agree. */
+             * on any machine now, matching what the DeepSeek path already does
+             * with its k-slices; see glm53_prefill_attnout_kslice(). */
             if (tp_attn_head_split &&
                 !g->quality &&
-                glm53_prefill_attnout_kslice(ds4_gpu_device_is_m5_apple_silicon()) &&
+                glm53_prefill_attnout_kslice() &&
                 n_tokens >= 32u) {
                 const uint64_t k_cnt = g->heads_dim / 2u;
                 const uint32_t sliced_rows = n_tokens & ~31u;
