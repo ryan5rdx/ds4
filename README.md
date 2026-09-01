@@ -25,6 +25,20 @@
 > | 65536 | 427.1 | **520.4** | **31.5** | 22.5 |
 > | 131072 | 367.3 | **444.4** | **28.1** | 20.6 |
 >
+> **GLM 5.3 Flash Q4_K** full TP2 sweep, same commit, 128 greedy tokens per
+> point, two M2 Ultra 128 GB Macs (lanfear coordinator + mat worker, RDMA,
+> 50/50 expert split). Prefill and decode are tokens/second.
+>
+> | ctx | TP prefill | TP decode |
+> |---:|---:|---:|
+> | 2048 | 248.1 | 18.4 |
+> | 4096 | 255.7 | 18.1 |
+> | 8192 | 263.2 | 18.0 |
+> | 16384 | 261.0 | 17.9 |
+> | 32768 | 256.6 | 17.7 |
+> | 65536 | 248.3 | 17.4 |
+> | 131072 | 233.6 | 16.7 |
+>
 > Cold 131k prefill under tensor parallelism: **402.6 t/s**. Prefill at 131k is
 > **+65.8%** over the same branch with the splits disabled, and **+100%** over
 > the pre-fork baseline. Tensor parallelism wins prefill to 16k and decode at
