@@ -38623,6 +38623,68 @@ static uint32_t glm53_graph_resume_prefill_min_tokens(void) {
 #define DS4_GLM53_INDEX_POOL_SIZE 4u
 #define DS4_GLM53_PREFILL_CHUNK_TOKENS 2048u
 
+/* Experiment knobs for the GLM 5.3 prefill chunk, default off.
+ *
+ * GLM's chunk is pinned at 2048 while the DeepSeek path climbs to 4096 through
+ * ds4_prefill_watchdog_chunk(), and ds4f's own sweep shows the 2k->8k step is
+ * +19.8% from exactly that doubling.  Whether GLM gets the same is unmeasured,
+ * so it is a knob rather than a new default.
+ *
+ * TP CONSTRAINT: the per-layer prefill gates only pair up if both ranks chunk
+ * identically, so these must be set on BOTH machines or neither.  A one-sided
+ * setting desynchronises the pair; the startup line below prints whenever they
+ * are overridden so a mismatch is visible in the two logs side by side.
+ *
+ * The score scratch has to move with the chunk.  At 131k the indexer pool is
+ * 32768 columns, so the shipped 256 MB budget is exactly 2048 score rows
+ * (glm_graph_indexed_prefill_score_tokens); leaving it alone while doubling the
+ * chunk would silently keep scoring in two 2048-row sub-slices and measure
+ * nothing. */
+static uint32_t glm53_prefill_chunk_tokens(void) {
+    static uint32_t cached;
+    if (cached) return cached;
+    cached = DS4_GLM53_PREFILL_CHUNK_TOKENS;
+    const char *env = getenv("DS4_GLM53_PREFILL_CHUNK");
+    if (env && env[0]) {
+        const long v = strtol(env, NULL, 10);
+        if (v >= 1024 && v <= 8192 && (v % 1024) == 0) {
+            cached = (uint32_t)v;
+            fprintf(stderr, "ds4: GLM prefill chunk overridden to %u tokens "
+                            "(must match on both TP ranks)\n", cached);
+        } else {
+            fprintf(stderr, "ds4: ignoring DS4_GLM53_PREFILL_CHUNK=%s "
+                            "(want a multiple of 1024 in [1024, 8192])\n", env);
+        }
+    }
+    return cached;
+}
+
+/* Tri-state: unset keeps whatever the hardware check decided. */
+static int glm53_prefill_attnout_kslice(int hardware_default) {
+    const char *env = getenv("DS4_GLM_TP_PREFILL_ATTNOUT_KSLICE");
+    if (!env || !env[0]) return hardware_default;
+    return env[0] != '0';
+}
+
+static uint32_t glm53_prefill_score_scratch_mb(void) {
+    static uint32_t cached;
+    if (cached) return cached;
+    cached = DS4_GLM_METAL_INDEXED_PREFILL_SCORE_SCRATCH_MB;
+    const char *env = getenv("DS4_GLM53_PREFILL_SCORE_SCRATCH_MB");
+    if (env && env[0]) {
+        const long v = strtol(env, NULL, 10);
+        if (v >= 64 && v <= 4096) {
+            cached = (uint32_t)v;
+            fprintf(stderr, "ds4: GLM prefill score scratch overridden to "
+                            "%u MB (must match on both TP ranks)\n", cached);
+        } else {
+            fprintf(stderr, "ds4: ignoring DS4_GLM53_PREFILL_SCORE_SCRATCH_MB=%s "
+                            "(want 64..4096)\n", env);
+        }
+    }
+    return cached;
+}
+
 static uint32_t glm_graph_full_attention_cap(uint32_t ctx_size,
                                              bool     ssd_streaming);
 static uint32_t glm_graph_indexed_prefill_chunk_tokens(
@@ -38900,8 +38962,8 @@ static uint32_t glm_graph_batch_row_cap(
         bool     expanded_kv) {
     if (ds4_model_is_glm53()) {
         uint32_t cap = full_attention_cap;
-        if (cap > DS4_GLM53_PREFILL_CHUNK_TOKENS) {
-            cap = DS4_GLM53_PREFILL_CHUNK_TOKENS;
+        if (cap > glm53_prefill_chunk_tokens()) {
+            cap = glm53_prefill_chunk_tokens();
         }
         if (indexed_prefill_cap != 0 && cap > indexed_prefill_cap) {
             cap = indexed_prefill_cap;
@@ -43072,7 +43134,7 @@ static uint32_t glm_graph_indexed_prefill_chunk_tokens(
                 getenv("DS4_GLM53_DISABLE_INDEXED_PREFILL"))) {
             return 0;
         }
-        uint32_t chunk = DS4_GLM53_PREFILL_CHUNK_TOKENS;
+        uint32_t chunk = glm53_prefill_chunk_tokens();
         if (compact_cap != 0 && chunk > compact_cap) chunk = compact_cap;
         return chunk;
     }
@@ -43086,7 +43148,7 @@ static uint32_t glm_graph_indexed_prefill_score_tokens(
         uint32_t indexed_prefill_cap,
         uint32_t compact_cap) {
     if (indexed_prefill_cap == 0 || compact_cap == 0) return 0;
-    const uint32_t scratch_mb = DS4_GLM_METAL_INDEXED_PREFILL_SCORE_SCRATCH_MB;
+    const uint32_t scratch_mb = glm53_prefill_score_scratch_mb();
     const uint64_t budget_bytes = (uint64_t)scratch_mb * 1024ull * 1024ull;
     const uint64_t score_columns = ds4_model_is_glm53() ?
         glm53_graph_indexer_pool_cap(compact_cap) : compact_cap;
@@ -44703,7 +44765,7 @@ static bool glm53_graph_prefill_workspace_ensure(
         ds4_glm_gpu_graph *g,
         uint32_t rows) {
     if (!g || !g->glm53 || rows == 0 ||
-        rows > DS4_GLM53_PREFILL_CHUNK_TOKENS) {
+        rows > glm53_prefill_chunk_tokens()) {
         return false;
     }
     if (g->glm53_prefill_cap >= rows) return true;
@@ -49083,7 +49145,7 @@ static bool glm_graph_forward_tokens(
         uint32_t           work_total) {
     if (!g || !model || !weights || !tokens ||
         n_tokens == 0 ||
-        (g->glm53 && n_tokens > DS4_GLM53_PREFILL_CHUNK_TOKENS) ||
+        (g->glm53 && n_tokens > glm53_prefill_chunk_tokens()) ||
         g->layer_count == 0 ||
         !glm_graph_span_fits_context(g, pos0, n_tokens)) {
         return false;
@@ -51543,9 +51605,17 @@ static bool glm_graph_forward_indexed_tokens(
             ds4_gpu_tensor *attn_out_dst =
                 tp_attn_head_split ? g->tp_bounce_out : g->batch_attn_out;
             if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ATTN_OUT)) { /* ablate */ } else
+            /* The k-slice is what stops each rank projecting the full head
+             * width through columns it zeroed, so on a 2-rank pair it removes
+             * half the attn_output work on every DSA layer.  It is gated to M5
+             * because that is where it was measured; the M2 Ultra pair pays the
+             * full width today.  DS4_GLM_TP_PREFILL_ATTNOUT_KSLICE=1 forces it
+             * on, =0 forces it off, unset keeps the measured-hardware default.
+             * Set it on both ranks: the kernel choice changes the reduction
+             * order, and the pair must agree. */
             if (tp_attn_head_split &&
                 !g->quality &&
-                ds4_gpu_device_is_m5_apple_silicon() &&
+                glm53_prefill_attnout_kslice(ds4_gpu_device_is_m5_apple_silicon()) &&
                 n_tokens >= 32u) {
                 const uint64_t k_cnt = g->heads_dim / 2u;
                 const uint32_t sliced_rows = n_tokens & ~31u;
@@ -52049,8 +52119,8 @@ static bool glm_graph_prefill_range(
         while (done < n_tokens) {
             const uint32_t pos = pos0 + done;
             uint32_t chunk = n_tokens - done;
-            if (chunk > DS4_GLM53_PREFILL_CHUNK_TOKENS) {
-                chunk = DS4_GLM53_PREFILL_CHUNK_TOKENS;
+            if (chunk > glm53_prefill_chunk_tokens()) {
+                chunk = glm53_prefill_chunk_tokens();
             }
             if (pos < g->ctx_cap) {
                 const uint32_t dense_left = g->ctx_cap - pos;
@@ -53432,10 +53502,20 @@ glm53_attention_done:
                 ok = ds4_gpu_begin_commands() != 0;
             }
         }
+        /* Same constraint the DeepSeek decode flush documents: splitting a TP
+         * token across command buffers is only safe when gate arrival and
+         * release both ride per-slot words, because a later buffer must not be
+         * able to signal a sequence the prefix has not reached.  This flush
+         * fires every decode_layer_flush_interval layers -- 4 whenever indexed
+         * attention is on, so ~11 times per token -- and had no such guard, so
+         * it was correct only by accident of DS4_METAL_FAST_SYNC being set.
+         * Falls closed to one command buffer per TP token. */
         if (ok &&
             !g->ssd_streaming &&
             decode_layer_flush_interval != 0 &&
             il < g->layer_end &&
+            (g->tp_world != 2 ||
+             ds4_gpu_tp_split_safe((uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER)) &&
             (slice_layer_done % decode_layer_flush_interval) == 0) {
             if (decode_flush_profile) {
                 ok = ds4_gpu_flush_commands() != 0;
@@ -67789,8 +67869,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
 
                 const uint32_t pos = (uint32_t)s->checkpoint.len;
                 uint32_t chunk = (uint32_t)(prompt->len - i);
-                if (chunk > DS4_GLM53_PREFILL_CHUNK_TOKENS) {
-                    chunk = DS4_GLM53_PREFILL_CHUNK_TOKENS;
+                if (chunk > glm53_prefill_chunk_tokens()) {
+                    chunk = glm53_prefill_chunk_tokens();
                 }
                 if (short_resume) chunk = 1;
                 const bool use_indexed =
@@ -70225,7 +70305,7 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
 static bool glm53_graph_native_session_batch_supported(
         ds4_decode_item *items,
         int count) {
-    if (!items || count < 2 || count > (int)DS4_GLM53_PREFILL_CHUNK_TOKENS ||
+    if (!items || count < 2 || count > (int)glm53_prefill_chunk_tokens() ||
         DS4_N_ROT != 0 || g_expert_profile.active) {
         return false;
     }
