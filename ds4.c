@@ -64455,9 +64455,20 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer) {
     return ds4_layer_compress_ratio(layer);
 }
 
+/* Width of one token's pipeline-parallel hand-off, in f32 values.  This has to
+ * agree exactly with what the graph reads back into it: every distributed
+ * hidden-state buffer is malloc'd from this (ds4_distributed.c), the wire
+ * payload is sized from it, and the remote output head indexes the last row by
+ * it.  GLM 5.2 hands off a single residual row, but GLM 5.3 carries the
+ * four-way hyper-connection state between layers and its encoders read and
+ * write DS4_N_HC rows per token (the tensor_write at the top of
+ * glm_graph_forward_indexed_tokens and the matching tensor_read at the end), so
+ * answering DS4_N_EMBD for the whole GLM family under-sized every GLM 5.3 PP
+ * buffer by 4x and overran it. */
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e) {
     (void)e;
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) return DS4_N_EMBD;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && !ds4_model_is_glm53())
+        return DS4_N_EMBD;
     return (uint64_t)DS4_N_HC * DS4_N_EMBD;
 }
 
@@ -65879,7 +65890,17 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #else
     if (ds4_session_is_glm(s)) {
         ds4_glm_gpu_graph *gg = &s->glm_graph;
-        bool ok = ds4_gpu_tensor_write(gg->cur,
+        /* glm_graph_encode_output_head() reduces hc_cur through the
+         * hyper-connection weighted sum and never looks at cur, so a GLM 5.3
+         * hand-off has to land in hc_cur -- which is also the only one of the
+         * two sized for DS4_N_HC rows.  Writing it to cur was wrong twice over:
+         * the output head read a buffer nobody had filled, and once the
+         * hand-off width was corrected the write overran a 4096-float tensor by
+         * 4x.  This is the PP route where the last transformer span is remote
+         * but the output head stays local (--layers 23:44), so it is not
+         * covered by a 23:output split. */
+        ds4_gpu_tensor *hidden_dst = gg->glm53 ? gg->hc_cur : gg->cur;
+        bool ok = ds4_gpu_tensor_write(hidden_dst,
                                        0,
                                        last_hc,
                                        hidden_dim * sizeof(float)) != 0;
@@ -66485,7 +66506,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             return 1;
         }
 
-        const uint64_t hidden_dim = DS4_N_EMBD;
+        /* Must be the same width the caller allocated and the graph moves;
+         * see ds4_engine_hidden_f32_values(). */
+        const uint64_t hidden_dim = ds4_engine_hidden_f32_values(e);
 #ifdef DS4_ROCM_BUILD
         const bool rocm_layer_slice_token_decode =
             glm_graph_env_truthy(
