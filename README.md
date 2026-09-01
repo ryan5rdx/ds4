@@ -959,6 +959,20 @@ Measured on two M5 Max 128 GB MacBooks (GLM 5.2, IQ2_XXS, 188 GiB):
 | prefill (4096 tokens) | ~94 t/s | ~3-5 t/s |
 | residency | fully memory-resident | streams experts from SSD |
 
+**GLM 5.3 Flash Q4_K full sweep** measured on two 2x M2 Ultra 128 GB Macs
+(this rig: lanfear coordinator + mat worker, TP2 over RDMA, 50/50 expert
+split), 128 greedy tokens per frontier:
+
+| ctx | prefill t/s | decode t/s |
+|---:|---:|---:|
+| 2048 | 248.1 | 18.4 |
+| 4096 | 255.7 | 18.1 |
+| 8192 | 263.2 | 18.0 |
+| 16384 | 261.0 | 17.9 |
+| 32768 | 256.6 | 17.7 |
+| 65536 | 248.3 | 17.4 |
+| 131072 | 233.6 | 16.7 |
+
 Notes: the coordinator mirrors every prompt sync and eval to the worker, so
 both KV caches stay in lockstep; prompt processing splits both the
 routed-expert GEMMs (by expert ownership) and the attention heads (a
