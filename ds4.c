@@ -66344,7 +66344,17 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #else
     if (ds4_session_is_glm(s)) {
         ds4_glm_gpu_graph *gg = &s->glm_graph;
-        bool ok = ds4_gpu_tensor_write(gg->cur,
+        /* glm_graph_encode_output_head() reduces hc_cur through the
+         * hyper-connection weighted sum and never looks at cur, so a GLM 5.3
+         * hand-off has to land in hc_cur -- which is also the only one of the
+         * two sized for DS4_N_HC rows.  Writing it to cur was wrong twice over:
+         * the output head read a buffer nobody had filled, and once the
+         * hand-off width was corrected the write overran a 4096-float tensor by
+         * 4x.  This is the PP route where the last transformer span is remote
+         * but the output head stays local (--layers 23:44), so it is not
+         * covered by a 23:output split. */
+        ds4_gpu_tensor *hidden_dst = gg->glm53 ? gg->hc_cur : gg->cur;
+        bool ok = ds4_gpu_tensor_write(hidden_dst,
                                        0,
                                        last_hc,
                                        hidden_dim * sizeof(float)) != 0;
