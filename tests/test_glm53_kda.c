@@ -903,7 +903,7 @@ int main(void) {
         out, conv, state, q, k, v, gate, beta, output_gate,
         model, MODEL_BYTES, Q_CONV_OFFSET, K_CONV_OFFSET, V_CONV_OFFSET,
         A_LOG_OFFSET, DT_BIAS_OFFSET, NORM_OFFSET,
-        HEADS, 1, -5.0f, 1e-5f), "KDA decode");
+        HEADS, 1, HEADS, 0u, -5.0f, 1e-5f), "KDA decode");
     float actual[PROJECTION];
     require_ok(ds4_gpu_tensor_read(out, 0, actual, sizeof(actual)), "output read");
     const float silu_one = 1.0f / (1.0f + expf(-1.0f));
@@ -943,7 +943,7 @@ int main(void) {
             out, conv, state, q, k, v, gate, beta, output_gate,
             model, MODEL_BYTES, Q_CONV_OFFSET, K_CONV_OFFSET, V_CONV_OFFSET,
             A_LOG_OFFSET, DT_BIAS_OFFSET, NORM_OFFSET,
-            HEADS, 1, -5.0f, 1e-5f), "consistency decode");
+            HEADS, 1, HEADS, 0u, -5.0f, 1e-5f), "consistency decode");
         require_ok(ds4_gpu_tensor_read(out, 0, decode_outputs + off,
                                        PROJECTION * sizeof(float)), "decode output read");
     }
@@ -971,7 +971,7 @@ int main(void) {
         pout, pconv, pstate, pq, pk, pv, pg, pbeta, poutput_gate,
         model, MODEL_BYTES, Q_CONV_OFFSET, K_CONV_OFFSET, V_CONV_OFFSET,
         A_LOG_OFFSET, DT_BIAS_OFFSET, NORM_OFFSET,
-        HEADS, TOKENS, -5.0f, 1e-5f), "KDA prefill");
+        HEADS, TOKENS, HEADS, 0u, -5.0f, 1e-5f), "KDA prefill");
     float prefill_outputs[TOKENS * PROJECTION];
     require_ok(ds4_gpu_tensor_read(pout, 0, prefill_outputs, sizeof(prefill_outputs)),
                "prefill output read");

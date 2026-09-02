@@ -819,8 +819,20 @@ extern "C" int ds4_gpu_glm53_kda_decode(
         uint64_t              output_norm_offset,
         uint32_t              n_heads,
         uint32_t              n_rows,
+        uint32_t              n_heads_total,
+        uint32_t              head_first,
         float                 gate_lower_bound,
         float                 norm_eps) {
+    /* Absolute head addressing is implemented on Metal only.  This backend
+     * still packs the KDA state at the caller's n_heads, so a lane-split call
+     * would silently re-partition the conv ring rather than fault.  Refuse it:
+     * DS4_GLM_TP_KDA_SPLIT is an Apple/Metal feature today. */
+    if (n_heads_total != n_heads || head_first != 0u) {
+        fprintf(stderr, "ds4: GLM-5.3 KDA head split is Metal-only "
+                        "(n_heads_total=%u head_first=%u)\n",
+                n_heads_total, head_first);
+        return 0;
+    }
     uint64_t projection = 0, activations = 0, conv_elements = 0;
     uint64_t state_elements = 0;
     if (n_heads == 0u || n_rows == 0u || gate_lower_bound >= 0.0f ||
@@ -887,8 +899,20 @@ extern "C" int ds4_gpu_glm53_kda_prefill(
         uint64_t              output_norm_offset,
         uint32_t              n_heads,
         uint32_t              n_tokens,
+        uint32_t              n_heads_total,
+        uint32_t              head_first,
         float                 gate_lower_bound,
         float                 norm_eps) {
+    /* Absolute head addressing is implemented on Metal only.  This backend
+     * still packs the KDA state at the caller's n_heads, so a lane-split call
+     * would silently re-partition the conv ring rather than fault.  Refuse it:
+     * DS4_GLM_TP_KDA_SPLIT is an Apple/Metal feature today. */
+    if (n_heads_total != n_heads || head_first != 0u) {
+        fprintf(stderr, "ds4: GLM-5.3 KDA head split is Metal-only "
+                        "(n_heads_total=%u head_first=%u)\n",
+                n_heads_total, head_first);
+        return 0;
+    }
     uint64_t projection = 0, activations = 0, conv_elements = 0;
     uint64_t state_elements = 0;
     if (n_heads == 0u || n_tokens == 0u || gate_lower_bound >= 0.0f ||
