@@ -848,6 +848,38 @@ static bool ds4_glm53_layer_is_kda(uint32_t il) {
            il % 4u != 3u;
 }
 
+/* Which TP gates a GLM 5.3 layer fires, from the layer index alone.
+ *
+ * The decode gate schedule and the graph encoders must agree on this exactly.
+ * tp_gate_slot() walks the schedule's mask by ordinal, so a gate the graph
+ * fires that the mask omits shifts every later gate onto the wrong slot and the
+ * pair dies at the first exchange.  S6a died precisely there: the schedule's
+ * loop started at DS4_N_LEADING_DENSE while the graph split KDA heads from
+ * layer 0, so an unscheduled layer-0 ATTN gate landed on seq 1.
+ *
+ * The trap is that "leading dense" describes only the FFN.  Layers 0..2 have a
+ * dense FFN and no FFN gate, but their attention is ordinary KDA and does fire
+ * an ATTN gate once the heads are split.  Keeping the two rules in one function
+ * is what stops the boundaries drifting apart again.
+ *
+ * Shape constants are parameters rather than the DS4_* macros so the CPU test
+ * build, which compiles a different model, can still pin GLM 5.3's answers. */
+static void glm53_layer_tp_gates(uint32_t il,
+                                 uint32_t n_layer,
+                                 uint32_t n_nextn,
+                                 uint32_t n_leading_dense,
+                                 bool kda_split,
+                                 bool *fires_attn,
+                                 bool *fires_ffn) {
+    const bool normal = il + n_nextn < n_layer;
+    const bool kda = normal && il % 4u != 3u;
+    /* DSA layers always exchange their attention output; KDA layers compute the
+     * whole recurrence locally and exchange nothing unless the heads are split. */
+    if (fires_attn) *fires_attn = normal && (!kda || kda_split);
+    /* Only the routed sparse FFNs exchange a partial. */
+    if (fires_ffn) *fires_ffn = normal && il >= n_leading_dense;
+}
+
 static int g_ds4_lock_fd = -1;
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -64122,6 +64154,20 @@ uint32_t ds4_test_glm53_prefill_chunk_for_prompt(uint32_t prompt_len) {
     return glm53_prefill_chunk_for_prompt(prompt_len);
 }
 
+void ds4_test_glm53_layer_tp_gates(uint32_t il,
+                                   uint32_t n_layer,
+                                   uint32_t n_nextn,
+                                   uint32_t n_leading_dense,
+                                   int kda_split,
+                                   int *fires_attn,
+                                   int *fires_ffn) {
+    bool attn = false, ffn = false;
+    glm53_layer_tp_gates(il, n_layer, n_nextn, n_leading_dense,
+                         kda_split != 0, &attn, &ffn);
+    if (fires_attn) *fires_attn = attn ? 1 : 0;
+    if (fires_ffn) *fires_ffn = ffn ? 1 : 0;
+}
+
 uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
     return engine_planner_raw_cap(ctx_size, prefill_cap);
 }
@@ -65420,30 +65466,35 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
             *per_token = sparse_layers;
         } else if (ds4_model_is_glm53()) {
             uint32_t count = 0;
+            uint32_t first = UINT32_MAX;
             const uint32_t normal_layers =
                 DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
-            /* A KDA layer fires an ATTN gate only when its heads are split
-             * across the pair; otherwise it computes the whole recurrence
-             * locally and exchanges nothing.  Reading the same env the graph
-             * reads keeps the schedule and the encoders in step, and a
-             * one-sided setting is caught by the hello's gate_slot_mask
-             * comparison rather than by a hung gate. */
+            /* Reading the same env the graph reads keeps the schedule and the
+             * encoders in step, and a one-sided setting is caught by the
+             * hello's gate_slot_mask comparison rather than by a hung gate. */
             const bool kda_split = glm53_tp_kda_split_requested() &&
                                    glm53_tp_kda_split_shape_ok();
-            for (uint32_t il = DS4_N_LEADING_DENSE;
-                 il < normal_layers; il++) {
-                if (!ds4_glm53_layer_is_kda(il) || kda_split) {
+            /* From layer 0, not DS4_N_LEADING_DENSE: the leading layers are
+             * dense only in their FFN and their KDA attention gates too.  See
+             * glm53_layer_tp_gates(), which owns both rules. */
+            for (uint32_t il = 0; il < normal_layers; il++) {
+                bool fires_attn = false, fires_ffn = false;
+                glm53_layer_tp_gates(il, DS4_N_LAYER, DS4_N_NEXTN_PREDICT,
+                                     DS4_N_LEADING_DENSE, kda_split,
+                                     &fires_attn, &fires_ffn);
+                const uint32_t gates[2] = { DS4_TP_GATE_ATTN, DS4_TP_GATE_FFN };
+                const bool fires[2] = { fires_attn, fires_ffn };
+                for (uint32_t k = 0; k < 2; k++) {
+                    if (!fires[k]) continue;
                     const uint32_t slot =
-                        il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN;
+                        il * DS4_TP_GATES_PER_LAYER + gates[k];
                     mask[slot / 64u] |= UINT64_C(1) << (slot % 64u);
+                    if (first == UINT32_MAX) first = slot;
                     count++;
                 }
-                const uint32_t slot =
-                    il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
-                mask[slot / 64u] |= UINT64_C(1) << (slot % 64u);
-                count++;
             }
-            *start = DS4_N_LEADING_DENSE * DS4_TP_GATES_PER_LAYER;
+            /* start/step are unused while a mask is set, but keep them honest. */
+            *start = first == UINT32_MAX ? 0 : first;
             *step = 1;
             *per_token = count;
         } else {

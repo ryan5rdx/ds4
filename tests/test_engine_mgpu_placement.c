@@ -89,6 +89,13 @@ uint64_t ds4_test_glm_memory_guard_default_budget(uint64_t host_bytes,
                                                    uint64_t model_bytes,
                                                    bool glm53);
 int ds4_test_glm_memory_guard_disabled(void);
+void ds4_test_glm53_layer_tp_gates(uint32_t il,
+                                   uint32_t n_layer,
+                                   uint32_t n_nextn,
+                                   uint32_t n_leading_dense,
+                                   int kda_split,
+                                   int *fires_attn,
+                                   int *fires_ffn);
 
 /* DS4_N_LAYER constant is private to ds4.c; for the test we use
  * the same value. (The packer header doesn't expose it.) */
@@ -810,6 +817,72 @@ static void test_prefill_watchdog_bound(void) {
         CHECK(glm_bounded, "GLM runtime chunk never exceeds its own ceiling");
         CHECK(glm_prev < glm_ceiling,
               "GLM runtime chunk has actually shrunk by 1M tokens");
+    }
+
+    /* GLM 5.3's TP gate firing rule.  The schedule mask and the graph encoders
+     * must agree layer for layer: tp_gate_slot() walks the mask by ordinal, so
+     * one unscheduled gate shifts every later gate onto the wrong slot and the
+     * pair dies at its first exchange.  That is exactly how S6a failed --
+     * the schedule started at layer 3 while the graph split KDA heads from
+     * layer 0, so a layer-0 ATTN gate arrived on seq 1 with nothing to match.
+     * GLM 5.3 shape: 46 layers, 1 nextn, 3 leading dense. */
+    {
+        const uint32_t N_LAYER = 46, N_NEXTN = 1, N_DENSE = 3;
+        int attn = -1, ffn = -1;
+
+        /* The leading three are dense in their FFN only; the attention is KDA
+         * and gates as soon as the heads are split.  This is the S6a bug. */
+        for (uint32_t il = 0; il < N_DENSE; il++) {
+            ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE, 0,
+                                          &attn, &ffn);
+            CHECK(attn == 0 && ffn == 0,
+                  "leading dense layer fires nothing with the KDA split off");
+            ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE, 1,
+                                          &attn, &ffn);
+            CHECK(attn == 1 && ffn == 0,
+                  "leading dense layer gates its KDA attention when split, "
+                  "and still never gates its dense FFN");
+        }
+
+        /* Layer 3 is the first DSA layer and the first routed FFN. */
+        ds4_test_glm53_layer_tp_gates(3, N_LAYER, N_NEXTN, N_DENSE, 0,
+                                      &attn, &ffn);
+        CHECK(attn == 1 && ffn == 1,
+              "a DSA layer gates attention regardless of the KDA split");
+        ds4_test_glm53_layer_tp_gates(4, N_LAYER, N_NEXTN, N_DENSE, 0,
+                                      &attn, &ffn);
+        CHECK(attn == 0 && ffn == 1,
+              "a sparse KDA layer gates only its FFN with the split off");
+        ds4_test_glm53_layer_tp_gates(4, N_LAYER, N_NEXTN, N_DENSE, 1,
+                                      &attn, &ffn);
+        CHECK(attn == 1 && ffn == 1,
+              "a sparse KDA layer gates both once the heads are split");
+
+        /* The nextn layer runs on the coordinator alone and never gates. */
+        ds4_test_glm53_layer_tp_gates(N_LAYER - 1, N_LAYER, N_NEXTN, N_DENSE, 1,
+                                      &attn, &ffn);
+        CHECK(attn == 0 && ffn == 0, "the nextn layer fires no gate");
+
+        /* Totals, and that the mask still fits the slab.  34 KDA + 11 DSA
+         * attention and 42 routed FFNs: 53 gates off, 87 on. */
+        uint32_t off = 0, on = 0, max_slot = 0;
+        for (uint32_t il = 0; il < N_LAYER; il++) {
+            int a0 = 0, f0 = 0, a1 = 0, f1 = 0;
+            ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE, 0,
+                                          &a0, &f0);
+            ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE, 1,
+                                          &a1, &f1);
+            off += (uint32_t)(a0 + f0);
+            on += (uint32_t)(a1 + f1);
+            if (a1) max_slot = il * 2u;
+            if (f1) max_slot = il * 2u + 1u;
+        }
+        CHECK(off == 53, "53 gates per token with the KDA split off");
+        CHECK(on == 87, "87 gates per token with the KDA split on");
+        CHECK(on - off == 34,
+              "the split adds one gate for each of the 34 KDA layers");
+        CHECK(max_slot < N_LAYER * 2u,
+              "every gated slot fits the n_layer * gates_per_layer slab");
     }
 
     /* Short prompts are untouched, and the clamp to prompt_len still holds. */
