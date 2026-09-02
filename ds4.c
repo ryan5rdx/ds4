@@ -12959,9 +12959,32 @@ static uint32_t glm53_prefill_chunk_tokens(void) {
  *
  * The override remains so the two paths can be compared again; it is not a
  * performance switch, and disabling it says so on the way past. */
-static int glm53_tp_kda_split_requested(void) {
+/* Which phases split their KDA heads.
+ *
+ *   0 / unset  off, both phases replicate (E1)
+ *   decode     split decode only, replicate prefill (S6c)
+ *   both / 1   split both phases (S6b)
+ *
+ * S6b measured the two phases pulling in opposite directions: decode +6.4-7.6%,
+ * prefill -3.2 to -7.3%.  Prefill loses because the combine exchanges
+ * rows * n_embd * 4 bytes per layer -- 1.14 GB for a 2048-row chunk -- against
+ * only half a matmul saved, while decode's single row makes the same trade for
+ * 16 KB.  So the phases want opposite answers and need separate control. */
+typedef enum {
+    GLM53_KDA_SPLIT_OFF = 0,
+    GLM53_KDA_SPLIT_DECODE,
+    GLM53_KDA_SPLIT_BOTH,
+} glm53_kda_split_mode;
+
+static glm53_kda_split_mode glm53_tp_kda_split_mode(void) {
     const char *env = getenv("DS4_GLM_TP_KDA_SPLIT");
-    return env && env[0] && env[0] != '0';
+    if (!env || !env[0] || env[0] == '0') return GLM53_KDA_SPLIT_OFF;
+    if (strcmp(env, "decode") == 0) return GLM53_KDA_SPLIT_DECODE;
+    return GLM53_KDA_SPLIT_BOTH;
+}
+
+static int glm53_tp_kda_split_requested(void) {
+    return glm53_tp_kda_split_mode() != GLM53_KDA_SPLIT_OFF;
 }
 
 static bool glm53_tp_kda_split_shape_ok(void) {
@@ -42367,6 +42390,10 @@ typedef struct ds4_glm_gpu_graph {
     bool ssd_streaming_cold;
     bool generic_routed_moe;
     bool glm53;
+    /* Set once a head-split KDA decode step has run, so this session's
+     * state is fresh only over this rank's head range.  The resume guard
+     * in ds4_session_sync() reads it. */
+    bool kda_decode_was_split;
     ds4_imatrix_collector *imatrix;
     ds4_gpu_tensor *directional_steering_dirs_by_tier[DS4_MAX_GPUS];
     float directional_steering_attn_scale;
@@ -45210,11 +45237,20 @@ typedef struct {
     uint32_t head_first;  /* absolute index of the first owned head */
 } glm53_kda_lane;
 
-static glm53_kda_lane glm53_kda_lane_for(const ds4_glm_gpu_graph *g) {
+typedef enum {
+    GLM53_KDA_PHASE_DECODE = 0,
+    GLM53_KDA_PHASE_PREFILL,
+} glm53_kda_phase;
+
+static glm53_kda_lane glm53_kda_lane_for_phase(const ds4_glm_gpu_graph *g,
+                                               glm53_kda_phase phase) {
+    const glm53_kda_split_mode mode = glm53_tp_kda_split_mode();
+    const bool phase_splits =
+        mode == GLM53_KDA_SPLIT_BOTH ||
+        (mode == GLM53_KDA_SPLIT_DECODE && phase == GLM53_KDA_PHASE_DECODE);
     glm53_kda_lane lane;
     lane.split = g && g->tp_world == 2 && g->tp_out && g->tp_in &&
-                 glm53_tp_kda_split_requested() &&
-                 glm53_tp_kda_split_shape_ok();
+                 phase_splits && glm53_tp_kda_split_shape_ok();
     lane.heads = lane.split ? (uint32_t)DS4_N_KDA_HEAD / 2u
                             : (uint32_t)DS4_N_KDA_HEAD;
     lane.projection = lane.heads * (uint32_t)DS4_N_KDA_HEAD_DIM;
@@ -45225,6 +45261,10 @@ static glm53_kda_lane glm53_kda_lane_for(const ds4_glm_gpu_graph *g) {
      * all 64 heads and another run 32 over the same state. */
     lane.head_first = lane.lane_rows / (uint32_t)DS4_N_KDA_HEAD_DIM;
     return lane;
+}
+
+static glm53_kda_lane glm53_kda_lane_for(const ds4_glm_gpu_graph *g) {
+    return glm53_kda_lane_for_phase(g, GLM53_KDA_PHASE_DECODE);
 }
 
 static bool glm_graph_tp_batch_bounce_ready(ds4_glm_gpu_graph *g,
@@ -45465,7 +45505,8 @@ static bool glm53_graph_kda_attention(
         !g->layer_kda_recurrent_state[il]) {
         return false;
     }
-    const glm53_kda_lane lane = glm53_kda_lane_for(g);
+    const glm53_kda_lane lane =
+        glm53_kda_lane_for_phase(g, GLM53_KDA_PHASE_PREFILL);
     const uint32_t projection = lane.projection;
     /* Per-head weights shift to this rank's head range; kda_f_a / kda_g_a are
      * head-shared low-rank stages and kda_o_norm is indexed by channel within a
@@ -45582,6 +45623,9 @@ static bool glm53_graph_kda_attention(
             DS4_KDA_GATE_LOWER_BOUND,
             DS4_RMS_EPS) != 0;
     if (ok && lane.split) {
+        /* This rank has now advanced only its own heads' state, so a later
+         * replicated prefill cannot resume from it. */
+        g->kda_decode_was_split = true;
         /* Each rank contracts only its own head range, so the result is a
          * partial sum; the gate adds the two.  x_elem_off is 0 because this
          * rank's kda_out is compact at the buffer base -- it is the weight rows
@@ -56649,8 +56693,10 @@ static void ds4_session_glm_reset_dense_cache(ds4_session *s) {
 }
 
 static bool ds4_session_glm_reset_kda_state(ds4_session *s) {
-    return !s || !s->glm_graph_ready ||
-           glm_graph_reset_kda_state(&s->glm_graph);
+    if (!s || !s->glm_graph_ready) return true;
+    /* A cleared state is whole by definition, so it is resumable again. */
+    s->glm_graph.kda_decode_was_split = false;
+    return glm_graph_reset_kda_state(&s->glm_graph);
 }
 
 static void ds4_session_glm_cap_dense_cache(ds4_session *s) {
@@ -68202,9 +68248,34 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             return 1;
         }
 
+        /* Under DS4_GLM_TP_KDA_SPLIT=decode a split decode leaves each rank
+         * holding only its own head range fresh, while prefill runs replicated
+         * and needs the whole state.  Resuming from the common prefix would
+         * continue the recurrence over the peer's stale half, so refuse the
+         * resume and rebuild.  That costs a full re-prefill per turn, which is
+         * why 'decode' is a measurement mode until the decode->prefill state
+         * exchange exists; 'both' and the off state are unaffected. */
+        bool kda_state_partial = false;
+#ifndef DS4_NO_GPU
+        kda_state_partial =
+            s->glm_graph.glm53 && s->glm_graph.tp_world == 2 &&
+            s->glm_graph.kda_decode_was_split &&
+            glm53_tp_kda_split_mode() == GLM53_KDA_SPLIT_DECODE;
+        if (kda_state_partial) {
+            static int warned;
+            if (!warned) {
+                warned = 1;
+                fprintf(stderr,
+                        "ds4: GLM KDA split=decode cannot resume a checkpoint "
+                        "(split decode leaves half the state stale on each "
+                        "rank); rebuilding the prefix. Multi-turn will be slow "
+                        "until the boundary state exchange lands.\n");
+            }
+        }
+#endif
         int start = 0;
         bool resumed_checkpoint = false;
-        if (s->checkpoint_valid &&
+        if (s->checkpoint_valid && !kda_state_partial &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint))
         {
@@ -68220,6 +68291,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 snprintf(err, errlen, "%s GLM KDA state reset failed", backend_name);
                 return 1;
             }
+#ifndef DS4_NO_GPU
+            s->glm_graph.kda_decode_was_split = false;
+#endif
         }
 
         /* GLM-5.3 uses bounded layer-major chunks for mHC and recurrent KDA.
@@ -70829,6 +70903,9 @@ static bool glm53_graph_encode_kda_session_batch(
                     lane.head_first,
                     DS4_KDA_GATE_LOWER_BOUND,
                     DS4_RMS_EPS) != 0;
+            /* Per session, not on the batch owner: each one's state has now
+             * advanced over this rank's head range only. */
+            if (ok && lane.split) g->kda_decode_was_split = true;
         }
         ds4_gpu_tensor_free(out);
         ds4_gpu_tensor_free(output_gate);
