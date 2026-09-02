@@ -55,6 +55,11 @@ typedef struct {
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
+    /* Split features that change per-rank arithmetic but NOT the gate mask, so
+     * the mask comparison cannot catch a one-sided setting.  Compared verbatim
+     * in the hello: a mismatch is refused at bring-up instead of silently
+     * corrupting rank state (S2) or hanging the logits transport (S5). */
+    uint32_t split_flags;
     uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
 } ds4_tp_identity;
 

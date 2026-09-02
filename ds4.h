@@ -266,6 +266,7 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);
+uint32_t ds4_engine_tp_split_flags(ds4_engine *e);
 uint64_t ds4_engine_model_bytes(ds4_engine *e);
 bool ds4_engine_has_vision(ds4_engine *e);
 int ds4_engine_vision_encode_file(ds4_engine *e,
