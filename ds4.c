@@ -66007,6 +66007,22 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         snprintf(err, errlen, "tp: prefill bounce view creation failed");
         goto tp_bind_fail;
     }
+    /* State the split configuration positively at bring-up.  split_flags is
+     * only visible when the hello REJECTS a pair, so a matched-but-unintended
+     * configuration -- both ranks accidentally on `both`, say -- was silent. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        const char *modes[] = { "off", "decode", "both" };
+        fprintf(stderr,
+                "ds4: GLM TP splits, rank %d: kda=%s shared=%s dense_ffn=%s "
+                "vocab=%s (split_flags 0x%x)\n",
+                ds4_tp_rank(tp),
+                modes[(int)glm53_tp_kda_split_mode()],
+                glm53_tp_shared_split_requested() ? "on" : "off",
+                glm53_tp_dense_ffn_split_requested() ? "on" : "off",
+                e->tp.vocab_split && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA
+                    ? "on" : "off",
+                ds4_engine_tp_split_flags(e));
+    }
     if (!ds4_gpu_tp_init((uint32_t)ds4_tp_rank(tp),
                          e->tp.slab, ds4_tp_slab_gpu_flags_offset(tp),
                          ds4_tp_slab_out_offset(tp, 0, 0), vec_bytes,
