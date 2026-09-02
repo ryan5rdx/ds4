@@ -45207,6 +45207,7 @@ typedef struct {
     uint32_t heads;       /* heads this rank owns */
     uint32_t projection;  /* heads * DS4_N_KDA_HEAD_DIM */
     uint32_t lane_rows;   /* first owned projection row */
+    uint32_t head_first;  /* absolute index of the first owned head */
 } glm53_kda_lane;
 
 static glm53_kda_lane glm53_kda_lane_for(const ds4_glm_gpu_graph *g) {
@@ -45219,6 +45220,10 @@ static glm53_kda_lane glm53_kda_lane_for(const ds4_glm_gpu_graph *g) {
     lane.projection = lane.heads * (uint32_t)DS4_N_KDA_HEAD_DIM;
     lane.lane_rows = lane.split
         ? (uint32_t)g->tp_rank * lane.projection : 0u;
+    /* The KDA state is addressed absolutely, so a rank stores its heads at
+     * their true index in a full-width buffer.  That is what lets one phase run
+     * all 64 heads and another run 32 over the same state. */
+    lane.head_first = lane.lane_rows / (uint32_t)DS4_N_KDA_HEAD_DIM;
     return lane;
 }
 
@@ -45353,6 +45358,8 @@ static bool glm53_graph_kda_attention_rows(
             l->kda_o_norm->abs_offset,
             lane.heads,
             rows,
+            (uint32_t)DS4_N_KDA_HEAD,
+            lane.head_first,
             DS4_KDA_GATE_LOWER_BOUND,
             DS4_RMS_EPS) != 0;
     if (ok) metal_graph_debug_dump_tensor(
@@ -45570,6 +45577,8 @@ static bool glm53_graph_kda_attention(
             l->kda_o_norm->abs_offset,
             lane.heads,
             1,
+            (uint32_t)DS4_N_KDA_HEAD,
+            lane.head_first,
             DS4_KDA_GATE_LOWER_BOUND,
             DS4_RMS_EPS) != 0;
     if (ok && lane.split) {
@@ -70816,6 +70825,8 @@ static bool glm53_graph_encode_kda_session_batch(
                     off_dt,
                     l->kda_o_norm->abs_offset,
                     lane.heads, 1,
+                    (uint32_t)DS4_N_KDA_HEAD,
+                    lane.head_first,
                     DS4_KDA_GATE_LOWER_BOUND,
                     DS4_RMS_EPS) != 0;
         }

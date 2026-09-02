@@ -1,10 +1,24 @@
 // Kimi Delta Attention kernels, adapted from the kimi-k3 branch.
 
 struct glm53_kda_args {
-    uint n_heads;
+    uint n_heads;        // heads this rank computes
     uint n_rows;
     float lower_bound;
     float norm_eps;
+    /* State addressing is ABSOLUTE, activations and weights are lane-relative.
+     *
+     * A rank that owns a head subrange still stores that range at its true head
+     * index in a full-width state buffer, so the conv ring and the recurrent
+     * state have one layout regardless of how the heads happen to be divided.
+     * Without this, a phase that ran 64 heads and a phase that ran 32 would
+     * partition the same buffer differently and silently corrupt it -- which is
+     * exactly what blocked replicating prefill while splitting decode.
+     *
+     * Activations (q_in/k_in/v_in/raw_gate/raw_beta/output_gate/out) stay packed
+     * at lane width, and the model-side conv/dt_bias/a_log pointers are already
+     * offset to the lane by the host, so both keep using n_heads and head. */
+    uint n_heads_total;  // heads in the whole layer, for state strides
+    uint head_first;     // absolute index of this rank's first head
 };
 
 /*
@@ -52,7 +66,10 @@ kernel void kernel_glm53_kda_decode(
     const uint projection = args.n_heads * D;
     const uint channel = head * D + tid;
     const ulong input_base = (ulong)row * projection + head * D;
-    const ulong conv_row_stride = 3ul * HISTORY * projection;
+    /* Absolute, full-width state geometry (see glm53_kda_args). */
+    const uint state_projection = args.n_heads_total * D;
+    const uint state_channel = (args.head_first + head) * D + tid;
+    const ulong conv_row_stride = 3ul * HISTORY * state_projection;
 
     if (tid < D) {
         float q_acc = 0.0f;
@@ -60,14 +77,14 @@ kernel void kernel_glm53_kda_decode(
         float v_acc = 0.0f;
         device float *q_state = conv_state +
             (ulong)row * conv_row_stride;
-        device float *k_state = q_state + HISTORY * projection;
-        device float *v_state = k_state + HISTORY * projection;
+        device float *k_state = q_state + HISTORY * state_projection;
+        device float *v_state = k_state + HISTORY * state_projection;
         for (uint w = 0; w < HISTORY; w++) {
-            q_acc = fma(q_state[(ulong)w * projection + channel],
+            q_acc = fma(q_state[(ulong)w * state_projection + state_channel],
                         q_conv[(ulong)channel * 4u + w], q_acc);
-            k_acc = fma(k_state[(ulong)w * projection + channel],
+            k_acc = fma(k_state[(ulong)w * state_projection + state_channel],
                         k_conv[(ulong)channel * 4u + w], k_acc);
-            v_acc = fma(v_state[(ulong)w * projection + channel],
+            v_acc = fma(v_state[(ulong)w * state_projection + state_channel],
                         v_conv[(ulong)channel * 4u + w], v_acc);
         }
         const float q_new = q_in[input_base + tid];
@@ -77,15 +94,18 @@ kernel void kernel_glm53_kda_decode(
         k_acc = fma(k_new, k_conv[(ulong)channel * 4u + 3u], k_acc);
         v_acc = fma(v_new, v_conv[(ulong)channel * 4u + 3u], v_acc);
 
-        q_state[channel] = q_state[projection + channel];
-        q_state[projection + channel] = q_state[2ul * projection + channel];
-        q_state[2ul * projection + channel] = q_new;
-        k_state[channel] = k_state[projection + channel];
-        k_state[projection + channel] = k_state[2ul * projection + channel];
-        k_state[2ul * projection + channel] = k_new;
-        v_state[channel] = v_state[projection + channel];
-        v_state[projection + channel] = v_state[2ul * projection + channel];
-        v_state[2ul * projection + channel] = v_new;
+        q_state[state_channel] = q_state[state_projection + state_channel];
+        q_state[state_projection + state_channel] =
+            q_state[2ul * state_projection + state_channel];
+        q_state[2ul * state_projection + state_channel] = q_new;
+        k_state[state_channel] = k_state[state_projection + state_channel];
+        k_state[state_projection + state_channel] =
+            k_state[2ul * state_projection + state_channel];
+        k_state[2ul * state_projection + state_channel] = k_new;
+        v_state[state_channel] = v_state[state_projection + state_channel];
+        v_state[state_projection + state_channel] =
+            v_state[2ul * state_projection + state_channel];
+        v_state[2ul * state_projection + state_channel] = v_new;
 
         sq[tid] = q_acc / (1.0f + exp(-q_acc));
         sk[tid] = k_acc / (1.0f + exp(-k_acc));
@@ -127,7 +147,7 @@ kernel void kernel_glm53_kda_decode(
     const float4 k4 = *((threadgroup float4 *)(sk + k0));
     const float4 decay4 = *((threadgroup float4 *)(sd + k0));
     const ulong state_head =
-        ((ulong)row * args.n_heads + head) * D * D;
+        ((ulong)row * args.n_heads_total + args.head_first + head) * D * D;
 
     for (uint value = sg; value < D; value += 4u) {
         device float4 *hptr =
@@ -185,9 +205,11 @@ kernel void kernel_glm53_kda_prefill_prepare(
     threadgroup float *reduce_k = reduce_q + 4u;
     const uint projection = args.n_heads * D;
     const uint channel = head * D + tid;
+    const uint state_projection = args.n_heads_total * D;
+    const uint state_channel = (args.head_first + head) * D + tid;
     device float *q_state = conv_state;
-    device float *k_state = q_state + HISTORY * projection;
-    device float *v_state = k_state + HISTORY * projection;
+    device float *k_state = q_state + HISTORY * state_projection;
+    device float *v_state = k_state + HISTORY * state_projection;
 
     for (uint token = 0; token < args.n_rows; token++) {
         const ulong index = (ulong)token * projection + channel;
@@ -195,11 +217,11 @@ kernel void kernel_glm53_kda_prefill_prepare(
         float k_acc = 0.0f;
         float v_acc = 0.0f;
         for (uint w = 0; w < HISTORY; w++) {
-            q_acc = fma(q_state[(ulong)w * projection + channel],
+            q_acc = fma(q_state[(ulong)w * state_projection + state_channel],
                         q_conv[(ulong)channel * 4u + w], q_acc);
-            k_acc = fma(k_state[(ulong)w * projection + channel],
+            k_acc = fma(k_state[(ulong)w * state_projection + state_channel],
                         k_conv[(ulong)channel * 4u + w], k_acc);
-            v_acc = fma(v_state[(ulong)w * projection + channel],
+            v_acc = fma(v_state[(ulong)w * state_projection + state_channel],
                         v_conv[(ulong)channel * 4u + w], v_acc);
         }
         const float q_new = q[index];
@@ -208,15 +230,18 @@ kernel void kernel_glm53_kda_prefill_prepare(
         q_acc = fma(q_new, q_conv[(ulong)channel * 4u + 3u], q_acc);
         k_acc = fma(k_new, k_conv[(ulong)channel * 4u + 3u], k_acc);
         v_acc = fma(v_new, v_conv[(ulong)channel * 4u + 3u], v_acc);
-        q_state[channel] = q_state[projection + channel];
-        q_state[projection + channel] = q_state[2ul * projection + channel];
-        q_state[2ul * projection + channel] = q_new;
-        k_state[channel] = k_state[projection + channel];
-        k_state[projection + channel] = k_state[2ul * projection + channel];
-        k_state[2ul * projection + channel] = k_new;
-        v_state[channel] = v_state[projection + channel];
-        v_state[projection + channel] = v_state[2ul * projection + channel];
-        v_state[2ul * projection + channel] = v_new;
+        q_state[state_channel] = q_state[state_projection + state_channel];
+        q_state[state_projection + state_channel] =
+            q_state[2ul * state_projection + state_channel];
+        q_state[2ul * state_projection + state_channel] = q_new;
+        k_state[state_channel] = k_state[state_projection + state_channel];
+        k_state[state_projection + state_channel] =
+            k_state[2ul * state_projection + state_channel];
+        k_state[2ul * state_projection + state_channel] = k_new;
+        v_state[state_channel] = v_state[state_projection + state_channel];
+        v_state[state_projection + state_channel] =
+            v_state[2ul * state_projection + state_channel];
+        v_state[2ul * state_projection + state_channel] = v_new;
 
         sq[tid] = q_acc / (1.0f + exp(-q_acc));
         sk[tid] = k_acc / (1.0f + exp(-k_acc));
@@ -265,7 +290,7 @@ kernel void kernel_glm53_kda_prefill_recurrence(
     const uint projection = args.n_heads * D;
     const uint k0 = lane * 4u;
     device float4 *state_ptr = (device float4 *)(
-        state + ((ulong)head * D + value) * D + k0);
+        state + ((ulong)(args.head_first + head) * D + value) * D + k0);
     float4 h = *state_ptr;
 
     for (uint token = 0; token < args.n_rows; token++) {

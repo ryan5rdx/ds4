@@ -3102,6 +3102,8 @@ int ds4_gpu_glm53_kda_decode(
         uint64_t              output_norm_offset,
         uint32_t              n_heads,
         uint32_t              n_rows,
+        uint32_t              n_heads_total,
+        uint32_t              head_first,
         float                 gate_lower_bound,
         float                 norm_eps);
 
@@ -3125,6 +3127,8 @@ int ds4_gpu_glm53_kda_prefill(
         uint64_t              output_norm_offset,
         uint32_t              n_heads,
         uint32_t              n_tokens,
+        uint32_t              n_heads_total,
+        uint32_t              head_first,
         float                 gate_lower_bound,
         float                 norm_eps);
 

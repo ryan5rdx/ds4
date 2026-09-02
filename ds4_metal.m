@@ -45948,6 +45948,10 @@ typedef struct {
     uint32_t n_rows;
     float lower_bound;
     float norm_eps;
+    /* State is addressed absolutely; activations and the host-offset model
+     * pointers stay lane-relative.  See glm53_kda_args in glm53_kda.metal. */
+    uint32_t n_heads_total;
+    uint32_t head_first;
 } glm53_gpu_kda_args;
 
 int ds4_gpu_glm53_kda_decode(
@@ -45970,18 +45974,26 @@ int ds4_gpu_glm53_kda_decode(
         uint64_t              output_norm_offset,
         uint32_t              n_heads,
         uint32_t              n_rows,
+        uint32_t              n_heads_total,
+        uint32_t              head_first,
         float                 gate_lower_bound,
         float                 norm_eps) {
     enum { GLM53_KDA_DIM = 128, GLM53_KDA_HISTORY = 3 };
     if (!g_initialized && !ds4_gpu_init()) return 0;
     uint64_t projection = 0, activation_elements = 0;
+    uint64_t state_projection = 0, state_rows = 0;
     uint64_t conv_elements = 0, state_elements = 0;
+    /* Buffers are sized against the FULL head count, not the lane's: absolute
+     * addressing means a 32-head rank still writes at its true head index. */
     if (n_heads == 0 || n_rows == 0 || gate_lower_bound >= 0.0f ||
+        n_heads_total < n_heads || head_first + n_heads > n_heads_total ||
         !glm53_gpu_mul_u64(n_heads, GLM53_KDA_DIM, &projection) ||
         !glm53_gpu_mul_u64(projection, n_rows, &activation_elements) ||
-        !glm53_gpu_mul_u64(activation_elements,
+        !glm53_gpu_mul_u64(n_heads_total, GLM53_KDA_DIM, &state_projection) ||
+        !glm53_gpu_mul_u64(state_projection, n_rows, &state_rows) ||
+        !glm53_gpu_mul_u64(state_rows,
                         3u * GLM53_KDA_HISTORY, &conv_elements) ||
-        !glm53_gpu_mul_u64(activation_elements, GLM53_KDA_DIM, &state_elements) ||
+        !glm53_gpu_mul_u64(state_rows, GLM53_KDA_DIM, &state_elements) ||
         !glm53_gpu_tensor_has(q, activation_elements, sizeof(float)) ||
         !glm53_gpu_tensor_has(k, activation_elements, sizeof(float)) ||
         !glm53_gpu_tensor_has(v, activation_elements, sizeof(float)) ||
@@ -46037,6 +46049,8 @@ int ds4_gpu_glm53_kda_decode(
             .n_rows = n_rows,
             .lower_bound = gate_lower_bound,
             .norm_eps = norm_eps,
+            .n_heads_total = n_heads_total,
+            .head_first = head_first,
         };
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -46097,18 +46111,25 @@ int ds4_gpu_glm53_kda_prefill(
         uint64_t              output_norm_offset,
         uint32_t              n_heads,
         uint32_t              n_tokens,
+        uint32_t              n_heads_total,
+        uint32_t              head_first,
         float                 gate_lower_bound,
         float                 norm_eps) {
     enum { GLM53_KDA_DIM = 128, GLM53_KDA_HISTORY = 3 };
     if (!g_initialized && !ds4_gpu_init()) return 0;
     uint64_t projection = 0, activation_elements = 0;
+    uint64_t state_projection = 0;
     uint64_t conv_elements = 0, state_elements = 0;
+    /* Prefill keeps a single conv ring and a single recurrent state for the
+     * whole chunk, so unlike decode these are not multiplied by the row count. */
     if (n_heads == 0 || n_tokens == 0 || gate_lower_bound >= 0.0f ||
+        n_heads_total < n_heads || head_first + n_heads > n_heads_total ||
         !glm53_gpu_mul_u64(n_heads, GLM53_KDA_DIM, &projection) ||
         !glm53_gpu_mul_u64(projection, n_tokens, &activation_elements) ||
-        !glm53_gpu_mul_u64(projection,
+        !glm53_gpu_mul_u64(n_heads_total, GLM53_KDA_DIM, &state_projection) ||
+        !glm53_gpu_mul_u64(state_projection,
                         3u * GLM53_KDA_HISTORY, &conv_elements) ||
-        !glm53_gpu_mul_u64(projection, GLM53_KDA_DIM, &state_elements) ||
+        !glm53_gpu_mul_u64(state_projection, GLM53_KDA_DIM, &state_elements) ||
         !glm53_gpu_tensor_has(q, activation_elements, sizeof(float)) ||
         !glm53_gpu_tensor_has(k, activation_elements, sizeof(float)) ||
         !glm53_gpu_tensor_has(v, activation_elements, sizeof(float)) ||
@@ -46168,6 +46189,8 @@ int ds4_gpu_glm53_kda_prefill(
             .n_rows = n_tokens,
             .lower_bound = gate_lower_bound,
             .norm_eps = norm_eps,
+            .n_heads_total = n_heads_total,
+            .head_first = head_first,
         };
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
