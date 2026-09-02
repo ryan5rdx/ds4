@@ -70802,6 +70802,22 @@ static bool glm53_graph_encode_kda_session_batch(
     const glm53_kda_lane lane = glm53_kda_lane_for(batch);
     const uint64_t projection = lane.projection;
     const uint32_t beta_rows = lane.heads;
+    /* Announce once. Rig arm S6d could not tell "batched and correct" from
+     * "never batched at all", because two concurrent requests only coalesce
+     * when they happen to be ready in the same step -- and byte-identical
+     * output is the expected result either way. One line makes the batch path
+     * observable so a concurrency arm can prove it exercised this encoder. */
+    {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "ds4: GLM KDA session-batch encoder active: count=%d "
+                    "heads=%u head_first=%u split=%s\n",
+                    count, lane.heads, lane.head_first,
+                    lane.split ? "yes" : "no");
+        }
+    }
     /* Per-head weights shift to this rank's head range; kda_f_a / kda_g_a are
      * head-shared low-rank stages and kda_o_norm is indexed by channel within a
      * head, so all three stay whole. */
