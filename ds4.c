@@ -49104,6 +49104,27 @@ static bool glm_graph_mtp_matmul(
  * hidden h[pos] (g->cur for GLM-5.2, g->hc_cur for GLM-5.3) and next_token
  * (= token[pos+1]), writes the nextn KV at slot pos, and returns the
  * drafted token[pos+2] by greedy argmax. Clobbers the decode scratch. */
+/* Diagnostic: flush and time at each stage boundary.
+ *
+ * Without this the whole MTP cycle -- KDA state save, the two-row verify across
+ * 46 layers with its TP gates, the head and the draft -- is encoded into one
+ * command batch and committed at "end", so a GPU watchdog timeout reports stage
+ * 'end' and localises nothing. That is exactly what M4 hit on the rig, and it is
+ * why the report could not say whether the cost was the state copy, the verify,
+ * or a gate waiting on a peer that never arrived.
+ *
+ * Flushing changes the shape of what is measured, so this is for localisation,
+ * not for timing runs. Same mechanism prefill already uses
+ * (glm_graph_prefill_stage_sync_boundary). */
+static bool glm_graph_mtp_stage_sync_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_GLM_MTP_STAGE_SYNC");
+        cached = env && env[0] && env[0] != '0';
+    }
+    return cached != 0;
+}
+
 static bool glm_graph_mtp_step(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -49193,7 +49214,20 @@ static bool glm_graph_mtp_step(
     }
 
     const char *mtp_stage = "begin";
-#define DS4_GLM_MTP_STAGE(name_) do { if (ok) mtp_stage = (name_); } while (0)
+#define DS4_GLM_MTP_STAGE(name_) do { \
+    if (ok && glm_graph_mtp_stage_sync_enabled()) { \
+        const double t_ = now_sec(); \
+        if (ds4_gpu_end_commands() == 0 || ds4_gpu_begin_commands() == 0) { \
+            fprintf(stderr, "ds4: glm mtp stage '%s' FAILED at flush\n", \
+                    mtp_stage ? mtp_stage : "?"); \
+            ok = false; \
+        } else { \
+            fprintf(stderr, "ds4: glm mtp stage '%s' %.2f ms\n", \
+                    mtp_stage ? mtp_stage : "?", (now_sec() - t_) * 1000.0); \
+        } \
+    } \
+    if (ok) mtp_stage = (name_); \
+} while (0)
     bool ok = glm_graph_begin_commands_if_needed();
     /* MTP input: concat(enorm(embed(next_token)), hnorm(h)) -> eh_proj. */
     if (ok && !input_ready) {
