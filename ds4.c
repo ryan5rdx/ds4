@@ -12849,6 +12849,117 @@ static uint32_t ds4_prefill_watchdog_chunk(uint32_t prompt_len) {
     return chunk;
 }
 
+#define DS4_GLM_METAL_INDEXED_PREFILL_SCORE_SCRATCH_MB 256u
+#define DS4_GLM53_PREFILL_CHUNK_TOKENS 4096u
+
+/* GLM 5.3 prefill chunking, in the two levels the DeepSeek path already uses.
+ *
+ * This function is the ALLOCATION ceiling: the largest chunk that can ever run,
+ * and what every workspace is sized from.  It must not consult the watchdog
+ * ladder, because its callers arrive with ctx_size rather than a prompt length
+ * -- evaluating the ladder against a 1M allocation would pin every prompt to the
+ * floor, which ds4_prefill_cap_for_prompt() records as a measured ~25% prefill
+ * loss even on prompts that were never at watchdog risk.
+ *
+ * 4096 rather than 2048 because that is what the DeepSeek base is and rig arm
+ * 2026-09-01-E2 measured the wider chunk at +2.7% prefill, consistent at 8k and
+ * 131k.  The cost is that prefill workspaces are now sized for 4096 rows at
+ * every context; DS4_GLM53_PREFILL_CHUNK=2048 restores the old footprint on a
+ * machine where that does not fit.
+ *
+ * TP CONSTRAINT: the per-layer prefill gates only pair up if both ranks chunk
+ * identically, so an override must be set on BOTH machines or neither.  The
+ * value is announced unconditionally below so a mismatch shows up in a diff of
+ * the two startup logs.
+ *
+ * The score scratch is sized alongside it.  E2 arm C measured 512 MB against the
+ * 256 MB default at both contexts and found no gain, so the default stands; the
+ * knob is kept because the coupling is real (at 131k the indexer pool is 32768
+ * columns, so 256 MB is exactly 2048 score rows) and a future chunk change would
+ * need to re-check it. */
+static uint32_t glm53_prefill_chunk_tokens(void) {
+    static uint32_t cached;
+    if (cached) return cached;
+    cached = DS4_GLM53_PREFILL_CHUNK_TOKENS;
+    const char *env = getenv("DS4_GLM53_PREFILL_CHUNK");
+    if (env && env[0]) {
+        const long v = strtol(env, NULL, 10);
+        if (v >= 1024 && v <= 8192 && (v % 1024) == 0) {
+            cached = (uint32_t)v;
+            fprintf(stderr, "ds4: GLM prefill chunk overridden to %u tokens "
+                            "(must match on both TP ranks)\n", cached);
+        } else {
+            fprintf(stderr, "ds4: ignoring DS4_GLM53_PREFILL_CHUNK=%s "
+                            "(want a multiple of 1024 in [1024, 8192])\n", env);
+        }
+    }
+    /* Announce unconditionally, not only when overridden.  Both ranks must
+     * agree or the per-layer prefill gates stop pairing and the wider rank's
+     * command buffer runs into the GPU watchdog -- an expensive failure that
+     * kills the pair.  A silent default is indistinguishable in the logs from a
+     * rank whose binary predates this knob entirely, which is exactly the
+     * ambiguity that cost a rig cycle: the worker used 2048 and printed
+     * nothing, and nothing is what both causes look like.  One line per
+     * process, so diffing the two logs settles it. */
+    fprintf(stderr, "ds4: GLM prefill chunk %u tokens (%s)\n",
+            cached, env && env[0] ? "override" : "default");
+    return cached;
+}
+
+/* Matches what the DeepSeek path does with k-slices under tensor parallelism:
+ * no hardware gate at all -- tp_split_shared k-slices the shared expert's down
+ * projection on any machine, and the attention output split is keyed only on
+ * tp_world.  The M5 device test this replaces marked where the win was
+ * measured, not where it stops: without the slice each rank projects the full
+ * head width through columns it has just zeroed, so a pair on any machine pays
+ * double on every DSA layer.  Set to 0 to restore the unsliced path for an
+ * A/B; both ranks must agree, because the slice changes a reduction order. */
+static int glm53_prefill_attnout_kslice(void) {
+    const char *env = getenv("DS4_GLM_TP_PREFILL_ATTNOUT_KSLICE");
+    if (env && env[0]) return env[0] != '0';
+    return 1;
+}
+
+static uint32_t glm53_prefill_score_scratch_mb(void) {
+    static uint32_t cached;
+    if (cached) return cached;
+    cached = DS4_GLM_METAL_INDEXED_PREFILL_SCORE_SCRATCH_MB;
+    const char *env = getenv("DS4_GLM53_PREFILL_SCORE_SCRATCH_MB");
+    if (env && env[0]) {
+        const long v = strtol(env, NULL, 10);
+        if (v >= 64 && v <= 4096) {
+            cached = (uint32_t)v;
+            fprintf(stderr, "ds4: GLM prefill score scratch overridden to "
+                            "%u MB (must match on both TP ranks)\n", cached);
+        } else {
+            fprintf(stderr, "ds4: ignoring DS4_GLM53_PREFILL_SCORE_SCRATCH_MB=%s "
+                            "(want 64..4096)\n", env);
+        }
+    }
+    fprintf(stderr, "ds4: GLM prefill score scratch %u MB (%s)\n",
+            cached, env && env[0] ? "override" : "default");
+    return cached;
+}
+
+/* Runtime chunk for a prompt of `prompt_len` tokens: the allocation ceiling
+ * above, clamped by the same work-budget ladder the DeepSeek path applies in
+ * metal_graph_prefill_chunked_range().  A chunk's GPU cost scales with the
+ * context it attends against, so a width that is comfortable at 131k blows the
+ * command-buffer watchdog further out -- and under tensor parallelism that kill
+ * lands on an in-flight bulk gate and is not recoverable.  E2 validated 4096 at
+ * 8k and 131k; the ladder is what keeps that win without betting the untested
+ * contexts above it (4096 to 163840 tokens, then 2048, 1024, 512).
+ *
+ * prompt_len is rank-identical by construction -- ds4_session_sync() mirrors the
+ * exact token array -- so both ranks derive the same schedule, which the
+ * per-layer gates require.  Never derive it from anything rank-local. */
+static uint32_t glm53_prefill_chunk_for_prompt(uint32_t prompt_len) {
+    const uint32_t ceiling = glm53_prefill_chunk_tokens();
+    if (prompt_len == 0) return ceiling;
+    const uint32_t ladder = ds4_prefill_watchdog_chunk(prompt_len);
+    return (ladder != 0 && ladder < ceiling) ? ladder : ceiling;
+}
+
 static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
                                            uint32_t requested_chunk) {
     if (prompt_len <= 0) return 1;
@@ -38619,90 +38730,8 @@ static uint32_t glm53_graph_resume_prefill_min_tokens(void) {
 #define DS4_GLM_METAL_LONG_CONTEXT_THRESHOLD 65536u
 #define DS4_GLM_METAL_LONG_CONTEXT_FULL_ATTN_CONTEXT 4096u
 #define DS4_GLM_METAL_INDEXED_PREFILL_CHUNK_TOKENS 4096u
-#define DS4_GLM_METAL_INDEXED_PREFILL_SCORE_SCRATCH_MB 256u
 #define DS4_GLM53_INDEX_POOL_SIZE 4u
-#define DS4_GLM53_PREFILL_CHUNK_TOKENS 2048u
 
-/* Experiment knobs for the GLM 5.3 prefill chunk, default off.
- *
- * GLM's chunk is pinned at 2048 while the DeepSeek path climbs to 4096 through
- * ds4_prefill_watchdog_chunk(), and ds4f's own sweep shows the 2k->8k step is
- * +19.8% from exactly that doubling.  Whether GLM gets the same is unmeasured,
- * so it is a knob rather than a new default.
- *
- * TP CONSTRAINT: the per-layer prefill gates only pair up if both ranks chunk
- * identically, so these must be set on BOTH machines or neither.  A one-sided
- * setting desynchronises the pair; the startup line below prints whenever they
- * are overridden so a mismatch is visible in the two logs side by side.
- *
- * The score scratch has to move with the chunk.  At 131k the indexer pool is
- * 32768 columns, so the shipped 256 MB budget is exactly 2048 score rows
- * (glm_graph_indexed_prefill_score_tokens); leaving it alone while doubling the
- * chunk would silently keep scoring in two 2048-row sub-slices and measure
- * nothing. */
-static uint32_t glm53_prefill_chunk_tokens(void) {
-    static uint32_t cached;
-    if (cached) return cached;
-    cached = DS4_GLM53_PREFILL_CHUNK_TOKENS;
-    const char *env = getenv("DS4_GLM53_PREFILL_CHUNK");
-    if (env && env[0]) {
-        const long v = strtol(env, NULL, 10);
-        if (v >= 1024 && v <= 8192 && (v % 1024) == 0) {
-            cached = (uint32_t)v;
-            fprintf(stderr, "ds4: GLM prefill chunk overridden to %u tokens "
-                            "(must match on both TP ranks)\n", cached);
-        } else {
-            fprintf(stderr, "ds4: ignoring DS4_GLM53_PREFILL_CHUNK=%s "
-                            "(want a multiple of 1024 in [1024, 8192])\n", env);
-        }
-    }
-    /* Announce unconditionally, not only when overridden.  Both ranks must
-     * agree or the per-layer prefill gates stop pairing and the wider rank's
-     * command buffer runs into the GPU watchdog -- an expensive failure that
-     * kills the pair.  A silent default is indistinguishable in the logs from a
-     * rank whose binary predates this knob entirely, which is exactly the
-     * ambiguity that cost a rig cycle: the worker used 2048 and printed
-     * nothing, and nothing is what both causes look like.  One line per
-     * process, so diffing the two logs settles it. */
-    fprintf(stderr, "ds4: GLM prefill chunk %u tokens (%s)\n",
-            cached, env && env[0] ? "override" : "default");
-    return cached;
-}
-
-/* Matches what the DeepSeek path does with k-slices under tensor parallelism:
- * no hardware gate at all -- tp_split_shared k-slices the shared expert's down
- * projection on any machine, and the attention output split is keyed only on
- * tp_world.  The M5 device test this replaces marked where the win was
- * measured, not where it stops: without the slice each rank projects the full
- * head width through columns it has just zeroed, so a pair on any machine pays
- * double on every DSA layer.  Set to 0 to restore the unsliced path for an
- * A/B; both ranks must agree, because the slice changes a reduction order. */
-static int glm53_prefill_attnout_kslice(void) {
-    const char *env = getenv("DS4_GLM_TP_PREFILL_ATTNOUT_KSLICE");
-    if (env && env[0]) return env[0] != '0';
-    return 1;
-}
-
-static uint32_t glm53_prefill_score_scratch_mb(void) {
-    static uint32_t cached;
-    if (cached) return cached;
-    cached = DS4_GLM_METAL_INDEXED_PREFILL_SCORE_SCRATCH_MB;
-    const char *env = getenv("DS4_GLM53_PREFILL_SCORE_SCRATCH_MB");
-    if (env && env[0]) {
-        const long v = strtol(env, NULL, 10);
-        if (v >= 64 && v <= 4096) {
-            cached = (uint32_t)v;
-            fprintf(stderr, "ds4: GLM prefill score scratch overridden to "
-                            "%u MB (must match on both TP ranks)\n", cached);
-        } else {
-            fprintf(stderr, "ds4: ignoring DS4_GLM53_PREFILL_SCORE_SCRATCH_MB=%s "
-                            "(want 64..4096)\n", env);
-        }
-    }
-    fprintf(stderr, "ds4: GLM prefill score scratch %u MB (%s)\n",
-            cached, env && env[0] ? "override" : "default");
-    return cached;
-}
 
 static uint32_t glm_graph_full_attention_cap(uint32_t ctx_size,
                                              bool     ssd_streaming);
@@ -52135,9 +52164,9 @@ static bool glm_graph_prefill_range(
         while (done < n_tokens) {
             const uint32_t pos = pos0 + done;
             uint32_t chunk = n_tokens - done;
-            if (chunk > glm53_prefill_chunk_tokens()) {
-                chunk = glm53_prefill_chunk_tokens();
-            }
+            const uint32_t span_chunk =
+                glm53_prefill_chunk_for_prompt(pos0 + n_tokens);
+            if (chunk > span_chunk) chunk = span_chunk;
             if (pos < g->ctx_cap) {
                 const uint32_t dense_left = g->ctx_cap - pos;
                 if (chunk > dense_left) chunk = dense_left;
@@ -63841,6 +63870,14 @@ uint32_t ds4_test_prefill_watchdog_chunk(uint32_t prompt_len) {
     return ds4_prefill_watchdog_chunk(prompt_len);
 }
 
+uint32_t ds4_test_glm53_prefill_chunk_ceiling(void) {
+    return glm53_prefill_chunk_tokens();
+}
+
+uint32_t ds4_test_glm53_prefill_chunk_for_prompt(uint32_t prompt_len) {
+    return glm53_prefill_chunk_for_prompt(prompt_len);
+}
+
 uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
     return engine_planner_raw_cap(ctx_size, prefill_cap);
 }
@@ -67895,9 +67932,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
 
                 const uint32_t pos = (uint32_t)s->checkpoint.len;
                 uint32_t chunk = (uint32_t)(prompt->len - i);
-                if (chunk > glm53_prefill_chunk_tokens()) {
-                    chunk = glm53_prefill_chunk_tokens();
-                }
+                const uint32_t ladder_chunk =
+                    glm53_prefill_chunk_for_prompt((uint32_t)prompt->len);
+                if (chunk > ladder_chunk) chunk = ladder_chunk;
                 if (short_resume) chunk = 1;
                 const bool use_indexed =
                     !short_resume &&
