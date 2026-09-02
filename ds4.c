@@ -66504,6 +66504,10 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
                     ? "on" : "off",
                 ds4_engine_tp_split_flags(e));
     }
+    /* Sparse layers that fire an FFN row gate -- the straggler statistic scales
+     * its per-layer delta by this, and it defaulted to DeepSeek's 43. */
+    ds4_gpu_tp_set_stat_layer_count(
+            (uint32_t)(DS4_N_LAYER - DS4_N_NEXTN_PREDICT - DS4_N_LEADING_DENSE));
     if (!ds4_gpu_tp_init((uint32_t)ds4_tp_rank(tp),
                          e->tp.slab, ds4_tp_slab_gpu_flags_offset(tp),
                          ds4_engine_tp_exchange, tp)) {

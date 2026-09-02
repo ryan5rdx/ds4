@@ -9986,6 +9986,11 @@ static uint64_t g_tp_stat_kind_gates[DS4_TP_STAT_KIND_COUNT];
  * no cross-epoch subtraction, and it bounds any shared-expert rebalancing.
  * If the two measure equal, the imbalance is zero and all of them are dead. */
 static uint64_t g_tp_stat_slot_gates[2];
+static uint32_t g_tp_stat_layers = 43u;   /* DeepSeek default; set per family */
+
+void ds4_gpu_tp_set_stat_layer_count(uint32_t layers) {
+    if (layers) g_tp_stat_layers = layers;
+}
 static double   g_tp_stat_slot_gpu_wait_ms[2];
 static double   g_tp_stat_slot_exchange_ms[2];
 static double g_tp_stat_kind_gpu_wait_ms[DS4_TP_STAT_KIND_COUNT];
@@ -10194,14 +10199,16 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                     const double f_x = f_n ? g_tp_stat_slot_exchange_ms[1] / f_n * 1000.0 : 0.0;
                     fprintf(stderr,
                             "ds4: TP row gates by slot: attn %.0f x %.1f us, ffn %.0f x %.1f us, "
-                            "exchange delta %+.1f us -> straggler %.2f ms/token\n",
+                            "exchange delta %+.1f us -> straggler %.2f ms/token "
+                            "(over %u gated layers)\n",
                             a_n, a_x, f_n, f_x, f_x - a_x,
                             /* delta = E|s|/2 is already the per-layer excess on
                              * the critical path (the token advances at the
                              * slower rank's pace, so the cost is
                              * E[max] - E[mean] = E|s|/2).  One layer's worth
                              * per layer -- do not double it. */
-                            (f_x - a_x) * 43.0 / 1000.0);
+                            (f_x - a_x) * (double)g_tp_stat_layers / 1000.0,
+                            g_tp_stat_layers);
                 }
                 fprintf(stderr,
                         "ds4: TP gate kinds: row %llu %.1f/%.1f us, "

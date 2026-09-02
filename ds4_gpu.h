@@ -309,6 +309,10 @@ int ds4_gpu_tp_init(uint32_t rank,
                     ds4_gpu_tensor *slab, uint64_t gpu_flags_off,
                     ds4_gpu_tp_exchange_fn fn, void *ud);
 void ds4_gpu_tp_shutdown(void);
+/* Sparse layers that fire an FFN row gate, for the straggler statistic.  It was
+ * hardcoded to DeepSeek's 43; GLM 5.3 has 42, so the printed total ran ~2.4%
+ * high on the family the statistic was about to be used for. */
+void ds4_gpu_tp_set_stat_layer_count(uint32_t layers);
 /* Multi-session TP reuses slab slots across several encoded graph tapes.
  * Shared-event arrival is required in that mode to make each partial vector
  * CPU-visible before the transport thread reads it. */
