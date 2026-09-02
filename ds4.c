@@ -71306,6 +71306,19 @@ static bool ds4_sessions_eval_batch_metal_supported(
     if (!items || count < 2 || !e || e->backend != DS4_BACKEND_METAL ||
         e->support_kind != DS4_SUPPORT_NONE ||
         (e->tp.active && tp_batch && strcmp(tp_batch, "0") == 0) ||
+        /* glm53_graph_encode_kda_session_batch() is not lane-aware: it runs all
+         * DS4_N_KDA_HEAD heads with unoffset weights and hands 64 to
+         * ds4_gpu_glm53_kda_decode.  The conv ring's q/k/v sub-block bases are
+         * HISTORY * (n_heads * head_dim) apart, so a session whose prefill and
+         * single-token decode wrote layer_kda_conv_state[] at 32 heads has that
+         * ring silently re-partitioned and rewritten at 64 the first time it is
+         * batched -- full-width allocation means it corrupts rather than
+         * faults.  Serialize into the lane-aware per-session path until the
+         * batch encoder takes a glm53_kda_lane.  Both predicates are env plus
+         * compiled shape, so the two ranks always agree and the pair stays
+         * symmetric. */
+        (e->tp.active && glm53_tp_kda_split_requested() &&
+         glm53_tp_kda_split_shape_ok()) ||
         getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
         getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL) {
         return false;
