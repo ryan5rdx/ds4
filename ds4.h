@@ -262,7 +262,8 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *start,
                                  uint32_t *step,
                                  uint32_t *per_token,
-                                 uint64_t mask[DS4_TP_GATE_MASK_WORDS]);
+                                 uint64_t mask[DS4_TP_GATE_MASK_WORDS],
+                                 uint32_t *split_flags);
 uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);

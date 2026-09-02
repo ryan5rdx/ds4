@@ -14678,7 +14678,7 @@ static server_config parse_options(int argc, char **argv) {
         uint32_t gate_start = 0, gate_step = 0, gates_per_row = 0;
         uint64_t gate_mask[DS4_TP_GATE_MASK_WORDS] = {0};
         ds4_engine_tp_gate_schedule(NULL, &gate_start, &gate_step,
-                                    &gates_per_row, gate_mask);
+                                    &gates_per_row, gate_mask, NULL);
         int tp_row_cap = gates_per_row > 0 ?
             (int)((DS4_SERVER_TP_GATE_QUEUE * 3u / 4u) / gates_per_row) : 32;
         if (tp_row_cap > 32) tp_row_cap = 32;

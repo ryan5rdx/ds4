@@ -293,7 +293,8 @@ int main(void) {
                                     &identity.gate_slot_start,
                                     &identity.gate_slot_step,
                                     &identity.gates_per_token,
-                                    identity.gate_slot_mask);
+                                    identity.gate_slot_mask,
+                                    &identity.split_flags);
         if (getenv("DS4_TEST_TP_IDENTITY_MISMATCH")) {
             identity.n_vocab++;
         }

@@ -722,7 +722,8 @@ int main(int argc, char **argv) {
                                     &tp_id.gate_slot_start,
                                     &tp_id.gate_slot_step,
                                     &tp_id.gates_per_token,
-                                    tp_id.gate_slot_mask);
+                                    tp_id.gate_slot_mask,
+                                    &tp_id.split_flags);
         if (!ds4_tp_create(&exit_tp, &tp, &tp_id,
                            tp_err, sizeof(tp_err)) ||
             !ds4_engine_tp_bind(engine, exit_tp,

@@ -1621,10 +1621,13 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         memcmp(theirs.gate_slot_mask, mine.gate_slot_mask,
                sizeof(mine.gate_slot_mask)) != 0) {
         tp_set_err(err, errlen,
-                   "tp hello: model mismatch (peer gguf=%llu id=%u layers=%u embd=%u "
-                   "vocab=%u qbits=%u)",
+                   "tp hello: identity mismatch (peer gguf=%llu id=%u layers=%u "
+                   "embd=%u vocab=%u qbits=%u gates/token=%u split_flags=0x%x; "
+                   "ours gates/token=%u split_flags=0x%x)",
                    (unsigned long long)theirs.gguf_bytes, theirs.model_id,
-                   theirs.n_layer, theirs.n_embd, theirs.n_vocab, theirs.quant_bits);
+                   theirs.n_layer, theirs.n_embd, theirs.n_vocab,
+                   theirs.quant_bits, theirs.gates_per_token,
+                   theirs.split_flags, mine.gates_per_token, mine.split_flags);
         return 0;
     }
     const uint32_t mask_count = tp_gate_mask_count(mine.gate_slot_mask);
@@ -2829,13 +2832,13 @@ int ds4_tp_leader_bind(ds4_tp **out, ds4_engine *engine,
         .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
         .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
         .ctx_size = (uint32_t)ctx_size,
-        .split_flags = ds4_engine_tp_split_flags(engine),
     };
     ds4_engine_tp_gate_schedule(engine,
                                 &id.gate_slot_start,
                                 &id.gate_slot_step,
                                 &id.gates_per_token,
-                                id.gate_slot_mask);
+                                id.gate_slot_mask,
+                                &id.split_flags);
     ds4_tp *tp = NULL;
     if (!ds4_tp_create(&tp, opt, &id, err, errlen)) return 0;
     if (!ds4_engine_tp_bind(engine, tp, err, errlen)) {
@@ -2861,7 +2864,8 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
                                 &id.gate_slot_start,
                                 &id.gate_slot_step,
                                 &id.gates_per_token,
-                                id.gate_slot_mask);
+                                id.gate_slot_mask,
+                                &id.split_flags);
 
     ds4_tp *tp = NULL;
     if (!ds4_tp_create(&tp, opt, &id, err, sizeof(err))) {

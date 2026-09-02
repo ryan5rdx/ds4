@@ -65899,12 +65899,21 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
 /* Decode gate firing schedule for the TP transport (see ds4_tp_identity).
  * Resident GLM splits attention and FFN on sparse layers. Streaming keeps
  * attention replicated and exchanges only the routed FFN partial. */
+/* split_flags is an out-param rather than something each caller fills in
+ * separately, because every ds4_tp_identity is built by a different function and
+ * a designated initializer that omits a field is silently zero.  Landing the
+ * flags word without this cost a bring-up failure on every split-enabled run:
+ * the leader advertised the real bitmask, the worker advertised 0, and the hello
+ * refused the pair with a "model mismatch" that named only fields which matched.
+ * Making it an out-param means a site that forgets it does not compile. */
 void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *start,
                                  uint32_t *step,
                                  uint32_t *per_token,
-                                 uint64_t mask[DS4_TP_GATE_MASK_WORDS]) {
+                                 uint64_t mask[DS4_TP_GATE_MASK_WORDS],
+                                 uint32_t *split_flags) {
     memset(mask, 0, sizeof(uint64_t) * DS4_TP_GATE_MASK_WORDS);
+    if (split_flags) *split_flags = ds4_engine_tp_split_flags(e);
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const uint32_t sparse_layers =
             DS4_N_LAYER - DS4_N_NEXTN_PREDICT - DS4_N_LEADING_DENSE;
