@@ -38656,6 +38656,16 @@ static uint32_t glm53_prefill_chunk_tokens(void) {
                             "(want a multiple of 1024 in [1024, 8192])\n", env);
         }
     }
+    /* Announce unconditionally, not only when overridden.  Both ranks must
+     * agree or the per-layer prefill gates stop pairing and the wider rank's
+     * command buffer runs into the GPU watchdog -- an expensive failure that
+     * kills the pair.  A silent default is indistinguishable in the logs from a
+     * rank whose binary predates this knob entirely, which is exactly the
+     * ambiguity that cost a rig cycle: the worker used 2048 and printed
+     * nothing, and nothing is what both causes look like.  One line per
+     * process, so diffing the two logs settles it. */
+    fprintf(stderr, "ds4: GLM prefill chunk %u tokens (%s)\n",
+            cached, env && env[0] ? "override" : "default");
     return cached;
 }
 
@@ -38689,6 +38699,8 @@ static uint32_t glm53_prefill_score_scratch_mb(void) {
                             "(want 64..4096)\n", env);
         }
     }
+    fprintf(stderr, "ds4: GLM prefill score scratch %u MB (%s)\n",
+            cached, env && env[0] ? "override" : "default");
     return cached;
 }
 
