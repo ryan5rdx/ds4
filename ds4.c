@@ -42406,10 +42406,12 @@ typedef struct ds4_glm_gpu_graph {
     bool ssd_streaming_cold;
     bool generic_routed_moe;
     bool glm53;
-    /* Set once a head-split KDA decode step has run, so this session's
-     * state is fresh only over this rank's head range.  The resume guard
-     * in ds4_session_sync() reads it. */
-    bool kda_decode_was_split;
+    /* One bit per layer whose KDA state a split decode advanced, so that layer
+     * is fresh only over this rank's head range.  A replicated prefill needs
+     * the whole thing, so it exchanges halves with the peer and clears the bit.
+     * A bitmap rather than a flag because prefill is chunked: the exchange must
+     * happen on the first chunk that touches the layer and not again. */
+    uint64_t kda_state_exchange_pending;
     ds4_imatrix_collector *imatrix;
     ds4_gpu_tensor *directional_steering_dirs_by_tier[DS4_MAX_GPUS];
     float directional_steering_attn_scale;
@@ -45292,6 +45294,81 @@ static bool glm_graph_tp_batch_ffn_combine(ds4_glm_gpu_graph *g,
                                            ds4_gpu_tensor    *ffn_out,
                                            uint32_t           n_tokens);
 
+/* Collect the peer's half of one layer's KDA state.
+ *
+ * Under DS4_GLM_TP_KDA_SPLIT=decode a split decode advances only this rank's
+ * head range, so a replicated prefill would continue the recurrence over a
+ * stale half.  Both halves are exchanged once, on the first prefill chunk that
+ * reaches the layer.
+ *
+ * Absolute head addressing (b79b3d5) makes the geometry simple: the recurrent
+ * state is indexed head * D * D, so a rank's heads are one contiguous run, and
+ * the conv ring is 3 buffers x (DS4_N_KDA_CONV - 1) taps of channel-major rows,
+ * so a rank owns a contiguous channel span within each. Gather, one exchange,
+ * scatter -- 2.14 MiB per layer for GLM 5.3, ~73 MiB per rank per turn, against
+ * a decode gain of ~3.1 ms/token. It pays for itself in ~15 generated tokens
+ * and happens once per turn, not per token.
+ *
+ * Both ranks split the same layers in the same order, so they reach this in
+ * lockstep and the gate stays symmetric. */
+static bool glm53_kda_collect_peer_state(ds4_glm_gpu_graph *g, uint32_t il) {
+    const uint32_t proj = (uint32_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
+    const uint32_t half_ch = proj / 2u;
+    const uint32_t taps = (uint32_t)DS4_N_KDA_CONV - 1u;
+    const uint64_t rec_half = (uint64_t)half_ch * DS4_N_KDA_HEAD_DIM;
+    const uint64_t conv_half = (uint64_t)3u * taps * half_ch;
+    const uint64_t total_f = rec_half + conv_half;
+    const uint64_t bytes = total_f * sizeof(float);
+
+    /* Reuse the prefill bounce pair, sized in whole n_embd rows. */
+    const uint64_t row_f = (uint64_t)DS4_N_EMBD;
+    const uint32_t rows = (uint32_t)((total_f + row_f - 1u) / row_f);
+    if (!glm_graph_tp_batch_bounce_ready(g, rows)) return false;
+
+    float *rec = (float *)ds4_gpu_tensor_contents(g->layer_kda_recurrent_state[il]);
+    float *conv = (float *)ds4_gpu_tensor_contents(g->layer_kda_conv_state[il]);
+    float *bo = (float *)ds4_gpu_tensor_contents(g->tp_bounce_out);
+    float *bi = (float *)ds4_gpu_tensor_contents(g->tp_bounce_in);
+    if (!rec || !conv || !bo || !bi) {
+        fprintf(stderr, "ds4: GLM KDA state exchange needs CPU-visible state\n");
+        return false;
+    }
+
+    const uint32_t mine = (uint32_t)g->tp_rank;
+    const uint32_t peer = mine ^ 1u;
+    /* Gather this rank's half: the recurrent run, then the nine conv spans. */
+    memcpy(bo, rec + (uint64_t)mine * rec_half, rec_half * sizeof(float));
+    uint64_t off = rec_half;
+    for (uint32_t buf = 0; buf < 3u; buf++) {
+        for (uint32_t w = 0; w < taps; w++) {
+            const uint64_t src = (uint64_t)buf * taps * proj +
+                                 (uint64_t)w * proj + (uint64_t)mine * half_ch;
+            memcpy(bo + off, conv + src, half_ch * sizeof(float));
+            off += half_ch;
+        }
+    }
+
+    if (!ds4_gpu_tp_big_gate_encode(il, rows, g->tp_bounce_out,
+                                    g->tp_bounce_in, bytes)) {
+        fprintf(stderr,
+                "ds4: GLM KDA state exchange failed at layer %u\n", il);
+        return false;
+    }
+
+    /* Scatter the peer's half into the slots this rank never advanced. */
+    memcpy(rec + (uint64_t)peer * rec_half, bi, rec_half * sizeof(float));
+    off = rec_half;
+    for (uint32_t buf = 0; buf < 3u; buf++) {
+        for (uint32_t w = 0; w < taps; w++) {
+            const uint64_t dst = (uint64_t)buf * taps * proj +
+                                 (uint64_t)w * proj + (uint64_t)peer * half_ch;
+            memcpy(conv + dst, bi + off, half_ch * sizeof(float));
+            off += half_ch;
+        }
+    }
+    return true;
+}
+
 static bool glm53_graph_kda_attention_rows(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -45306,6 +45383,13 @@ static bool glm53_graph_kda_attention_rows(
         return false;
     }
     const glm53_kda_lane lane = glm53_kda_lane_prefill(g);
+    /* A replicated prefill needs the whole state.  If a split decode advanced
+     * only this rank's heads, collect the peer's half before touching it. */
+    if (!lane.split && il < 64u &&
+        (g->kda_state_exchange_pending & (UINT64_C(1) << il)) != 0) {
+        if (!glm53_kda_collect_peer_state(g, il)) return false;
+        g->kda_state_exchange_pending &= ~(UINT64_C(1) << il);
+    }
     const uint32_t projection = lane.projection;
     /* Same lane as the decode path -- both must agree, because they share the
      * recurrent state and its layout is sized by the head count. */
@@ -45640,9 +45724,10 @@ static bool glm53_graph_kda_attention(
             DS4_KDA_GATE_LOWER_BOUND,
             DS4_RMS_EPS) != 0;
     if (ok && lane.split) {
-        /* This rank has now advanced only its own heads' state, so a later
-         * replicated prefill cannot resume from it. */
-        g->kda_decode_was_split = true;
+        /* This rank has now advanced only its own heads' state; a later
+         * replicated prefill must collect the peer's half before it can
+         * continue the recurrence. */
+        if (il < 64u) g->kda_state_exchange_pending |= UINT64_C(1) << il;
         /* Each rank contracts only its own head range, so the result is a
          * partial sum; the gate adds the two.  x_elem_off is 0 because this
          * rank's kda_out is compact at the buffer base -- it is the weight rows
@@ -56711,8 +56796,8 @@ static void ds4_session_glm_reset_dense_cache(ds4_session *s) {
 
 static bool ds4_session_glm_reset_kda_state(ds4_session *s) {
     if (!s || !s->glm_graph_ready) return true;
-    /* A cleared state is whole by definition, so it is resumable again. */
-    s->glm_graph.kda_decode_was_split = false;
+    /* A cleared state is whole by definition: nothing to collect. */
+    s->glm_graph.kda_state_exchange_pending = 0;
     return glm_graph_reset_kda_state(&s->glm_graph);
 }
 
@@ -68283,34 +68368,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             return 1;
         }
 
-        /* Under DS4_GLM_TP_KDA_SPLIT=decode a split decode leaves each rank
-         * holding only its own head range fresh, while prefill runs replicated
-         * and needs the whole state.  Resuming from the common prefix would
-         * continue the recurrence over the peer's stale half, so refuse the
-         * resume and rebuild.  That costs a full re-prefill per turn, which is
-         * why 'decode' is a measurement mode until the decode->prefill state
-         * exchange exists; 'both' and the off state are unaffected. */
-        bool kda_state_partial = false;
-#ifndef DS4_NO_GPU
-        kda_state_partial =
-            s->glm_graph.glm53 && s->glm_graph.tp_world == 2 &&
-            s->glm_graph.kda_decode_was_split &&
-            glm53_tp_kda_split_mode() == GLM53_KDA_SPLIT_DECODE;
-        if (kda_state_partial) {
-            static int warned;
-            if (!warned) {
-                warned = 1;
-                fprintf(stderr,
-                        "ds4: GLM KDA split=decode cannot resume a checkpoint "
-                        "(split decode leaves half the state stale on each "
-                        "rank); rebuilding the prefix. Multi-turn will be slow "
-                        "until the boundary state exchange lands.\n");
-            }
-        }
-#endif
+        /* A checkpoint left half-fresh by a split decode is resumable again:
+         * the replicated prefill collects the peer's half per layer before it
+         * continues the recurrence (glm53_kda_collect_peer_state). */
         int start = 0;
         bool resumed_checkpoint = false;
-        if (s->checkpoint_valid && !kda_state_partial &&
+        if (s->checkpoint_valid &&
             prompt->len >= s->checkpoint.len &&
             ds4_tokens_starts_with(prompt, &s->checkpoint))
         {
@@ -68326,9 +68389,6 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 snprintf(err, errlen, "%s GLM KDA state reset failed", backend_name);
                 return 1;
             }
-#ifndef DS4_NO_GPU
-            s->glm_graph.kda_decode_was_split = false;
-#endif
         }
 
         /* GLM-5.3 uses bounded layer-major chunks for mHC and recurrent KDA.
@@ -70956,7 +71016,8 @@ static bool glm53_graph_encode_kda_session_batch(
                     DS4_RMS_EPS) != 0;
             /* Per session, not on the batch owner: each one's state has now
              * advanced over this rank's head range only. */
-            if (ok && lane.split) g->kda_decode_was_split = true;
+            if (ok && lane.split && il < 64u)
+                g->kda_state_exchange_pending |= UINT64_C(1) << il;
         }
         ds4_gpu_tensor_free(out);
         ds4_gpu_tensor_free(output_gate);
