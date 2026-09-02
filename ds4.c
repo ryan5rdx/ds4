@@ -12991,6 +12991,22 @@ static bool glm53_tp_kda_split_shape_ok(void) {
     return DS4_N_KDA_HEAD >= 2u && (DS4_N_KDA_HEAD % 2u) == 0u;
 }
 
+typedef enum {
+    GLM53_KDA_PHASE_DECODE = 0,
+    GLM53_KDA_PHASE_PREFILL,
+} glm53_kda_phase;
+
+/* Does this phase split its heads under this mode?  The gate schedule and the
+ * encoders both derive from this one function: the schedule describes the
+ * DECODE gates, so it must ask about the decode phase specifically rather than
+ * about "is the split on at all". */
+static bool glm53_kda_phase_splits(glm53_kda_split_mode mode,
+                                   glm53_kda_phase phase) {
+    return mode == GLM53_KDA_SPLIT_BOTH ||
+           (mode == GLM53_KDA_SPLIT_DECODE && phase == GLM53_KDA_PHASE_DECODE);
+}
+
+
 static int glm53_prefill_attnout_kslice(void) {
     const char *env = getenv("DS4_GLM_TP_PREFILL_ATTNOUT_KSLICE");
     if (env && env[0] && env[0] == '0') {
@@ -45237,17 +45253,10 @@ typedef struct {
     uint32_t head_first;  /* absolute index of the first owned head */
 } glm53_kda_lane;
 
-typedef enum {
-    GLM53_KDA_PHASE_DECODE = 0,
-    GLM53_KDA_PHASE_PREFILL,
-} glm53_kda_phase;
-
 static glm53_kda_lane glm53_kda_lane_for_phase(const ds4_glm_gpu_graph *g,
                                                glm53_kda_phase phase) {
-    const glm53_kda_split_mode mode = glm53_tp_kda_split_mode();
     const bool phase_splits =
-        mode == GLM53_KDA_SPLIT_BOTH ||
-        (mode == GLM53_KDA_SPLIT_DECODE && phase == GLM53_KDA_PHASE_DECODE);
+        glm53_kda_phase_splits(glm53_tp_kda_split_mode(), phase);
     glm53_kda_lane lane;
     lane.split = g && g->tp_world == 2 && g->tp_out && g->tp_in &&
                  phase_splits && glm53_tp_kda_split_shape_ok();
@@ -45263,8 +45272,17 @@ static glm53_kda_lane glm53_kda_lane_for_phase(const ds4_glm_gpu_graph *g,
     return lane;
 }
 
-static glm53_kda_lane glm53_kda_lane_for(const ds4_glm_gpu_graph *g) {
+/* Named per phase on purpose.  S6c failed on the rig because the phase was
+ * passed as a bare enum argument and the two call sites got swapped -- the
+ * decode encoder asked for the prefill lane and vice versa, which no local
+ * probe could catch because probes drive the kernel directly and never go
+ * through lane selection.  A wrong name is visible at the call site. */
+static glm53_kda_lane glm53_kda_lane_decode(const ds4_glm_gpu_graph *g) {
     return glm53_kda_lane_for_phase(g, GLM53_KDA_PHASE_DECODE);
+}
+
+static glm53_kda_lane glm53_kda_lane_prefill(const ds4_glm_gpu_graph *g) {
+    return glm53_kda_lane_for_phase(g, GLM53_KDA_PHASE_PREFILL);
 }
 
 static bool glm_graph_tp_batch_bounce_ready(ds4_glm_gpu_graph *g,
@@ -45287,7 +45305,7 @@ static bool glm53_graph_kda_attention_rows(
         !g->layer_kda_recurrent_state[il]) {
         return false;
     }
-    const glm53_kda_lane lane = glm53_kda_lane_for(g);
+    const glm53_kda_lane lane = glm53_kda_lane_prefill(g);
     const uint32_t projection = lane.projection;
     /* Same lane as the decode path -- both must agree, because they share the
      * recurrent state and its layout is sized by the head count. */
@@ -45505,8 +45523,7 @@ static bool glm53_graph_kda_attention(
         !g->layer_kda_recurrent_state[il]) {
         return false;
     }
-    const glm53_kda_lane lane =
-        glm53_kda_lane_for_phase(g, GLM53_KDA_PHASE_PREFILL);
+    const glm53_kda_lane lane = glm53_kda_lane_decode(g);
     const uint32_t projection = lane.projection;
     /* Per-head weights shift to this rank's head range; kda_f_a / kda_g_a are
      * head-shared low-rank stages and kda_o_norm is indexed by channel within a
@@ -64223,6 +64240,18 @@ void ds4_test_glm53_layer_tp_gates(uint32_t il,
     if (fires_ffn) *fires_ffn = ffn ? 1 : 0;
 }
 
+/* mode: 0 off, 1 decode, 2 both.  phase: 0 decode, 1 prefill. */
+int ds4_test_glm53_kda_phase_splits(int mode, int phase) {
+    return glm53_kda_phase_splits((glm53_kda_split_mode)mode,
+                                  (glm53_kda_phase)phase) ? 1 : 0;
+}
+
+int ds4_test_glm53_kda_split_mode_of(const char *env) {
+    if (!env || !env[0] || env[0] == '0') return (int)GLM53_KDA_SPLIT_OFF;
+    if (strcmp(env, "decode") == 0) return (int)GLM53_KDA_SPLIT_DECODE;
+    return (int)GLM53_KDA_SPLIT_BOTH;
+}
+
 uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap) {
     return engine_planner_raw_cap(ctx_size, prefill_cap);
 }
@@ -65527,8 +65556,14 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
             /* Reading the same env the graph reads keeps the schedule and the
              * encoders in step, and a one-sided setting is caught by the
              * hello's gate_slot_mask comparison rather than by a hung gate. */
-            const bool kda_split = glm53_tp_kda_split_requested() &&
-                                   glm53_tp_kda_split_shape_ok();
+            /* This mask describes the DECODE gate sequence, so it must follow
+             * the decode phase's policy -- not "is the split on at all".  Under
+             * mode=decode those happen to coincide, but only by accident, and
+             * an inverted call site is exactly how S6c died. */
+            const bool kda_split =
+                glm53_kda_phase_splits(glm53_tp_kda_split_mode(),
+                                       GLM53_KDA_PHASE_DECODE) &&
+                glm53_tp_kda_split_shape_ok();
             /* From layer 0, not DS4_N_LEADING_DENSE: the leading layers are
              * dense only in their FFN and their KDA attention gates too.  See
              * glm53_layer_tp_gates(), which owns both rules. */
@@ -70799,7 +70834,7 @@ static bool glm53_graph_encode_kda_session_batch(
      * q/k/v sub-block bases are HISTORY * (n_heads * head_dim) apart.  A batch
      * step that disagreed with them on n_heads would silently re-partition a
      * live conv ring rather than fault, since the buffers are full width. */
-    const glm53_kda_lane lane = glm53_kda_lane_for(batch);
+    const glm53_kda_lane lane = glm53_kda_lane_decode(batch);
     const uint64_t projection = lane.projection;
     const uint32_t beta_rows = lane.heads;
     /* Announce once. Rig arm S6d could not tell "batched and correct" from

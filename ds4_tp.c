@@ -1196,8 +1196,22 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
                 layer, gate, (unsigned long long)seq, tp_gate_slot(tp, seq));
     }
     if (slot != tp_gate_slot(tp, seq)) {
-        fprintf(stderr, "ds4-tp: gate order broke: layer %u gate %u vs seq %llu\n",
-                layer, gate, (unsigned long long)seq);
+        /* Say what was expected, not just what arrived.  This mismatch means
+         * the graph and ds4_engine_tp_gate_schedule() disagree about which
+         * gates fire, and it has now cost two rig cycles (S6a, S6c) because the
+         * old message named only the offending gate.  Naming the expected slot
+         * and the per-token count identifies the disagreement directly: a gate
+         * short means the graph skipped one the schedule mask includes, a gate
+         * long means the reverse. */
+        const uint32_t want = tp_gate_slot(tp, seq);
+        fprintf(stderr,
+                "ds4-tp: gate order broke: graph fired layer %u gate %u "
+                "(slot %u), schedule expected slot %u (layer %u gate %u) "
+                "at seq %llu; %u gates/token\n",
+                layer, gate, slot,
+                want, want / DS4_TP_GATES_PER_LAYER,
+                want % DS4_TP_GATES_PER_LAYER,
+                (unsigned long long)seq, tp->gates_per_token);
         return 0;
     }
     const uintptr_t send_base =

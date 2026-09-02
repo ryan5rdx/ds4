@@ -89,6 +89,8 @@ uint64_t ds4_test_glm_memory_guard_default_budget(uint64_t host_bytes,
                                                    uint64_t model_bytes,
                                                    bool glm53);
 int ds4_test_glm_memory_guard_disabled(void);
+int ds4_test_glm53_kda_phase_splits(int mode, int phase);
+int ds4_test_glm53_kda_split_mode_of(const char *env);
 void ds4_test_glm53_layer_tp_gates(uint32_t il,
                                    uint32_t n_layer,
                                    uint32_t n_nextn,
@@ -883,6 +885,63 @@ static void test_prefill_watchdog_bound(void) {
               "the split adds one gate for each of the 34 KDA layers");
         CHECK(max_slot < N_LAYER * 2u,
               "every gated slot fits the n_layer * gates_per_layer slab");
+    }
+
+    /* Which KDA phases split, per mode.  Rig arm S6c died because the phase
+     * was passed as a bare enum argument and the two call sites were swapped:
+     * the decode encoder asked for the prefill lane and the prefill encoder for
+     * the decode lane.  Under mode=decode that meant decode did NOT split while
+     * the gate schedule still expected its ATTN gates, so the pair broke on the
+     * first decode gate ("layer 3 gate 0 vs seq 1" -- layer 3 is the first DSA
+     * layer, i.e. no KDA gate had fired at all).
+     *
+     * No local probe could catch it: probes drive the kernel directly and never
+     * go through lane selection. This pins the policy the schedule and both
+     * encoders now share. */
+    {
+        enum { OFF = 0, DECODE_ONLY = 1, BOTH = 2 };
+        enum { PH_DECODE = 0, PH_PREFILL = 1 };
+
+        CHECK(ds4_test_glm53_kda_split_mode_of(NULL) == OFF &&
+              ds4_test_glm53_kda_split_mode_of("") == OFF &&
+              ds4_test_glm53_kda_split_mode_of("0") == OFF,
+              "unset/empty/0 leaves the KDA split off");
+        CHECK(ds4_test_glm53_kda_split_mode_of("decode") == DECODE_ONLY,
+              "\"decode\" selects the decode-only split");
+        CHECK(ds4_test_glm53_kda_split_mode_of("both") == BOTH &&
+              ds4_test_glm53_kda_split_mode_of("1") == BOTH,
+              "\"both\" and legacy \"1\" split both phases");
+
+        CHECK(!ds4_test_glm53_kda_phase_splits(OFF, PH_DECODE) &&
+              !ds4_test_glm53_kda_phase_splits(OFF, PH_PREFILL),
+              "off: neither phase splits");
+        CHECK(ds4_test_glm53_kda_phase_splits(DECODE_ONLY, PH_DECODE),
+              "decode mode splits DECODE -- the half S6c inverted");
+        CHECK(!ds4_test_glm53_kda_phase_splits(DECODE_ONLY, PH_PREFILL),
+              "decode mode leaves PREFILL replicated -- the other half");
+        CHECK(ds4_test_glm53_kda_phase_splits(BOTH, PH_DECODE) &&
+              ds4_test_glm53_kda_phase_splits(BOTH, PH_PREFILL),
+              "both: each phase splits, i.e. S6b is unchanged");
+
+        /* The decode gate schedule keys off the DECODE phase, so any mode whose
+         * decode splits must light the KDA ATTN bits, and one whose decode does
+         * not must leave them dark.  This is the schedule/graph agreement that
+         * actually broke. */
+        const uint32_t N_LAYER = 46, N_NEXTN = 1, N_DENSE = 3;
+        int attn = -1, ffn = -1;
+        for (int mode = OFF; mode <= BOTH; mode++) {
+            const int decode_splits =
+                ds4_test_glm53_kda_phase_splits(mode, PH_DECODE);
+            /* layer 4: a sparse KDA layer */
+            ds4_test_glm53_layer_tp_gates(4, N_LAYER, N_NEXTN, N_DENSE,
+                                          decode_splits, &attn, &ffn);
+            CHECK(attn == decode_splits,
+                  "KDA ATTN gate fires exactly when the decode phase splits");
+            /* layer 3: DSA, always gates, whatever the mode */
+            ds4_test_glm53_layer_tp_gates(3, N_LAYER, N_NEXTN, N_DENSE,
+                                          decode_splits, &attn, &ffn);
+            CHECK(attn == 1, "DSA attention gates in every mode");
+        }
     }
 
     /* Short prompts are untouched, and the clamp to prompt_len still holds. */
