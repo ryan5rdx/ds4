@@ -70710,40 +70710,80 @@ static bool glm53_graph_encode_kda_session_batch(
         const ds4_layer_weights *l,
         uint32_t                 il) {
     const uint32_t rows = (uint32_t)count;
-    const uint64_t projection =
-        (uint64_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
-    bool ok = glm53_graph_matmul_rows(batch->batch_kda_q, model, l->kda_q,
-                                      DS4_N_EMBD, (uint32_t)projection,
-                                      batch->batch_attn_norm, rows);
-    if (ok) ok = glm53_graph_matmul_rows(batch->batch_kda_k, model, l->kda_k,
-                                         DS4_N_EMBD, (uint32_t)projection,
+    /* `batch` is items[0]'s own graph, so it carries the TP fields and this is
+     * the same lane the per-session prefill and single-token decode paths take.
+     * It must be: all three write the same layer_kda_*_state buffers, whose
+     * q/k/v sub-block bases are HISTORY * (n_heads * head_dim) apart.  A batch
+     * step that disagreed with them on n_heads would silently re-partition a
+     * live conv ring rather than fault, since the buffers are full width. */
+    const glm53_kda_lane lane = glm53_kda_lane_for(batch);
+    const uint64_t projection = lane.projection;
+    const uint32_t beta_rows = lane.heads;
+    /* Per-head weights shift to this rank's head range; kda_f_a / kda_g_a are
+     * head-shared low-rank stages and kda_o_norm is indexed by channel within a
+     * head, so all three stay whole. */
+    uint64_t off_q = 0, off_k = 0, off_v = 0, off_fb = 0, off_gb = 0, off_beta = 0;
+    if (!glm53_graph_weight_row_offset(l->kda_q, DS4_N_EMBD, lane.lane_rows, &off_q) ||
+        !glm53_graph_weight_row_offset(l->kda_k, DS4_N_EMBD, lane.lane_rows, &off_k) ||
+        !glm53_graph_weight_row_offset(l->kda_v, DS4_N_EMBD, lane.lane_rows, &off_v) ||
+        !glm53_graph_weight_row_offset(l->kda_f_b, DS4_N_KDA_HEAD_DIM,
+                                       lane.lane_rows, &off_fb) ||
+        !glm53_graph_weight_row_offset(l->kda_g_b, DS4_N_KDA_HEAD_DIM,
+                                       lane.lane_rows, &off_gb) ||
+        !glm53_graph_weight_row_offset(l->kda_beta, DS4_N_EMBD,
+                                       lane.lane_rows / DS4_N_KDA_HEAD_DIM,
+                                       &off_beta)) {
+        return false;
+    }
+    /* F32 side tensors: conv is channel-major with DS4_N_KDA_CONV taps each,
+     * dt_bias is one float per channel, a_log one per head. */
+    const uint64_t f32_chan = (uint64_t)lane.lane_rows * sizeof(float);
+    const uint64_t off_qc = l->kda_q_conv->abs_offset + f32_chan * DS4_N_KDA_CONV;
+    const uint64_t off_kc = l->kda_k_conv->abs_offset + f32_chan * DS4_N_KDA_CONV;
+    const uint64_t off_vc = l->kda_v_conv->abs_offset + f32_chan * DS4_N_KDA_CONV;
+    const uint64_t off_dt = l->kda_dt_bias->abs_offset + f32_chan;
+    const uint64_t off_al = l->kda_a_log->abs_offset +
+        (uint64_t)(lane.lane_rows / DS4_N_KDA_HEAD_DIM) * sizeof(float);
+
+    bool ok = glm53_graph_matmul_rows_at(batch->batch_kda_q, model, l->kda_q,
+                                         off_q, DS4_N_EMBD,
+                                         (uint32_t)projection,
                                          batch->batch_attn_norm, rows);
-    if (ok) ok = glm53_graph_matmul_rows(batch->batch_kda_v, model, l->kda_v,
-                                         DS4_N_EMBD, (uint32_t)projection,
-                                         batch->batch_attn_norm, rows);
+    if (ok) ok = glm53_graph_matmul_rows_at(batch->batch_kda_k, model, l->kda_k,
+                                            off_k, DS4_N_EMBD,
+                                            (uint32_t)projection,
+                                            batch->batch_attn_norm, rows);
+    if (ok) ok = glm53_graph_matmul_rows_at(batch->batch_kda_v, model, l->kda_v,
+                                            off_v, DS4_N_EMBD,
+                                            (uint32_t)projection,
+                                            batch->batch_attn_norm, rows);
     if (ok) ok = glm53_graph_matmul_rows(batch->batch_kda_lowrank, model,
                                          l->kda_f_a, DS4_N_EMBD,
                                          DS4_N_KDA_HEAD_DIM,
                                          batch->batch_attn_norm, rows);
-    if (ok) ok = glm53_graph_matmul_rows(batch->batch_kda_raw_gate, model,
-                                         l->kda_f_b, DS4_N_KDA_HEAD_DIM,
-                                         (uint32_t)projection,
-                                         batch->batch_kda_lowrank, rows);
-    if (ok) ok = glm53_graph_matmul_rows(batch->batch_kda_raw_beta, model,
-                                         l->kda_beta, DS4_N_EMBD,
-                                         DS4_N_KDA_HEAD,
-                                         batch->batch_attn_norm, rows);
+    if (ok) ok = glm53_graph_matmul_rows_at(batch->batch_kda_raw_gate, model,
+                                            l->kda_f_b, off_fb,
+                                            DS4_N_KDA_HEAD_DIM,
+                                            (uint32_t)projection,
+                                            batch->batch_kda_lowrank, rows);
+    if (ok) ok = glm53_graph_matmul_rows_at(batch->batch_kda_raw_beta, model,
+                                            l->kda_beta, off_beta, DS4_N_EMBD,
+                                            beta_rows,
+                                            batch->batch_attn_norm, rows);
     if (ok) ok = glm53_graph_matmul_rows(batch->batch_kda_lowrank, model,
                                          l->kda_g_a, DS4_N_EMBD,
                                          DS4_N_KDA_HEAD_DIM,
                                          batch->batch_attn_norm, rows);
-    if (ok) ok = glm53_graph_matmul_rows(batch->batch_kda_output_gate, model,
-                                         l->kda_g_b, DS4_N_KDA_HEAD_DIM,
-                                         (uint32_t)projection,
-                                         batch->batch_kda_lowrank, rows);
+    if (ok) ok = glm53_graph_matmul_rows_at(batch->batch_kda_output_gate, model,
+                                            l->kda_g_b, off_gb,
+                                            DS4_N_KDA_HEAD_DIM,
+                                            (uint32_t)projection,
+                                            batch->batch_kda_lowrank, rows);
 
     for (int i = 0; ok && i < count; i++) {
         ds4_glm_gpu_graph *g = &items[i].session->glm_graph;
+        /* Every row is lane-width now, so the row views stride by the lane, not
+         * by the full projection. */
         ds4_gpu_tensor *q = glm_graph_tensor_row_view_strided(
                 batch->batch_kda_q, (uint32_t)i, projection, projection);
         ds4_gpu_tensor *k = glm_graph_tensor_row_view_strided(
@@ -70755,7 +70795,7 @@ static bool glm53_graph_encode_kda_session_batch(
                 projection, projection);
         ds4_gpu_tensor *raw_beta = glm_graph_tensor_row_view_strided(
                 batch->batch_kda_raw_beta, (uint32_t)i,
-                DS4_N_KDA_HEAD, DS4_N_KDA_HEAD);
+                beta_rows, beta_rows);
         ds4_gpu_tensor *output_gate = glm_graph_tensor_row_view_strided(
                 batch->batch_kda_output_gate, (uint32_t)i,
                 projection, projection);
@@ -70769,13 +70809,13 @@ static bool glm53_graph_encode_kda_session_batch(
                     g->layer_kda_recurrent_state[il],
                     q, k, v, raw_gate, raw_beta, output_gate,
                     model->map, model->size,
-                    l->kda_q_conv->abs_offset,
-                    l->kda_k_conv->abs_offset,
-                    l->kda_v_conv->abs_offset,
-                    l->kda_a_log->abs_offset,
-                    l->kda_dt_bias->abs_offset,
+                    off_qc,
+                    off_kc,
+                    off_vc,
+                    off_al,
+                    off_dt,
                     l->kda_o_norm->abs_offset,
-                    DS4_N_KDA_HEAD, 1,
+                    lane.heads, 1,
                     DS4_KDA_GATE_LOWER_BOUND,
                     DS4_RMS_EPS) != 0;
         }
@@ -70787,13 +70827,34 @@ static bool glm53_graph_encode_kda_session_batch(
         ds4_gpu_tensor_free(k);
         ds4_gpu_tensor_free(q);
     }
-    if (ok) ok = glm53_graph_matmul_rows(batch->batch_attn_out,
-                                         model,
-                                         l->kda_output,
-                                         (uint32_t)projection,
-                                         DS4_N_EMBD,
-                                         batch->batch_kda_out,
-                                         rows);
+    if (ok && lane.split) {
+        /* Partial over this rank's head range, summed through the same big gate
+         * the prefill KDA split and the routed FFN already use.  One exchange
+         * for the whole batch, not one per session. */
+        ok = glm_graph_tp_batch_bounce_ready(batch, rows) &&
+             ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+                     batch->tp_bounce_out,
+                     model->map,
+                     model->size,
+                     l->kda_output->abs_offset,
+                     (uint64_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM,
+                     DS4_N_EMBD,
+                     lane.lane_rows,
+                     lane.projection,
+                     batch->batch_kda_out,
+                     rows) != 0;
+        if (ok) ok = glm_graph_tp_batch_ffn_combine(batch, il,
+                                                    batch->batch_attn_out,
+                                                    rows);
+    } else if (ok) {
+        ok = glm53_graph_matmul_rows(batch->batch_attn_out,
+                                     model,
+                                     l->kda_output,
+                                     (uint32_t)projection,
+                                     DS4_N_EMBD,
+                                     batch->batch_kda_out,
+                                     rows);
+    }
     return ok;
 }
 
@@ -71306,19 +71367,6 @@ static bool ds4_sessions_eval_batch_metal_supported(
     if (!items || count < 2 || !e || e->backend != DS4_BACKEND_METAL ||
         e->support_kind != DS4_SUPPORT_NONE ||
         (e->tp.active && tp_batch && strcmp(tp_batch, "0") == 0) ||
-        /* glm53_graph_encode_kda_session_batch() is not lane-aware: it runs all
-         * DS4_N_KDA_HEAD heads with unoffset weights and hands 64 to
-         * ds4_gpu_glm53_kda_decode.  The conv ring's q/k/v sub-block bases are
-         * HISTORY * (n_heads * head_dim) apart, so a session whose prefill and
-         * single-token decode wrote layer_kda_conv_state[] at 32 heads has that
-         * ring silently re-partitioned and rewritten at 64 the first time it is
-         * batched -- full-width allocation means it corrupts rather than
-         * faults.  Serialize into the lane-aware per-session path until the
-         * batch encoder takes a glm53_kda_lane.  Both predicates are env plus
-         * compiled shape, so the two ranks always agree and the pair stays
-         * symmetric. */
-        (e->tp.active && glm53_tp_kda_split_requested() &&
-         glm53_tp_kda_split_shape_ok()) ||
         getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL ||
         getenv("DS4_METAL_DECODE_STAGE_PROFILE") != NULL) {
         return false;
