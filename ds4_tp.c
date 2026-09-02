@@ -1445,6 +1445,18 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
     const bool direct =
         out_lo >= slab_lo && out_lo <= slab_hi && bytes <= slab_hi - out_lo &&
         in_lo >= slab_lo && in_lo <= slab_hi && bytes <= slab_hi - in_lo;
+    {
+        /* Say which path this is, once.  `direct` versus staged is a 2x-volume
+         * difference in CPU copies and is otherwise invisible from outside. */
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "ds4-tp: bulk gate path is %s (%.1f MiB payload)\n",
+                    direct ? "DIRECT, no staging" : "STAGED through the slab",
+                    (double)bytes / 1048576.0);
+        }
+    }
     uint8_t *stage_send = tp->slab + tp->batch_out_off;
     uint8_t *stage_recv = tp->slab + tp->batch_in_off;
     uint64_t off = 0;

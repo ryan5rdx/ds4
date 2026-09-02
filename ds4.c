@@ -46213,6 +46213,15 @@ static bool glm_graph_tp_batch_bounce_ready(ds4_glm_gpu_graph *g,
      * the kind of regression that hides in a throughput number. */
     if (g->tp_slab_bounce_out && g->tp_slab_bounce_in &&
         ds4_gpu_tensor_bytes(g->tp_slab_bounce_out) >= bytes) {
+        /* Release any private pair first.  A large chunk followed by a smaller
+         * tail comes back here, and simply reassigning would leak the private
+         * buffers AND leave tp_bounce_owned set over a slab alias -- so teardown
+         * would free a view the engine still owns. */
+        if (g->tp_bounce_owned) {
+            ds4_gpu_tensor_free(g->tp_bounce_out);
+            ds4_gpu_tensor_free(g->tp_bounce_in);
+            g->tp_bounce_owned = false;
+        }
         g->tp_bounce_out = g->tp_slab_bounce_out;
         g->tp_bounce_in = g->tp_slab_bounce_in;
         return true;
@@ -46221,9 +46230,14 @@ static bool glm_graph_tp_batch_bounce_ready(ds4_glm_gpu_graph *g,
         static int warned;
         if (!warned) {
             warned = 1;
+            /* Reachable: DS4_GLM53_PREFILL_CHUNK accepts up to 8192 while the
+             * slab reserves DS4_TP_PREFILL_BOUNCE_ROWS = 4096.  Reserving for
+             * the env maximum would cost 256 MiB of slab for a non-default
+             * setting, so the staged path stays -- but it says so. */
             fprintf(stderr,
                     "ds4: prefill bounce %llu B exceeds the registered slab "
-                    "region %llu B; falling back to staged copies\n",
+                    "region %llu B; falling back to staged copies (set "
+                    "DS4_GLM53_PREFILL_CHUNK <= 4096 to keep the direct path)\n",
                     (unsigned long long)bytes,
                     (unsigned long long)ds4_gpu_tensor_bytes(g->tp_slab_bounce_out));
         }
@@ -66439,6 +66453,22 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     if (!e->tp.prefill_bounce_out || !e->tp.prefill_bounce_in) {
         snprintf(err, errlen, "tp: prefill bounce view creation failed");
         goto tp_bind_fail;
+    }
+    /* State the split configuration positively at bring-up.  split_flags is
+     * only visible when the hello REJECTS a pair, so a matched-but-unintended
+     * configuration -- both ranks accidentally on `both`, say -- was silent. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        const char *modes[] = { "off", "decode", "both" };
+        fprintf(stderr,
+                "ds4: GLM TP splits, rank %d: kda=%s shared=%s dense_ffn=%s "
+                "vocab=%s (split_flags 0x%x)\n",
+                ds4_tp_rank(tp),
+                modes[(int)glm53_tp_kda_split_mode()],
+                glm53_tp_shared_split_requested() ? "on" : "off",
+                glm53_tp_dense_ffn_split_requested() ? "on" : "off",
+                e->tp.vocab_split && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA
+                    ? "on" : "off",
+                ds4_engine_tp_split_flags(e));
     }
     if (!ds4_gpu_tp_init((uint32_t)ds4_tp_rank(tp),
                          e->tp.slab, ds4_tp_slab_gpu_flags_offset(tp),

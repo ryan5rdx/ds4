@@ -183,6 +183,11 @@ static int run_kslice_rows(void) {
     int ok = ds4_gpu_set_model_map(kmodel, (uint64_t)kbytes + 4096) != 0;
     const uint32_t counts[] = { 1u, 8u, 9u, 32u, 128u };
     int failures = 0;
+    /* Correctness alone cannot see a silent fallback -- both kernels give the
+     * right answer, one just re-reads the weight per row. Assert the dispatch
+     * actually crossed to the tiled path, or this test would keep passing while
+     * the optimisation it guards quietly stopped happening. */
+    const uint64_t tiled_before = ds4_gpu_kslice_tiled_count();
 
     for (size_t ci = 0; ok && ci < sizeof(counts) / sizeof(counts[0]); ci++) {
         const uint32_t R = counts[ci];
@@ -248,6 +253,15 @@ static int run_kslice_rows(void) {
     }
     free(kmodel);
     if (!ok) return 0;
+    /* rows 32 and 128 are above the mv/mm threshold with k_cnt = 256, which is
+     * not a multiple of 128, so the generic rule sends them to the tiled path. */
+    const uint64_t tiled = ds4_gpu_kslice_tiled_count() - tiled_before;
+    if (tiled == 0) {
+        fprintf(stderr,
+                "  kslice: no tiled dispatch happened -- every row count fell "
+                "back to the matvec\n");
+        failures++;
+    }
     return failures == 0;
 }
 

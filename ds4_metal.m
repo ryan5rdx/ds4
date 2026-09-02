@@ -25975,6 +25975,12 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
     }
 }
 
+static uint64_t g_kslice_tiled_count;
+static uint64_t g_kslice_matvec_count;
+
+uint64_t ds4_gpu_kslice_tiled_count(void) { return g_kslice_tiled_count; }
+uint64_t ds4_gpu_kslice_matvec_count(void) { return g_kslice_matvec_count; }
+
 /* The staged mm kernel is far faster once there are enough rows to fill a
  * tile, but it only accepts the 64/32-aligned extents that tiling assumes.
  * It is the fast path; the single-row and ragged shapes the cross-device and
@@ -26005,7 +26011,15 @@ static int ds4_gpu_matmul_q8_0_kslice_rows_mpp(
     @autoreleasepool {
         const uint64_t row_bytes = (full_in_dim / 32u) * 34u;
         const uint64_t weight_bytes = out_dim * row_bytes;
-        const uint64_t x_bytes = n_rows * full_in_dim * sizeof(float);
+        /* The activation is COMPACT at k_cnt -- this rank's slice packed at its
+         * own base -- not a window into a full-width row.  Validating and
+         * striding at full_in_dim was doubly wrong: the size check passes
+         * whenever the caller's buffer happens to be allocated at full width
+         * (the KDA case allocates the unsplit projection and packs half of it),
+         * and then the kernel strides across the wrong rows and reads garbage.
+         * Silent, and only on M5 -- M2 Ultra disables MPP, so the rig never saw
+         * it. Matches the matvec and tiled paths below. */
+        const uint64_t x_bytes = n_rows * k_cnt * sizeof(float);
         const uint64_t out_bytes = n_rows * out_dim * sizeof(float);
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
@@ -26042,8 +26056,8 @@ static int ds4_gpu_matmul_q8_0_kslice_rows_mpp(
         args.nb01 = row_bytes;
         args.nb02 = row_bytes * out_dim;
         args.nb03 = row_bytes * out_dim;
-        args.nb11 = full_in_dim * sizeof(float);
-        args.nb12 = n_rows * full_in_dim * sizeof(float);
+        args.nb11 = k_cnt * sizeof(float);
+        args.nb12 = n_rows * k_cnt * sizeof(float);
         args.nb13 = args.nb12;
 
         int owned = 0;
@@ -26056,8 +26070,7 @@ static int ds4_gpu_matmul_q8_0_kslice_rows_mpp(
                 offset:(NSUInteger)(inner_offset + (k_off / 32u) * 34u)
                atIndex:1];
         [enc setBuffer:xbuf
-                offset:(NSUInteger)(ds4_gpu_tensor_offset(x) +
-                                    k_off * sizeof(float))
+                offset:(NSUInteger)ds4_gpu_tensor_offset(x)
                atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
         [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t)
@@ -26175,6 +26188,18 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
                                     ((NSUInteger)out_dim + 63u) / 64u, 1)
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
                 ds4_gpu_end_compute_encoder(cb, enc);
+                g_kslice_tiled_count++;
+                {
+                    static int announced;
+                    if (!announced) {
+                        announced = 1;
+                        fprintf(stderr,
+                                "ds4: Q8_0 k-slice using the tiled kernel "
+                                "(k_cnt %llu, %llu rows)\n",
+                                (unsigned long long)k_cnt,
+                                (unsigned long long)n_rows);
+                    }
+                }
                 return ds4_gpu_finish_command_buffer(
                         cb, mm_owned, "Q8_0 k-slice tiled matmul");
             }
@@ -26217,6 +26242,7 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
              threadsPerThreadgroup:
                 MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
+        g_kslice_matvec_count++;
         return ds4_gpu_finish_command_buffer(
                 cb, owned, "Q8_0 k-slice row matvec");
     }

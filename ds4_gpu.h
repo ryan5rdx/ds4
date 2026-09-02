@@ -411,6 +411,12 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
         uint64_t                x_elem_off);
 /* CUDA multi-row variant. Each input row contains only the owned contiguous
  * K slice, while each output row spans the full projection width. */
+/* Which path the last k-slice dispatches took.  Exposed because a silent
+ * fallback to the matvec is a performance regression that no correctness test
+ * can see -- both paths give the right answer. */
+uint64_t ds4_gpu_kslice_tiled_count(void);
+uint64_t ds4_gpu_kslice_matvec_count(void);
+
 int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
