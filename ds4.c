@@ -77108,7 +77108,25 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     bool glm53_state_ok = true;
     if (ds4_session_is_glm(s) && s->glm_graph.glm53 &&
         pos < s->checkpoint.len) {
-        glm53_state_ok = ds4_session_glm_mtp_rewind(s, pos);
+        (void)ds4_session_glm_mtp_rewind(s, pos);
+        /* The KDA layers hold a running recurrence, not a per-token cache, so
+         * unlike the compressed KV there is nothing here to truncate: the state
+         * reflects every token up to the OLD checkpoint, and whatever it held
+         * at `pos` was overwritten in place long ago.  Moving the checkpoint
+         * back while leaving it alone is the worst of both -- the next sync
+         * sees a valid shorter checkpoint, resumes at `pos`, and feeds the
+         * recurrence tokens it has already consumed.
+         *
+         * There is no cheap way back, so drop the checkpoint and let
+         * ds4_session_sync() take its reset branch, which zeroes the KDA state
+         * and re-prefills from scratch.  That is the same recovery this
+         * function already performs when the compressor state cannot be
+         * rewound, and it makes GLM rewind correct at the cost of the reuse it
+         * was trying to buy.  Restoring instead of re-prefilling needs a state
+         * snapshot; worth adding only if rewind turns out to be hot, since the
+         * ordinary multi-turn append never reaches here (ds4_session_sync
+         * resumes from the common prefix without rewinding). */
+        glm53_state_ok = false;
     }
 #endif
     if (ds4_session_tp_leader(s) &&
