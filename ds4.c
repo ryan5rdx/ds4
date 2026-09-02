@@ -42457,6 +42457,13 @@ typedef struct ds4_glm_gpu_graph {
     bool ssd_streaming_cold;
     bool generic_routed_moe;
     bool glm53;
+    /* The ENGINE's decision on the vocab split, not the env.  The graph must
+     * not re-derive it: ds4_engine_tp_bind refuses the split under --mtp,
+     * because the MTP cycle argmaxes the full vocabulary without merging the
+     * halves.  A graph that read the env directly would keep splitting the head
+     * while the merge stayed off -- half-written logits on every token, which is
+     * worse than not mitigating at all. */
+    bool tp_vocab_split;
     /* One bit per layer whose KDA state a split decode advanced, so that layer
      * is fresh only over this rank's head range.  A replicated prefill needs
      * the whole thing, so it exchanges halves with the peer and clears the bit.
@@ -45813,7 +45820,7 @@ static bool glm_graph_encode_output_head_from(
      * unlike the FFN and attention splits this one changes no arithmetic. */
     const bool vocab_split =
         g->tp_world == 2 && (DS4_N_VOCAB % 2u) == 0u &&
-        glm53_tp_vocab_split_requested();
+        g->tp_vocab_split;
     if (!vocab_split) {
         return glm53_graph_matmul(g->logits,
                                   model,
@@ -66736,6 +66743,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         if (e->tp.active) {
             s->glm_graph.tp_world = 2;
             s->glm_graph.tp_rank = (uint32_t)e->tp.rank;
+            s->glm_graph.tp_vocab_split = e->tp.vocab_split;
             s->glm_graph.tp_out = e->tp.out_views;
             s->glm_graph.tp_in = e->tp.in_views;
         }
