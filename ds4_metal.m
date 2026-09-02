@@ -26119,6 +26119,67 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
                 model_map, model_size, weight_offset, weight_bytes, &inner);
         if (!wbuf) return 0;
 
+        /* Multi-row k-slices take the tiled kernel, not the matvec below.
+         *
+         * The matvec re-reads the weight for every row, so at a prefill chunk it
+         * turns a 17.8 MB weight into ~36 GB of traffic per layer -- which is
+         * what made the S6b prefill split lose: it compared a full-width TILED
+         * GEMM against a half-width MATVEC, and the lost cross-row weight reuse
+         * swamped the halved arithmetic.
+         *
+         * A k-slice is expressible in the tiled kernel's own arguments with no
+         * new shader: walk only k_cnt (ne00), keep the FULL row stride so output
+         * rows are still addressed in the whole matrix (nb01), start each row at
+         * k_off, and read the activation compactly because it is already sliced
+         * (nb11 = k_cnt). k_off is 32-aligned by the caller's check above, so the
+         * byte offset lands on a Q8_0 block boundary. */
+        /* Mirror the generic Q8_0 path's kernel choice exactly, contraction
+         * width and all: it takes the extended matvec while
+         * n_tok <= DS4_METAL_Q8_MV_EXT_MAX_TOKENS (default 16, not 8) AND the
+         * contraction is a multiple of 128, otherwise the tiled kernel.
+         * Diverging from it would make the split and unsplit paths pick
+         * different kernels for the same shape, and the mv/mm precision fork is
+         * ~1.5e-04 -- two orders above the reduction band -- so that shows up as
+         * a correctness signal that is really a kernel-selection artefact.
+         * Note the width that matters here is k_cnt, this rank's slice. */
+        const uint64_t mv_ext_max = ds4_gpu_env_u64(
+                "DS4_METAL_Q8_MV_EXT_MAX_TOKENS", 16u, 2u, 128u);
+        const bool generic_would_use_mv =
+                n_rows <= mv_ext_max && (k_cnt % 128u) == 0;
+        if (!generic_would_use_mv && n_rows > 1) {
+            const uint64_t k_off_bytes = (k_off / 32u) * 34u;
+            const bool bc_inp = (k_cnt % 32u) != 0;
+            const bool bc_out = (out_dim % 64u) != 0 || (n_rows % 32u) != 0;
+            id<MTLComputePipelineState> mm =
+                ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_q8_0_f32",
+                                            bc_inp, bc_out);
+            if (mm) {
+                ds4_gpu_mul_mm_args margs =
+                    ds4_gpu_make_mm_args(k_cnt, out_dim, n_rows, row_bytes);
+                /* make_mm_args derives the activation strides from its in_dim,
+                 * which is already k_cnt here, so nb1x are correct as built. */
+                int mm_owned = 0;
+                id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&mm_owned);
+                if (!cb) return 0;
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:mm];
+                [enc setBytes:&margs length:sizeof(margs) atIndex:0];
+                [enc setBuffer:wbuf
+                        offset:(NSUInteger)(inner + k_off_bytes) atIndex:1];
+                [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+                [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+                [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u)
+                                         atIndex:0];
+                [DS4_DISP(enc) dispatchThreadgroups:
+                        MTLSizeMake(((NSUInteger)n_rows + 31u) / 32u,
+                                    ((NSUInteger)out_dim + 63u) / 64u, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                return ds4_gpu_finish_command_buffer(
+                        cb, mm_owned, "Q8_0 k-slice tiled matmul");
+            }
+        }
+
         ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch();
         if (out_dim > 65536u) dispatch.nsg = 8;
         ds4_gpu_q8_0_matvec_args args =
