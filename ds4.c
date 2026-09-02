@@ -44957,6 +44957,70 @@ static bool glm_graph_weights_are_q8_0(
            glm_graph_weight_type_for_offset(model, offset_b) == DS4_TENSOR_Q8_0;
 }
 
+/* Output-row slice of a dense-quant weight.  Rows are contiguous and each is
+ * in_dim wide, so owning a contiguous block of them is pure offset math -- the
+ * same decomposition tp_split_shared uses for the shared expert.  Returns the
+ * byte offset of row `skip_rows`. */
+static bool glm53_graph_weight_row_offset(const ds4_tensor *weight,
+                                          uint64_t          in_dim,
+                                          uint32_t          skip_rows,
+                                          uint64_t         *out_offset) {
+    if (!weight || !out_offset) return false;
+    *out_offset = weight->abs_offset;
+    if (skip_rows == 0) return true;
+    uint64_t row_bytes = 0;
+    if (!metal_graph_dense_quant_row_bytes(weight, in_dim, &row_bytes)) {
+        return false;
+    }
+    *out_offset += (uint64_t)skip_rows * row_bytes;
+    return true;
+}
+
+static bool glm53_graph_matmul_at(
+        ds4_gpu_tensor       *out,
+        const ds4_model      *model,
+        const ds4_tensor     *weight,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x) {
+    if (!out || !model || !weight || !x ||
+        !tensor_type_is_glm_dense_quant(weight->type)) {
+        return false;
+    }
+    if (weight->type == DS4_TENSOR_BF16) {
+        return ds4_gpu_glm53_matmul_bf16(out, model->map, model->size,
+                                         weight_offset, in_dim, out_dim,
+                                         x, 1) != 0;
+    }
+    return ds4_gpu_matmul_quant_tensor(out, model->map, model->size,
+                                       weight_offset, weight->type,
+                                       in_dim, out_dim, x, 1) != 0;
+}
+
+static bool glm53_graph_matmul_rows_at(
+        ds4_gpu_tensor       *out,
+        const ds4_model      *model,
+        const ds4_tensor     *weight,
+        uint64_t              weight_offset,
+        uint32_t              in_dim,
+        uint32_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!out || !model || !weight || !x || n_rows == 0 ||
+        !tensor_type_is_glm_dense_quant(weight->type)) {
+        return false;
+    }
+    if (weight->type == DS4_TENSOR_BF16) {
+        return ds4_gpu_glm53_matmul_bf16(out, model->map, model->size,
+                                         weight_offset, in_dim, out_dim,
+                                         x, n_rows) != 0;
+    }
+    return ds4_gpu_matmul_quant_tensor(out, model->map, model->size,
+                                       weight_offset, weight->type,
+                                       in_dim, out_dim, x, n_rows) != 0;
+}
+
 static bool glm53_graph_matmul(
         ds4_gpu_tensor       *out,
         const ds4_model      *model,
@@ -45251,6 +45315,59 @@ static bool glm53_graph_hc_pre(
     return ok;
 }
 
+/* Tensor-parallel head lane for the KDA layers.
+ *
+ * The recurrence is exactly head-independent: metal/glm53_kda.metal gives one
+ * threadgroup per (row, head), every reduction is inside a head, and the state
+ * is indexed [head][value][key].  Everything the kernels touch is sized by
+ * n_heads, so handing a rank its own head count, offsetting the per-head
+ * weights to its range, and letting its activations stay compact at the buffer
+ * base makes the whole path self-consistent with no kernel change at all.
+ *
+ * The one cross-rank step is kda_output, which contracts over the full
+ * projection.  Each rank k-slices its half and the partials are summed through
+ * the ATTN gate slot -- which the schedule leaves idle on KDA layers today, so
+ * this costs no slab space and no new frame.
+ *
+ * The state stays allocated at full width.  A rank only ever indexes its first
+ * `heads` entries, and the unused tail is 2 MiB/layer that buys no measurable
+ * time back (the state read is occupancy-capped: 64 threadgroups on 60 cores,
+ * so halving it removes bytes but not latency).  Sizing it per rank would tie
+ * graph allocation to a TP field that is not set yet at that point, for
+ * nothing.
+ *
+ * A one-sided DS4_GLM_TP_KDA_SPLIT cannot corrupt output: the split changes the
+ * gate schedule, and the TP hello compares gate_slot_mask for equality and
+ * refuses the pair at bring-up.  Default off pending rig arm S6. */
+typedef struct {
+    bool     split;
+    uint32_t heads;       /* heads this rank owns */
+    uint32_t projection;  /* heads * DS4_N_KDA_HEAD_DIM */
+    uint32_t lane_rows;   /* first owned projection row */
+} glm53_kda_lane;
+
+static int glm53_tp_kda_split_requested(void) {
+    const char *env = getenv("DS4_GLM_TP_KDA_SPLIT");
+    return env && env[0] && env[0] != '0';
+}
+
+static bool glm53_tp_kda_split_shape_ok(void) {
+    return DS4_N_KDA_HEAD >= 2u && (DS4_N_KDA_HEAD % 2u) == 0u;
+}
+
+static glm53_kda_lane glm53_kda_lane_for(const ds4_glm_gpu_graph *g) {
+    glm53_kda_lane lane;
+    lane.split = g && g->tp_world == 2 && g->tp_out && g->tp_in &&
+                 glm53_tp_kda_split_requested() &&
+                 glm53_tp_kda_split_shape_ok();
+    lane.heads = lane.split ? (uint32_t)DS4_N_KDA_HEAD / 2u
+                            : (uint32_t)DS4_N_KDA_HEAD;
+    lane.projection = lane.heads * (uint32_t)DS4_N_KDA_HEAD_DIM;
+    lane.lane_rows = lane.split
+        ? (uint32_t)g->tp_rank * lane.projection : 0u;
+    return lane;
+}
+
 static bool glm53_graph_kda_attention(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -45261,11 +45378,35 @@ static bool glm53_graph_kda_attention(
         !g->layer_kda_recurrent_state[il]) {
         return false;
     }
-    const uint32_t projection = DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
+    const glm53_kda_lane lane = glm53_kda_lane_for(g);
+    const uint32_t projection = lane.projection;
+    /* Per-head weights shift to this rank's head range; kda_f_a / kda_g_a are
+     * head-shared low-rank stages and kda_o_norm is indexed by channel within a
+     * head, so all three stay whole. */
+    uint64_t off_q = 0, off_k = 0, off_v = 0, off_fb = 0, off_gb = 0, off_beta = 0;
+    if (!glm53_graph_weight_row_offset(l->kda_q, DS4_N_EMBD, lane.lane_rows, &off_q) ||
+        !glm53_graph_weight_row_offset(l->kda_k, DS4_N_EMBD, lane.lane_rows, &off_k) ||
+        !glm53_graph_weight_row_offset(l->kda_v, DS4_N_EMBD, lane.lane_rows, &off_v) ||
+        !glm53_graph_weight_row_offset(l->kda_f_b, DS4_N_KDA_HEAD_DIM, lane.lane_rows, &off_fb) ||
+        !glm53_graph_weight_row_offset(l->kda_g_b, DS4_N_KDA_HEAD_DIM, lane.lane_rows, &off_gb) ||
+        !glm53_graph_weight_row_offset(l->kda_beta, DS4_N_EMBD,
+                                       lane.lane_rows / DS4_N_KDA_HEAD_DIM, &off_beta)) {
+        return false;
+    }
+    /* F32 side tensors: conv is channel-major with DS4_N_KDA_CONV taps each,
+     * dt_bias is one float per channel, a_log one per head. */
+    const uint64_t f32_chan = (uint64_t)lane.lane_rows * sizeof(float);
+    const uint64_t off_qc = l->kda_q_conv->abs_offset + f32_chan * DS4_N_KDA_CONV;
+    const uint64_t off_kc = l->kda_k_conv->abs_offset + f32_chan * DS4_N_KDA_CONV;
+    const uint64_t off_vc = l->kda_v_conv->abs_offset + f32_chan * DS4_N_KDA_CONV;
+    const uint64_t off_dt = l->kda_dt_bias->abs_offset + f32_chan;
+    const uint64_t off_al = l->kda_a_log->abs_offset +
+        (uint64_t)(lane.lane_rows / DS4_N_KDA_HEAD_DIM) * sizeof(float);
     bool qk_paired = false;
 #if defined(__APPLE__)
     bool qkv_paired = false;
-    if (getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == NULL &&
+    if (!lane.split &&
+        getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == NULL &&
         getenv("DS4_METAL_DISABLE_GLM53_BF16_QKV") == NULL &&
         l->kda_q->type == DS4_TENSOR_BF16 &&
         l->kda_k->type == DS4_TENSOR_BF16 &&
@@ -45287,7 +45428,8 @@ static bool glm53_graph_kda_attention(
     const bool qkv_paired = false;
 #endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
-    if (l->kda_q->type == DS4_TENSOR_Q4_K &&
+    if (!lane.split &&
+        l->kda_q->type == DS4_TENSOR_Q4_K &&
         l->kda_k->type == DS4_TENSOR_Q4_K &&
         getenv("DS4_CUDA_GLM_DISABLE_KDA_QK_PAIR") == NULL) {
         qk_paired = ds4_gpu_matmul_q4_K_pair_decode_tensor(
@@ -45303,30 +45445,30 @@ static bool glm53_graph_kda_attention(
     }
 #endif
     bool ok = qkv_paired || qk_paired ||
-        glm53_graph_matmul(g->kda_q, model, l->kda_q,
+        glm53_graph_matmul_at(g->kda_q, model, l->kda_q, off_q,
                            DS4_N_EMBD, projection, g->attn_norm);
     if (ok && !qkv_paired && !qk_paired) {
-        ok = glm53_graph_matmul(g->kda_k, model, l->kda_k,
+        ok = glm53_graph_matmul_at(g->kda_k, model, l->kda_k, off_k,
                                 DS4_N_EMBD, projection, g->attn_norm);
     }
     if (ok && !qkv_paired) {
-        ok = glm53_graph_matmul(g->kda_v, model, l->kda_v,
+        ok = glm53_graph_matmul_at(g->kda_v, model, l->kda_v, off_v,
                                 DS4_N_EMBD, projection, g->attn_norm);
     }
     if (ok) ok = glm53_graph_matmul(
             g->kda_lowrank, model, l->kda_f_a,
             DS4_N_EMBD, DS4_N_KDA_HEAD_DIM, g->attn_norm);
-    if (ok) ok = glm53_graph_matmul(
-            g->kda_raw_gate, model, l->kda_f_b,
+    if (ok) ok = glm53_graph_matmul_at(
+            g->kda_raw_gate, model, l->kda_f_b, off_fb,
             DS4_N_KDA_HEAD_DIM, projection, g->kda_lowrank);
-    if (ok) ok = glm53_graph_matmul(
-            g->kda_raw_beta, model, l->kda_beta,
-            DS4_N_EMBD, DS4_N_KDA_HEAD, g->attn_norm);
+    if (ok) ok = glm53_graph_matmul_at(
+            g->kda_raw_beta, model, l->kda_beta, off_beta,
+            DS4_N_EMBD, lane.heads, g->attn_norm);
     if (ok) ok = glm53_graph_matmul(
             g->kda_lowrank, model, l->kda_g_a,
             DS4_N_EMBD, DS4_N_KDA_HEAD_DIM, g->attn_norm);
-    if (ok) ok = glm53_graph_matmul(
-            g->kda_output_gate, model, l->kda_g_b,
+    if (ok) ok = glm53_graph_matmul_at(
+            g->kda_output_gate, model, l->kda_g_b, off_gb,
             DS4_N_KDA_HEAD_DIM, projection, g->kda_lowrank);
     if (ok) ok = ds4_gpu_glm53_kda_decode(
             g->kda_out,
@@ -45340,16 +45482,45 @@ static bool glm53_graph_kda_attention(
             g->kda_output_gate,
             model->map,
             model->size,
-            l->kda_q_conv->abs_offset,
-            l->kda_k_conv->abs_offset,
-            l->kda_v_conv->abs_offset,
-            l->kda_a_log->abs_offset,
-            l->kda_dt_bias->abs_offset,
+            off_qc,
+            off_kc,
+            off_vc,
+            off_al,
+            off_dt,
             l->kda_o_norm->abs_offset,
-            DS4_N_KDA_HEAD,
+            lane.heads,
             1,
             DS4_KDA_GATE_LOWER_BOUND,
             DS4_RMS_EPS) != 0;
+    if (ok && lane.split) {
+        /* Each rank contracts only its own head range, so the result is a
+         * partial sum; the gate adds the two.  x_elem_off is 0 because this
+         * rank's kda_out is compact at the buffer base -- it is the weight rows
+         * that are offset, not the activation. */
+        const uint32_t attn_slot =
+            il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN;
+        ok = metal_graph_matmul_dense_quant_kslice(g->tp_out[attn_slot],
+                                                   model,
+                                                   l->kda_output,
+                                                   (uint64_t)DS4_N_KDA_HEAD *
+                                                       DS4_N_KDA_HEAD_DIM,
+                                                   lane.lane_rows,
+                                                   lane.projection,
+                                                   DS4_N_EMBD,
+                                                   g->kda_out,
+                                                   0);
+        if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_ATTN) != 0;
+        if (ok) ok = ds4_gpu_add_tensor(g->attn_out,
+                                        g->tp_out[attn_slot],
+                                        g->tp_in[attn_slot],
+                                        DS4_N_EMBD) != 0;
+        if (!ok) {
+            fprintf(stderr,
+                    "ds4: GLM KDA head-split gate/combine failed (layer %u)\n",
+                    il);
+        }
+        return ok;
+    }
     if (ok) ok = glm53_graph_matmul(g->attn_out,
                                          model,
                                          l->kda_output,
