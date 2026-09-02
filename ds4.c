@@ -13056,6 +13056,24 @@ static uint32_t glm53_tp_exact_prefill_max(void) {
  * and friends are family-agnostic).  M3 measured that frame at 0.41 ms exposed
  * against 337 MB saved, so the net is about -0.34 ms -- the smallest item in
  * the plan, and the one that touches the most integration surface. */
+/* S8 -- split the replicated shared expert at PREFILL by token rows.
+ *
+ * Ported from the DeepSeek path (tp_row_split_ffn), which already does exactly
+ * this: "Each shared-expert row must appear exactly once in the all-reduce.
+ * Fold this rank's shared rows into its full-row routed partial; the peer does
+ * the same for the complementary rows."
+ *
+ * Rows, not the hidden dimension.  That is what makes it cheap: the shared
+ * expert runs unmodified on half the rows, so there is no sliced-intermediate
+ * kernel the way S2 needed at decode, and it rides the FFN bulk exchange that
+ * already fires so there is no new gate.  Correctness is a partition argument
+ * rather than a reduction split -- each row is computed exactly once -- so
+ * unlike S2/S4 there is no last-bit band to expect. */
+static int glm53_tp_prefill_shared_split_requested(void) {
+    const char *env = getenv("DS4_GLM_TP_PREFILL_SHARED_SPLIT");
+    return env && env[0] && env[0] != '0';
+}
+
 static int glm53_tp_vocab_split_requested(void) {
     const char *env = getenv("DS4_GLM_TP_VOCAB_SPLIT");
     return env && env[0] && env[0] != '0';
@@ -48448,6 +48466,52 @@ static bool glm_graph_disable_add3_residual(void) {
     return false;
 }
 
+/* The shared expert over a contiguous row range, writing into a matching range
+ * of `out`.  Same two primitives the whole-tensor path uses; only the extents
+ * move. */
+static bool glm_graph_encode_shared_rows_into(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *l,
+        uint32_t                 row0,
+        uint32_t                 rows,
+        ds4_gpu_tensor          *out) {
+    if (!g || !model || !l || !out || rows == 0) return false;
+    const uint64_t span = (uint64_t)rows * DS4_N_EMBD;
+    ds4_gpu_tensor *in_v =
+        glm_graph_tensor_row_view_strided(g->batch_ffn_norm, row0,
+                                          DS4_N_EMBD, span);
+    ds4_gpu_tensor *out_v =
+        glm_graph_tensor_row_view_strided(out, row0, DS4_N_EMBD, span);
+    bool ok = in_v && out_v;
+    if (ok && !glm_graph_shared_gate_up_swiglu_q8_0_tensor(
+                  g->batch_ffn_gate, g->batch_ffn_up, g->batch_shared_mid,
+                  model, l->ffn_gate_shexp->abs_offset,
+                  l->ffn_up_shexp->abs_offset, DS4_N_EMBD, DS4_N_FF_EXP,
+                  in_v, rows,
+                  g->glm53 ? DS4_SWIGLU_CLAMP_EXP : 0.0f)) {
+        /* The fused form is optional; fall back to gate/up then swiglu. */
+        ok = glm_graph_matmul_q8_0_tensor(g->batch_ffn_gate, model,
+                                          l->ffn_gate_shexp->abs_offset,
+                                          DS4_N_EMBD, DS4_N_FF_EXP, in_v, rows) &&
+             glm_graph_matmul_q8_0_tensor(g->batch_ffn_up, model,
+                                          l->ffn_up_shexp->abs_offset,
+                                          DS4_N_EMBD, DS4_N_FF_EXP, in_v, rows) &&
+             ds4_gpu_swiglu_tensor(g->batch_shared_mid, g->batch_ffn_gate,
+                                   g->batch_ffn_up,
+                                   (uint32_t)((uint64_t)rows * DS4_N_FF_EXP),
+                                   g->glm53 ? DS4_SWIGLU_CLAMP_EXP : 0.0f,
+                                   1.0f) != 0;
+    }
+    if (ok) ok = glm_graph_matmul_q8_0_tensor(out_v, model,
+                                              l->ffn_down_shexp->abs_offset,
+                                              DS4_N_FF_EXP, DS4_N_EMBD,
+                                              g->batch_shared_mid, rows);
+    ds4_gpu_tensor_free(out_v);
+    ds4_gpu_tensor_free(in_v);
+    return ok;
+}
+
 static bool glm_graph_encode_ffn_batch(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -48692,6 +48756,36 @@ static bool glm_graph_encode_ffn_batch(
                                                           pos0,
                                                           n_tokens);
     const bool tp_batch_split_ffn = g->tp_world == 2;
+    /* S8: this rank owns a contiguous half of the rows for the shared expert.
+     * Odd row counts give rank 0 the extra row; both ranks derive the same
+     * split from n_tokens alone, so they partition without communicating. */
+    /* Both halves must land on the same side of the mv/mm threshold
+     * (DS4_METAL_Q8_MV_EXT_MAX_TOKENS, default 16).  A 17/16 split puts one half
+     * on the tiled kernel and the other on the matvec, and the precision fork
+     * between them is ~2.6e-03 -- three orders above the reduction-order noise
+     * this split otherwise produces.  Measured, not assumed: 64/64 and
+     * 1024/1024 come out bit-exact against the unsplit result, 17/16 does not.
+     * Prefill chunks are 2048-4096 so this never binds in practice; it stops a
+     * short final chunk from silently changing kernel class mid-sweep. */
+    const bool shared_row_split =
+        tp_batch_split_ffn && !g->ssd_streaming && n_tokens >= 34u &&
+        glm53_tp_prefill_shared_split_requested();
+    const uint32_t shared_half = shared_row_split ? (n_tokens + 1u) / 2u : 0u;
+    const uint32_t shared_row0 =
+        shared_row_split ? (g->tp_rank ? shared_half : 0u) : 0u;
+    const uint32_t shared_rows = shared_row_split
+        ? (g->tp_rank ? n_tokens - shared_half : shared_half) : 0u;
+    if (shared_row_split) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "ds4: GLM S8 prefill shared-expert row split active: "
+                    "rank %u rows [%u,%u) of %u\n",
+                    (unsigned)g->tp_rank, shared_row0,
+                    shared_row0 + shared_rows, n_tokens);
+        }
+    }
     if (ok && tp_batch_split_ffn) {
         ok = glm_graph_tp_batch_bounce_ready(g, n_tokens);
     }
@@ -48849,7 +48943,33 @@ static bool glm_graph_encode_ffn_batch(
             full_layer_prefill,
             false) != 0;
     if (ok && g->tp_world == 2) {
-        ok = glm_graph_tp_batch_ffn_combine(g, il, g->batch_ffn_out, n_tokens);
+        if (ok && shared_row_split && shared_rows > 0) {
+            /* Compute this rank's shared rows and fold them into its full-row
+             * routed partial, so the one all-reduce below carries both.  Each
+             * row is added by exactly one rank, which is what makes the sum
+             * correct rather than doubled. */
+            ok = glm_graph_encode_shared_rows_into(g, model, l, shared_row0,
+                                                   shared_rows,
+                                                   g->batch_attn_out);
+            if (ok) {
+                const uint64_t span = (uint64_t)shared_rows * DS4_N_EMBD;
+                ds4_gpu_tensor *dst = glm_graph_tensor_row_view_strided(
+                        g->tp_bounce_out, shared_row0, DS4_N_EMBD, span);
+                ds4_gpu_tensor *src = glm_graph_tensor_row_view_strided(
+                        g->batch_attn_out, shared_row0, DS4_N_EMBD, span);
+                ok = dst && src &&
+                     ds4_gpu_add_tensor(dst, dst, src, (uint32_t)span) != 0;
+                ds4_gpu_tensor_free(src);
+                ds4_gpu_tensor_free(dst);
+            }
+            if (ok) shared_done = true;
+            if (!ok) {
+                fprintf(stderr,
+                        "ds4: GLM S8 prefill shared row split failed "
+                        "(layer %u)\n", il);
+            }
+        }
+        ok = ok && glm_graph_tp_batch_ffn_combine(g, il, g->batch_ffn_out, n_tokens);
         if (!ok) fprintf(stderr, "ds4: GLM TP batch gate failed (layer %u)\n", il);
     }
     if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
@@ -48876,7 +48996,14 @@ static bool glm_graph_encode_ffn_batch(
                                       il,
                                       pos0);
     }
-    if (ok && g->glm53) {
+    if (ok && g->glm53 && shared_row_split) {
+        /* The shared contribution is already inside batch_ffn_out -- the gate
+         * exchanged routed plus shared together -- and batch_attn_out holds
+         * only this rank's rows, so adding it would be both a double-count and
+         * a read of the peer's stale half. */
+        ok = ds4_gpu_tensor_copy(next, 0, g->batch_ffn_out, 0,
+                                 residual_elems * sizeof(float)) != 0;
+    } else if (ok && g->glm53) {
         ok = ds4_gpu_add_tensor(next,
                                 g->batch_ffn_out,
                                 g->batch_attn_out,
