@@ -45403,6 +45403,7 @@ static glm53_kda_lane glm53_kda_lane_prefill(const ds4_glm_gpu_graph *g) {
 
 static bool glm_graph_tp_batch_bounce_ready(ds4_glm_gpu_graph *g,
                                             uint32_t n_tokens);
+static void glm_graph_expert_balance_sample(ds4_glm_gpu_graph *g);
 static bool glm_graph_tp_batch_ffn_combine(ds4_glm_gpu_graph *g,
                                            uint32_t           il,
                                            ds4_gpu_tensor    *ffn_out,
@@ -46709,6 +46710,7 @@ static bool glm_graph_encode_sparse_ffn_one(
                                                   DS4_N_EXPERT,
                                                   DS4_N_EXPERT_USED,
                                                   DS4_EXPERT_WEIGHT_SCALE) != 0;
+    if (ok) glm_graph_expert_balance_sample(g);
     if (ok) ok = glm_graph_profile_stage(stage_profile,
                                          "glm_decode_ffn",
                                          "router",
@@ -47408,6 +47410,69 @@ static ds4_gpu_tensor *glm_graph_tensor_row_view_strided(
     return ds4_gpu_tensor_view(base,
                                (uint64_t)row * stride_values * sizeof(float),
                                row_values * sizeof(float));
+}
+
+/* Which rank owns each selected expert, histogrammed.
+ *
+ * M5 measured a 0.74 ms/token routed-expert straggler and the decision rule says
+ * "pursue a co-occurrence-aware permutation".  But a permutation can only
+ * exploit CORRELATION between co-selected experts.  If selection is effectively
+ * independent, the imbalance is pure binomial variance -- E[max(k, 8-k)] = 5.09
+ * against an ideal 4 -- and no reordering of ownership can reduce it at all.
+ *
+ * So the question that decides whether to build an artifact pipeline is whether
+ * the observed split is worse than Binomial(8, 0.5) or matches it.  This counts
+ * it directly.  Diagnostic only: it reads router_selected back per layer, which
+ * serialises the graph.
+ *
+ * DS4_GLM_EXPERT_BALANCE=1 */
+static int glm_graph_expert_balance_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_GLM_EXPERT_BALANCE");
+        cached = env && env[0] && env[0] != '0';
+    }
+    return cached != 0;
+}
+
+static uint64_t g_glm_expert_balance_hist[33];
+static uint64_t g_glm_expert_balance_samples;
+
+static void glm_graph_expert_balance_sample(ds4_glm_gpu_graph *g) {
+    if (!glm_graph_expert_balance_enabled() || !g || !g->router_selected) return;
+    const uint32_t used = (uint32_t)DS4_N_EXPERT_USED;
+    if (used == 0 || used > 32u) return;
+    int32_t sel[32];
+    if (!ds4_gpu_tensor_read(g->router_selected, 0, sel,
+                             (uint64_t)used * sizeof(int32_t))) {
+        return;
+    }
+    const int32_t half = (int32_t)DS4_N_EXPERT / 2;
+    uint32_t lo = 0;
+    for (uint32_t i = 0; i < used; i++) {
+        if (sel[i] >= 0 && sel[i] < half) lo++;
+    }
+    g_glm_expert_balance_hist[lo]++;
+    g_glm_expert_balance_samples++;
+    /* Report periodically; the run may not exit cleanly. */
+    if ((g_glm_expert_balance_samples % 20000u) == 0) {
+        double exp_max = 0.0;
+        uint64_t tot = 0;
+        for (uint32_t k = 0; k <= used; k++) {
+            const uint64_t c = g_glm_expert_balance_hist[k];
+            tot += c;
+            exp_max += (double)c * (double)(k > used - k ? k : used - k);
+        }
+        if (!tot) return;
+        fprintf(stderr, "ds4: GLM expert balance over %llu (layer,token) samples, "
+                        "E[max]=%.3f vs ideal %.1f (binomial would be 5.094): ",
+                (unsigned long long)tot, exp_max / (double)tot, used / 2.0);
+        for (uint32_t k = 0; k <= used; k++) {
+            fprintf(stderr, "%u:%.1f%% ", k,
+                    100.0 * (double)g_glm_expert_balance_hist[k] / (double)tot);
+        }
+        fprintf(stderr, "\n");
+    }
 }
 
 static uint32_t glm_graph_q8_stripe_tokens(void) {
@@ -49552,6 +49617,7 @@ static bool glm_graph_mtp_step(
                                                   DS4_N_EXPERT,
                                                   DS4_N_EXPERT_USED,
                                                   DS4_EXPERT_WEIGHT_SCALE) != 0;
+    if (ok) glm_graph_expert_balance_sample(g);
     DS4_GLM_MTP_STAGE("routed");
     if (ok) {
         uint64_t gate_in = 0, gate_out = 0, gate_row_bytes = 0;
