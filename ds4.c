@@ -869,6 +869,7 @@ static void glm53_layer_tp_gates(uint32_t il,
                                  uint32_t n_nextn,
                                  uint32_t n_leading_dense,
                                  bool kda_split,
+                                 bool dense_ffn_split,
                                  bool *fires_attn,
                                  bool *fires_ffn) {
     const bool normal = il + n_nextn < n_layer;
@@ -876,8 +877,10 @@ static void glm53_layer_tp_gates(uint32_t il,
     /* DSA layers always exchange their attention output; KDA layers compute the
      * whole recurrence locally and exchange nothing unless the heads are split. */
     if (fires_attn) *fires_attn = normal && (!kda || kda_split);
-    /* Only the routed sparse FFNs exchange a partial. */
-    if (fires_ffn) *fires_ffn = normal && il >= n_leading_dense;
+    /* The routed sparse FFNs always exchange a partial; the three leading dense
+     * FFNs do so only when S4 splits them. */
+    if (fires_ffn)
+        *fires_ffn = normal && (il >= n_leading_dense || dense_ffn_split);
 }
 
 static int g_ds4_lock_fd = -1;
@@ -13010,6 +13013,20 @@ static int glm53_tp_shared_split_requested(void) {
 
 static bool glm53_tp_shared_split_shape_ok(void) {
     return DS4_N_FF_EXP >= 2u && (DS4_N_FF_EXP % 64u) == 0u;
+}
+
+/* S4 -- split the three leading dense FFNs.
+ *
+ * Layers 0..2 have a dense FFN that is fully replicated, and they fire no FFN
+ * gate today. Splitting the SwiGLU intermediate the same way S2 does gives each
+ * rank a partial over n_embd, but unlike S2 there is no existing exchange to
+ * fold into, so this one costs three new gates. At 241 MB over 3 gates that is
+ * ~80 MB/gate against the 11.5 MB/rank/token break-even, so it clears
+ * comfortably -- but it does mean the gate schedule changes, which is where S6a
+ * went wrong twice. glm53_layer_tp_gates() owns that rule for both sides. */
+static int glm53_tp_dense_ffn_split_requested(void) {
+    const char *env = getenv("DS4_GLM_TP_DENSE_FFN_SPLIT");
+    return env && env[0] && env[0] != '0';
 }
 
 typedef enum {
@@ -46909,7 +46926,27 @@ static bool glm_graph_encode_ffn_one_normed_from(
     }
 
     if (il < DS4_N_LEADING_DENSE) {
-        const uint64_t hidden = l->ffn_gate->dim[1];
+        const uint64_t hidden_full = l->ffn_gate->dim[1];
+        /* S4: split the SwiGLU intermediate; the down projection then k-slices
+         * over this rank's half into a partial that a new FFN gate sums. */
+        const bool dense_split =
+            g->tp_world == 2 && g->tp_out && g->tp_in && !g->ssd_streaming &&
+            glm53_tp_dense_ffn_split_requested() &&
+            hidden_full >= 2u && (hidden_full % 64u) == 0u;
+        const uint64_t hidden = dense_split ? hidden_full / 2u : hidden_full;
+        const uint32_t dense_mid_off =
+            dense_split ? (uint32_t)g->tp_rank * (uint32_t)hidden : 0u;
+        const uint32_t dense_ffn_slot =
+            il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
+        ds4_gpu_tensor *dense_dst = dense_split ? g->tp_out[dense_ffn_slot]
+                                                : ffn_out;
+        uint64_t dgate_off = 0, dup_off = 0;
+        if (!glm53_graph_weight_row_offset(l->ffn_gate, DS4_N_EMBD,
+                                           dense_mid_off, &dgate_off) ||
+            !glm53_graph_weight_row_offset(l->ffn_up, DS4_N_EMBD,
+                                           dense_mid_off, &dup_off)) {
+            return false;
+        }
         const bool can_fuse_gate_up =
             glm_graph_weights_are_q8_0(model,
                                        l->ffn_gate->abs_offset,
@@ -46921,8 +46958,8 @@ static bool glm_graph_encode_ffn_one_normed_from(
                     ffn_mid,
                     model->map,
                     model->size,
-                    l->ffn_gate->abs_offset,
-                    l->ffn_up->abs_offset,
+                    dgate_off,
+                    dup_off,
                     DS4_N_EMBD,
                     hidden,
                     ffn_norm,
@@ -46939,7 +46976,7 @@ static bool glm_graph_encode_ffn_one_normed_from(
         } else {
             ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_gate,
                                                               model,
-                                                              l->ffn_gate->abs_offset,
+                                                              dgate_off,
                                                               DS4_N_EMBD,
                                                               hidden,
                                                               ffn_norm,
@@ -46949,7 +46986,7 @@ static bool glm_graph_encode_ffn_one_normed_from(
                                                               g->ssd_streaming) != 0;
             if (ok) ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_up,
                                                                       model,
-                                                                      l->ffn_up->abs_offset,
+                                                                      dup_off,
                                                                       DS4_N_EMBD,
                                                                       hidden,
                                                                       ffn_norm,
@@ -46978,7 +47015,28 @@ static bool glm_graph_encode_ffn_one_normed_from(
                                                  1,
                                                  stage_t0);
         }
-        if (ok) ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_out,
+        if (ok && dense_split) {
+            ok = metal_graph_matmul_dense_quant_kslice(dense_dst,
+                                                       model,
+                                                       l->ffn_down,
+                                                       hidden_full,
+                                                       dense_mid_off,
+                                                       (uint32_t)hidden,
+                                                       DS4_N_EMBD,
+                                                       ffn_mid,
+                                                       0);
+            if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
+            if (ok) ok = ds4_gpu_add_tensor(ffn_out,
+                                            g->tp_out[dense_ffn_slot],
+                                            g->tp_in[dense_ffn_slot],
+                                            DS4_N_EMBD) != 0;
+            if (!ok) {
+                fprintf(stderr,
+                        "ds4: GLM dense FFN split gate/combine failed "
+                        "(layer %u)\n", il);
+            }
+        } else if (ok) {
+            ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_out,
                                                                   model,
                                                                   l->ffn_down->abs_offset,
                                                                   hidden,
@@ -46988,6 +47046,7 @@ static bool glm_graph_encode_ffn_one_normed_from(
                                                                   pos,
                                                                   "dense_down",
                                                                   g->ssd_streaming) != 0;
+        }
         if (ok) ok = glm_graph_profile_stage(stage_profile,
                                              "glm_decode_ffn",
                                              "dense_down",
@@ -64435,11 +64494,12 @@ void ds4_test_glm53_layer_tp_gates(uint32_t il,
                                    uint32_t n_nextn,
                                    uint32_t n_leading_dense,
                                    int kda_split,
+                                   int dense_ffn_split,
                                    int *fires_attn,
                                    int *fires_ffn) {
     bool attn = false, ffn = false;
     glm53_layer_tp_gates(il, n_layer, n_nextn, n_leading_dense,
-                         kda_split != 0, &attn, &ffn);
+                         kda_split != 0, dense_ffn_split != 0, &attn, &ffn);
     if (fires_attn) *fires_attn = attn ? 1 : 0;
     if (fires_ffn) *fires_ffn = ffn ? 1 : 0;
 }
@@ -65768,6 +65828,8 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
                 glm53_kda_phase_splits(glm53_tp_kda_split_mode(),
                                        GLM53_KDA_PHASE_DECODE) &&
                 glm53_tp_kda_split_shape_ok();
+            const bool dense_ffn_split =
+                glm53_tp_dense_ffn_split_requested() != 0;
             /* From layer 0, not DS4_N_LEADING_DENSE: the leading layers are
              * dense only in their FFN and their KDA attention gates too.  See
              * glm53_layer_tp_gates(), which owns both rules. */
@@ -65775,6 +65837,7 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
                 bool fires_attn = false, fires_ffn = false;
                 glm53_layer_tp_gates(il, DS4_N_LAYER, DS4_N_NEXTN_PREDICT,
                                      DS4_N_LEADING_DENSE, kda_split,
+                                     dense_ffn_split,
                                      &fires_attn, &fires_ffn);
                 const uint32_t gates[2] = { DS4_TP_GATE_ATTN, DS4_TP_GATE_FFN };
                 const bool fires[2] = { fires_attn, fires_ffn };

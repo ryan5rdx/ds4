@@ -96,6 +96,7 @@ void ds4_test_glm53_layer_tp_gates(uint32_t il,
                                    uint32_t n_nextn,
                                    uint32_t n_leading_dense,
                                    int kda_split,
+                                   int dense_ffn_split,
                                    int *fires_attn,
                                    int *fires_ffn);
 
@@ -835,11 +836,11 @@ static void test_prefill_watchdog_bound(void) {
         /* The leading three are dense in their FFN only; the attention is KDA
          * and gates as soon as the heads are split.  This is the S6a bug. */
         for (uint32_t il = 0; il < N_DENSE; il++) {
-            ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE, 0,
+            ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE, 0, 0,
                                           &attn, &ffn);
             CHECK(attn == 0 && ffn == 0,
                   "leading dense layer fires nothing with the KDA split off");
-            ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE, 1,
+            ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE, 1, 0,
                                           &attn, &ffn);
             CHECK(attn == 1 && ffn == 0,
                   "leading dense layer gates its KDA attention when split, "
@@ -847,32 +848,64 @@ static void test_prefill_watchdog_bound(void) {
         }
 
         /* Layer 3 is the first DSA layer and the first routed FFN. */
-        ds4_test_glm53_layer_tp_gates(3, N_LAYER, N_NEXTN, N_DENSE, 0,
+        ds4_test_glm53_layer_tp_gates(3, N_LAYER, N_NEXTN, N_DENSE, 0, 0,
                                       &attn, &ffn);
         CHECK(attn == 1 && ffn == 1,
               "a DSA layer gates attention regardless of the KDA split");
-        ds4_test_glm53_layer_tp_gates(4, N_LAYER, N_NEXTN, N_DENSE, 0,
+        ds4_test_glm53_layer_tp_gates(4, N_LAYER, N_NEXTN, N_DENSE, 0, 0,
                                       &attn, &ffn);
         CHECK(attn == 0 && ffn == 1,
               "a sparse KDA layer gates only its FFN with the split off");
-        ds4_test_glm53_layer_tp_gates(4, N_LAYER, N_NEXTN, N_DENSE, 1,
+        ds4_test_glm53_layer_tp_gates(4, N_LAYER, N_NEXTN, N_DENSE, 1, 0,
                                       &attn, &ffn);
         CHECK(attn == 1 && ffn == 1,
               "a sparse KDA layer gates both once the heads are split");
 
         /* The nextn layer runs on the coordinator alone and never gates. */
-        ds4_test_glm53_layer_tp_gates(N_LAYER - 1, N_LAYER, N_NEXTN, N_DENSE, 1,
+        ds4_test_glm53_layer_tp_gates(N_LAYER - 1, N_LAYER, N_NEXTN, N_DENSE, 1, 0,
                                       &attn, &ffn);
         CHECK(attn == 0 && ffn == 0, "the nextn layer fires no gate");
+
+        /* S4 lights the FFN gate on the three leading dense layers, which fire
+         * nothing today.  This is the same rule S6a got wrong twice, so pin it
+         * from both directions. */
+        for (uint32_t il = 0; il < N_DENSE; il++) {
+            ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE, 0, 1,
+                                          &attn, &ffn);
+            CHECK(attn == 0 && ffn == 1,
+                  "S4 gates the leading dense FFN and nothing else");
+            ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE, 1, 1,
+                                          &attn, &ffn);
+            CHECK(attn == 1 && ffn == 1,
+                  "S4 and the KDA split compose on a leading dense layer");
+        }
+        ds4_test_glm53_layer_tp_gates(N_LAYER - 1, N_LAYER, N_NEXTN, N_DENSE,
+                                      1, 1, &attn, &ffn);
+        CHECK(attn == 0 && ffn == 0,
+              "S4 does not gate the nextn layer");
+        {
+            uint32_t on = 0, max_slot = 0;
+            for (uint32_t il = 0; il < N_LAYER; il++) {
+                int a1 = 0, f1 = 0;
+                ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE,
+                                              1, 1, &a1, &f1);
+                on += (uint32_t)(a1 + f1);
+                if (a1) max_slot = il * 2u;
+                if (f1) max_slot = il * 2u + 1u;
+            }
+            CHECK(on == 90, "KDA split plus S4 is 90 gates per token");
+            CHECK(max_slot < N_LAYER * 2u,
+                  "S4's extra gates still fit the 92-slot slab");
+        }
 
         /* Totals, and that the mask still fits the slab.  34 KDA + 11 DSA
          * attention and 42 routed FFNs: 53 gates off, 87 on. */
         uint32_t off = 0, on = 0, max_slot = 0;
         for (uint32_t il = 0; il < N_LAYER; il++) {
             int a0 = 0, f0 = 0, a1 = 0, f1 = 0;
-            ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE, 0,
+            ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE, 0, 0,
                                           &a0, &f0);
-            ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE, 1,
+            ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE, 1, 0,
                                           &a1, &f1);
             off += (uint32_t)(a0 + f0);
             on += (uint32_t)(a1 + f1);
@@ -934,12 +967,12 @@ static void test_prefill_watchdog_bound(void) {
                 ds4_test_glm53_kda_phase_splits(mode, PH_DECODE);
             /* layer 4: a sparse KDA layer */
             ds4_test_glm53_layer_tp_gates(4, N_LAYER, N_NEXTN, N_DENSE,
-                                          decode_splits, &attn, &ffn);
+                                          decode_splits, 0, &attn, &ffn);
             CHECK(attn == decode_splits,
                   "KDA ATTN gate fires exactly when the decode phase splits");
             /* layer 3: DSA, always gates, whatever the mode */
             ds4_test_glm53_layer_tp_gates(3, N_LAYER, N_NEXTN, N_DENSE,
-                                          decode_splits, &attn, &ffn);
+                                          decode_splits, 0, &attn, &ffn);
             CHECK(attn == 1, "DSA attention gates in every mode");
         }
     }
