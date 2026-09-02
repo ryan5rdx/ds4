@@ -12927,6 +12927,15 @@ static uint32_t glm53_prefill_chunk_tokens(void) {
  *
  * The override remains so the two paths can be compared again; it is not a
  * performance switch, and disabling it says so on the way past. */
+static int glm53_tp_kda_split_requested(void) {
+    const char *env = getenv("DS4_GLM_TP_KDA_SPLIT");
+    return env && env[0] && env[0] != '0';
+}
+
+static bool glm53_tp_kda_split_shape_ok(void) {
+    return DS4_N_KDA_HEAD >= 2u && (DS4_N_KDA_HEAD % 2u) == 0u;
+}
+
 static int glm53_prefill_attnout_kslice(void) {
     const char *env = getenv("DS4_GLM_TP_PREFILL_ATTNOUT_KSLICE");
     if (env && env[0] && env[0] == '0') {
@@ -45137,6 +45146,57 @@ static bool glm53_graph_hc_pre_rows(
     return ok;
 }
 
+/* Tensor-parallel head lane for the KDA layers.
+ *
+ * The recurrence is exactly head-independent: metal/glm53_kda.metal gives one
+ * threadgroup per (row, head), every reduction is inside a head, and the state
+ * is indexed [head][value][key].  Everything the kernels touch is sized by
+ * n_heads, so handing a rank its own head count, offsetting the per-head
+ * weights to its range, and letting its activations stay compact at the buffer
+ * base makes the whole path self-consistent with no kernel change at all.
+ *
+ * The one cross-rank step is kda_output, which contracts over the full
+ * projection.  Each rank k-slices its half and the partials are summed through
+ * the ATTN gate slot -- which the schedule leaves idle on KDA layers today, so
+ * this costs no slab space and no new frame.
+ *
+ * The state stays allocated at full width.  A rank only ever indexes its first
+ * `heads` entries, and the unused tail is 2 MiB/layer that buys no measurable
+ * time back (the state read is occupancy-capped: 64 threadgroups on 60 cores,
+ * so halving it removes bytes but not latency).  Sizing it per rank would tie
+ * graph allocation to a TP field that is not set yet at that point, for
+ * nothing.
+ *
+ * A one-sided DS4_GLM_TP_KDA_SPLIT cannot corrupt output: the split changes the
+ * gate schedule, and the TP hello compares gate_slot_mask for equality and
+ * refuses the pair at bring-up.  Default off pending rig arm S6. */
+typedef struct {
+    bool     split;
+    uint32_t heads;       /* heads this rank owns */
+    uint32_t projection;  /* heads * DS4_N_KDA_HEAD_DIM */
+    uint32_t lane_rows;   /* first owned projection row */
+} glm53_kda_lane;
+
+static glm53_kda_lane glm53_kda_lane_for(const ds4_glm_gpu_graph *g) {
+    glm53_kda_lane lane;
+    lane.split = g && g->tp_world == 2 && g->tp_out && g->tp_in &&
+                 glm53_tp_kda_split_requested() &&
+                 glm53_tp_kda_split_shape_ok();
+    lane.heads = lane.split ? (uint32_t)DS4_N_KDA_HEAD / 2u
+                            : (uint32_t)DS4_N_KDA_HEAD;
+    lane.projection = lane.heads * (uint32_t)DS4_N_KDA_HEAD_DIM;
+    lane.lane_rows = lane.split
+        ? (uint32_t)g->tp_rank * lane.projection : 0u;
+    return lane;
+}
+
+static bool glm_graph_tp_batch_bounce_ready(ds4_glm_gpu_graph *g,
+                                            uint32_t n_tokens);
+static bool glm_graph_tp_batch_ffn_combine(ds4_glm_gpu_graph *g,
+                                           uint32_t           il,
+                                           ds4_gpu_tensor    *ffn_out,
+                                           uint32_t           n_tokens);
+
 static bool glm53_graph_kda_attention_rows(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -45150,10 +45210,30 @@ static bool glm53_graph_kda_attention_rows(
         !g->layer_kda_recurrent_state[il]) {
         return false;
     }
-    const uint32_t projection = DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
+    const glm53_kda_lane lane = glm53_kda_lane_for(g);
+    const uint32_t projection = lane.projection;
+    /* Same lane as the decode path -- both must agree, because they share the
+     * recurrent state and its layout is sized by the head count. */
+    uint64_t off_q = 0, off_k = 0, off_v = 0, off_fb = 0, off_gb = 0, off_beta = 0;
+    if (!glm53_graph_weight_row_offset(l->kda_q, DS4_N_EMBD, lane.lane_rows, &off_q) ||
+        !glm53_graph_weight_row_offset(l->kda_k, DS4_N_EMBD, lane.lane_rows, &off_k) ||
+        !glm53_graph_weight_row_offset(l->kda_v, DS4_N_EMBD, lane.lane_rows, &off_v) ||
+        !glm53_graph_weight_row_offset(l->kda_f_b, DS4_N_KDA_HEAD_DIM, lane.lane_rows, &off_fb) ||
+        !glm53_graph_weight_row_offset(l->kda_g_b, DS4_N_KDA_HEAD_DIM, lane.lane_rows, &off_gb) ||
+        !glm53_graph_weight_row_offset(l->kda_beta, DS4_N_EMBD,
+                                       lane.lane_rows / DS4_N_KDA_HEAD_DIM, &off_beta)) {
+        return false;
+    }
+    const uint64_t f32_chan = (uint64_t)lane.lane_rows * sizeof(float);
+    const uint64_t off_qc = l->kda_q_conv->abs_offset + f32_chan * DS4_N_KDA_CONV;
+    const uint64_t off_kc = l->kda_k_conv->abs_offset + f32_chan * DS4_N_KDA_CONV;
+    const uint64_t off_vc = l->kda_v_conv->abs_offset + f32_chan * DS4_N_KDA_CONV;
+    const uint64_t off_dt = l->kda_dt_bias->abs_offset + f32_chan;
+    const uint64_t off_al = l->kda_a_log->abs_offset +
+        (uint64_t)(lane.lane_rows / DS4_N_KDA_HEAD_DIM) * sizeof(float);
     const char *failed_stage = "Q projection";
     const ds4_tensor *failed_weight = l->kda_q;
-    bool ok = glm53_graph_matmul_rows(g->batch_kda_q, model, l->kda_q,
+    bool ok = glm53_graph_matmul_rows_at(g->batch_kda_q, model, l->kda_q, off_q,
                                       DS4_N_EMBD, projection,
                                       g->batch_attn_norm, rows);
     if (ok) metal_graph_debug_dump_tensor(
@@ -45161,7 +45241,7 @@ static bool glm53_graph_kda_attention_rows(
             (uint64_t)rows * projection, il, pos0);
     if (ok) failed_stage = "K projection";
     if (ok) failed_weight = l->kda_k;
-    if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_k, model, l->kda_k,
+    if (ok) ok = glm53_graph_matmul_rows_at(g->batch_kda_k, model, l->kda_k, off_k,
                                          DS4_N_EMBD, projection,
                                          g->batch_attn_norm, rows);
     if (ok) metal_graph_debug_dump_tensor(
@@ -45169,7 +45249,7 @@ static bool glm53_graph_kda_attention_rows(
             (uint64_t)rows * projection, il, pos0);
     if (ok) failed_stage = "V projection";
     if (ok) failed_weight = l->kda_v;
-    if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_v, model, l->kda_v,
+    if (ok) ok = glm53_graph_matmul_rows_at(g->batch_kda_v, model, l->kda_v, off_v,
                                          DS4_N_EMBD, projection,
                                          g->batch_attn_norm, rows);
     if (ok) metal_graph_debug_dump_tensor(
@@ -45184,8 +45264,8 @@ static bool glm53_graph_kda_attention_rows(
                                          g->batch_attn_norm, rows);
     if (ok) failed_stage = "decay gate projection";
     if (ok) failed_weight = l->kda_f_b;
-    if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_raw_gate, model,
-                                         l->kda_f_b,
+    if (ok) ok = glm53_graph_matmul_rows_at(g->batch_kda_raw_gate, model,
+                                         l->kda_f_b, off_fb,
                                          DS4_N_KDA_HEAD_DIM,
                                          projection,
                                          g->batch_kda_lowrank, rows);
@@ -45194,14 +45274,14 @@ static bool glm53_graph_kda_attention_rows(
             (uint64_t)rows * projection, il, pos0);
     if (ok) failed_stage = "beta projection";
     if (ok) failed_weight = l->kda_beta;
-    if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_raw_beta, model,
-                                         l->kda_beta,
+    if (ok) ok = glm53_graph_matmul_rows_at(g->batch_kda_raw_beta, model,
+                                         l->kda_beta, off_beta,
                                          DS4_N_EMBD,
-                                         DS4_N_KDA_HEAD,
+                                         lane.heads,
                                          g->batch_attn_norm, rows);
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_raw_beta_ready", g->batch_kda_raw_beta,
-            (uint64_t)rows * DS4_N_KDA_HEAD, il, pos0);
+            (uint64_t)rows * lane.heads, il, pos0);
     if (ok) failed_stage = "output-gate low-rank projection";
     if (ok) failed_weight = l->kda_g_a;
     if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_lowrank, model,
@@ -45211,8 +45291,8 @@ static bool glm53_graph_kda_attention_rows(
                                          g->batch_attn_norm, rows);
     if (ok) failed_stage = "output-gate projection";
     if (ok) failed_weight = l->kda_g_b;
-    if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_output_gate, model,
-                                         l->kda_g_b,
+    if (ok) ok = glm53_graph_matmul_rows_at(g->batch_kda_output_gate, model,
+                                         l->kda_g_b, off_gb,
                                          DS4_N_KDA_HEAD_DIM,
                                          projection,
                                          g->batch_kda_lowrank, rows);
@@ -45233,13 +45313,13 @@ static bool glm53_graph_kda_attention_rows(
             g->batch_kda_output_gate,
             model->map,
             model->size,
-            l->kda_q_conv->abs_offset,
-            l->kda_k_conv->abs_offset,
-            l->kda_v_conv->abs_offset,
-            l->kda_a_log->abs_offset,
-            l->kda_dt_bias->abs_offset,
+            off_qc,
+            off_kc,
+            off_vc,
+            off_al,
+            off_dt,
             l->kda_o_norm->abs_offset,
-            DS4_N_KDA_HEAD,
+            lane.heads,
             rows,
             DS4_KDA_GATE_LOWER_BOUND,
             DS4_RMS_EPS) != 0;
@@ -45248,9 +45328,29 @@ static bool glm53_graph_kda_attention_rows(
             (uint64_t)rows * projection, il, pos0);
     if (ok) failed_stage = "output projection";
     if (ok) failed_weight = l->kda_output;
-    if (ok) ok = glm53_graph_matmul_rows(attn_out, model, l->kda_output,
-                                         projection, DS4_N_EMBD,
-                                         g->batch_kda_out, rows);
+    if (ok && lane.split) {
+        /* Partial over this rank's head range, summed through the prefill big
+         * gate the routed FFN already uses.  k_off/k_cnt are 32-aligned by
+         * construction (DS4_N_KDA_HEAD_DIM is 128), and the generic k-slice
+         * path constrains only the k dimension, so no row tail arises. */
+        ok = glm_graph_tp_batch_bounce_ready(g, rows) &&
+             ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+                     g->tp_bounce_out,
+                     model->map,
+                     model->size,
+                     l->kda_output->abs_offset,
+                     (uint64_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM,
+                     DS4_N_EMBD,
+                     lane.lane_rows,
+                     lane.projection,
+                     g->batch_kda_out,
+                     rows) != 0;
+        if (ok) ok = glm_graph_tp_batch_ffn_combine(g, il, attn_out, rows);
+    } else if (ok) {
+        ok = glm53_graph_matmul_rows(attn_out, model, l->kda_output,
+                                     projection, DS4_N_EMBD,
+                                     g->batch_kda_out, rows);
+    }
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_attn_out_ready", attn_out,
             (uint64_t)rows * DS4_N_EMBD, il, pos0);
@@ -45315,58 +45415,6 @@ static bool glm53_graph_hc_pre(
     return ok;
 }
 
-/* Tensor-parallel head lane for the KDA layers.
- *
- * The recurrence is exactly head-independent: metal/glm53_kda.metal gives one
- * threadgroup per (row, head), every reduction is inside a head, and the state
- * is indexed [head][value][key].  Everything the kernels touch is sized by
- * n_heads, so handing a rank its own head count, offsetting the per-head
- * weights to its range, and letting its activations stay compact at the buffer
- * base makes the whole path self-consistent with no kernel change at all.
- *
- * The one cross-rank step is kda_output, which contracts over the full
- * projection.  Each rank k-slices its half and the partials are summed through
- * the ATTN gate slot -- which the schedule leaves idle on KDA layers today, so
- * this costs no slab space and no new frame.
- *
- * The state stays allocated at full width.  A rank only ever indexes its first
- * `heads` entries, and the unused tail is 2 MiB/layer that buys no measurable
- * time back (the state read is occupancy-capped: 64 threadgroups on 60 cores,
- * so halving it removes bytes but not latency).  Sizing it per rank would tie
- * graph allocation to a TP field that is not set yet at that point, for
- * nothing.
- *
- * A one-sided DS4_GLM_TP_KDA_SPLIT cannot corrupt output: the split changes the
- * gate schedule, and the TP hello compares gate_slot_mask for equality and
- * refuses the pair at bring-up.  Default off pending rig arm S6. */
-typedef struct {
-    bool     split;
-    uint32_t heads;       /* heads this rank owns */
-    uint32_t projection;  /* heads * DS4_N_KDA_HEAD_DIM */
-    uint32_t lane_rows;   /* first owned projection row */
-} glm53_kda_lane;
-
-static int glm53_tp_kda_split_requested(void) {
-    const char *env = getenv("DS4_GLM_TP_KDA_SPLIT");
-    return env && env[0] && env[0] != '0';
-}
-
-static bool glm53_tp_kda_split_shape_ok(void) {
-    return DS4_N_KDA_HEAD >= 2u && (DS4_N_KDA_HEAD % 2u) == 0u;
-}
-
-static glm53_kda_lane glm53_kda_lane_for(const ds4_glm_gpu_graph *g) {
-    glm53_kda_lane lane;
-    lane.split = g && g->tp_world == 2 && g->tp_out && g->tp_in &&
-                 glm53_tp_kda_split_requested() &&
-                 glm53_tp_kda_split_shape_ok();
-    lane.heads = lane.split ? (uint32_t)DS4_N_KDA_HEAD / 2u
-                            : (uint32_t)DS4_N_KDA_HEAD;
-    lane.projection = lane.heads * (uint32_t)DS4_N_KDA_HEAD_DIM;
-    lane.lane_rows = lane.split
-        ? (uint32_t)g->tp_rank * lane.projection : 0u;
-    return lane;
-}
 
 static bool glm53_graph_kda_attention(
         ds4_glm_gpu_graph       *g,
@@ -65374,9 +65422,17 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
             uint32_t count = 0;
             const uint32_t normal_layers =
                 DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+            /* A KDA layer fires an ATTN gate only when its heads are split
+             * across the pair; otherwise it computes the whole recurrence
+             * locally and exchanges nothing.  Reading the same env the graph
+             * reads keeps the schedule and the encoders in step, and a
+             * one-sided setting is caught by the hello's gate_slot_mask
+             * comparison rather than by a hung gate. */
+            const bool kda_split = glm53_tp_kda_split_requested() &&
+                                   glm53_tp_kda_split_shape_ok();
             for (uint32_t il = DS4_N_LEADING_DENSE;
                  il < normal_layers; il++) {
-                if (!ds4_glm53_layer_is_kda(il)) {
+                if (!ds4_glm53_layer_is_kda(il) || kda_split) {
                     const uint32_t slot =
                         il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN;
                     mask[slot / 64u] |= UINT64_C(1) << (slot % 64u);
