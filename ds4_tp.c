@@ -200,6 +200,8 @@ struct ds4_tp {
     uint64_t gpu_flags_off;     /* GPU-written gate-ready flags (u32/slot) */
     uint64_t batch_out_off;     /* [layer][row] verify-block local partials */
     uint64_t batch_in_off;      /* [layer][row] verify-block peer partials */
+    uint64_t prefill_bounce_out_off; /* one prefill chunk, local partial   */
+    uint64_t prefill_bounce_in_off;  /* one prefill chunk, peer partial    */
     uint64_t timeout_sec;
     uint64_t gate_timeout_ms;
     atomic_bool failed;
@@ -554,6 +556,12 @@ int ds4_tp_validate_engine_options(
  * Slab layout.
  * --------------------------------------------------------------------- */
 
+/* One prefill chunk's worth of rows, each direction.  DS4_GLM53_PREFILL_CHUNK
+ * caps the chunk at 4096, so this is 64 MiB per direction at n_embd 4096 -- paid
+ * once, against 2.28 GB of CPU memcpy per 1.14 GB exchange if the bounce lives
+ * outside the registered region. */
+#define DS4_TP_PREFILL_BOUNCE_ROWS 4096u
+
 uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
     uint64_t vec = (uint64_t)n_embd * sizeof(float);
     uint64_t slots = (uint64_t)n_layer * DS4_TP_GATES_PER_LAYER;
@@ -562,7 +570,8 @@ uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
            16 +                 /* token slot */
            (uint64_t)DS4_GPU_TP_FLAG_BANK_SLOTS * 4u * 2u +
                                 /* row + verifier GPU-ready flag banks */
-           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
+           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2 + /* batch out+in */
+           (uint64_t)DS4_TP_PREFILL_BOUNCE_ROWS * vec * 2;  /* prefill bounce */
 }
 
 static void tp_slab_layout(ds4_tp *tp) {
@@ -578,8 +587,24 @@ static void tp_slab_layout(ds4_tp *tp) {
                         (uint64_t)DS4_GPU_TP_FLAG_BANK_SLOTS * 4u * 2u;
     tp->batch_in_off = tp->batch_out_off +
                        (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
-    tp->slab_bytes = tp->batch_in_off +
+    tp->prefill_bounce_out_off = tp->batch_in_off +
                      (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+    tp->prefill_bounce_in_off = tp->prefill_bounce_out_off +
+                     (uint64_t)DS4_TP_PREFILL_BOUNCE_ROWS * vec;
+    tp->slab_bytes = tp->prefill_bounce_in_off +
+                     (uint64_t)DS4_TP_PREFILL_BOUNCE_ROWS * vec;
+}
+
+uint64_t ds4_tp_slab_prefill_bounce_out_offset(const ds4_tp *tp) {
+    return tp->prefill_bounce_out_off;
+}
+
+uint64_t ds4_tp_slab_prefill_bounce_in_offset(const ds4_tp *tp) {
+    return tp->prefill_bounce_in_off;
+}
+
+uint64_t ds4_tp_slab_prefill_bounce_bytes(const ds4_tp *tp) {
+    return (uint64_t)DS4_TP_PREFILL_BOUNCE_ROWS * tp->vec_bytes;
 }
 
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp) {
@@ -1515,6 +1540,16 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
     struct ibv_mr *out_mr = r->mr;
     struct ibv_mr *in_mr = r->mr;
     const bool direct = in_slab;
+    {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "ds4-tp: bulk gate path is %s (%.1f MiB payload)\n",
+                    direct ? "DIRECT, no staging" : "STAGED through the slab",
+                    (double)bytes / 1048576.0);
+        }
+    }
     uint8_t *stage_send = tp->slab + tp->batch_out_off;
     uint8_t *stage_recv = tp->slab + tp->batch_in_off;
     const uint64_t stage_bytes = (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;

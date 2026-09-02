@@ -38759,6 +38759,10 @@ typedef struct {
     ds4_gpu_tensor **out_views;
     ds4_gpu_tensor **in_views;
     ds4_gpu_tensor **batch_out_views;   /* [layer] verify-block row partials */
+    /* One prefill chunk each way, inside the registered slab so the bulk RDMA
+     * path posts against them directly instead of staging through CPU copies. */
+    ds4_gpu_tensor *prefill_bounce_out;
+    ds4_gpu_tensor *prefill_bounce_in;
     ds4_gpu_tensor **batch_in_views;
     ds4_gpu_tensor *zero_vec;
     uint64_t eval_seq;          /* leader: mirrored eval counter */
@@ -41344,6 +41348,12 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor **tp_in;
     /* Prefill batch gate bounce buffers (shared storage; grow on demand). */
     ds4_gpu_tensor *tp_bounce_out;
+    /* Slab-backed pair, when TP is bound: inside the NIC's registered region so
+     * the bulk exchange posts directly.  tp_bounce_* alias these unless a chunk
+     * outgrows the region, in which case they are privately owned. */
+    ds4_gpu_tensor *tp_slab_bounce_out;
+    ds4_gpu_tensor *tp_slab_bounce_in;
+    bool tp_bounce_owned;
     ds4_gpu_tensor *tp_bounce_in;
     /* CUDA multi-tier placement and device-local decode scratch mirrors. */
     const int *placement;
@@ -43197,8 +43207,16 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->kda_q);
     ds4_gpu_tensor_free(g->routed_down);
     ds4_gpu_tensor_free(g->routed_up);
-    ds4_gpu_tensor_free(g->tp_bounce_out);
-    ds4_gpu_tensor_free(g->tp_bounce_in);
+    /* Only free these when the graph owns them.  When TP is bound they alias
+     * the engine's slab views, and freeing those here would destroy a view the
+     * engine still holds for every other session. */
+    if (g->tp_bounce_owned) {
+        ds4_gpu_tensor_free(g->tp_bounce_out);
+        ds4_gpu_tensor_free(g->tp_bounce_in);
+    }
+    g->tp_bounce_out = NULL;
+    g->tp_bounce_in = NULL;
+    g->tp_bounce_owned = false;
     ds4_gpu_tensor_free(g->routed_gate);
     ds4_gpu_tensor_free(g->ffn_mid);
     ds4_gpu_tensor_free(g->ffn_up);
@@ -44742,11 +44760,43 @@ static const int32_t *g_glm_tp_debug_ids DS4_MAYBE_UNUSED;
 static bool glm_graph_tp_batch_bounce_ready(ds4_glm_gpu_graph *g,
                                             uint32_t n_tokens) {
     const uint64_t bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
-    if (!g->tp_bounce_out || ds4_gpu_tensor_bytes(g->tp_bounce_out) < bytes) {
-        ds4_gpu_tensor_free(g->tp_bounce_out);
-        ds4_gpu_tensor_free(g->tp_bounce_in);
+    /* Prefer the slab-backed pair: it is inside the NIC's registered region, so
+     * the bulk exchange takes its `direct` path and skips a memcpy of every byte
+     * in each direction.  Fall back to a private allocation only if the chunk
+     * outgrows the reserved region, which the prefill chunk ceiling should
+     * prevent -- and say so, because silently reverting to staging is exactly
+     * the kind of regression that hides in a throughput number. */
+    if (g->tp_slab_bounce_out && g->tp_slab_bounce_in &&
+        ds4_gpu_tensor_bytes(g->tp_slab_bounce_out) >= bytes) {
+        if (g->tp_bounce_owned) {
+            ds4_gpu_tensor_free(g->tp_bounce_out);
+            ds4_gpu_tensor_free(g->tp_bounce_in);
+            g->tp_bounce_owned = false;
+        }
+        g->tp_bounce_out = g->tp_slab_bounce_out;
+        g->tp_bounce_in = g->tp_slab_bounce_in;
+        return true;
+    }
+    if (g->tp_slab_bounce_out) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "ds4: prefill bounce %llu B exceeds the registered slab "
+                    "region %llu B; falling back to staged copies (set "
+                    "DS4_GLM53_PREFILL_CHUNK <= 4096 to keep the direct path)\n",
+                    (unsigned long long)bytes,
+                    (unsigned long long)ds4_gpu_tensor_bytes(g->tp_slab_bounce_out));
+        }
+    }
+    if (!g->tp_bounce_owned || ds4_gpu_tensor_bytes(g->tp_bounce_out) < bytes) {
+        if (g->tp_bounce_owned) {
+            ds4_gpu_tensor_free(g->tp_bounce_out);
+            ds4_gpu_tensor_free(g->tp_bounce_in);
+        }
         g->tp_bounce_out = ds4_gpu_tensor_alloc(bytes);
         g->tp_bounce_in = ds4_gpu_tensor_alloc(bytes);
+        g->tp_bounce_owned = true;
     }
     return g->tp_bounce_out && g->tp_bounce_in;
 }
@@ -64757,6 +64807,33 @@ static int ds4_engine_tp_big_exchange(void *ud, uint32_t layer, uint64_t seq,
 }
 #endif
 
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+static void ds4_engine_tp_storage_free(ds4_engine *e, bool shutdown_gate) {
+    if (!e) return;
+    if (shutdown_gate) ds4_gpu_tp_shutdown();
+    const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
+    for (uint32_t i = 0; i < slots; i++) {
+        if (e->tp.out_views) ds4_gpu_tensor_free(e->tp.out_views[i]);
+        if (e->tp.in_views) ds4_gpu_tensor_free(e->tp.in_views[i]);
+    }
+    for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER; i++) {
+        if (e->tp.batch_out_views) ds4_gpu_tensor_free(e->tp.batch_out_views[i]);
+        if (e->tp.batch_in_views) ds4_gpu_tensor_free(e->tp.batch_in_views[i]);
+    }
+    free(e->tp.batch_out_views);
+    free(e->tp.batch_in_views);
+    free(e->tp.out_views);
+    free(e->tp.in_views);
+    ds4_gpu_tensor_free(e->tp.prefill_bounce_out);
+    ds4_gpu_tensor_free(e->tp.prefill_bounce_in);
+    e->tp.prefill_bounce_out = NULL;
+    e->tp.prefill_bounce_in = NULL;
+    ds4_gpu_tensor_free(e->tp.zero_vec);
+    ds4_gpu_tensor_free(e->tp.slab);
+    memset(&e->tp, 0, sizeof(e->tp));
+}
+#endif
+
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen) {
 #if defined(DS4_NO_GPU) || !defined(__APPLE__)
     (void)e; (void)tp;
@@ -64782,17 +64859,17 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     e->tp.batch_in_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_in_views));
     if (!e->tp.batch_out_views || !e->tp.batch_in_views) {
         snprintf(err, errlen, "tp: batch view table allocation failed");
-        return 0;
+        goto tp_bind_fail;
     }
     if (!e->tp.slab || !e->tp.zero_vec || !e->tp.out_views || !e->tp.in_views) {
         snprintf(err, errlen, "tp: slab allocation failed (%llu bytes)",
                  (unsigned long long)slab_bytes);
-        return 0;
+        goto tp_bind_fail;
     }
     memset(ds4_gpu_tensor_contents(e->tp.slab), 0, slab_bytes);
     memset(ds4_gpu_tensor_contents(e->tp.zero_vec), 0, vec_bytes);
     if (!ds4_tp_attach_slab(tp, ds4_gpu_tensor_contents(e->tp.slab), err, errlen))
-        return 0;
+        goto tp_bind_fail;
     for (uint32_t l = 0; l < (uint32_t)DS4_N_LAYER; l++) {
         for (uint32_t gate = 0; gate < DS4_TP_GATES_PER_LAYER; gate++) {
             const uint32_t slot = l * DS4_TP_GATES_PER_LAYER + gate;
@@ -64802,7 +64879,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
                     e->tp.slab, ds4_tp_slab_in_offset(tp, l, gate), vec_bytes);
             if (!e->tp.out_views[slot] || !e->tp.in_views[slot]) {
                 snprintf(err, errlen, "tp: slab view creation failed");
-                return 0;
+                goto tp_bind_fail;
             }
         }
         e->tp.batch_out_views[l] = ds4_gpu_tensor_view(
@@ -64813,15 +64890,29 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
                 (uint64_t)DS4_TP_BATCH_MAX_ROWS * vec_bytes);
         if (!e->tp.batch_out_views[l] || !e->tp.batch_in_views[l]) {
             snprintf(err, errlen, "tp: batch slab view creation failed");
-            return 0;
+            goto tp_bind_fail;
         }
+    }
+    /* The prefill bounce lives in the slab so the bulk RDMA path can post
+     * against it directly.  Outside the registered region every byte is
+     * memcpy'd through a staging buffer on both send and receive -- 2.28 GB of
+     * CPU copies for a 1.14 GB exchange. */
+    e->tp.prefill_bounce_out = ds4_gpu_tensor_view(
+            e->tp.slab, ds4_tp_slab_prefill_bounce_out_offset(tp),
+            ds4_tp_slab_prefill_bounce_bytes(tp));
+    e->tp.prefill_bounce_in = ds4_gpu_tensor_view(
+            e->tp.slab, ds4_tp_slab_prefill_bounce_in_offset(tp),
+            ds4_tp_slab_prefill_bounce_bytes(tp));
+    if (!e->tp.prefill_bounce_out || !e->tp.prefill_bounce_in) {
+        snprintf(err, errlen, "tp: prefill bounce view creation failed");
+        goto tp_bind_fail;
     }
     if (!ds4_gpu_tp_init((uint32_t)ds4_tp_rank(tp),
                          e->tp.slab, ds4_tp_slab_gpu_flags_offset(tp),
                          ds4_tp_slab_out_offset(tp, 0, 0), vec_bytes,
                          ds4_engine_tp_exchange, tp)) {
         snprintf(err, errlen, "tp: gate service init failed");
-        return 0;
+        goto tp_bind_fail;
     }
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
     g_tp_block_ctx = tp;
@@ -64837,6 +64928,9 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
             "tensor parallelism bound: rank %d, 50/50 expert split, %s transport",
             e->tp.rank, ds4_tp_is_rdma(tp) ? "rdma" : "tcp");
     return 1;
+tp_bind_fail:
+    ds4_engine_tp_storage_free(e, false);
+    return 0;
 #endif
 }
 
@@ -64849,23 +64943,7 @@ void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
     if (e->tp.active) {
-        ds4_gpu_tp_shutdown();
-        const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
-        for (uint32_t i = 0; i < slots; i++) {
-            if (e->tp.out_views) ds4_gpu_tensor_free(e->tp.out_views[i]);
-            if (e->tp.in_views) ds4_gpu_tensor_free(e->tp.in_views[i]);
-        }
-        for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER; i++) {
-            if (e->tp.batch_out_views) ds4_gpu_tensor_free(e->tp.batch_out_views[i]);
-            if (e->tp.batch_in_views) ds4_gpu_tensor_free(e->tp.batch_in_views[i]);
-        }
-        free(e->tp.batch_out_views);
-        free(e->tp.batch_in_views);
-        free(e->tp.out_views);
-        free(e->tp.in_views);
-        ds4_gpu_tensor_free(e->tp.zero_vec);
-        ds4_gpu_tensor_free(e->tp.slab);
-        memset(&e->tp, 0, sizeof(e->tp));
+        ds4_engine_tp_storage_free(e, true);
     }
 #endif
     ds4_expert_profile_close();
@@ -65134,6 +65212,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         if (e->tp.active) {
             s->glm_graph.tp_world = 2;
             s->glm_graph.tp_rank = (uint32_t)e->tp.rank;
+            s->glm_graph.tp_slab_bounce_out = e->tp.prefill_bounce_out;
+            s->glm_graph.tp_slab_bounce_in = e->tp.prefill_bounce_in;
             s->glm_graph.tp_out = e->tp.out_views;
             s->glm_graph.tp_in = e->tp.in_views;
         }
