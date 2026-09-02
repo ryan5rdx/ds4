@@ -89,6 +89,7 @@ uint64_t ds4_test_glm_memory_guard_default_budget(uint64_t host_bytes,
                                                    uint64_t model_bytes,
                                                    bool glm53);
 int ds4_test_glm_memory_guard_disabled(void);
+uint32_t ds4_test_glm53_tp_split_flags(void);
 int ds4_test_glm53_kda_phase_splits(int mode, int phase);
 int ds4_test_glm53_kda_split_mode_of(const char *env);
 void ds4_test_glm53_layer_tp_gates(uint32_t il,
@@ -974,6 +975,53 @@ static void test_prefill_watchdog_bound(void) {
             ds4_test_glm53_layer_tp_gates(3, N_LAYER, N_NEXTN, N_DENSE,
                                           decode_splits, 0, &attn, &ffn);
             CHECK(attn == 1, "DSA attention gates in every mode");
+        }
+    }
+
+    /* The TP hello's split-capability word.  This is the field whose absence on
+     * the worker would have refused every split-enabled bring-up -- including
+     * the shipping DS4_GLM_TP_KDA_SPLIT=decode config -- while building clean
+     * under -Wall -Wextra and reporting it as a model mismatch.
+     *
+     * The structural fix is that split_flags is an out-param of
+     * ds4_engine_tp_gate_schedule(), so a site that forgets it does not compile.
+     * These checks pin the payload: it must be a pure function of the
+     * environment, so the two ranks agree by construction. */
+    {
+        const char *keys[] = { "DS4_GLM_TP_KDA_SPLIT", "DS4_GLM_TP_SHARED_SPLIT",
+                               "DS4_GLM_TP_DENSE_FFN_SPLIT",
+                               "DS4_GLM_TP_VOCAB_SPLIT",
+                               "DS4_GLM_TP_EXACT_PREFILL_MAX" };
+        char *saved[5];
+        for (int i = 0; i < 5; i++) {
+            const char *v = getenv(keys[i]);
+            saved[i] = v ? strdup(v) : NULL;
+            unsetenv(keys[i]);
+        }
+
+        /* On a non-GLM build the word is always 0, so nothing changes for
+         * DeepSeek and an old peer still matches. */
+        const uint32_t clean = ds4_test_glm53_tp_split_flags();
+        CHECK(clean == 0, "no split env yields a zero capability word");
+
+        setenv("DS4_GLM_TP_SHARED_SPLIT", "1", 1);
+        CHECK(ds4_test_glm53_tp_split_flags() == clean,
+              "capability word is shape-gated: zero on a non-GLM build");
+        unsetenv("DS4_GLM_TP_SHARED_SPLIT");
+
+        /* Determinism is the property that matters: both ranks run the same
+         * binary and must compute the same word from the same environment. */
+        setenv("DS4_GLM_TP_KDA_SPLIT", "decode", 1);
+        setenv("DS4_GLM_TP_VOCAB_SPLIT", "1", 1);
+        const uint32_t a1 = ds4_test_glm53_tp_split_flags();
+        const uint32_t a2 = ds4_test_glm53_tp_split_flags();
+        CHECK(a1 == a2, "capability word is a pure function of the environment");
+        unsetenv("DS4_GLM_TP_KDA_SPLIT");
+        unsetenv("DS4_GLM_TP_VOCAB_SPLIT");
+
+        for (int i = 0; i < 5; i++) {
+            if (saved[i]) { setenv(keys[i], saved[i], 1); free(saved[i]); }
+            else unsetenv(keys[i]);
         }
     }
 

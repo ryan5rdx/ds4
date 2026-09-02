@@ -13029,6 +13029,25 @@ static int glm53_tp_dense_ffn_split_requested(void) {
     return env && env[0] && env[0] != '0';
 }
 
+/* The graph used to carry this check while the schedule did not, so a shape with
+ * an unaligned dense FFN would have the mask counting three gates the graph
+ * never fires -- the ordinal-shift class that broke S6a and S6c.  Latent on
+ * GLM 5.3 (n_ff_dense = 12288), but only by luck, so both sides ask here. */
+static bool glm53_tp_dense_ffn_split_shape_ok(void) {
+    return DS4_N_FF_DENSE >= 2u && (DS4_N_FF_DENSE % 64u) == 0u;
+}
+
+/* Read in two places -- the prefill path decision and the hello capability word
+ * -- and a one-sided value makes the ranks take different prefill paths. */
+static uint32_t glm53_tp_exact_prefill_max(void) {
+    const char *em = getenv("DS4_GLM_TP_EXACT_PREFILL_MAX");
+    if (em && em[0]) {
+        const int v = atoi(em);
+        return v > 0 ? (uint32_t)v : 0u;
+    }
+    return 64u;
+}
+
 /* S5 -- split the 154,880-row output head.
  *
  * Each rank computes its half of the head rows into its half of the logits
@@ -45319,6 +45338,7 @@ static glm53_kda_lane glm53_kda_lane_for_phase(const ds4_glm_gpu_graph *g,
         glm53_kda_phase_splits(glm53_tp_kda_split_mode(), phase);
     glm53_kda_lane lane;
     lane.split = g && g->tp_world == 2 && g->tp_out && g->tp_in &&
+                 !g->ssd_streaming &&
                  phase_splits && glm53_tp_kda_split_shape_ok();
     lane.heads = lane.split ? (uint32_t)DS4_N_KDA_HEAD / 2u
                             : (uint32_t)DS4_N_KDA_HEAD;
@@ -47020,7 +47040,8 @@ static bool glm_graph_encode_ffn_one_normed_from(
             decode_step &&
             g->tp_world == 2 && g->tp_out && g->tp_in && !g->ssd_streaming &&
             glm53_tp_dense_ffn_split_requested() &&
-            hidden_full >= 2u && (hidden_full % 64u) == 0u;
+            glm53_tp_dense_ffn_split_shape_ok() &&
+            hidden_full == (uint64_t)DS4_N_FF_DENSE;
         if (dense_split) {
             static int announced;
             if (!announced) {
@@ -64612,6 +64633,10 @@ void ds4_test_glm53_layer_tp_gates(uint32_t il,
     if (fires_ffn) *fires_ffn = ffn ? 1 : 0;
 }
 
+uint32_t ds4_test_glm53_tp_split_flags(void) {
+    return ds4_engine_tp_split_flags(NULL);
+}
+
 /* mode: 0 off, 1 decode, 2 both.  phase: 0 decode, 1 prefill. */
 int ds4_test_glm53_kda_phase_splits(int mode, int phase) {
     return glm53_kda_phase_splits((glm53_kda_split_mode)mode,
@@ -65946,7 +65971,8 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                        GLM53_KDA_PHASE_DECODE) &&
                 glm53_tp_kda_split_shape_ok();
             const bool dense_ffn_split =
-                glm53_tp_dense_ffn_split_requested() != 0;
+                glm53_tp_dense_ffn_split_requested() != 0 &&
+                glm53_tp_dense_ffn_split_shape_ok();
             /* From layer 0, not DS4_N_LEADING_DENSE: the leading layers are
              * dense only in their FFN and their KDA attention gates too.  See
              * glm53_layer_tp_gates(), which owns both rules. */
@@ -66003,6 +66029,10 @@ uint32_t ds4_engine_tp_split_flags(ds4_engine *e) {
     if (glm53_tp_shared_split_requested()) f |= 1u << 2;
     if (glm53_tp_dense_ffn_split_requested()) f |= 1u << 3;
     if (glm53_tp_vocab_split_requested()) f |= 1u << 4;
+    /* Not a split, but a one-sided value makes the two ranks choose different
+     * prefill paths, and S2/S4 make those paths gate-bearing.  Carrying the
+     * value (not just "is it set") catches a mismatch in either direction. */
+    f |= (glm53_tp_exact_prefill_max() & 0xffffu) << 16;
     return f;
 }
 
@@ -68870,11 +68900,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             return 0;
         }
 
-        uint32_t glm_exact_prefill_max = 64;
-        {
-            const char *em = getenv("DS4_GLM_TP_EXACT_PREFILL_MAX");
-            if (em && em[0]) glm_exact_prefill_max = (uint32_t)atoi(em);
-        }
+        const uint32_t glm_exact_prefill_max = glm53_tp_exact_prefill_max();
         if (s->engine->glm_tp_token_prefill ||
             s->glm_graph.placement != NULL ||
             (s->glm_graph.tp_world == 2 &&
