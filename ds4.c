@@ -12906,17 +12906,40 @@ static uint32_t glm53_prefill_chunk_tokens(void) {
     return cached;
 }
 
-/* Matches what the DeepSeek path does with k-slices under tensor parallelism:
- * no hardware gate at all -- tp_split_shared k-slices the shared expert's down
- * projection on any machine, and the attention output split is keyed only on
- * tp_world.  The M5 device test this replaces marked where the win was
- * measured, not where it stops: without the slice each rank projects the full
- * head width through columns it has just zeroed, so a pair on any machine pays
- * double on every DSA layer.  Set to 0 to restore the unsliced path for an
- * A/B; both ranks must agree, because the slice changes a reduction order. */
+/* The head-split attention-output projection must be k-sliced.  This started as
+ * a device-name gate ("Apple M5") that read like a performance tuning choice,
+ * and un-gating it to match the DeepSeek path turned out to fix a silent
+ * correctness bug on every other machine.
+ *
+ * The unsliced alternative projects the full head width and relies on the
+ * unowned columns of batch_heads being exactly the zeros filled once per chunk,
+ * so that each rank's result is its own partial.  Rig arm 2026-09-01-E3
+ * measured the two paths against each other on identical input: max|delta| 7.74
+ * and mean 1.22 over the full 154880-wide frontier logits, with the argmax
+ * moving, against a control-versus-control delta of 0.017.  That is not a
+ * reduction-order difference, it is a different computation -- the zeros do not
+ * survive the layer loop.  The sliced path is the one externally validated:
+ * arm C2 scored it at 90/100 first-token match against the FP8 reference.
+ *
+ * It is also about 6% slower than the incorrect path, because it does half the
+ * FLOPs through a less efficient kernel.  That is a real optimization target,
+ * but it is not a reason to turn this off.
+ *
+ * The override remains so the two paths can be compared again; it is not a
+ * performance switch, and disabling it says so on the way past. */
 static int glm53_prefill_attnout_kslice(void) {
     const char *env = getenv("DS4_GLM_TP_PREFILL_ATTNOUT_KSLICE");
-    if (env && env[0]) return env[0] != '0';
+    if (env && env[0] && env[0] == '0') {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "ds4: WARNING: GLM prefill attn-output k-slice disabled; "
+                    "this path produces incorrect logits (see rig arm E3) and "
+                    "exists only for comparison\n");
+        }
+        return 0;
+    }
     return 1;
 }
 
@@ -51653,11 +51676,13 @@ static bool glm_graph_forward_indexed_tokens(
             ds4_gpu_tensor *attn_out_dst =
                 tp_attn_head_split ? g->tp_bounce_out : g->batch_attn_out;
             if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ATTN_OUT)) { /* ablate */ } else
-            /* The k-slice is what stops each rank projecting the full head
-             * width through columns it zeroed, so on a 2-rank pair it removes
-             * half the attn_output work on every DSA layer.  It is gated to M5
-             * on any machine now, matching what the DeepSeek path already does
-             * with its k-slices; see glm53_prefill_attnout_kslice(). */
+            /* Required for correctness, not an optimization -- see
+             * glm53_prefill_attnout_kslice().  Each rank projects only its own
+             * half of the head width; the full-width alternative depends on the
+             * unowned columns of batch_heads still being the zeros filled once
+             * per chunk, and rig arm 2026-09-01-E3 shows they are not: the two
+             * paths disagree by max|delta| 7.74 with argmax flips, against a
+             * 0.017 control. */
             if (tp_attn_head_split &&
                 !g->quality &&
                 glm53_prefill_attnout_kslice() &&
