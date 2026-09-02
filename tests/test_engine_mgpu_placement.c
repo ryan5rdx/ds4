@@ -77,6 +77,8 @@ uint32_t ds4_test_planner_prefill_cap(int prompt_len,
                                       uint32_t prefill_chunk);
 uint32_t ds4_test_prefill_watchdog_chunk(uint32_t prompt_len);
 uint32_t ds4_test_planner_raw_cap(int ctx_size, uint32_t prefill_cap);
+uint32_t ds4_test_glm53_prefill_chunk_ceiling(void);
+uint32_t ds4_test_glm53_prefill_chunk_for_prompt(uint32_t prompt_len);
 size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size);
 size_t ds4_test_compute_glm_entry_bytes_sum_with_sessions(
                                          const ds4_test_fake_tensor *tensors,
@@ -715,7 +717,8 @@ static void test_cuda_tp_output_head_moves_to_lower_half(void) {
  *  - ds4_test_prefill_watchdog_chunk() is the RUNTIME bound, keyed on the real
  *    prompt length, and is the one that must shrink.
  *
- * Pin both, so neither can absorb the other's job again. */
+ * Pin both, so neither can absorb the other's job again. The GLM assertions
+ * below verify that its model-specific ceiling uses this same runtime ladder. */
 static void test_prefill_watchdog_bound(void) {
     fprintf(stderr, "RUN: test_prefill_watchdog_bound\n");
 
@@ -728,6 +731,10 @@ static void test_prefill_watchdog_bound(void) {
     static const int ladder[] = {
         8192, 65536, 131072, 154390, 163840, 232306, 262144, 327680,
         393216, 524288, 655360, 1000000,
+        /* Past the point where the work budget alone would select a chunk
+         * below the floor, so the floor assertion below is actually
+         * exercised rather than vacuously true. */
+        2000000,
     };
     const int n_ladder = (int)(sizeof(ladder) / sizeof(ladder[0]));
 
@@ -772,6 +779,37 @@ static void test_prefill_watchdog_bound(void) {
     CHECK(ds4_test_prefill_watchdog_chunk(271180) < 4096,
           "runtime bound rejects the 4096 chunk that was killed at 271k");
 
+    /* GLM 5.3 runs the same two-level scheme: a fixed allocation ceiling, and a
+     * runtime chunk that follows the shared ladder.  Before this, GLM had only
+     * the constant, so a chunk proven at 131k would have been used unchanged at
+     * every context above it. */
+    {
+        const uint32_t glm_ceiling = ds4_test_glm53_prefill_chunk_ceiling();
+        CHECK(glm_ceiling == 4096,
+              "GLM allocation ceiling matches the DeepSeek base");
+        CHECK(ds4_test_glm53_prefill_chunk_for_prompt(0) == glm_ceiling,
+              "an unknown prompt length sizes at the ceiling");
+        CHECK(ds4_test_glm53_prefill_chunk_for_prompt(8192) == 4096,
+              "GLM keeps the E2-measured 4096 chunk at 8k");
+        CHECK(ds4_test_glm53_prefill_chunk_for_prompt(131072) == 4096,
+              "GLM keeps the E2-measured 4096 chunk at 131k");
+        CHECK(ds4_test_glm53_prefill_chunk_for_prompt(271180) < glm_ceiling,
+              "GLM backs off past the context that killed a 4096 chunk");
+
+        uint32_t glm_prev = glm_ceiling;
+        bool glm_monotone = true, glm_bounded = true;
+        for (size_t i = 0; i < sizeof(ladder) / sizeof(ladder[0]); i++) {
+            const uint32_t c =
+                ds4_test_glm53_prefill_chunk_for_prompt((uint32_t)ladder[i]);
+            if (c > glm_prev) glm_monotone = false;
+            if (c > glm_ceiling) glm_bounded = false;
+            glm_prev = c;
+        }
+        CHECK(glm_monotone, "GLM runtime chunk never grows as the prompt grows");
+        CHECK(glm_bounded, "GLM runtime chunk never exceeds its own ceiling");
+        CHECK(glm_prev < glm_ceiling,
+              "GLM runtime chunk has actually shrunk by 1M tokens");
+    }
     /* Short prompts are untouched, and the clamp to prompt_len still holds. */
     CHECK(ds4_test_planner_prefill_cap(4096, 0) == 4096,
           "prompts at the whole-batch threshold are not chunked");
