@@ -13370,6 +13370,17 @@ static bool glm53_tp_dense_ffn_split_shape_ok(void) {
     return DS4_N_FF_DENSE >= 2u && (DS4_N_FF_DENSE % 64u) == 0u;
 }
 
+/* Read in two places -- the prefill path decision and the hello capability word
+ * -- and a one-sided value makes the ranks take different prefill paths. */
+static uint32_t glm53_tp_exact_prefill_max(void) {
+    const char *em = getenv("DS4_GLM_TP_EXACT_PREFILL_MAX");
+    if (em && em[0]) {
+        const int v = atoi(em);
+        return v > 0 ? (uint32_t)v : 0u;
+    }
+    return 64u;
+}
+
 /* HC1 -- fuse the hc_pre tail: split+weighted-sum and the RMS norm are one
  * kernel, `ds4_gpu_hc_split_weighted_sum_norm_tensor`, which the DeepSeek path
  * has shipped at seven call sites.  GLM 5.3 issues them as two dispatches, and
@@ -13388,8 +13399,9 @@ static bool glm53_tp_dense_ffn_split_shape_ok(void) {
  * latency-bound saving, so the 1.64x M1 Max -> M2 Ultra factor does NOT apply
  * and the rig may show less. */
 static int glm53_hc_pre_fuse_requested(void) {
+    /* Default ON. Set DS4_GLM_HC_PRE_FUSE=0 to disable. */
     const char *env = getenv("DS4_GLM_HC_PRE_FUSE");
-    return env && env[0] && env[0] != '0';
+    return !(env && env[0] == '0');
 }
 
 /* HC3 -- fold the KDA output projection into the HC expand.
@@ -44955,6 +44967,7 @@ static glm53_kda_lane glm53_kda_lane_for_phase(const ds4_glm_gpu_graph *g,
         glm53_kda_phase_splits(glm53_tp_kda_split_mode(), phase);
     glm53_kda_lane lane;
     lane.split = g && g->tp_world == 2 && g->tp_out && g->tp_in &&
+                 !g->ssd_streaming &&
                  phase_splits && glm53_tp_kda_split_shape_ok();
     lane.heads = lane.split ? (uint32_t)DS4_N_KDA_HEAD / 2u
                             : (uint32_t)DS4_N_KDA_HEAD;
@@ -46872,7 +46885,8 @@ static bool glm_graph_encode_ffn_one_normed_from(
             decode_step && g->glm53 &&
             g->tp_world == 2 && g->tp_out && g->tp_in && !g->ssd_streaming &&
             glm53_tp_dense_ffn_split_requested() &&
-            hidden_full >= 2u && (hidden_full % 64u) == 0u;
+            glm53_tp_dense_ffn_split_shape_ok() &&
+            hidden_full == (uint64_t)DS4_N_FF_DENSE;
         if (dense_split) {
             static int announced;
             if (!announced) {
@@ -64859,6 +64873,10 @@ int ds4_test_glm53_idx_split_decide(int gate_due, uint32_t score_rows,
                                     uint32_t selected_pools, uint32_t min_ctx) {
     return glm53_idx_split_decide(gate_due, score_rows, selected_pools, min_ctx);
 }
+
+uint32_t ds4_test_glm53_tp_split_flags(void) {
+    return ds4_engine_tp_split_flags(NULL);
+}
 /* mode: 0 off, 1 decode, 2 both.  phase: 0 decode, 1 prefill. */
 int ds4_test_glm53_kda_phase_splits(int mode, int phase) {
     return glm53_kda_phase_splits((glm53_kda_split_mode)mode,
@@ -66344,6 +66362,10 @@ uint32_t ds4_engine_tp_split_flags(ds4_engine *e) {
      * and omits the other, so it must be part of the hello even though it
      * reuses the existing FFN gate schedule. */
     if (glm53_tp_prefill_shared_split_requested()) f |= 1u << 6;
+    /* Not a split, but a one-sided value makes the two ranks choose different
+     * prefill paths, and S2/S4 make those paths gate-bearing.  Carrying the
+     * value (not just "is it set") catches a mismatch in either direction. */
+    f |= (glm53_tp_exact_prefill_max() & 0xffffu) << 16;
     return f;
 }
 
@@ -69306,11 +69328,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             return 0;
         }
 
-        uint32_t glm_exact_prefill_max = 64;
-        {
-            const char *em = getenv("DS4_GLM_TP_EXACT_PREFILL_MAX");
-            if (em && em[0]) glm_exact_prefill_max = (uint32_t)atoi(em);
-        }
+        const uint32_t glm_exact_prefill_max = glm53_tp_exact_prefill_max();
         if (s->engine->glm_tp_token_prefill ||
             s->glm_graph.placement != NULL ||
             (s->glm_graph.tp_world == 2 &&
