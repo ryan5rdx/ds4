@@ -70,7 +70,7 @@ typedef struct {
     uint32_t gate_slot_start;
     uint32_t gate_slot_step;
     uint32_t gates_per_token;
-    uint32_t pad;
+    uint32_t split_flags;   /* was pad; same wire size */
     uint64_t gate_slot_mask[DS4_TP_GATE_MASK_WORDS];
 } ds4_tp_hello_fixed;
 
@@ -1970,6 +1970,7 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         .gate_slot_start = id->gate_slot_start,
         .gate_slot_step = id->gate_slot_step,
         .gates_per_token = id->gates_per_token,
+        .split_flags = id->split_flags,
     };
     memcpy(mine.gate_slot_mask, id->gate_slot_mask,
            sizeof(mine.gate_slot_mask));
@@ -1998,6 +1999,7 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
         theirs.gate_slot_start != mine.gate_slot_start ||
         theirs.gate_slot_step != mine.gate_slot_step ||
         theirs.gates_per_token != mine.gates_per_token ||
+        theirs.split_flags != mine.split_flags ||
         memcmp(theirs.gate_slot_mask, mine.gate_slot_mask,
                sizeof(mine.gate_slot_mask)) != 0) {
         tp_set_err(err, errlen,
@@ -3047,6 +3049,7 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
         .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
         .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
         .ctx_size = 0, /* adopt the leader's */
+        .split_flags = ds4_engine_tp_split_flags(engine),
     };
     ds4_engine_tp_gate_schedule(engine,
                                 &id.gate_slot_start,

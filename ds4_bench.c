@@ -707,6 +707,7 @@ int main(int argc, char **argv) {
             .n_vocab = (uint32_t)ds4_engine_vocab_size(engine),
             .quant_bits = (uint32_t)ds4_engine_routed_quant_bits(engine),
             .ctx_size = (uint32_t)cfg.ctx_alloc,
+            .split_flags = ds4_engine_tp_split_flags(engine),
         };
         ds4_engine_tp_gate_schedule(engine,
                                     &tp_id.gate_slot_start,

@@ -13187,6 +13187,40 @@ static bool glm53_tp_kda_split_shape_ok(void) {
     return DS4_N_KDA_HEAD >= 2u && (DS4_N_KDA_HEAD % 2u) == 0u;
 }
 
+/* S2 -- split the shared expert's intermediate dimension across the pair.
+ *
+ * The shared expert runs on all 42 sparse layers and is fully replicated today.
+ * Splitting the FF_EXP dimension gives each rank half the SwiGLU mid, and the
+ * down projection k-slices over that half into a partial sum -- which is added
+ * into the routed partial BEFORE the FFN gate, so it rides the exchange that
+ * already fires and costs no extra round trip.
+ *
+ * Decode-only by construction: the fold happens at the row-gate combine, which
+ * prefill does not use (prefill combines through the big gate over whole rows).
+ * That is deliberate given S6b -- a prefill split trades half a matmul for
+ * rows * n_embd * 4 bytes per layer and loses. */
+static int glm53_tp_shared_split_requested(void) {
+    /* Default ON. Set DS4_GLM_TP_SHARED_SPLIT=0 to disable. */
+    const char *env = getenv("DS4_GLM_TP_SHARED_SPLIT");
+    return !(env && env[0] == '0');
+}
+
+static bool glm53_tp_shared_split_shape_ok(void) {
+    return DS4_N_FF_EXP >= 2u && (DS4_N_FF_EXP % 64u) == 0u;
+}
+
+static int glm53_tp_dense_ffn_split_requested(void) {
+    /* Default ON. Set DS4_GLM_TP_DENSE_FFN_SPLIT=0 to disable. */
+    const char *env = getenv("DS4_GLM_TP_DENSE_FFN_SPLIT");
+    return !(env && env[0] == '0');
+}
+
+static int glm53_tp_vocab_split_requested(void) {
+    /* Default ON. Set DS4_GLM_TP_VOCAB_SPLIT=0 to disable. */
+    const char *env = getenv("DS4_GLM_TP_VOCAB_SPLIT");
+    return !(env && env[0] == '0');
+}
+
 typedef enum {
     GLM53_KDA_PHASE_DECODE = 0,
     GLM53_KDA_PHASE_PREFILL,
@@ -41631,6 +41665,13 @@ typedef struct ds4_glm_gpu_graph {
     bool ssd_streaming_cold;
     bool generic_routed_moe;
     bool glm53;
+    /* The ENGINE's decision on the vocab split, not the env.  The graph must
+     * not re-derive it: ds4_engine_tp_bind refuses the split under --mtp,
+     * because the MTP cycle argmaxes the full vocabulary without merging the
+     * halves.  A graph that read the env directly would keep splitting the head
+     * while the merge stayed off -- half-written logits on every token, which is
+     * worse than not mitigating at all. */
+    bool tp_vocab_split;
     /* One bit per layer whose KDA state a split decode advanced, so that layer
      * is fresh only over this rank's head range.  A replicated prefill needs
      * the whole thing, so it exchanges halves with the peer and clears the bit.
@@ -45080,12 +45121,49 @@ static bool glm_graph_encode_output_head_from(
                                              weights->output_norm->abs_offset,
                                              DS4_N_EMBD,
                                              DS4_RMS_EPS) != 0;
-    if (ok) ok = glm53_graph_matmul(g->logits,
-                                    model,
-                                    weights->output,
-                                    DS4_N_EMBD,
-                                    DS4_N_VOCAB,
-                                    g->output_norm);
+    if (!ok) return false;
+    /* S5: this rank materialises only its half of the head rows, in place at
+     * its own offset in the logits buffer.  The halves are bit-identical to the
+     * full head -- same kernel, same rows, no reduction is being split -- so
+     * unlike the FFN and attention splits this one changes no arithmetic. */
+    const bool vocab_split =
+        g->tp_world == 2 && (DS4_N_VOCAB % 2u) == 0u &&
+        g->tp_vocab_split;
+    if (!vocab_split) {
+        return glm53_graph_matmul(g->logits,
+                                  model,
+                                  weights->output,
+                                  DS4_N_EMBD,
+                                  DS4_N_VOCAB,
+                                  g->output_norm);
+    }
+    const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
+    uint64_t head_off = 0;
+    if (!glm53_graph_weight_row_offset(weights->output, DS4_N_EMBD,
+                                       (uint32_t)g->tp_rank * vhalf,
+                                       &head_off)) {
+        return false;
+    }
+    ds4_gpu_tensor *half =
+        ds4_gpu_tensor_view(g->logits,
+                            (uint64_t)g->tp_rank * vhalf * sizeof(float),
+                            (uint64_t)vhalf * sizeof(float));
+    if (!half) return false;
+    {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "ds4: GLM S5 output-head split active: rank %u rows "
+                    "[%u,%u) of %u\n",
+                    (unsigned)g->tp_rank, (unsigned)((uint32_t)g->tp_rank * vhalf),
+                    (unsigned)(((uint32_t)g->tp_rank + 1u) * vhalf),
+                    (unsigned)DS4_N_VOCAB);
+        }
+    }
+    ok = glm53_graph_matmul_at(half, model, weights->output, head_off,
+                               DS4_N_EMBD, vhalf, g->output_norm);
+    ds4_gpu_tensor_free(half);
     return ok;
 }
 
@@ -45712,7 +45790,10 @@ static uint32_t glm_decode_ablate_mask(void) {
     return (uint32_t)cached;
 }
 
-static bool glm_graph_encode_shared_swiglu_one(
+/* mid_off / mid_dim select this rank's slice of the SwiGLU intermediate; pass
+ * (0, DS4_N_FF_EXP) for the whole thing.  Only the out rows of gate/up move --
+ * both are [n_embd][n_ff_exp], so a row offset is a clean byte offset. */
+static bool glm_graph_encode_shared_swiglu_lane(
         ds4_gpu_tensor          *mid,
         ds4_gpu_tensor          *gate,
         ds4_gpu_tensor          *up,
@@ -45724,9 +45805,18 @@ static bool glm_graph_encode_shared_swiglu_one(
         float                    clamp,
         bool                     ssd_streaming,
         bool                     stage_profile,
-        double                  *stage_t0) {
+        double                  *stage_t0,
+        uint32_t                 mid_off,
+        uint32_t                 mid_dim) {
     if (!mid || !gate || !up || !model || !l || !x ||
         !l->ffn_gate_shexp || !l->ffn_up_shexp) {
+        return false;
+    }
+    uint64_t gate_off = 0, up_off = 0;
+    if (!glm53_graph_weight_row_offset(l->ffn_gate_shexp, DS4_N_EMBD,
+                                       mid_off, &gate_off) ||
+        !glm53_graph_weight_row_offset(l->ffn_up_shexp, DS4_N_EMBD,
+                                       mid_off, &up_off)) {
         return false;
     }
 
@@ -45738,10 +45828,10 @@ static bool glm_graph_encode_shared_swiglu_one(
                 mid,
                 model->map,
                 model->size,
-                l->ffn_gate_shexp->abs_offset,
-                l->ffn_up_shexp->abs_offset,
+                gate_off,
+                up_off,
                 DS4_N_EMBD,
-                DS4_N_FF_EXP,
+                mid_dim,
                 x,
                 clamp) != 0;
         if (ok) ok = glm_graph_profile_stage(stage_profile,
@@ -45756,9 +45846,9 @@ static bool glm_graph_encode_shared_swiglu_one(
 
     ok = glm_graph_matmul_q8_0_decode_profiled_tensor(gate,
                                                       model,
-                                                      l->ffn_gate_shexp->abs_offset,
+                                                      gate_off,
                                                       DS4_N_EMBD,
-                                                      DS4_N_FF_EXP,
+                                                      mid_dim,
                                                       x,
                                                       il,
                                                       pos,
@@ -45766,9 +45856,9 @@ static bool glm_graph_encode_shared_swiglu_one(
                                                       ssd_streaming) != 0;
     if (ok) ok = glm_graph_matmul_q8_0_decode_profiled_tensor(up,
                                                               model,
-                                                              l->ffn_up_shexp->abs_offset,
+                                                              up_off,
                                                               DS4_N_EMBD,
-                                                              DS4_N_FF_EXP,
+                                                              mid_dim,
                                                               x,
                                                               il,
                                                               pos,
@@ -45784,7 +45874,7 @@ static bool glm_graph_encode_shared_swiglu_one(
     if (ok) ok = ds4_gpu_swiglu_tensor(mid,
                                        gate,
                                        up,
-                                       DS4_N_FF_EXP,
+                                       mid_dim,
                                        clamp,
                                        1.0f) != 0;
     if (ok) ok = glm_graph_profile_stage(stage_profile,
@@ -45797,10 +45887,30 @@ static bool glm_graph_encode_shared_swiglu_one(
     return ok;
 }
 
+static bool glm_graph_encode_shared_swiglu_one(
+        ds4_gpu_tensor          *mid,
+        ds4_gpu_tensor          *gate,
+        ds4_gpu_tensor          *up,
+        const ds4_model         *model,
+        const ds4_layer_weights *l,
+        uint32_t                 il,
+        uint32_t                 pos,
+        const ds4_gpu_tensor    *x,
+        float                    clamp,
+        bool                     ssd_streaming,
+        bool                     stage_profile,
+        double                  *stage_t0) {
+    return glm_graph_encode_shared_swiglu_lane(mid, gate, up, model, l, il, pos,
+                                               x, clamp, ssd_streaming,
+                                               stage_profile, stage_t0,
+                                               0u, (uint32_t)DS4_N_FF_EXP);
+}
+
 static bool glm_graph_encode_sparse_ffn_one(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
         const ds4_layer_weights *l,
+        bool                     decode_step,
         uint32_t                 il,
         uint32_t                 pos,
         const ds4_gpu_tensor    *ffn_norm,
@@ -45869,7 +45979,36 @@ static bool glm_graph_encode_sparse_ffn_one(
     const bool streaming_selected_cache =
         generic_streaming_selected_cache ||
         uniform_streaming_selected_cache;
-    const bool shared_first = streaming_selected_cache;
+    /* S2: the shared expert's partial must land in the routed buffer before
+     * the FFN gate fires, so it rides that exchange instead of adding one. */
+    /* decode_step, not add_residual.  The GLM 5.3 decode tail passes
+     * add_residual = false, so gating on it disabled S2 entirely on the one
+     * path it exists to speed up.  And prefill reaches this function through a
+     * per-row fallback loop, where firing a row gate per row would desync the
+     * ordinal walk -- so the guard has to be "is this a single decode step",
+     * which only the caller knows. */
+    const bool shared_split =
+        decode_step &&
+        g->tp_world == 2 && g->tp_out && g->tp_in && !g->ssd_streaming &&
+        glm53_tp_shared_split_requested() && glm53_tp_shared_split_shape_ok();
+    if (shared_split) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "ds4: GLM S2 shared-expert split active: rank %u mid rows "
+                    "[%u,%u) of %u\n",
+                    (unsigned)g->tp_rank,
+                    (unsigned)((uint32_t)g->tp_rank * ((uint32_t)DS4_N_FF_EXP / 2u)),
+                    (unsigned)(((uint32_t)g->tp_rank + 1u) * ((uint32_t)DS4_N_FF_EXP / 2u)),
+                    (unsigned)DS4_N_FF_EXP);
+        }
+    }
+    const uint32_t shared_mid_dim =
+        shared_split ? (uint32_t)DS4_N_FF_EXP / 2u : (uint32_t)DS4_N_FF_EXP;
+    const uint32_t shared_mid_off =
+        shared_split ? (uint32_t)g->tp_rank * shared_mid_dim : 0u;
+    const bool shared_first = streaming_selected_cache || shared_split;
     metal_graph_selected_async_load async_load = {0};
     bool async_load_started = false;
     const bool async_profile =
@@ -45950,7 +46089,7 @@ static bool glm_graph_encode_sparse_ffn_one(
         }
     }
     if (ok && shared_first) {
-        ok = glm_graph_encode_shared_swiglu_one(ffn_mid,
+        ok = glm_graph_encode_shared_swiglu_lane(ffn_mid,
                                                 ffn_gate,
                                                 ffn_up,
                                                 model,
@@ -45961,8 +46100,25 @@ static bool glm_graph_encode_sparse_ffn_one(
                                                 g->glm53 ? DS4_SWIGLU_CLAMP_EXP : 0.0f,
                                                 g->ssd_streaming,
                                                 stage_profile,
-                                                stage_t0);
-        if (ok) ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_sum,
+                                                stage_t0,
+                                                shared_mid_off,
+                                                shared_mid_dim);
+        if (ok && shared_split) {
+            /* This rank owns mid rows [off, off+dim); the down projection
+             * contracts over exactly those, giving a partial over n_embd.
+             * x_elem_off is 0 because ffn_mid is compact at its base -- it is
+             * the weight's k range that moves, not the activation. */
+            ok = metal_graph_matmul_dense_quant_kslice(ffn_sum,
+                                                       model,
+                                                       l->ffn_down_shexp,
+                                                       (uint64_t)DS4_N_FF_EXP,
+                                                       shared_mid_off,
+                                                       shared_mid_dim,
+                                                       DS4_N_EMBD,
+                                                       ffn_mid,
+                                                       0);
+        } else if (ok) {
+            ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_sum,
                                                                   model,
                                                                   l->ffn_down_shexp->abs_offset,
                                                                   DS4_N_FF_EXP,
@@ -45972,6 +46128,7 @@ static bool glm_graph_encode_sparse_ffn_one(
                                                                   pos,
                                                                   "shared_down",
                                                                   g->ssd_streaming) != 0;
+        }
         if (ok) ok = glm_graph_profile_stage(stage_profile,
                                              "glm_decode_ffn",
                                              "shared_down",
@@ -46043,6 +46200,14 @@ static bool glm_graph_encode_sparse_ffn_one(
         !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) {
         ok = imatrix_collect_glm_one(g->imatrix, g, il);
     }
+    if (ok && shared_split) {
+        /* S2: fold this rank's shared partial into the routed partial so the
+         * FFN gate carries both.  Zero added gates -- the whole point. */
+        ok = ds4_gpu_add_tensor(g->tp_out[tp_ffn_slot],
+                                g->tp_out[tp_ffn_slot],
+                                ffn_sum,
+                                DS4_N_EMBD) != 0;
+    }
     if (ok && tp_split_ffn) {
         ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
         if (ok) ok = ds4_gpu_add_tensor(ffn_out,
@@ -46103,7 +46268,12 @@ static bool glm_graph_encode_sparse_ffn_one(
                                              1,
                                              stage_t0);
     }
-    if (ok && add_residual && !glm_graph_disable_add3_residual()) {
+    if (ok && shared_split) {
+        /* ffn_sum is already inside ffn_out -- the gate exchanged routed plus
+         * shared together -- so adding it again would double-count it.  The
+         * split requires add_residual, so this is the only shape to handle. */
+        ok = ds4_gpu_add_tensor(next, after_attn, ffn_out, DS4_N_EMBD) != 0;
+    } else if (ok && add_residual && !glm_graph_disable_add3_residual()) {
         ok = ds4_gpu_add3_tensor(next,
                                  after_attn,
                                  ffn_out,
@@ -46152,6 +46322,7 @@ static bool glm_graph_encode_ffn_one_normed_from(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
         const ds4_layer_weights *l,
+        bool                     decode_step,
         uint32_t                 il,
         uint32_t                 pos,
         const ds4_gpu_tensor    *ffn_norm,
@@ -46173,11 +46344,50 @@ static bool glm_graph_encode_ffn_one_normed_from(
     }
 
     if (il < DS4_N_LEADING_DENSE) {
-        const uint64_t hidden = l->ffn_gate->dim[1];
+        const uint64_t hidden_full = l->ffn_gate->dim[1];
+        /* S4: split the SwiGLU intermediate; the down projection then k-slices
+         * over this rank's half into a partial that a new FFN gate sums. */
+        /* decode_step is load-bearing: prefill drives this helper once per row
+         * (glm_graph_forward_indexed_tokens' per-row fallback), and the leading
+         * dense layers have no batched path at all, so without this the gate
+         * would fire once per token on the same layer slot and the ordinal walk
+         * would desync immediately. */
+        const bool dense_split =
+            decode_step && g->glm53 &&
+            g->tp_world == 2 && g->tp_out && g->tp_in && !g->ssd_streaming &&
+            glm53_tp_dense_ffn_split_requested() &&
+            hidden_full >= 2u && (hidden_full % 64u) == 0u;
+        if (dense_split) {
+            static int announced;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: GLM S4 dense-FFN split active: rank %u, hidden "
+                        "%llu -> %llu per rank, +%u gates\n",
+                        (unsigned)g->tp_rank,
+                        (unsigned long long)hidden_full,
+                        (unsigned long long)(hidden_full / 2u),
+                        (unsigned)DS4_N_LEADING_DENSE);
+            }
+        }
+        const uint64_t hidden = dense_split ? hidden_full / 2u : hidden_full;
+        const uint32_t dense_mid_off =
+            dense_split ? (uint32_t)g->tp_rank * (uint32_t)hidden : 0u;
+        const uint32_t dense_ffn_slot =
+            il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
+        ds4_gpu_tensor *dense_dst = dense_split ? g->tp_out[dense_ffn_slot]
+                                                : ffn_out;
+        uint64_t dgate_off = 0, dup_off = 0;
+        if (!glm53_graph_weight_row_offset(l->ffn_gate, DS4_N_EMBD,
+                                           dense_mid_off, &dgate_off) ||
+            !glm53_graph_weight_row_offset(l->ffn_up, DS4_N_EMBD,
+                                           dense_mid_off, &dup_off)) {
+            return false;
+        }
         const bool can_fuse_gate_up =
             glm_graph_weights_are_q8_0(model,
-                                       l->ffn_gate->abs_offset,
-                                       l->ffn_up->abs_offset);
+                                       dgate_off,
+                                       dup_off);
         const bool fused_gate_up = can_fuse_gate_up &&
             ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(
                     ffn_gate,
@@ -46185,8 +46395,8 @@ static bool glm_graph_encode_ffn_one_normed_from(
                     ffn_mid,
                     model->map,
                     model->size,
-                    l->ffn_gate->abs_offset,
-                    l->ffn_up->abs_offset,
+                    dgate_off,
+                    dup_off,
                     DS4_N_EMBD,
                     hidden,
                     ffn_norm,
@@ -46203,7 +46413,7 @@ static bool glm_graph_encode_ffn_one_normed_from(
         } else {
             ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_gate,
                                                               model,
-                                                              l->ffn_gate->abs_offset,
+                                                              dgate_off,
                                                               DS4_N_EMBD,
                                                               hidden,
                                                               ffn_norm,
@@ -46213,7 +46423,7 @@ static bool glm_graph_encode_ffn_one_normed_from(
                                                               g->ssd_streaming) != 0;
             if (ok) ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_up,
                                                                       model,
-                                                                      l->ffn_up->abs_offset,
+                                                                      dup_off,
                                                                       DS4_N_EMBD,
                                                                       hidden,
                                                                       ffn_norm,
@@ -46242,16 +46452,38 @@ static bool glm_graph_encode_ffn_one_normed_from(
                                                  1,
                                                  stage_t0);
         }
-        if (ok) ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_out,
-                                                                  model,
-                                                                  l->ffn_down->abs_offset,
-                                                                  hidden,
-                                                                  DS4_N_EMBD,
-                                                                  ffn_mid,
-                                                                  il,
-                                                                  pos,
-                                                                  "dense_down",
-                                                                  g->ssd_streaming) != 0;
+        if (ok && dense_split) {
+            ok = metal_graph_matmul_dense_quant_kslice(dense_dst,
+                                                       model,
+                                                       l->ffn_down,
+                                                       hidden_full,
+                                                       dense_mid_off,
+                                                       (uint32_t)hidden,
+                                                       DS4_N_EMBD,
+                                                       ffn_mid,
+                                                       0);
+            if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
+            if (ok) ok = ds4_gpu_add_tensor(ffn_out,
+                                            g->tp_out[dense_ffn_slot],
+                                            g->tp_in[dense_ffn_slot],
+                                            DS4_N_EMBD) != 0;
+            if (!ok) {
+                fprintf(stderr,
+                        "ds4: GLM dense FFN split gate/combine failed "
+                        "(layer %u)\n", il);
+            }
+        } else if (ok) {
+            ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_out,
+                                                              model,
+                                                              l->ffn_down->abs_offset,
+                                                              hidden,
+                                                              DS4_N_EMBD,
+                                                              ffn_mid,
+                                                              il,
+                                                              pos,
+                                                              "dense_down",
+                                                              g->ssd_streaming) != 0;
+        }
         if (ok) ok = glm_graph_profile_stage(stage_profile,
                                              "glm_decode_ffn",
                                              "dense_down",
@@ -46284,6 +46516,7 @@ static bool glm_graph_encode_ffn_one_normed_from(
     return glm_graph_encode_sparse_ffn_one(g,
                                            model,
                                            l,
+                                           decode_step,
                                            il,
                                            pos,
                                            ffn_norm,
@@ -46311,6 +46544,7 @@ static bool glm53_graph_encode_ffn_tail_one(
     bool ok = glm_graph_encode_ffn_one_normed_from(g,
                                                    model,
                                                    l,
+                                                   true,
                                                    il,
                                                    pos,
                                                    g->ffn_norm,
@@ -46349,6 +46583,7 @@ static bool glm_graph_encode_ffn_one_from(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
         const ds4_layer_weights *l,
+        bool                     decode_step,
         uint32_t                 il,
         uint32_t                 pos,
         const ds4_gpu_tensor    *after_attn,
@@ -46387,6 +46622,7 @@ static bool glm_graph_encode_ffn_one_from(
     return glm_graph_encode_ffn_one_normed_from(g,
                                                 model,
                                                 l,
+                                                decode_step,
                                                 il,
                                                 pos,
                                                 ffn_norm,
@@ -51700,6 +51936,7 @@ glm53_indexed_attention_done:
                     ok = glm_graph_encode_ffn_one_normed_from(g,
                                                               model,
                                                               l,
+                                                              false,
                                                               il,
                                                               pos0 + t,
                                                               ffn_norm_view,
@@ -51718,6 +51955,7 @@ glm53_indexed_attention_done:
                     ok = glm_graph_encode_ffn_one_from(g,
                                                        model,
                                                        l,
+                                                       false,
                                                        il,
                                                        pos0 + t,
                                                        after_attn_view,
@@ -53396,6 +53634,7 @@ glm53_attention_done:
             ok = glm_graph_encode_ffn_one_normed_from(g,
                                                       model,
                                                       l,
+                                                      true,
                                                       il,
                                                       pos,
                                                       g->ffn_norm,
@@ -53450,7 +53689,8 @@ glm53_attention_done:
             !g->ssd_streaming &&
             decode_layer_flush_interval != 0 &&
             il < g->layer_end &&
-            (g->tp_world != 2 || ds4_gpu_tp_decode_split_flush_safe()) &&
+            (g->tp_world != 2 ||
+             ds4_gpu_tp_decode_split_flush_safe()) &&
             (slice_layer_done % decode_layer_flush_interval) == 0) {
             if (decode_flush_profile) {
                 ok = ds4_gpu_flush_commands() != 0;
@@ -65196,6 +65436,29 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
     }
 }
 
+/* Split features the gate mask cannot distinguish, packed for the TP hello.
+ *
+ * The mask catches anything that changes WHICH gates fire.  It does not catch a
+ * split that changes each rank's arithmetic while leaving the firing pattern
+ * alone (S2, S5), nor the KDA decode-vs-both mode, which produces a bit-identical
+ * decode mask and differs only in prefill.  Those are exactly the settings where
+ * a one-sided env silently corrupts rank state or hangs the logits transport, so
+ * they ride the hello and are compared verbatim. */
+uint32_t ds4_engine_tp_split_flags(ds4_engine *e) {
+    (void)e;
+    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA) return 0;
+    uint32_t f = 0;
+    switch (glm53_tp_kda_split_mode()) {
+        case GLM53_KDA_SPLIT_DECODE: f |= 1u << 0; break;
+        case GLM53_KDA_SPLIT_BOTH:   f |= 1u << 1; break;
+        default: break;
+    }
+    if (glm53_tp_shared_split_requested()) f |= 1u << 2;
+    if (glm53_tp_dense_ffn_split_requested()) f |= 1u << 3;
+    if (glm53_tp_vocab_split_requested()) f |= 1u << 4;
+    return f;
+}
+
 int ds4_engine_embd_dim(ds4_engine *e) {
     (void)e;
     return (int)DS4_N_EMBD;
@@ -65754,9 +66017,44 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
     g_tp_block_ctx = tp;
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
-    /* GLM keeps its replicated output head unsplit in v0: the
-     * leader computes full logits and nothing crosses the wire. */
-    e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA;
+    /* GLM kept its replicated output head unsplit in v0: the leader computed
+     * full logits and nothing crossed the wire.  S5 opts in per run, because at
+     * -0.34 ms it is worth measuring before it is worth defaulting. */
+    e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA ||
+                        glm53_tp_vocab_split_requested() != 0;
+    /* S5 and GLM MTP are mutually exclusive, and the failure is silent rather
+     * than loud, so refuse the combination outright.  The MTP cycle calls
+     * glm_graph_forward_output_head() and then argmaxes the full vocabulary
+     * immediately (ds4_session_glm_spec_cycle_impl), bypassing the half-merge
+     * that ds4_session_eval does after a normal eval -- so under a split head it
+     * would argmax a buffer whose upper half was never written.
+     *
+     * An earlier note in the plan claimed these were compatible because the
+     * DeepSeek path reconciles them.  It does; the GLM MTP path does not, and
+     * checking one and asserting the other is how that error happened. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA &&
+        e->tp.vocab_split && e->glm_mtp) {
+        fprintf(stderr,
+                "ds4: DS4_GLM_TP_VOCAB_SPLIT is incompatible with --mtp on GLM "
+                "(the MTP cycle argmaxes the full vocabulary without merging "
+                "the halves); disabling the vocab split for this run\n");
+        e->tp.vocab_split = false;
+    }
+    /* Report effective values only after policy and incompatibility handling
+     * have finalized them.  The hello rejects mismatched split_flags, but a
+     * matched yet unintended configuration still needs to be visible. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        const char *modes[] = { "off", "decode", "both" };
+        fprintf(stderr,
+                "ds4: GLM TP splits, rank %d: kda=%s shared=%s dense_ffn=%s "
+                "vocab=%s (split_flags 0x%x)\n",
+                ds4_tp_rank(tp),
+                modes[(int)glm53_tp_kda_split_mode()],
+                glm53_tp_shared_split_requested() ? "on" : "off",
+                glm53_tp_dense_ffn_split_requested() ? "on" : "off",
+                e->tp.vocab_split ? "on" : "off",
+                ds4_engine_tp_split_flags(e));
+    }
     e->tp.ctx = tp;
     e->tp.rank = ds4_tp_rank(tp);
     e->tp.eval_seq = 0;
@@ -66051,6 +66349,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             s->glm_graph.tp_rank = (uint32_t)e->tp.rank;
             s->glm_graph.tp_slab_bounce_out = e->tp.prefill_bounce_out;
             s->glm_graph.tp_slab_bounce_in = e->tp.prefill_bounce_in;
+            s->glm_graph.tp_vocab_split = e->tp.vocab_split;
             s->glm_graph.tp_out = e->tp.out_views;
             s->glm_graph.tp_in = e->tp.in_views;
         }
