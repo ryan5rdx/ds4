@@ -39935,6 +39935,10 @@ typedef struct {
     ds4_gpu_tensor **out_views;
     ds4_gpu_tensor **in_views;
     ds4_gpu_tensor **batch_out_views;   /* [layer] verify-block row partials */
+    /* One prefill chunk each way, inside the registered slab so the bulk RDMA
+     * path posts against them directly instead of staging through CPU copies. */
+    ds4_gpu_tensor *prefill_bounce_out;
+    ds4_gpu_tensor *prefill_bounce_in;
     ds4_gpu_tensor **batch_in_views;
     ds4_gpu_tensor *zero_vec;
     uint64_t eval_seq;          /* leader: mirrored eval counter */
@@ -42504,6 +42508,12 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor **tp_in;
     /* Prefill batch gate bounce buffers (shared storage; grow on demand). */
     ds4_gpu_tensor *tp_bounce_out;
+    /* Slab-backed pair, when TP is bound: inside the NIC's registered region so
+     * the bulk exchange posts directly.  tp_bounce_* alias these unless a chunk
+     * outgrows the region, in which case they are privately owned. */
+    ds4_gpu_tensor *tp_slab_bounce_out;
+    ds4_gpu_tensor *tp_slab_bounce_in;
+    bool tp_bounce_owned;
     ds4_gpu_tensor *tp_bounce_in;
     /* CUDA multi-tier placement and device-local decode scratch mirrors. */
     const int *placement;
@@ -44355,8 +44365,16 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->kda_q);
     ds4_gpu_tensor_free(g->routed_down);
     ds4_gpu_tensor_free(g->routed_up);
-    ds4_gpu_tensor_free(g->tp_bounce_out);
-    ds4_gpu_tensor_free(g->tp_bounce_in);
+    /* Only free these when the graph owns them.  When TP is bound they alias
+     * the engine's slab views, and freeing those here would destroy a view the
+     * engine still holds for every other session. */
+    if (g->tp_bounce_owned) {
+        ds4_gpu_tensor_free(g->tp_bounce_out);
+        ds4_gpu_tensor_free(g->tp_bounce_in);
+    }
+    g->tp_bounce_out = NULL;
+    g->tp_bounce_in = NULL;
+    g->tp_bounce_owned = false;
     ds4_gpu_tensor_free(g->routed_gate);
     ds4_gpu_tensor_free(g->ffn_mid);
     ds4_gpu_tensor_free(g->ffn_up);
@@ -46187,11 +46205,37 @@ static const int32_t *g_glm_tp_debug_ids DS4_MAYBE_UNUSED;
 static bool glm_graph_tp_batch_bounce_ready(ds4_glm_gpu_graph *g,
                                             uint32_t n_tokens) {
     const uint64_t bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
-    if (!g->tp_bounce_out || ds4_gpu_tensor_bytes(g->tp_bounce_out) < bytes) {
-        ds4_gpu_tensor_free(g->tp_bounce_out);
-        ds4_gpu_tensor_free(g->tp_bounce_in);
+    /* Prefer the slab-backed pair: it is inside the NIC's registered region, so
+     * the bulk exchange takes its `direct` path and skips a memcpy of every byte
+     * in each direction.  Fall back to a private allocation only if the chunk
+     * outgrows the reserved region, which the prefill chunk ceiling should
+     * prevent -- and say so, because silently reverting to staging is exactly
+     * the kind of regression that hides in a throughput number. */
+    if (g->tp_slab_bounce_out && g->tp_slab_bounce_in &&
+        ds4_gpu_tensor_bytes(g->tp_slab_bounce_out) >= bytes) {
+        g->tp_bounce_out = g->tp_slab_bounce_out;
+        g->tp_bounce_in = g->tp_slab_bounce_in;
+        return true;
+    }
+    if (g->tp_slab_bounce_out) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "ds4: prefill bounce %llu B exceeds the registered slab "
+                    "region %llu B; falling back to staged copies\n",
+                    (unsigned long long)bytes,
+                    (unsigned long long)ds4_gpu_tensor_bytes(g->tp_slab_bounce_out));
+        }
+    }
+    if (!g->tp_bounce_owned || ds4_gpu_tensor_bytes(g->tp_bounce_out) < bytes) {
+        if (g->tp_bounce_owned) {
+            ds4_gpu_tensor_free(g->tp_bounce_out);
+            ds4_gpu_tensor_free(g->tp_bounce_in);
+        }
         g->tp_bounce_out = ds4_gpu_tensor_alloc(bytes);
         g->tp_bounce_in = ds4_gpu_tensor_alloc(bytes);
+        g->tp_bounce_owned = true;
     }
     return g->tp_bounce_out && g->tp_bounce_in;
 }
@@ -66313,6 +66357,10 @@ static void ds4_engine_tp_storage_free(ds4_engine *e, bool shutdown_gate) {
     free(e->tp.batch_in_views);
     free(e->tp.out_views);
     free(e->tp.in_views);
+    ds4_gpu_tensor_free(e->tp.prefill_bounce_out);
+    ds4_gpu_tensor_free(e->tp.prefill_bounce_in);
+    e->tp.prefill_bounce_out = NULL;
+    e->tp.prefill_bounce_in = NULL;
     ds4_gpu_tensor_free(e->tp.zero_vec);
     ds4_gpu_tensor_free(e->tp.slab);
     memset(&e->tp, 0, sizeof(e->tp));
@@ -66377,6 +66425,20 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
             snprintf(err, errlen, "tp: batch slab view creation failed");
             goto tp_bind_fail;
         }
+    }
+    /* The prefill bounce lives in the slab so the bulk RDMA path can post
+     * against it directly.  Outside the registered region every byte is
+     * memcpy'd through a staging buffer on both send and receive -- 2.28 GB of
+     * CPU copies for a 1.14 GB exchange. */
+    e->tp.prefill_bounce_out = ds4_gpu_tensor_view(
+            e->tp.slab, ds4_tp_slab_prefill_bounce_out_offset(tp),
+            ds4_tp_slab_prefill_bounce_bytes(tp));
+    e->tp.prefill_bounce_in = ds4_gpu_tensor_view(
+            e->tp.slab, ds4_tp_slab_prefill_bounce_in_offset(tp),
+            ds4_tp_slab_prefill_bounce_bytes(tp));
+    if (!e->tp.prefill_bounce_out || !e->tp.prefill_bounce_in) {
+        snprintf(err, errlen, "tp: prefill bounce view creation failed");
+        goto tp_bind_fail;
     }
     if (!ds4_gpu_tp_init((uint32_t)ds4_tp_rank(tp),
                          e->tp.slab, ds4_tp_slab_gpu_flags_offset(tp),
@@ -66774,6 +66836,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             s->glm_graph.tp_world = 2;
             s->glm_graph.tp_rank = (uint32_t)e->tp.rank;
             s->glm_graph.tp_vocab_split = e->tp.vocab_split;
+            s->glm_graph.tp_slab_bounce_out = e->tp.prefill_bounce_out;
+            s->glm_graph.tp_slab_bounce_in = e->tp.prefill_bounce_in;
             s->glm_graph.tp_out = e->tp.out_views;
             s->glm_graph.tp_in = e->tp.in_views;
         }

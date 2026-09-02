@@ -136,6 +136,13 @@ uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd);
 uint64_t ds4_tp_slab_out_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate);
 uint64_t ds4_tp_slab_in_offset(const ds4_tp *tp, uint32_t layer, uint32_t gate);
 uint64_t ds4_tp_slab_batch_out_offset(const ds4_tp *tp, uint32_t layer);
+/* Prefill bounce, sized for the largest prefill chunk.  Living inside the
+ * registered slab is the whole point: the bulk RDMA path can then post directly
+ * against the caller's buffers instead of memcpying every byte through a staging
+ * region, which for a 1.14 GB exchange was 2.28 GB of CPU copies. */
+uint64_t ds4_tp_slab_prefill_bounce_out_offset(const ds4_tp *tp);
+uint64_t ds4_tp_slab_prefill_bounce_in_offset(const ds4_tp *tp);
+uint64_t ds4_tp_slab_prefill_bounce_bytes(const ds4_tp *tp);
 uint64_t ds4_tp_slab_batch_in_offset(const ds4_tp *tp, uint32_t layer);
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp);
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen);
