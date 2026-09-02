@@ -12991,6 +12991,27 @@ static bool glm53_tp_kda_split_shape_ok(void) {
     return DS4_N_KDA_HEAD >= 2u && (DS4_N_KDA_HEAD % 2u) == 0u;
 }
 
+/* S2 -- split the shared expert's intermediate dimension across the pair.
+ *
+ * The shared expert runs on all 42 sparse layers and is fully replicated today.
+ * Splitting the FF_EXP dimension gives each rank half the SwiGLU mid, and the
+ * down projection k-slices over that half into a partial sum -- which is added
+ * into the routed partial BEFORE the FFN gate, so it rides the exchange that
+ * already fires and costs no extra round trip.
+ *
+ * Decode-only by construction: the fold happens at the row-gate combine, which
+ * prefill does not use (prefill combines through the big gate over whole rows).
+ * That is deliberate given S6b -- a prefill split trades half a matmul for
+ * rows * n_embd * 4 bytes per layer and loses. */
+static int glm53_tp_shared_split_requested(void) {
+    const char *env = getenv("DS4_GLM_TP_SHARED_SPLIT");
+    return env && env[0] && env[0] != '0';
+}
+
+static bool glm53_tp_shared_split_shape_ok(void) {
+    return DS4_N_FF_EXP >= 2u && (DS4_N_FF_EXP % 64u) == 0u;
+}
+
 typedef enum {
     GLM53_KDA_PHASE_DECODE = 0,
     GLM53_KDA_PHASE_PREFILL,
@@ -46355,7 +46376,10 @@ static uint32_t glm_decode_ablate_mask(void) {
     return (uint32_t)cached;
 }
 
-static bool glm_graph_encode_shared_swiglu_one(
+/* mid_off / mid_dim select this rank's slice of the SwiGLU intermediate; pass
+ * (0, DS4_N_FF_EXP) for the whole thing.  Only the out rows of gate/up move --
+ * both are [n_embd][n_ff_exp], so a row offset is a clean byte offset. */
+static bool glm_graph_encode_shared_swiglu_lane(
         ds4_gpu_tensor          *mid,
         ds4_gpu_tensor          *gate,
         ds4_gpu_tensor          *up,
@@ -46367,9 +46391,18 @@ static bool glm_graph_encode_shared_swiglu_one(
         float                    clamp,
         bool                     ssd_streaming,
         bool                     stage_profile,
-        double                  *stage_t0) {
+        double                  *stage_t0,
+        uint32_t                 mid_off,
+        uint32_t                 mid_dim) {
     if (!mid || !gate || !up || !model || !l || !x ||
         !l->ffn_gate_shexp || !l->ffn_up_shexp) {
+        return false;
+    }
+    uint64_t gate_off = 0, up_off = 0;
+    if (!glm53_graph_weight_row_offset(l->ffn_gate_shexp, DS4_N_EMBD,
+                                       mid_off, &gate_off) ||
+        !glm53_graph_weight_row_offset(l->ffn_up_shexp, DS4_N_EMBD,
+                                       mid_off, &up_off)) {
         return false;
     }
 
@@ -46381,10 +46414,10 @@ static bool glm_graph_encode_shared_swiglu_one(
                 mid,
                 model->map,
                 model->size,
-                l->ffn_gate_shexp->abs_offset,
-                l->ffn_up_shexp->abs_offset,
+                gate_off,
+                up_off,
                 DS4_N_EMBD,
-                DS4_N_FF_EXP,
+                mid_dim,
                 x,
                 clamp) != 0;
         if (ok) ok = glm_graph_profile_stage(stage_profile,
@@ -46399,9 +46432,9 @@ static bool glm_graph_encode_shared_swiglu_one(
 
     ok = glm_graph_matmul_q8_0_decode_profiled_tensor(gate,
                                                       model,
-                                                      l->ffn_gate_shexp->abs_offset,
+                                                      gate_off,
                                                       DS4_N_EMBD,
-                                                      DS4_N_FF_EXP,
+                                                      mid_dim,
                                                       x,
                                                       il,
                                                       pos,
@@ -46409,9 +46442,9 @@ static bool glm_graph_encode_shared_swiglu_one(
                                                       ssd_streaming) != 0;
     if (ok) ok = glm_graph_matmul_q8_0_decode_profiled_tensor(up,
                                                               model,
-                                                              l->ffn_up_shexp->abs_offset,
+                                                              up_off,
                                                               DS4_N_EMBD,
-                                                              DS4_N_FF_EXP,
+                                                              mid_dim,
                                                               x,
                                                               il,
                                                               pos,
@@ -46427,7 +46460,7 @@ static bool glm_graph_encode_shared_swiglu_one(
     if (ok) ok = ds4_gpu_swiglu_tensor(mid,
                                        gate,
                                        up,
-                                       DS4_N_FF_EXP,
+                                       mid_dim,
                                        clamp,
                                        1.0f) != 0;
     if (ok) ok = glm_graph_profile_stage(stage_profile,
@@ -46438,6 +46471,25 @@ static bool glm_graph_encode_shared_swiglu_one(
                                          1,
                                          stage_t0);
     return ok;
+}
+
+static bool glm_graph_encode_shared_swiglu_one(
+        ds4_gpu_tensor          *mid,
+        ds4_gpu_tensor          *gate,
+        ds4_gpu_tensor          *up,
+        const ds4_model         *model,
+        const ds4_layer_weights *l,
+        uint32_t                 il,
+        uint32_t                 pos,
+        const ds4_gpu_tensor    *x,
+        float                    clamp,
+        bool                     ssd_streaming,
+        bool                     stage_profile,
+        double                  *stage_t0) {
+    return glm_graph_encode_shared_swiglu_lane(mid, gate, up, model, l, il, pos,
+                                               x, clamp, ssd_streaming,
+                                               stage_profile, stage_t0,
+                                               0u, (uint32_t)DS4_N_FF_EXP);
 }
 
 static bool glm_graph_encode_sparse_ffn_one(
@@ -46512,7 +46564,17 @@ static bool glm_graph_encode_sparse_ffn_one(
     const bool streaming_selected_cache =
         generic_streaming_selected_cache ||
         uniform_streaming_selected_cache;
-    const bool shared_first = streaming_selected_cache;
+    /* S2: the shared expert's partial must land in the routed buffer before
+     * the FFN gate fires, so it rides that exchange instead of adding one. */
+    const bool shared_split =
+        g->tp_world == 2 && g->tp_out && g->tp_in && !g->ssd_streaming &&
+        add_residual &&
+        glm53_tp_shared_split_requested() && glm53_tp_shared_split_shape_ok();
+    const uint32_t shared_mid_dim =
+        shared_split ? (uint32_t)DS4_N_FF_EXP / 2u : (uint32_t)DS4_N_FF_EXP;
+    const uint32_t shared_mid_off =
+        shared_split ? (uint32_t)g->tp_rank * shared_mid_dim : 0u;
+    const bool shared_first = streaming_selected_cache || shared_split;
     metal_graph_selected_async_load async_load = {0};
     bool async_load_started = false;
     const bool async_profile =
@@ -46593,7 +46655,7 @@ static bool glm_graph_encode_sparse_ffn_one(
         }
     }
     if (ok && shared_first) {
-        ok = glm_graph_encode_shared_swiglu_one(ffn_mid,
+        ok = glm_graph_encode_shared_swiglu_lane(ffn_mid,
                                                 ffn_gate,
                                                 ffn_up,
                                                 model,
@@ -46604,8 +46666,25 @@ static bool glm_graph_encode_sparse_ffn_one(
                                                 g->glm53 ? DS4_SWIGLU_CLAMP_EXP : 0.0f,
                                                 g->ssd_streaming,
                                                 stage_profile,
-                                                stage_t0);
-        if (ok) ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_sum,
+                                                stage_t0,
+                                                shared_mid_off,
+                                                shared_mid_dim);
+        if (ok && shared_split) {
+            /* This rank owns mid rows [off, off+dim); the down projection
+             * contracts over exactly those, giving a partial over n_embd.
+             * x_elem_off is 0 because ffn_mid is compact at its base -- it is
+             * the weight's k range that moves, not the activation. */
+            ok = metal_graph_matmul_dense_quant_kslice(ffn_sum,
+                                                       model,
+                                                       l->ffn_down_shexp,
+                                                       (uint64_t)DS4_N_FF_EXP,
+                                                       shared_mid_off,
+                                                       shared_mid_dim,
+                                                       DS4_N_EMBD,
+                                                       ffn_mid,
+                                                       0);
+        } else if (ok) {
+            ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_sum,
                                                                   model,
                                                                   l->ffn_down_shexp->abs_offset,
                                                                   DS4_N_FF_EXP,
@@ -46615,6 +46694,7 @@ static bool glm_graph_encode_sparse_ffn_one(
                                                                   pos,
                                                                   "shared_down",
                                                                   g->ssd_streaming) != 0;
+        }
         if (ok) ok = glm_graph_profile_stage(stage_profile,
                                              "glm_decode_ffn",
                                              "shared_down",
@@ -46686,6 +46766,14 @@ static bool glm_graph_encode_sparse_ffn_one(
         !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) {
         ok = imatrix_collect_glm_one(g->imatrix, g, il);
     }
+    if (ok && shared_split) {
+        /* S2: fold this rank's shared partial into the routed partial so the
+         * FFN gate carries both.  Zero added gates -- the whole point. */
+        ok = ds4_gpu_add_tensor(g->tp_out[tp_ffn_slot],
+                                g->tp_out[tp_ffn_slot],
+                                ffn_sum,
+                                DS4_N_EMBD) != 0;
+    }
     if (ok && tp_split_ffn) {
         ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_FFN) != 0;
         if (ok) ok = ds4_gpu_add_tensor(ffn_out,
@@ -46746,7 +46834,12 @@ static bool glm_graph_encode_sparse_ffn_one(
                                              1,
                                              stage_t0);
     }
-    if (ok && add_residual && !glm_graph_disable_add3_residual()) {
+    if (ok && shared_split) {
+        /* ffn_sum is already inside ffn_out -- the gate exchanged routed plus
+         * shared together -- so adding it again would double-count it.  The
+         * split requires add_residual, so this is the only shape to handle. */
+        ok = ds4_gpu_add_tensor(next, after_attn, ffn_out, DS4_N_EMBD) != 0;
+    } else if (ok && add_residual && !glm_graph_disable_add3_residual()) {
         ok = ds4_gpu_add3_tensor(next,
                                  after_attn,
                                  ffn_out,
