@@ -13029,6 +13029,19 @@ static int glm53_tp_dense_ffn_split_requested(void) {
     return env && env[0] && env[0] != '0';
 }
 
+/* S5 -- split the 154,880-row output head.
+ *
+ * Each rank computes its half of the head rows into its half of the logits
+ * buffer; the worker ships its half to the leader after the eval, which is the
+ * exchange machinery the DeepSeek family already uses (ds4_tp_recv_logits_half
+ * and friends are family-agnostic).  M3 measured that frame at 0.41 ms exposed
+ * against 337 MB saved, so the net is about -0.34 ms -- the smallest item in
+ * the plan, and the one that touches the most integration surface. */
+static int glm53_tp_vocab_split_requested(void) {
+    const char *env = getenv("DS4_GLM_TP_VOCAB_SPLIT");
+    return env && env[0] && env[0] != '0';
+}
+
 typedef enum {
     GLM53_KDA_PHASE_DECODE = 0,
     GLM53_KDA_PHASE_PREFILL,
@@ -45793,12 +45806,37 @@ static bool glm_graph_encode_output_head_from(
                                              weights->output_norm->abs_offset,
                                              DS4_N_EMBD,
                                              DS4_RMS_EPS) != 0;
-    if (ok) ok = glm53_graph_matmul(g->logits,
-                                    model,
-                                    weights->output,
-                                    DS4_N_EMBD,
-                                    DS4_N_VOCAB,
-                                    g->output_norm);
+    if (!ok) return false;
+    /* S5: this rank materialises only its half of the head rows, in place at
+     * its own offset in the logits buffer.  The halves are bit-identical to the
+     * full head -- same kernel, same rows, no reduction is being split -- so
+     * unlike the FFN and attention splits this one changes no arithmetic. */
+    const bool vocab_split =
+        g->tp_world == 2 && (DS4_N_VOCAB % 2u) == 0u &&
+        glm53_tp_vocab_split_requested();
+    if (!vocab_split) {
+        return glm53_graph_matmul(g->logits,
+                                  model,
+                                  weights->output,
+                                  DS4_N_EMBD,
+                                  DS4_N_VOCAB,
+                                  g->output_norm);
+    }
+    const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
+    uint64_t head_off = 0;
+    if (!glm53_graph_weight_row_offset(weights->output, DS4_N_EMBD,
+                                       (uint32_t)g->tp_rank * vhalf,
+                                       &head_off)) {
+        return false;
+    }
+    ds4_gpu_tensor *half =
+        ds4_gpu_tensor_view(g->logits,
+                            (uint64_t)g->tp_rank * vhalf * sizeof(float),
+                            (uint64_t)vhalf * sizeof(float));
+    if (!half) return false;
+    ok = glm53_graph_matmul_at(half, model, weights->output, head_off,
+                               DS4_N_EMBD, vhalf, g->output_norm);
+    ds4_gpu_tensor_free(half);
     return ok;
 }
 
@@ -66216,9 +66254,11 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     }
     ds4_gpu_tp_set_batch_exchange(ds4_engine_tp_batch_exchange);
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
-    /* GLM keeps its replicated output head unsplit in v0: the
-     * leader computes full logits and nothing crosses the wire. */
-    e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA;
+    /* GLM kept its replicated output head unsplit in v0: the leader computed
+     * full logits and nothing crossed the wire.  S5 opts in per run, because at
+     * -0.34 ms it is worth measuring before it is worth defaulting. */
+    e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA ||
+                        glm53_tp_vocab_split_requested() != 0;
     e->tp.ctx = tp;
     e->tp.rank = ds4_tp_rank(tp);
     e->tp.eval_seq = 0;
