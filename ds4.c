@@ -56298,6 +56298,7 @@ struct ds4_session {
     uint32_t glm_mtp_rollback_dense_len;
     int glm_mtp_rollback_first_token;
     int glm_spec_inside;
+    int tp_eval_spec;   /* leader announced this EVAL as a speculative cycle */
     uint32_t glm_mtp_min_pos;
     float *glm_mtp_hc;
     float *glm_mtp_logits0;
@@ -71566,8 +71567,16 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         /* TP worker under GLM MTP: run the full speculative cycle off the
          * mirrored EVAL frame so drafts, verify batches, and gate traffic
          * stay in lockstep with the leader's cycle. */
+        /* Key on what the LEADER announced, not on this rank's own --mtp.
+         * The leader has fallback paths that send a plain EVAL while --mtp is
+         * set (DS4_GLM_MTP_PROBE at ds4.c, pos+2 > ctx, graph not ready), and
+         * it does not test dspark_exact_sampling the way this side used to --
+         * every one of those asymmetries put the worker in a spec cycle the
+         * leader was not running, waiting on gates nobody fires. */
+        const int leader_said_spec = s->tp_eval_spec;
+        s->tp_eval_spec = 0;
         if (!s->glm_spec_inside && s->glm_graph_ready &&
-            e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 &&
+            leader_said_spec && DS4_N_NEXTN_PREDICT != 0 &&
             !e->dspark_exact_sampling &&
             e->tp.active && e->tp.rank != 0) {
             int acc[2];
@@ -71692,8 +71701,11 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (ds4_session_tp_leader(s)) {
         ds4_engine *e = s->engine;
+        /* Plain eval: no speculative cycle announced, so the worker must not
+         * run one.  This is one of the sites that made the old
+         * infer-from-own-argv scheme unsafe. */
         if (!ds4_tp_send_eval(e->tp.ctx, s->tp_session_id,
-                              ++e->tp.eval_seq, token)) {
+                              ++e->tp.eval_seq, token, 0u)) {
             snprintf(err, errlen, "tp: worker eval send failed");
             return 1;
         }
@@ -71761,6 +71773,10 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         }
     }
     return rc;
+}
+
+void ds4_session_set_tp_eval_spec(ds4_session *s, int on) {
+    if (s) s->tp_eval_spec = on ? 1 : 0;
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
@@ -77571,7 +77587,8 @@ static int ds4_session_eval_speculative_argmax_impl(
             if (ds4_session_tp_leader(s)) {
                 ds4_engine *ge = s->engine;
                 if (!ds4_tp_send_eval(ge->tp.ctx, s->tp_session_id,
-                                      ++ge->tp.eval_seq, first_token)) {
+                                      ++ge->tp.eval_seq, first_token,
+                                      DS4_TP_EVAL_F_GLM_SPEC)) {
                     snprintf(err, errlen, "tp: worker eval send failed");
                     return -1;
                 }
@@ -78452,8 +78469,11 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
             return 1;
         }
         if (ds4_session_tp_leader(s)) {
+            /* Plain eval on a leader that HAS --mtp set (this is the path
+             * below the DS4_GLM_MTP_PROBE early-return).  Announcing 0 here is
+             * the whole point of the flag. */
             if (!ds4_tp_send_eval(e->tp.ctx, s->tp_session_id,
-                                  ++e->tp.eval_seq, first_token)) {
+                                  ++e->tp.eval_seq, first_token, 0u)) {
                 snprintf(err, errlen, "tp: worker eval send failed");
                 return -1;
             }

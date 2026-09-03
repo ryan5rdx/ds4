@@ -34,6 +34,16 @@ enum {
     DS4_TP_BATCH_MAX_ROWS = 8,
 };
 
+/* EVAL frame flags.  The leader is authoritative about whether a given token
+ * is a speculative cycle: it is the side that decides, and it has fallback
+ * paths (DS4_GLM_MTP_PROBE, pos+2 > ctx, graph-not-ready) where it sends a
+ * PLAIN eval even though --mtp is set.  A worker that inferred "speculative"
+ * from its own startup --mtp would then run a full spec cycle against a
+ * leader doing a one-token decode and hang on gates nobody fires. */
+enum {
+    DS4_TP_EVAL_F_GLM_SPEC = 1u << 0,
+};
+
 /* Engine identity exchanged in the hello so a mismatched pair aborts before
  * any inference runs. */
 typedef struct {
@@ -179,7 +189,7 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
                                 const ds4_vision_span *images,
                                 uint32_t image_count);
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
-                     uint64_t seq, int token);
+                     uint64_t seq, int token, uint32_t flags);
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
 /* Abort the mirrored prefill the worker is currently running for this session.

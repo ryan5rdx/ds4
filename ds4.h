@@ -499,6 +499,10 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
  * used by the TP worker right after session create (no-op on CPU/GLM). */
 void ds4_session_gpu_warmup(ds4_session *s);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+/* TP worker only: records whether the EVAL frame just received was announced
+ * by the leader as a speculative cycle.  Consumed by the next
+ * ds4_session_eval() and cleared there. */
+void ds4_session_set_tp_eval_spec(ds4_session *s, int on);
 
 typedef struct {
     ds4_session *session;

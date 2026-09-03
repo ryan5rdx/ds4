@@ -2156,7 +2156,7 @@ typedef struct {
     uint64_t session_id;
     uint64_t seq;
     int32_t token;
-    uint32_t reserved;
+    uint32_t flags;     /* was `reserved`, always sent as 0; same wire size */
 } ds4_tp_eval_command;
 
 typedef struct {
@@ -2278,8 +2278,8 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
 }
 
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
-                     uint64_t seq, int token) {
-    ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, 0 };
+                     uint64_t seq, int token, uint32_t flags) {
+    ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, flags };
     pthread_mutex_lock(&tp->control_lock);
     const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
     pthread_mutex_unlock(&tp->control_lock);
@@ -2601,6 +2601,7 @@ static int ds4_tp_recv_command_unlocked(ds4_tp *tp, ds4_tp_command *command,
         command->session_id = msg.session_id;
         command->seq = msg.seq;
         command->value = msg.token;
+        command->flags = msg.flags;
         break;
     }
     case DS4_TP_FRAME_EVAL_BATCH: {
@@ -3061,6 +3062,9 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
                 rc = 1;
             }
         } else if (command.type == DS4_TP_FRAME_EVAL) {
+            /* The frame decides, not this rank's argv. */
+            ds4_session_set_tp_eval_spec(
+                    session, (command.flags & DS4_TP_EVAL_F_GLM_SPEC) != 0);
             if (ds4_session_eval(session, command.value, err, sizeof(err)) != 0) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker eval: %s", err);
                 rc = 1;
