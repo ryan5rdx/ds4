@@ -232,6 +232,7 @@ static id<MTLComputePipelineState> g_glm_indexer_scores_tiled_f32_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_glm52_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_glm52_sg_pipeline;
+static id<MTLComputePipelineState> g_glm_qk_lowrank_glm53_sg_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_batch_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_batch_glm52_t4_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_batch_glm53_t4_pipeline;
@@ -8808,6 +8809,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_glm52");
         g_glm_qk_lowrank_glm52_sg_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_glm52_sg");
+        g_glm_qk_lowrank_glm53_sg_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_glm53_sg");
         g_glm_qk_lowrank_batch_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_batch");
         g_glm_qk_lowrank_batch_glm52_t4_pipeline =
@@ -8926,6 +8929,7 @@ int ds4_gpu_init(void) {
             !g_glm_qk_lowrank_pipeline ||
             !g_glm_qk_lowrank_glm52_pipeline ||
             !g_glm_qk_lowrank_glm52_sg_pipeline ||
+            !g_glm_qk_lowrank_glm53_sg_pipeline ||
             !g_glm_qk_lowrank_batch_pipeline ||
             !g_glm_qk_lowrank_batch_glm52_t4_pipeline ||
             !g_glm_qk_lowrank_batch_glm53_t4_pipeline ||
@@ -11190,6 +11194,7 @@ void ds4_gpu_cleanup(void) {
         g_glm_qk_lowrank_pipeline = nil;
         g_glm_qk_lowrank_glm52_pipeline = nil;
         g_glm_qk_lowrank_glm52_sg_pipeline = nil;
+        g_glm_qk_lowrank_glm53_sg_pipeline = nil;
         g_glm_qk_lowrank_batch_pipeline = nil;
         g_glm_qk_lowrank_batch_glm52_t4_pipeline = nil;
         g_glm_qk_lowrank_batch_glm53_t4_pipeline = nil;
@@ -35854,26 +35859,56 @@ int ds4_gpu_glm_qk_lowrank_typed_tensor(
          * (7.2ms of the decode token by skip-ablation). Covers the GLM 5.2
          * shape for both Q8_0 k_b and the DenseQ4 GGUF's Q4_0 k_b (the Q8
          * fast path above never engaged there). */
-        const int use_glm52_sg =
+        /* D3: the same shape gate as the sg kernel, at GLM 5.3's qk_nope.
+         * n_rot=0 there, so q_nope = n_key_mla - n_rot = 256 and neither 5.2
+         * predicate above can ever fire -- every DSA decode layer was taking
+         * the thread-per-row kernel, which dispatches one threadgroup per head
+         * (32 under TP2) against the sg variant's n_head * kv_lora/16 = 1024.
+         * Measured on an M1 Max at n_head 32: 0.973 ms vs 0.239 ms, 8.6 vs
+         * 26.3 GFLOP/s.  This is the decode twin of the D2a batch miss.
+         * Q8_0 rows are 8 blocks x 34 B = 272; Q4_0 are 8 x 18 = 144. */
+        const int shape_common_sg =
             (n_head == 32u || n_head == 64u) &&
             kv_lora_dim == 512u &&
-            qk_nope == 192u &&
             qk_dim == 256u &&
+            getenv("DS4_METAL_DISABLE_GLM_QKLOW_SG") == NULL;
+        const int use_glm52_sg =
+            shape_common_sg &&
+            qk_nope == 192u &&
             ((weight_type == DS4_METAL_TENSOR_Q8_0 && row_bytes == 204u) ||
              (weight_type == DS4_METAL_TENSOR_Q4_0 && row_bytes == 108u)) &&
-            getenv("DS4_METAL_DISABLE_GLM_QKLOW_SG") == NULL &&
             ds4_gpu_hot_pipeline(g_glm_qk_lowrank_glm52_sg_pipeline,
                                  "kernel_glm_qk_lowrank_q8_0_glm52_sg") != nil;
-        if (getenv("DS4_METAL_GLM_QKLOW_DEBUG")) {
-            static int printed = 0;
-            if (!printed) {
-                printed = 1;
-                fprintf(stderr, "ds4: qk_lowrank decode path: use_glm52=%d sg=%d n_head=%u kv=%u nope=%u dim=%u rb=%llu type=%u\n",
-                        use_glm52, use_glm52_sg, n_head, kv_lora_dim, qk_nope, qk_dim,
+        const int use_glm53_sg =
+            shape_common_sg &&
+            qk_nope == 256u &&
+            ((weight_type == DS4_METAL_TENSOR_Q8_0 && row_bytes == 272u) ||
+             (weight_type == DS4_METAL_TENSOR_Q4_0 && row_bytes == 144u)) &&
+            ds4_gpu_hot_pipeline(g_glm_qk_lowrank_glm53_sg_pipeline,
+                                 "kernel_glm_qk_lowrank_q8_0_glm53_sg") != nil;
+        const int use_sg = use_glm52_sg || use_glm53_sg;
+        /* Unconditional one-time announce, as D2a's did.  The whole failure
+         * mode here is a predicate silently not firing, so "which kernel"
+         * must be visible without setting a debug env first. */
+        {
+            static int announced = 0;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: GLM qk_lowrank DECODE kernel: %s "
+                        "(n_head %u kv_lora %u qk_nope %u qk_dim %u "
+                        "row_bytes %llu type %u)\n",
+                        use_glm53_sg ? "glm53_sg coalesced" :
+                        use_glm52_sg ? "glm52_sg coalesced" :
+                        use_glm52 ? "glm52 threadgroup" : "GENERIC (slow path)",
+                        n_head, kv_lora_dim, qk_nope, qk_dim,
                         (unsigned long long)row_bytes, weight_type);
             }
         }
         id<MTLComputePipelineState> pipeline =
+            use_glm53_sg ?
+                ds4_gpu_hot_pipeline(g_glm_qk_lowrank_glm53_sg_pipeline,
+                                     "kernel_glm_qk_lowrank_q8_0_glm53_sg") :
             use_glm52_sg ?
                 ds4_gpu_hot_pipeline(g_glm_qk_lowrank_glm52_sg_pipeline,
                                      "kernel_glm_qk_lowrank_q8_0_glm52_sg") :
@@ -35905,8 +35940,10 @@ int ds4_gpu_glm_qk_lowrank_typed_tensor(
         [enc setBuffer:weightbuf offset:(NSUInteger)weight_inner atIndex:1];
         [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(qk_low) atIndex:3];
-        if (use_glm52_sg) {
-            /* 8 simdgroups x 2 rows per threadgroup: (64, 512/16) grid. */
+        if (use_sg) {
+            /* 8 simdgroups x 2 rows per threadgroup: (n_head, 512/16) grid.
+             * Identical geometry for both qk_nope variants -- the shape
+             * difference is entirely inside the dot, not the tiling. */
             [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_head,
                                                   (NSUInteger)(kv_lora_dim / 16u),
                                                   1)

@@ -67055,8 +67055,15 @@ static void ds4_tp_coherency_selftest(ds4_engine *e) {
             rank, ds4_tp_is_rdma(e->tp.ctx) ? "rdma" : "tcp", iters,
             (double)cap / 1048576.0);
 
-    ds4_gpu_tensor *sa = ds4_gpu_tensor_alloc(sizes[2]);
-    ds4_gpu_tensor *sb = ds4_gpu_tensor_alloc(sizes[2]);
+    /* The buffers must hold the LARGEST cell this run will exercise, which is
+     * not sizes[2]: with DS4_TP_COHERENCY_SELFTEST_BYTES set, `sizes` is a
+     * one-element array and sizes[2] read past it -- the rig hit "selftest:
+     * alloc failed" and had to work around it by running every size. */
+    uint64_t max_size = 0;
+    for (size_t i = 0; i < n_sizes; i++)
+        if (sizes[i] > max_size) max_size = sizes[i];
+    ds4_gpu_tensor *sa = ds4_gpu_tensor_alloc(max_size);
+    ds4_gpu_tensor *sb = ds4_gpu_tensor_alloc(max_size);
     ds4_gpu_tensor *fa = ds4_gpu_tensor_alloc(sizeof(float));
     ds4_gpu_tensor *fb = ds4_gpu_tensor_alloc(sizeof(float));
     ds4_gpu_tensor *split_flag = ds4_gpu_tensor_alloc(sizeof(float));
@@ -67065,7 +67072,7 @@ static void ds4_tp_coherency_selftest(ds4_engine *e) {
         fprintf(stderr, "  selftest: alloc failed\n");
         goto done;
     }
-    (void)ds4_gpu_tensor_fill_f32(sb, 0.0f, sizes[2] / sizeof(float));
+    (void)ds4_gpu_tensor_fill_f32(sb, 0.0f, max_size / sizeof(float));
     (void)ds4_gpu_tensor_fill_f32(fb, 0.0f, 1);
 
     for (size_t si = 0; si < n_sizes; si++) {

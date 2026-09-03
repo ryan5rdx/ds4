@@ -2475,6 +2475,85 @@ kernel void kernel_glm_qk_lowrank_q8_0_glm52_sg(
     }
 }
 
+
+// GLM 5.3 decode qk-low, the glm52_sg kernel at qk_nope 256 instead of 192.
+// GLM 5.3 sets n_rot=0, so q_nope = n_key_mla - n_rot = 256 and BOTH 5.2
+// decode predicates (use_glm52, use_glm52_sg) are unreachable -- every DSA
+// decode layer was falling to the thread-per-row kernel, which dispatches
+// one threadgroup per head (32 under TP2) and measures ~7.5x off the
+// weight-bandwidth floor. Same miss as D2a, which was the batch twin.
+// One simdgroup per pair of output rows; lanes split the 256-wide dot so
+// the 272-byte Q8 rows are read with consecutive per-lane bytes.
+kernel void kernel_glm_qk_lowrank_q8_0_glm53_sg(
+        constant ds4_metal_args_glm_qk_lowrank & args,
+        device const char *weight,
+        device const char *q,
+        device char *qk_low,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort3 ntg_u [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint kv_lora_dim = 512u;
+    constexpr uint qk_nope = 256u;
+    constexpr uint qk_dim = 256u;
+    constexpr uint NR = 2u;
+
+    const uint head = tgpig.x;
+    const uint wt = args.weight_type;
+    if (head >= args.n_head ||
+        (args.n_head != 32u && args.n_head != 64u) ||
+        args.kv_lora_dim != kv_lora_dim ||
+        args.qk_nope != qk_nope ||
+        args.qk_dim != qk_dim ||
+        !((wt == DS4_METAL_GGUF_Q8_0 && args.row_bytes == 272u) ||
+          (wt == DS4_METAL_GGUF_Q4_0 && args.row_bytes == 144u))) {
+        return;
+    }
+    const uint row_bytes = args.row_bytes;
+
+    const uint nsg = ntg_u.y;
+    const uint row0 = (tgpig.y * nsg + (uint)sgitg) * NR;
+    if (row0 >= kv_lora_dim) return;
+
+    device const float *qh =
+        (device const float *)(q + (uint64_t)head * qk_dim * sizeof(float));
+    float qv[8];
+    FOR_UNROLL (uint b = 0; b < 8u; b++) {
+        qv[b] = qh[(b << 5) + tiisg];
+    }
+
+    device float *out =
+        (device float *)(qk_low + (uint64_t)head * kv_lora_dim * sizeof(float));
+    for (uint r = 0; r < NR; r++) {
+        const uint j = row0 + r;
+        device const char *row =
+            weight + ((uint64_t)head * kv_lora_dim + j) * row_bytes;
+        float acc = 0.0f;
+        if (wt == DS4_METAL_GGUF_Q8_0) {
+            FOR_UNROLL (uint b = 0; b < 8u; b++) {
+                device const char *block_base = row + (uint64_t)b * 34u;
+                const float d = (float)(*((device const half *)block_base));
+                device const int8_t *qs = (device const int8_t *)(block_base + 2u);
+                acc += d * (float)qs[tiisg] * qv[b];
+            }
+        } else {
+            /* Q4_0: 18B blocks; elems 0..15 = low nibbles, 16..31 = high. */
+            FOR_UNROLL (uint b = 0; b < 8u; b++) {
+                device const char *block_base = row + (uint64_t)b * 18u;
+                const float d = (float)(*((device const half *)block_base));
+                device const uint8_t *qs = (device const uint8_t *)(block_base + 2u);
+                const uint byte = qs[tiisg & 15u];
+                const float v = (float)((tiisg < 16u) ? (byte & 0xFu) : (byte >> 4)) - 8.0f;
+                acc += d * v * qv[b];
+            }
+        }
+        const float sum = simd_sum(acc);
+        if (tiisg == 0) {
+            out[j] = sum;
+        }
+    }
+}
+
 kernel void kernel_glm_qk_lowrank_q8_0_batch(
         constant ds4_metal_args_glm_qk_lowrank_batch & args,
         device const char *weight,
