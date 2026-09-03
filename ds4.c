@@ -66374,7 +66374,6 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
  * a one-sided env silently corrupts rank state or hangs the logits transport, so
  * they ride the hello and are compared verbatim. */
 uint32_t ds4_engine_tp_split_flags(ds4_engine *e) {
-    (void)e;
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA) return 0;
     uint32_t f = 0;
     switch (glm53_tp_kda_split_mode()) {
@@ -66396,6 +66395,15 @@ uint32_t ds4_engine_tp_split_flags(ds4_engine *e) {
      * was in the hello before -- exactly what this word exists to catch. */
     if (glm53_tp_prefill_shared_split_requested()) f |= 1u << 6;
     if (glm53_tp_prefill_dense_split_requested()) f |= 1u << 7;
+    /* --mtp is argv-local: it rode neither the hello nor this word, so a pair
+     * with --mtp on the leader only looked identical at bring-up and then
+     * deadlocked -- the worker's mirror (ds4.c:71447) is gated on e->glm_mtp,
+     * so it never ran the cycle and never fired the layer-45 big gate the
+     * leader was waiting on.  The engine is live at the one production caller
+     * (ds4.c:66304) and glm_mtp is assigned during init (ds4.c:65137), well
+     * before bring-up; the NULL guard covers only the test hook at
+     * ds4.c:64993.  Bit 5 is retired (S14), so this takes bit 8. */
+    if (e && e->glm_mtp) f |= 1u << 8;
     /* Not a split, but a one-sided value makes the two ranks choose different
      * prefill paths, and S2/S4 make those paths gate-bearing.  Carrying the
      * value (not just "is it set") catches a mismatch in either direction. */
@@ -66781,10 +66789,15 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA ||
                         glm53_tp_vocab_split_requested() != 0;
     /* GLM MTP under TP does not fail -- it HANGS THE PAIR.
-     * ds4_session_glm_spec_cycle_impl() runs four kinds of gate-encoding graph
-     * forward (the 2-row verify, the indexed verify, two output heads, the
-     * draft) and makes ZERO TP calls: the worker is never told a cycle is
-     * happening, so the leader encodes gate waits nobody will ever satisfy.
+     *
+     * CORRECTED 2026-09-03: an earlier version of this comment claimed the
+     * cycle "makes ZERO TP calls".  That was wrong and was reached by grepping
+     * only ds4_session_glm_spec_cycle_impl's own body.  The protocol exists:
+     * the leader sends an EVAL frame at ds4.c:77450 and the worker mirrors the
+     * whole cycle at ds4.c:71443-71454 (written 2026-07-18).  The mirror is
+     * gated on the WORKER's own e->glm_mtp, which is argv-local -- so a pair
+     * launched with --mtp on the leader only leaves the worker running a plain
+     * one-token decode that never reaches layer 45.
      * The nextn layer's routed experts are split 50/50 by the base design, not
      * by a flag, so layer 45 must exchange even with every optional split off
      * -- which is why the rig reproduced this with `split off`.  A big gate's
@@ -66797,13 +66810,15 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
      * (ds4_tp_send_verify -> ds4_session_tp_spec_cycle); GLM has no equivalent
      * yet.  Refuse at bring-up until it does: a startup error costs one run, a
      * watchdog costs the pair.  See 2026-09-02-MTP-WATCHDOG-ROOT-CAUSE.md. */
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && e->glm_mtp) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && e->glm_mtp &&
+        getenv("DS4_GLM_MTP_TP_ALLOW") == NULL) {
         snprintf(err, errlen,
-                 "GLM MTP is not supported under tensor parallelism: the "
-                 "speculative cycle does not mirror its verify block to the "
-                 "worker, so the leader waits on gates the peer never fires "
-                 "and the GPU watchdog kills both ranks. Run --mtp on a single "
-                 "node, or drop --mtp under TP.");
+                 "GLM MTP under tensor parallelism has never completed a run: "
+                 "the worker's mirror is gated on its OWN --mtp flag, so a pair "
+                 "launched with --mtp on the leader only deadlocks and the GPU "
+                 "watchdog kills both ranks. Pass --mtp to BOTH ranks and set "
+                 "DS4_GLM_MTP_TP_ALLOW=1 to try it; the split_flags handshake "
+                 "now refuses the one-sided case by name.");
         goto tp_bind_fail;
     }
     /* S5 and GLM MTP are mutually exclusive, and the failure is silent rather
