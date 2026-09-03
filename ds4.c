@@ -66681,22 +66681,6 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         snprintf(err, errlen, "tp: prefill bounce view creation failed");
         goto tp_bind_fail;
     }
-    /* State the split configuration positively at bring-up.  split_flags is
-     * only visible when the hello REJECTS a pair, so a matched-but-unintended
-     * configuration -- both ranks accidentally on `both`, say -- was silent. */
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        const char *modes[] = { "off", "decode", "both" };
-        fprintf(stderr,
-                "ds4: GLM TP splits, rank %d: kda=%s shared=%s dense_ffn=%s "
-                "vocab=%s (split_flags 0x%x)\n",
-                ds4_tp_rank(tp),
-                modes[(int)glm53_tp_kda_split_mode()],
-                glm53_tp_shared_split_requested() ? "on" : "off",
-                glm53_tp_dense_ffn_split_requested() ? "on" : "off",
-                e->tp.vocab_split && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA
-                    ? "on" : "off",
-                ds4_engine_tp_split_flags(e));
-    }
     /* Sparse layers that fire an FFN row gate -- the straggler statistic scales
      * its per-layer delta by this, and it defaulted to DeepSeek's 43. */
     ds4_gpu_tp_set_stat_layer_count(
@@ -66731,6 +66715,30 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
                 "(the MTP cycle argmaxes the full vocabulary without merging "
                 "the halves); disabling the vocab split for this run\n");
         e->tp.vocab_split = false;
+    }
+    /* State the split configuration positively at bring-up.  split_flags is
+     * only visible when the hello REJECTS a pair, so a matched-but-unintended
+     * configuration -- both ranks accidentally on `both`, say -- was silent.
+     *
+     * This MUST stay below the e->tp.vocab_split assignment and the --mtp
+     * override above.  It previously sat before them and read the field while
+     * it was still zero, so it printed "vocab=off" on every run whatever the
+     * environment said -- including S245, where split_flags 0x40001c showed the
+     * split had in fact been requested and was active.  Three env-backed fields
+     * were right and the one effective field was wrong, which is the worst
+     * shape for an observability line: it disagreed with reality only for the
+     * flag whose request and effect can legitimately differ. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
+        const char *modes[] = { "off", "decode", "both" };
+        fprintf(stderr,
+                "ds4: GLM TP splits, rank %d: kda=%s shared=%s dense_ffn=%s "
+                "vocab=%s (split_flags 0x%x)\n",
+                ds4_tp_rank(tp),
+                modes[(int)glm53_tp_kda_split_mode()],
+                glm53_tp_shared_split_requested() ? "on" : "off",
+                glm53_tp_dense_ffn_split_requested() ? "on" : "off",
+                e->tp.vocab_split ? "on" : "off",
+                ds4_engine_tp_split_flags(e));
     }
     e->tp.ctx = tp;
     e->tp.rank = ds4_tp_rank(tp);
