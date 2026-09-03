@@ -13082,6 +13082,14 @@ static int glm53_tp_prefill_shared_split_requested(void) {
     return env && env[0] && env[0] != '0';
 }
 
+/* S9: prefill dense-FFN row split.  Separate knob from S4 (which splits the
+ * same layers' intermediate at decode) because the two use different axes and
+ * different transports -- S4 rides a row gate, S9 needs its own big gate. */
+static int glm53_tp_prefill_dense_split_requested(void) {
+    const char *env = getenv("DS4_GLM_TP_PREFILL_DENSE_SPLIT");
+    return env && env[0] && env[0] != '0';
+}
+
 static int glm53_tp_vocab_split_requested(void) {
     const char *env = getenv("DS4_GLM_TP_VOCAB_SPLIT");
     return env && env[0] && env[0] != '0';
@@ -48630,9 +48638,60 @@ static bool glm_graph_encode_ffn_batch(
     if (il < DS4_N_LEADING_DENSE) {
         const uint64_t hidden = l->ffn_gate->dim[1];
         if (hidden == 0 || hidden > UINT32_MAX / n_tokens) return false;
-        const uint32_t mid_elems = (uint32_t)(hidden * n_tokens);
+        const uint32_t mid_elems = (uint32_t)(hidden * n_tokens);  /* full-chunk scratch bound */
         const uint64_t residual_elems = (uint64_t)n_tokens * DS4_N_EMBD;
         if (residual_elems > UINT32_MAX) return false;
+
+        /* S9: split the dense FFN by token rows at prefill.  Unlike S8 there is
+         * nothing to ride -- layers 0-2 have no routed experts, so the dense
+         * prefill path carries no TP exchange at all -- and this adds one big
+         * gate per dense layer per chunk.  ~1.15% gross against ~0.36% wire.
+         *
+         * The >= 34 row guard mirrors S8's, for the same measured reason: below
+         * it the halves cross a kernel-class boundary and stop being bit-exact
+         * against the unsplit result. */
+        const bool dense_row_split =
+            g->tp_world == 2 && g->tp_out && g->tp_in && !g->ssd_streaming &&
+            n_tokens >= 34u && glm53_tp_prefill_dense_split_requested();
+        const uint32_t dense_half = dense_row_split ? (n_tokens + 1u) / 2u : 0u;
+        const uint32_t dense_row0 =
+            dense_row_split ? (g->tp_rank ? dense_half : 0u) : 0u;
+        const uint32_t dense_rows = dense_row_split
+            ? (g->tp_rank ? n_tokens - dense_half : dense_half) : n_tokens;
+        ds4_gpu_tensor *dense_in = g->batch_ffn_norm;
+        ds4_gpu_tensor *dense_out = g->batch_ffn_out;
+        ds4_gpu_tensor *dense_in_view = NULL;
+        ds4_gpu_tensor *dense_out_view = NULL;
+        if (dense_row_split) {
+            static int announced;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: GLM S9 prefill dense-FFN row split active: "
+                        "rank %u rows [%u,%u) of %u\n",
+                        (unsigned)g->tp_rank, dense_row0,
+                        dense_row0 + dense_rows, n_tokens);
+            }
+            /* Each row is produced by exactly one rank and the peer's rows stay
+             * zero, so the post-exchange add rebuilds the chunk without
+             * double-counting.  A partition argument, not a reduction split --
+             * same correctness shape as S8. */
+            if (!glm_graph_tp_batch_bounce_ready(g, n_tokens)) return false;
+            if (ds4_gpu_tensor_fill_f32(g->tp_bounce_out, 0.0f,
+                                        residual_elems) == 0) return false;
+            const uint64_t span = (uint64_t)dense_rows * DS4_N_EMBD;
+            dense_in_view = glm_graph_tensor_row_view_strided(
+                    g->batch_ffn_norm, dense_row0, DS4_N_EMBD, span);
+            dense_out_view = glm_graph_tensor_row_view_strided(
+                    g->tp_bounce_out, dense_row0, DS4_N_EMBD, span);
+            if (!dense_in_view || !dense_out_view) {
+                ds4_gpu_tensor_free(dense_out_view);
+                ds4_gpu_tensor_free(dense_in_view);
+                return false;
+            }
+            dense_in = dense_in_view;
+            dense_out = dense_out_view;
+        }
 
         const bool fused_gate_up = glm_graph_shared_gate_up_swiglu_q8_0_tensor(
                 g->batch_ffn_gate,
@@ -48643,8 +48702,8 @@ static bool glm_graph_encode_ffn_batch(
                 l->ffn_up->abs_offset,
                 DS4_N_EMBD,
                 hidden,
-                g->batch_ffn_norm,
-                n_tokens,
+                dense_in,
+                dense_rows,
                 g->glm53 ? DS4_SWIGLU_CLAMP_EXP : 0.0f);
         if (fused_gate_up) {
             ok = glm_graph_prefill_stage_boundary(stage_profile,
@@ -48661,15 +48720,15 @@ static bool glm_graph_encode_ffn_batch(
                                               l->ffn_gate->abs_offset,
                                               DS4_N_EMBD,
                                               hidden,
-                                              g->batch_ffn_norm,
-                                              n_tokens);
+                                              dense_in,
+                                              dense_rows);
             if (ok) ok = glm_graph_matmul_q8_0_tensor(g->batch_ffn_up,
                                                       model,
                                                       l->ffn_up->abs_offset,
                                                       DS4_N_EMBD,
                                                       hidden,
-                                                      g->batch_ffn_norm,
-                                                      n_tokens);
+                                                      dense_in,
+                                                      dense_rows);
             if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
                                                           stage_sync,
                                                           "glm_ffn",
@@ -48698,13 +48757,25 @@ static bool glm_graph_encode_ffn_batch(
                     "glm53_dense_ffn_mid", g->batch_ffn_mid,
                     (uint64_t)n_tokens * hidden, il, pos0);
         }
-        if (ok) ok = glm_graph_matmul_q8_0_tensor(g->batch_ffn_out,
+        if (ok) ok = glm_graph_matmul_q8_0_tensor(dense_out,
                                                   model,
                                                   l->ffn_down->abs_offset,
                                                   hidden,
                                                   DS4_N_EMBD,
                                                   g->batch_ffn_mid,
-                                                  n_tokens);
+                                                  dense_rows);
+        if (dense_row_split) {
+            /* Free before the combine: the views alias tp_bounce_out, which the
+             * exchange writes through. */
+            ds4_gpu_tensor_free(dense_out_view);
+            ds4_gpu_tensor_free(dense_in_view);
+            dense_out_view = NULL;
+            dense_in_view = NULL;
+            if (ok) {
+                ok = glm_graph_tp_batch_ffn_combine(g, il, g->batch_ffn_out,
+                                                    n_tokens);
+            }
+        }
         if (ok) {
             metal_graph_debug_dump_tensor(
                     "glm53_dense_ffn_out", g->batch_ffn_out,
@@ -66327,6 +66398,11 @@ uint32_t ds4_engine_tp_split_flags(ds4_engine *e) {
      * two ranks reaching each gate on different command buffers -- exactly the
      * asymmetry the hello exists to refuse. */
     if (glm53_tp_batch_cb_split_requested()) f |= 1u << 5;
+    /* S8/S9 are partition splits: if only one rank enables one, that stage is
+     * counted 1.5x in the all-reduce and the output is silently wrong.  Neither
+     * was in the hello before -- exactly what this word exists to catch. */
+    if (glm53_tp_prefill_shared_split_requested()) f |= 1u << 6;
+    if (glm53_tp_prefill_dense_split_requested()) f |= 1u << 7;
     /* Not a split, but a one-sided value makes the two ranks choose different
      * prefill paths, and S2/S4 make those paths gate-bearing.  Carrying the
      * value (not just "is it set") catches a mismatch in either direction. */
@@ -66745,13 +66821,16 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         const char *modes[] = { "off", "decode", "both" };
         fprintf(stderr,
                 "ds4: GLM TP splits, rank %d: kda=%s shared=%s dense_ffn=%s "
-                "vocab=%s batch_cb_split=%s (split_flags 0x%x)\n",
+                "vocab=%s batch_cb_split=%s pf_shared=%s pf_dense=%s "
+                "(split_flags 0x%x)\n",
                 ds4_tp_rank(tp),
                 modes[(int)glm53_tp_kda_split_mode()],
                 glm53_tp_shared_split_requested() ? "on" : "off",
                 glm53_tp_dense_ffn_split_requested() ? "on" : "off",
                 e->tp.vocab_split ? "on" : "off",
                 glm53_tp_batch_cb_split_requested() ? "on" : "off",
+                glm53_tp_prefill_shared_split_requested() ? "on" : "off",
+                glm53_tp_prefill_dense_split_requested() ? "on" : "off",
                 ds4_engine_tp_split_flags(e));
     }
     e->tp.ctx = tp;
