@@ -43332,10 +43332,20 @@ static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected)
     (void)n_selected;
     return false;
 #else
+    /* Same-build control for the D4 arm.  Without it the only way to measure
+     * split-K off is to run a different commit, which is what made D2a's arm
+     * need two builds; D3 got a disable env and its arm was cleaner for it.
+     * Read per call, not cached: an ABBA interleave toggles it inside one
+     * process and a cached read would compare the candidate against itself. */
+    {
+        const char *off = getenv("DS4_METAL_DISABLE_GLM_DECODE_SPLITK");
+        if (off && off[0] && off[0] != '0') return false;
+    }
     const uint32_t block_rows = glm_graph_indexed_decode_split_block_rows_for(n_selected);
     const uint32_t needed_blocks =
         block_rows != 0u ? (n_selected + block_rows - 1u) / block_rows : 0u;
-    return n_selected > 512u &&
+    const bool avail =
+           n_selected > 512u &&
            block_rows > 0 &&
            needed_blocks > 0 &&
            needed_blocks <= glm_graph_indexed_decode_split_blocks() &&
@@ -43349,6 +43359,26 @@ static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected)
             * a 2D grid.  Same occupancy miss as D3, one clause away. */
            (DS4_N_ROT == 64u || DS4_N_ROT == 0u) &&
            glm_graph_compact_cache_is_f16();
+    /* Announce BOTH the first engaged call and the first refused one, not just
+     * the first call.  n_selected grows with position and the gate needs it
+     * above 512, so a run that starts below the threshold and crosses it later
+     * is normal -- a single one-shot would report whichever happened first and
+     * read as a permanent state.  Printing the n_selected that decided it is
+     * the point: it is the variable that makes this win context-dependent. */
+    {
+        static int said_on, said_off;
+        if (avail ? !said_on : !said_off) {
+            if (avail) said_on = 1; else said_off = 1;
+            fprintf(stderr,
+                    "ds4: GLM decode attention split-K %s (n_selected %u, "
+                    "blocks %u, n_rot %u)%s\n",
+                    avail ? "ENGAGED" : "not available",
+                    n_selected, needed_blocks, (unsigned)DS4_N_ROT,
+                    (!avail && n_selected <= 512u) ?
+                        " -- n_selected <= 512, grows with position" : "");
+        }
+    }
+    return avail;
 #endif
 }
 
