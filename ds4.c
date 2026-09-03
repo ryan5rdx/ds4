@@ -66821,7 +66821,12 @@ static void ds4_tp_coherency_selftest(ds4_engine *e) {
     if (iters <= 0) iters = 200;
 
     const uint64_t cap = ds4_tp_slab_prefill_bounce_bytes(e->tp.ctx);
-    static const uint64_t sizes[] = { 16u << 10, 1u << 20, 32u << 20 };
+    static const uint64_t all_sizes[] = { 16u << 10, 1u << 20, 32u << 20 };
+    uint64_t one_size = 0;
+    const char *only = getenv("DS4_TP_COHERENCY_SELFTEST_BYTES");
+    if (only && only[0]) one_size = strtoull(only, NULL, 0);
+    const uint64_t *sizes = one_size ? &one_size : all_sizes;
+    const size_t n_sizes = one_size ? 1u : sizeof(all_sizes)/sizeof(all_sizes[0]);
     const int rank = e->tp.rank;
 
     fprintf(stderr,
@@ -66846,7 +66851,7 @@ static void ds4_tp_coherency_selftest(ds4_engine *e) {
     (void)ds4_gpu_tensor_fill_f32(sb, 0.0f, sizes[2] / sizeof(float));
     (void)ds4_gpu_tensor_fill_f32(fb, 0.0f, 1);
 
-    for (size_t si = 0; si < sizeof(sizes) / sizeof(sizes[0]); si++) {
+    for (size_t si = 0; si < n_sizes; si++) {
         const uint64_t bytes = sizes[si];
         if (bytes > cap) continue;
         const uint64_t n = bytes / sizeof(float);
@@ -66856,6 +66861,11 @@ static void ds4_tp_coherency_selftest(ds4_engine *e) {
         for (int arm = 0; arm < 2; arm++) {
             const int same_buffer = (arm == 0);
             int bad = 0, spin_timeouts = 0;
+            /* Record WHICH iterations went wrong.  v2 reported only counts, so
+             * the 16 KiB cell's "1 stale + 1 timeout" could not be resolved into
+             * one bad iteration (the guard working) versus two independent
+             * events (a real coherency miss alongside a separate stall). */
+            int first_bad = -1, first_timeout = -1, bad_and_timeout = 0;
             for (int it = 1; it <= iters; it++) {
                 const float mine = (float)(it * 2 + rank);
                 const float want = (float)(it * 2 + (1 - rank));
@@ -66888,7 +66898,19 @@ static void ds4_tp_coherency_selftest(ds4_engine *e) {
                         : (const volatile float *)ds4_gpu_tensor_contents(split_flag);
                 long spun = 0;
                 while (fp && *fp != mine && spun < 200000000L) spun++;
-                if (spun >= 200000000L) spin_timeouts++;
+                int timed_out = (spun >= 200000000L);
+                if (timed_out) {
+                    /* Retry once with a far longer budget: that separates "the
+                     * producer was merely slow" from "the store never became
+                     * visible", which are different findings. */
+                    long retry = 0;
+                    while (fp && *fp != mine && retry < 2000000000L) retry++;
+                    if (fp && *fp == mine) timed_out = 0;
+                }
+                if (timed_out) {
+                    spin_timeouts++;
+                    if (first_timeout < 0) first_timeout = it;
+                }
 
                 if (!ds4_tp_big_gate_exchange(
                             e->tp.ctx, 0, (uint64_t)it,
@@ -66902,14 +66924,29 @@ static void ds4_tp_coherency_selftest(ds4_engine *e) {
                 (void)ds4_gpu_end_commands();
                 if (!ds4_gpu_tensor_read(e->tp.prefill_bounce_in, 0, got, bytes)) break;
                 for (uint64_t k = 0; k + 1 < n; k++) {
-                    if (got[k] != want) { bad++; break; }
+                    if (got[k] != want) {
+                        bad++;
+                        if (first_bad < 0) first_bad = it;
+                        if (timed_out) bad_and_timeout++;
+                        break;
+                    }
                 }
             }
             fprintf(stderr, "  %6llu KB  %-13s  %6d / %-6d       %d%s\n",
                     (unsigned long long)(bytes >> 10),
                     same_buffer ? "same-buffer" : "split-buffer",
                     bad, iters, spin_timeouts,
-                    bad ? "   <-- NOT COHERENT" : "");
+                    bad ? "   <-- stale rows seen" : "");
+            if (bad || spin_timeouts) {
+                fprintf(stderr,
+                        "      first stale iter %d, first timeout iter %d, "
+                        "iters that were BOTH %d%s\n",
+                        first_bad, first_timeout, bad_and_timeout,
+                        (bad && bad == bad_and_timeout)
+                            ? "  -- every stale iter also timed out, so the guard"
+                              " caught a stalled producer, NOT a coherency miss"
+                            : "");
+            }
         }
     }
     fprintf(stderr,
