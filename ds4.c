@@ -870,13 +870,20 @@ static void glm53_layer_tp_gates(uint32_t il,
                                  uint32_t n_leading_dense,
                                  bool kda_split,
                                  bool dense_ffn_split,
+                                 bool router_split,
                                  bool *fires_attn,
+                                 bool *fires_router,
                                  bool *fires_ffn) {
     const bool normal = il + n_nextn < n_layer;
     const bool kda = normal && il % 4u != 3u;
     /* DSA layers always exchange their attention output; KDA layers compute the
      * whole recurrence locally and exchange nothing unless the heads are split. */
     if (fires_attn) *fires_attn = normal && (!kda || kda_split);
+    /* S15's router gate exists only where there is a router at all: the leading
+     * dense layers have no expert selection, so unlike the FFN gate this one
+     * does NOT follow dense_ffn_split.  42 layers on GLM 5.3. */
+    if (fires_router)
+        *fires_router = normal && il >= n_leading_dense && router_split;
     /* The routed sparse FFNs always exchange a partial; the three leading dense
      * FFNs do so only when S4 splits them. */
     if (fires_ffn)
@@ -13035,6 +13042,50 @@ static int glm53_tp_dense_ffn_split_requested(void) {
  * GLM 5.3 (n_ff_dense = 12288), but only by luck, so both sides ask here. */
 static bool glm53_tp_dense_ffn_split_shape_ok(void) {
     return DS4_N_FF_DENSE >= 2u && (DS4_N_FF_DENSE % 64u) == 0u;
+}
+
+/* S15 -- split the router (ffn_gate_inp) at DECODE.
+ *
+ * The model predicts this LOSES, and it is built anyway to measure the number
+ * the prediction rests on.  ffn_gate_inp is [n_expert][n_embd] F32 = 4.72 MB
+ * per sparse layer, 198 MB/rank/token over 42 layers; halving it saves 99 MB
+ * against an 8.672 GB decode stream, about 1.1% of bytes.  Collecting that
+ * needs 42 new gates -- 2.36 MB/gate against an 11.5 MB break-even that itself
+ * derives from an UNMEASURED 25.7 us/gate.
+ *
+ * So the arm's real product is the per-gate cost.  42 gates is the largest
+ * single-arm gate delta available in the decode graph, which makes the measured
+ * decode delta divide down to us/gate with the best signal-to-noise we can get,
+ * and that one number prices every remaining split (the DSA head-shared
+ * projections at 5.0 MB/gate and the indexer at 3.3 MB/gate both hang off it).
+ * S14's premise and S6f's "prefill is not FLOP-bound" both died on unmeasured
+ * assumptions of exactly this shape.
+ *
+ * Split by OUTPUT ROWS, not by contraction.  Each rank owns a contiguous half
+ * of the 288 expert logits and writes it into its own half of the slab slot,
+ * whose other half is zero from bind and never written; the peer's slot is the
+ * mirror image, so the existing add-combine reassembles the full logit vector
+ * BIT-IDENTICALLY.  A k-slice would have been a reduction, and a last-bit
+ * difference in a router logit can flip top-k and change which experts run --
+ * a far louder output change than the band a reduction normally costs. */
+static int glm53_tp_router_split_requested(void) {
+    const char *env = getenv("DS4_GLM_TP_ROUTER_SPLIT");
+    return env && env[0] && env[0] != '0';
+}
+
+/* Asked by both the schedule and the graph, for the reason S4 documents: a
+ * shape the graph refuses but the mask still counts shifts every later gate's
+ * ordinal and the pair dies at the first exchange. */
+static bool glm53_tp_router_split_shape_ok(void) {
+    /* is_glm53 belongs here, not just at the call sites: only the 5.3 branch of
+     * the schedule emits a mask that can carry a router gate.  On a GLM 5.2
+     * pair the schedule takes the ATTN+FFN branch, so a graph that fired the
+     * router anyway would shift every later ordinal. */
+    return ds4_model_is_glm53() &&
+           /* Even split of the expert rows, and the half-vector must fit the
+            * slab slot the gate exchanges (vec_bytes = n_embd * 4). */
+           DS4_N_EXPERT >= 2u && (DS4_N_EXPERT % 2u) == 0u &&
+           (uint64_t)DS4_N_EXPERT <= (uint64_t)DS4_N_EMBD;
 }
 
 /* Read in two places -- the prefill path decision and the hello capability word
@@ -39960,6 +40011,15 @@ typedef struct {
     ds4_gpu_tensor *slab;
     ds4_gpu_tensor **out_views;
     ds4_gpu_tensor **in_views;
+    /* S15: [layer] view of THIS rank's half of the router gate's out slot.
+     * The router split is a partition, so each rank writes only its own 144
+     * logits and the slot's other half stays zero from the bind-time memset;
+     * the peer's slot is the mirror image, so the ordinary add-combine
+     * reassembles all 288 bit-identically.  Built once here rather than per
+     * token because 42 view create/destroy pairs per token would churn the
+     * tracked-view table for a (buffer, offset, bytes) triple that never
+     * changes. */
+    ds4_gpu_tensor **router_half_views;
     ds4_gpu_tensor **batch_out_views;   /* [layer] verify-block row partials */
     /* One prefill chunk each way, inside the registered slab so the bulk RDMA
      * path posts against them directly instead of staging through CPU copies. */
@@ -42532,6 +42592,8 @@ typedef struct ds4_glm_gpu_graph {
     uint32_t tp_rank;
     ds4_gpu_tensor **tp_out;
     ds4_gpu_tensor **tp_in;
+    /* S15: [layer] this rank's half of the router gate's out slot. */
+    ds4_gpu_tensor **tp_router_half;
     /* Prefill batch gate bounce buffers (shared storage; grow on demand). */
     ds4_gpu_tensor *tp_bounce_out;
     /* Slab-backed pair, when TP is bound: inside the NIC's registered region so
@@ -46729,14 +46791,67 @@ static bool glm_graph_encode_sparse_ffn_one(
     (void)up_in;
     (void)down_in;
 
-    bool ok = ds4_gpu_matmul_f32_tensor(g->router_logits,
-                                        model->map,
-                                        model->size,
-                                        l->ffn_gate_inp->abs_offset,
-                                        DS4_N_EMBD,
-                                        DS4_N_EXPERT,
-                                        ffn_norm,
-                                        1) != 0;
+    /* S15 -- split the router across the pair.  Each rank owns a contiguous
+     * half of the 288 expert rows, so it reads half of ffn_gate_inp and writes
+     * its logits into its own half of the router slab slot; the gate swaps the
+     * slots and the add reassembles all 288 exactly (the untouched halves are
+     * zero from the bind-time memset and nothing ever writes them).
+     *
+     * The gate MUST sit here, before router_select: top-k over a half-filled
+     * logit vector would pick experts out of 144 real values and 144 zeros. */
+    /* Ask the shared policy rather than re-deriving the layer range here: a
+     * graph that fires a gate the mask omits shifts every later gate's ordinal
+     * and kills the pair, which is how S6a and S6c each died once. */
+    bool router_gate_fires = false;
+    glm53_layer_tp_gates(il, DS4_N_LAYER, DS4_N_NEXTN_PREDICT,
+                         DS4_N_LEADING_DENSE, false, false,
+                         glm53_tp_router_split_requested() != 0 &&
+                             glm53_tp_router_split_shape_ok(),
+                         NULL, &router_gate_fires, NULL);
+    const bool router_split =
+        router_gate_fires && g->tp_world == 2 && g->tp_out && g->tp_in &&
+        /* SSD streaming takes the schedule's start/step branch, which fires one
+         * FFN gate per sparse layer and no router gate at all.  Firing one here
+         * would desync, so the split simply does not apply in that mode. */
+        !g->ssd_streaming &&
+        g->tp_router_half && il < (uint32_t)DS4_N_LAYER &&
+        g->tp_router_half[il];
+    bool ok;
+    if (router_split) {
+        const uint32_t router_slot =
+            il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ROUTER;
+        const uint32_t half = (uint32_t)DS4_N_EXPERT / 2u;
+        /* Row-major [n_expert][n_embd], so this rank's rows start a whole
+         * number of rows in -- a contiguous read, not a stride. */
+        const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+        ok = ds4_gpu_matmul_f32_tensor(g->tp_router_half[il],
+                                       model->map,
+                                       model->size,
+                                       l->ffn_gate_inp->abs_offset +
+                                           (uint64_t)g->tp_rank * half * row_bytes,
+                                       DS4_N_EMBD,
+                                       half,
+                                       ffn_norm,
+                                       1) != 0;
+        if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_ROUTER) != 0;
+        if (ok) ok = ds4_gpu_add_tensor(g->router_logits,
+                                        g->tp_out[router_slot],
+                                        g->tp_in[router_slot],
+                                        (uint32_t)DS4_N_EXPERT) != 0;
+        if (!ok) {
+            fprintf(stderr,
+                    "ds4: GLM router split gate/combine failed (layer %u)\n", il);
+        }
+    } else {
+        ok = ds4_gpu_matmul_f32_tensor(g->router_logits,
+                                       model->map,
+                                       model->size,
+                                       l->ffn_gate_inp->abs_offset,
+                                       DS4_N_EMBD,
+                                       DS4_N_EXPERT,
+                                       ffn_norm,
+                                       1) != 0;
+    }
     if (ok) ok = ds4_gpu_glm_router_select_tensor(g->router_selected,
                                                   g->router_weights,
                                                   g->router_probs,
@@ -56370,6 +56485,11 @@ struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
+    /* Set from the EVAL frame flags by the TP worker loop, which is compiled in
+     * the CPU build too -- so this lives outside the GPU block even though only
+     * the Metal path reads it.  It was inside, and ds4_session_set_tp_eval_spec
+     * then failed to compile without a GPU backend. */
+    int tp_eval_spec;   /* leader announced this EVAL as a speculative cycle */
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
@@ -56386,7 +56506,6 @@ struct ds4_session {
     uint32_t glm_mtp_rollback_dense_len;
     int glm_mtp_rollback_first_token;
     int glm_spec_inside;
-    int tp_eval_spec;   /* leader announced this EVAL as a speculative cycle */
     uint32_t glm_mtp_min_pos;
     float *glm_mtp_hc;
     float *glm_mtp_logits0;
@@ -65073,9 +65192,29 @@ void ds4_test_glm53_layer_tp_gates(uint32_t il,
                                    int *fires_ffn) {
     bool attn = false, ffn = false;
     glm53_layer_tp_gates(il, n_layer, n_nextn, n_leading_dense,
-                         kda_split != 0, dense_ffn_split != 0, &attn, &ffn);
+                         kda_split != 0, dense_ffn_split != 0, false,
+                         &attn, NULL, &ffn);
     if (fires_attn) *fires_attn = attn ? 1 : 0;
     if (fires_ffn) *fires_ffn = ffn ? 1 : 0;
+}
+
+/* S15's router gate, as a separate shim so the existing attn/ffn coverage keeps
+ * its signature.  The rule worth pinning is that the router gate follows the
+ * ROUTER, not the FFN: layers 0..n_leading_dense-1 fire an FFN gate when S4 is
+ * on but must never fire a router gate, because they have no expert selection
+ * to exchange.  Getting that wrong is the S6a ordinal shift again. */
+void ds4_test_glm53_layer_tp_router_gate(uint32_t il,
+                                         uint32_t n_layer,
+                                         uint32_t n_nextn,
+                                         uint32_t n_leading_dense,
+                                         int router_split,
+                                         int dense_ffn_split,
+                                         int *fires_router) {
+    bool router = false;
+    glm53_layer_tp_gates(il, n_layer, n_nextn, n_leading_dense,
+                         false, dense_ffn_split != 0, router_split != 0,
+                         NULL, &router, NULL);
+    if (fires_router) *fires_router = router ? 1 : 0;
 }
 
 uint32_t ds4_test_glm53_tp_split_flags(void) {
@@ -66383,6 +66522,31 @@ bool ds4_engine_is_glm53(ds4_engine *e) {
  * the leader advertised the real bitmask, the worker advertised 0, and the hello
  * refused the pair with a "model mismatch" that named only fields which matched.
  * Making it an out-param means a site that forgets it does not compile. */
+/* Set the ATTN+FFN bits for layers [first_layer, n_layer), report the first
+ * slot through *start, and return the count.
+ *
+ * Extracted because ROUTER taking slot index 1 split what used to be a
+ * contiguous per-layer run into two interleaved sequences: "start, step 1" and
+ * "start, step GATES_PER_LAYER" both stopped describing an ATTN+FFN schedule,
+ * and two branches below depended on that. */
+static uint32_t tp_gate_mask_attn_ffn(uint64_t mask[DS4_TP_GATE_MASK_WORDS],
+                                      uint32_t first_layer,
+                                      uint32_t n_layer,
+                                      uint32_t *start) {
+    const uint32_t gates[2] = { DS4_TP_GATE_ATTN, DS4_TP_GATE_FFN };
+    uint32_t count = 0, first = UINT32_MAX;
+    for (uint32_t il = first_layer; il < n_layer; il++) {
+        for (uint32_t k = 0; k < 2; k++) {
+            const uint32_t slot = il * DS4_TP_GATES_PER_LAYER + gates[k];
+            mask[slot / 64u] |= UINT64_C(1) << (slot % 64u);
+            if (first == UINT32_MAX) first = slot;
+            count++;
+        }
+    }
+    if (start) *start = first == UINT32_MAX ? 0u : first;
+    return count;
+}
+
 void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *start,
                                  uint32_t *step,
@@ -66391,6 +66555,25 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *split_flags) {
     memset(mask, 0, sizeof(uint64_t) * DS4_TP_GATE_MASK_WORDS);
     if (split_flags) *split_flags = ds4_engine_tp_split_flags(e);
+    /* Every branch indexes `mask` by layer * DS4_TP_GATES_PER_LAYER + gate and
+     * none of them bounds-check, so overflowing the mask would corrupt an
+     * adjacent word and desync the ordinal walk.  DS4_N_LAYER is a runtime
+     * shape field, so this cannot be a static assert.  Both ranks would compute
+     * the SAME wrong mask, which is precisely the case the hello's mask
+     * comparison cannot catch -- hence a loud refusal rather than a warning. */
+    if ((uint64_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER >
+        (uint64_t)DS4_TP_GATE_MASK_WORDS * 64u) {
+        fprintf(stderr,
+                "ds4: TP gate mask holds %u slots, this model needs %llu "
+                "(%u layers x %u gates); raise DS4_TP_GATE_MASK_WORDS\n",
+                (unsigned)(DS4_TP_GATE_MASK_WORDS * 64u),
+                (unsigned long long)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER,
+                (unsigned)DS4_N_LAYER, (unsigned)DS4_TP_GATES_PER_LAYER);
+        *start = 0;
+        *step = 1;
+        *per_token = 0;
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const uint32_t sparse_layers =
             DS4_N_LAYER - DS4_N_NEXTN_PREDICT - DS4_N_LEADING_DENSE;
@@ -66418,18 +66601,26 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
             const bool dense_ffn_split =
                 glm53_tp_dense_ffn_split_requested() != 0 &&
                 glm53_tp_dense_ffn_split_shape_ok();
+            const bool router_split =
+                glm53_tp_router_split_requested() != 0 &&
+                glm53_tp_router_split_shape_ok();
             /* From layer 0, not DS4_N_LEADING_DENSE: the leading layers are
              * dense only in their FFN and their KDA attention gates too.  See
              * glm53_layer_tp_gates(), which owns both rules. */
             for (uint32_t il = 0; il < normal_layers; il++) {
-                bool fires_attn = false, fires_ffn = false;
+                bool fires_attn = false, fires_router = false, fires_ffn = false;
                 glm53_layer_tp_gates(il, DS4_N_LAYER, DS4_N_NEXTN_PREDICT,
                                      DS4_N_LEADING_DENSE, kda_split,
-                                     dense_ffn_split,
-                                     &fires_attn, &fires_ffn);
-                const uint32_t gates[2] = { DS4_TP_GATE_ATTN, DS4_TP_GATE_FFN };
-                const bool fires[2] = { fires_attn, fires_ffn };
-                for (uint32_t k = 0; k < 2; k++) {
+                                     dense_ffn_split, router_split,
+                                     &fires_attn, &fires_router, &fires_ffn);
+                /* Listed in firing order; the slot indices are ascending by
+                 * construction (ATTN 0 < ROUTER 1 < FFN 2) so the ordinal walk
+                 * in tp_gate_slot() matches the graph. */
+                const uint32_t gates[3] = { DS4_TP_GATE_ATTN,
+                                            DS4_TP_GATE_ROUTER,
+                                            DS4_TP_GATE_FFN };
+                const bool fires[3] = { fires_attn, fires_router, fires_ffn };
+                for (uint32_t k = 0; k < 3; k++) {
                     if (!fires[k]) continue;
                     const uint32_t slot =
                         il * DS4_TP_GATES_PER_LAYER + gates[k];
@@ -66443,14 +66634,20 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
             *step = 1;
             *per_token = count;
         } else {
-            *start = DS4_N_LEADING_DENSE * DS4_TP_GATES_PER_LAYER;
+            /* GLM but not 5.3: ATTN+FFN on every sparse layer, never the
+             * router.  Those two slots stopped being adjacent when ROUTER took
+             * index 1, so "start, step 1" no longer describes the sequence and
+             * this has to emit an explicit mask like the 5.3 branch. */
+            *per_token = tp_gate_mask_attn_ffn(mask, DS4_N_LEADING_DENSE,
+                                               (uint32_t)DS4_N_LAYER, start);
             *step = 1;
-            *per_token = sparse_layers * DS4_TP_GATES_PER_LAYER;
         }
     } else {
-        *start = 0;
+        /* Same reason as above: DeepSeek fires ATTN and FFN on every layer and
+         * they are no longer consecutive slots. */
+        *per_token = tp_gate_mask_attn_ffn(mask, 0u, (uint32_t)DS4_N_LAYER,
+                                           start);
         *step = 1;
-        *per_token = DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
     }
 }
 
@@ -66493,6 +66690,15 @@ uint32_t ds4_engine_tp_split_flags(ds4_engine *e) {
      * before bring-up; the NULL guard covers only the test hook at
      * ds4.c:64993.  Bit 5 is retired (S14), so this takes bit 8. */
     if (e && e->glm_mtp) f |= 1u << 8;
+    /* Bit 9 left free so the three replicated-decode arms (router, DSA
+     * head-shared projections, indexer) can take a contiguous 10/11/12. */
+    /* S15 is a partition split feeding top-k: a one-sided pair would have one
+     * rank selecting experts from 144 real logits and 144 zeros.  That is not
+     * a hang and not a last-bit band -- it silently routes to the wrong
+     * experts, so it must ride the hello.  The gate mask would catch it too
+     * (the router gate changes WHICH gates fire), but the flag names it. */
+    if (glm53_tp_router_split_requested() && glm53_tp_router_split_shape_ok())
+        f |= 1u << 10;
     /* Not a split, but a one-sided value makes the two ranks choose different
      * prefill paths, and S2/S4 make those paths gate-bearing.  Carrying the
      * value (not just "is it set") catches a mismatch in either direction. */
@@ -66772,9 +66978,12 @@ static void ds4_engine_tp_storage_free(ds4_engine *e, bool shutdown_gate) {
     for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER; i++) {
         if (e->tp.batch_out_views) ds4_gpu_tensor_free(e->tp.batch_out_views[i]);
         if (e->tp.batch_in_views) ds4_gpu_tensor_free(e->tp.batch_in_views[i]);
+        if (e->tp.router_half_views)
+            ds4_gpu_tensor_free(e->tp.router_half_views[i]);
     }
     free(e->tp.batch_out_views);
     free(e->tp.batch_in_views);
+    free(e->tp.router_half_views);
     free(e->tp.out_views);
     free(e->tp.in_views);
     ds4_gpu_tensor_free(e->tp.prefill_bounce_out);
@@ -66787,6 +66996,7 @@ static void ds4_engine_tp_storage_free(ds4_engine *e, bool shutdown_gate) {
 }
 #endif
 
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
 /* Does the NIC see GPU writes without a coherency mechanism?
  *
  * If Apple's RDMA DMA is coherent with GPU caches, anyone RDMA-ing directly out
@@ -66971,6 +67181,13 @@ done:
     ds4_gpu_tensor_free(sb);
     ds4_gpu_tensor_free(sa);
 }
+/* The selftest calls ds4_gpu_* directly, so it cannot compile in the CPU test
+ * build.  It landed outside every guard, which broke ds4_cpu_test_hooks.o and
+ * with it `make test` / `make test-rocm` from a clean tree -- the placement and
+ * layer-pack suites still passed only because their binaries were stale.  Its
+ * one call site is inside ds4_engine_tp_bind's Metal branch, so guarding the
+ * definition alone is sufficient; there is no CPU-build stub to write. */
+#endif
 
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen) {
 #if defined(DS4_NO_GPU) || !defined(__APPLE__)
@@ -66995,7 +67212,10 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     e->tp.in_views = calloc(slots, sizeof(*e->tp.in_views));
     e->tp.batch_out_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_out_views));
     e->tp.batch_in_views = calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.batch_in_views));
-    if (!e->tp.batch_out_views || !e->tp.batch_in_views) {
+    e->tp.router_half_views =
+        calloc((size_t)DS4_N_LAYER, sizeof(*e->tp.router_half_views));
+    if (!e->tp.batch_out_views || !e->tp.batch_in_views ||
+        !e->tp.router_half_views) {
         snprintf(err, errlen, "tp: batch view table allocation failed");
         goto tp_bind_fail;
     }
@@ -67017,6 +67237,26 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
                     e->tp.slab, ds4_tp_slab_in_offset(tp, l, gate), vec_bytes);
             if (!e->tp.out_views[slot] || !e->tp.in_views[slot]) {
                 snprintf(err, errlen, "tp: slab view creation failed");
+                goto tp_bind_fail;
+            }
+        }
+        /* S15's half-slot.  Built unconditionally -- the split is an env flag
+         * read per graph encode, and a view is three fields, so making it
+         * conditional would only add a way for the flag and the view to
+         * disagree.  e->tp.rank is not assigned until later in this function,
+         * hence ds4_tp_rank(tp) rather than the cached copy. */
+        {
+            const uint64_t router_half =
+                (uint64_t)DS4_N_EXPERT / 2u * sizeof(float);
+            const uint64_t router_off =
+                (uint64_t)ds4_tp_rank(tp) * router_half;
+            e->tp.router_half_views[l] = ds4_gpu_tensor_view(
+                    e->tp.slab,
+                    ds4_tp_slab_out_offset(tp, l, DS4_TP_GATE_ROUTER) +
+                        router_off,
+                    router_half);
+            if (!e->tp.router_half_views[l]) {
+                snprintf(err, errlen, "tp: router half-view creation failed");
                 goto tp_bind_fail;
             }
         }
@@ -67129,7 +67369,8 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         const char *modes[] = { "off", "decode", "both" };
         fprintf(stderr,
                 "ds4: GLM TP splits, rank %d: kda=%s shared=%s dense_ffn=%s "
-                "vocab=%s pf_shared=%s pf_dense=%s (split_flags 0x%x)\n",
+                "vocab=%s pf_shared=%s pf_dense=%s router=%s "
+                "(split_flags 0x%x, %u gate slots/layer)\n",
                 ds4_tp_rank(tp),
                 modes[(int)glm53_tp_kda_split_mode()],
                 glm53_tp_shared_split_requested() ? "on" : "off",
@@ -67137,7 +67378,14 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
                 e->tp.vocab_split ? "on" : "off",
                 glm53_tp_prefill_shared_split_requested() ? "on" : "off",
                 glm53_tp_prefill_dense_split_requested() ? "on" : "off",
-                ds4_engine_tp_split_flags(e));
+                /* Report the EFFECTIVE state, not just the request: a shape the
+                 * split refuses would otherwise read "on" while the graph and
+                 * the schedule both leave the gate out. */
+                (glm53_tp_router_split_requested() &&
+                 glm53_tp_router_split_shape_ok()) ? "on" :
+                    (glm53_tp_router_split_requested() ? "REFUSED(shape)" : "off"),
+                ds4_engine_tp_split_flags(e),
+                (unsigned)DS4_TP_GATES_PER_LAYER);
     }
     e->tp.ctx = tp;
     e->tp.rank = ds4_tp_rank(tp);
@@ -67509,6 +67757,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             s->glm_graph.tp_slab_bounce_in = e->tp.prefill_bounce_in;
             s->glm_graph.tp_out = e->tp.out_views;
             s->glm_graph.tp_in = e->tp.in_views;
+            s->glm_graph.tp_router_half = e->tp.router_half_views;
         }
 #endif
         if (!glm_graph_load_directional_steering(

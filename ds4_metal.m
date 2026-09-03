@@ -10105,7 +10105,7 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                 if (++spins > (1u << 16)) sched_yield();
             }
         } else if (!req.event_arrival) {
-            uint32_t slot = req.layer * 2u + req.gate;
+            uint32_t slot = req.layer * DS4_TP_GATES_PER_LAYER + req.gate;
             if (req.rows > 0) slot += DS4_TP_GPU_FLAG_BANK_SLOTS;
             uint32_t want = ds4_gpu_tp_fence_value(req.seq);
             while (__atomic_load_n(&g_tp_gpu_flags[slot], __ATOMIC_ACQUIRE) != want) {
@@ -10153,7 +10153,7 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
         /* Release the GPU even on failure so end_commands can drain.  Must
          * match what gate_encode chose; both key off the same init-fixed
          * conditions. */
-        const uint32_t gate_slot = req.layer * 2u + req.gate;
+        const uint32_t gate_slot = req.layer * DS4_TP_GATES_PER_LAYER + req.gate;
         if (req.rows > 0 && req.big_bytes == 0 &&
             g_tp_fast_batch_sync && g_tp_release_words != NULL &&
             gate_slot < DS4_TP_FENCE_SLOTS) {
@@ -10495,7 +10495,7 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
     }
     if (!ds4_gpu_tp_queue_preflight()) return 0;
     const uint64_t seq = ++g_tp_seq;
-    const uint32_t gate_slot = layer * 2u + gate;
+    const uint32_t gate_slot = layer * DS4_TP_GATES_PER_LAYER + gate;
     const bool fast_release =
         g_tp_fast_sync && g_tp_release_words != NULL &&
         gate_slot < DS4_TP_FENCE_SLOTS;
@@ -10578,7 +10578,11 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
     if (!g_tp_thread_running || rows == 0) return 0;
     if (!ds4_gpu_tp_queue_preflight()) return 0;
     const uint64_t seq = ++g_tp_batch_seq;
-    const uint32_t gate_slot = layer * 2u + 1u; /* FFN gate slot */
+    /* Batch gates borrow the layer's FFN slot for their release word.  This is
+     * a slot INDEX into a private bank, not a slab offset, so it only has to
+     * agree with what the service thread computes at the release site. */
+    const uint32_t gate_slot =
+        layer * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
     const bool fast_release =
         g_tp_fast_batch_sync && g_tp_release_words != NULL &&
         gate_slot < DS4_TP_FENCE_SLOTS;
@@ -10626,7 +10630,10 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
     }
     uint32_t tail = (g_tp_queue_head + g_tp_queue_count) % DS4_GPU_TP_QUEUE;
     g_tp_queue[tail].layer = layer;
-    g_tp_queue[tail].gate = 1u; /* FFN */
+    /* Must equal the gate index used for gate_slot above: the service thread
+     * recomputes the arrival/release slot from req.gate, so a literal here
+     * silently polls a different word than the encoder signals. */
+    g_tp_queue[tail].gate = DS4_TP_GATE_FFN;
     g_tp_queue[tail].rows = rows;
     g_tp_queue[tail].event_arrival = event_arrival ? 1u : 0u;
     g_tp_queue[tail].seq = seq;
@@ -10678,7 +10685,7 @@ uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
     }
     uint32_t tail = (g_tp_queue_head + g_tp_queue_count) % DS4_GPU_TP_QUEUE;
     g_tp_queue[tail].layer = layer;
-    g_tp_queue[tail].gate = 1u;
+    g_tp_queue[tail].gate = DS4_TP_GATE_FFN;
     g_tp_queue[tail].rows = rows;
     g_tp_queue[tail].event_arrival = 1u;
     g_tp_queue[tail].seq = seq;
@@ -36021,10 +36028,11 @@ int ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
                 fprintf(stderr,
                         "ds4: GLM qk_lowrank batch kernel: %s "
                         "(n_head %u kv_lora %u qk_nope %u qk_dim %u "
-                        "row_bytes %u type %u)\n",
+                        "row_bytes %llu type %u)\n",
                         use_glm53_t4 ? "glm53_t4 tiled" :
                         use_glm52_t4 ? "glm52_t4 tiled" : "GENERIC (slow path)",
-                        n_head, kv_lora_dim, qk_nope, qk_dim, row_bytes,
+                        n_head, kv_lora_dim, qk_nope, qk_dim,
+                        (unsigned long long)row_bytes,
                         weight_type);
             }
         }

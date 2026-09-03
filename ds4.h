@@ -256,8 +256,35 @@ int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
-/* Decode gate schedule for the TP transport; see ds4_tp_identity. */
-enum { DS4_TP_GATE_MASK_WORDS = 3 };
+/* Decode gate schedule for the TP transport; see ds4_tp_identity.
+ * 4 words = 256 slots.  Was 3 (192) when a layer held 2 gate slots, which the
+ * router gate raised to 3 -- that capped the transport at 64 layers, and
+ * DeepSeek already runs 61.  Widening is free here because the router
+ * renumbering has already broken wire compatibility with an older binary. */
+enum { DS4_TP_GATE_MASK_WORDS = 4 };
+/* Per-layer TP gate slots.  Lives here rather than in ds4_tp.h because
+ * ds4_metal.m derives the same slot index for the fence release bank and only
+ * sees ds4.h; it used to hardcode `layer * 2u + gate` in four places, which is
+ * why adding a gate was a four-file change with no compiler help.
+ *
+ * ORDER IS LOAD-BEARING.  tp_gate_slot() walks the schedule mask by ascending
+ * slot, so these must be listed in the order the graph fires them within one
+ * layer: attention output, then the router (whose logits must be complete
+ * before expert top-k), then the FFN partial.  That is why ROUTER takes index 1
+ * and FFN moved 1 -> 2 rather than the router simply being appended -- a slot
+ * that sorts after FFN would shift every later gate's ordinal and the pair
+ * dies at the first exchange (the S6a failure mode).
+ *
+ * Renumbering is safe across a pair because both ranks derive every offset
+ * from this enum, but it is NOT wire-compatible with an older binary; the
+ * hello's gate_slot_mask comparison refuses that pairing rather than
+ * corrupting it. */
+enum {
+    DS4_TP_GATE_ATTN = 0,
+    DS4_TP_GATE_ROUTER = 1,
+    DS4_TP_GATE_FFN = 2,
+    DS4_TP_GATES_PER_LAYER = 3,
+};
 void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *start,
                                  uint32_t *step,

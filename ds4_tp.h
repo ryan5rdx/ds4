@@ -27,9 +27,8 @@
 typedef struct ds4_tp ds4_tp;
 
 enum {
-    DS4_TP_GATE_ATTN = 0,
-    DS4_TP_GATE_FFN = 1,
-    DS4_TP_GATES_PER_LAYER = 2,
+    /* DS4_TP_GATE_* and DS4_TP_GATES_PER_LAYER moved to ds4.h so ds4_metal.m
+     * can derive the same slot index instead of hardcoding it. */
     /* Max rows in a verify-block batch gate (speculative blocks are <=5). */
     DS4_TP_BATCH_MAX_ROWS = 8,
 };

@@ -100,6 +100,13 @@ void ds4_test_glm53_layer_tp_gates(uint32_t il,
                                    int dense_ffn_split,
                                    int *fires_attn,
                                    int *fires_ffn);
+void ds4_test_glm53_layer_tp_router_gate(uint32_t il,
+                                         uint32_t n_layer,
+                                         uint32_t n_nextn,
+                                         uint32_t n_leading_dense,
+                                         int router_split,
+                                         int dense_ffn_split,
+                                         int *fires_router);
 
 /* DS4_N_LAYER constant is private to ds4.c; for the test we use
  * the same value. (The packer header doesn't expose it.) */
@@ -891,13 +898,61 @@ static void test_prefill_watchdog_bound(void) {
                 ds4_test_glm53_layer_tp_gates(il, N_LAYER, N_NEXTN, N_DENSE,
                                               1, 1, &a1, &f1);
                 on += (uint32_t)(a1 + f1);
-                if (a1) max_slot = il * 2u;
-                if (f1) max_slot = il * 2u + 1u;
+                if (a1) max_slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_ATTN;
+                if (f1) max_slot = il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN;
             }
             CHECK(on == 90, "KDA split plus S4 is 90 gates per token");
-            CHECK(max_slot < N_LAYER * 2u,
-                  "S4's extra gates still fit the 92-slot slab");
+            CHECK(max_slot < N_LAYER * DS4_TP_GATES_PER_LAYER,
+                  "S4's extra gates still fit the slab's slot count");
         }
+
+        /* S15's router gate.  Its layer range follows the ROUTER, not the FFN:
+         * the leading dense layers gain an FFN gate under S4 but must never
+         * gain a router gate, because they have no expert selection to
+         * exchange.  Getting that wrong is the S6a ordinal shift again, so pin
+         * it against S4 being on as well as off. */
+        {
+            int r = -1;
+            for (uint32_t il = 0; il < N_DENSE; il++) {
+                ds4_test_glm53_layer_tp_router_gate(il, N_LAYER, N_NEXTN,
+                                                    N_DENSE, 1, 0, &r);
+                CHECK(r == 0, "a leading dense layer fires no router gate");
+                ds4_test_glm53_layer_tp_router_gate(il, N_LAYER, N_NEXTN,
+                                                    N_DENSE, 1, 1, &r);
+                CHECK(r == 0,
+                      "S4's dense FFN gate does not drag a router gate with it");
+            }
+            ds4_test_glm53_layer_tp_router_gate(N_DENSE, N_LAYER, N_NEXTN,
+                                                N_DENSE, 1, 0, &r);
+            CHECK(r == 1, "the first sparse layer fires a router gate");
+            ds4_test_glm53_layer_tp_router_gate(N_DENSE, N_LAYER, N_NEXTN,
+                                                N_DENSE, 0, 0, &r);
+            CHECK(r == 0, "no router gate with S15 off");
+            ds4_test_glm53_layer_tp_router_gate(N_LAYER - 1, N_LAYER, N_NEXTN,
+                                                N_DENSE, 1, 1, &r);
+            CHECK(r == 0, "the nextn layer fires no router gate");
+
+            uint32_t routers = 0;
+            for (uint32_t il = 0; il < N_LAYER; il++) {
+                ds4_test_glm53_layer_tp_router_gate(il, N_LAYER, N_NEXTN,
+                                                    N_DENSE, 1, 1, &r);
+                routers += (uint32_t)r;
+            }
+            CHECK(routers == 42, "S15 adds exactly 42 router gates per token");
+        }
+
+        /* The ordinal walk in tp_gate_slot() consumes the mask in ascending
+         * slot order, so a layer's gates must be numbered in the order the
+         * graph fires them: attention output, then the router (before expert
+         * top-k), then the FFN partial.  This is why ROUTER took index 1 and
+         * FFN moved to 2 rather than the router being appended. */
+        CHECK(DS4_TP_GATE_ATTN < DS4_TP_GATE_ROUTER &&
+              DS4_TP_GATE_ROUTER < DS4_TP_GATE_FFN &&
+              DS4_TP_GATE_FFN < DS4_TP_GATES_PER_LAYER,
+              "per-layer gate slots are numbered in firing order");
+        CHECK((uint64_t)N_LAYER * DS4_TP_GATES_PER_LAYER <=
+              (uint64_t)DS4_TP_GATE_MASK_WORDS * 64u,
+              "GLM 5.3's slots fit the hello's gate mask");
 
         /* Totals, and that the mask still fits the slab.  34 KDA + 11 DSA
          * attention and 42 routed FFNs: 53 gates off, 87 on. */
