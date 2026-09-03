@@ -37162,7 +37162,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         n_selected == 0 || cache_cap == 0 || n_selected > cache_cap ||
         n_head == 0 || (n_head % 8u) != 0 ||
         kv_lora_dim != 512u ||
-        qk_nope == 0 || qk_rope != 64u ||
+        qk_nope == 0 || (qk_rope != 0u && qk_rope != 64u) ||
         value_dim == 0 || qk_dim < qk_nope ||
         block_rows == 0u || needed_blocks == 0u ||
         n_blocks < needed_blocks || n_blocks > 64u ||
