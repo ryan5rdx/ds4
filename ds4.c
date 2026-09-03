@@ -13011,14 +13011,6 @@ static int glm53_tp_shared_split_requested(void) {
     return env && env[0] && env[0] != '0';
 }
 
-/* S14: mirrors ds4_gpu_batch_cb_split_requested() in ds4_metal.m.  Duplicated
- * rather than called because ds4.c also builds with DS4_NO_GPU for the CPU
- * tests, where the Metal translation unit is absent. */
-static int glm53_tp_batch_cb_split_requested(void) {
-    const char *env = getenv("DS4_GLM_TP_BATCH_CB_SPLIT");
-    return env && env[0] && env[0] != '0';
-}
-
 static bool glm53_tp_shared_split_shape_ok(void) {
     return DS4_N_FF_EXP >= 2u && (DS4_N_FF_EXP % 64u) == 0u;
 }
@@ -66397,7 +66389,8 @@ uint32_t ds4_engine_tp_split_flags(ds4_engine *e) {
      * local to each rank, but a pair where only one side splits would have the
      * two ranks reaching each gate on different command buffers -- exactly the
      * asymmetry the hello exists to refuse. */
-    if (glm53_tp_batch_cb_split_requested()) f |= 1u << 5;
+    /* Bit 5 is retired: it carried S14, which was reverted.  Left unused rather
+     * than reassigned so an old binary's flags word cannot alias a new meaning. */
     /* S8/S9 are partition splits: if only one rank enables one, that stage is
      * counted 1.5x in the all-reduce and the output is silently wrong.  Neither
      * was in the hello before -- exactly what this word exists to catch. */
@@ -66821,14 +66814,12 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         const char *modes[] = { "off", "decode", "both" };
         fprintf(stderr,
                 "ds4: GLM TP splits, rank %d: kda=%s shared=%s dense_ffn=%s "
-                "vocab=%s batch_cb_split=%s pf_shared=%s pf_dense=%s "
-                "(split_flags 0x%x)\n",
+                "vocab=%s pf_shared=%s pf_dense=%s (split_flags 0x%x)\n",
                 ds4_tp_rank(tp),
                 modes[(int)glm53_tp_kda_split_mode()],
                 glm53_tp_shared_split_requested() ? "on" : "off",
                 glm53_tp_dense_ffn_split_requested() ? "on" : "off",
                 e->tp.vocab_split ? "on" : "off",
-                glm53_tp_batch_cb_split_requested() ? "on" : "off",
                 glm53_tp_prefill_shared_split_requested() ? "on" : "off",
                 glm53_tp_prefill_dense_split_requested() ? "on" : "off",
                 ds4_engine_tp_split_flags(e));

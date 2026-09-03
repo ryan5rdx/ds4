@@ -10383,15 +10383,6 @@ int ds4_gpu_tp_init(uint32_t rank,
     return 1;
 }
 
-/* S14: opt-in for the mid-token command-buffer split under session batching.
- * Off by default -- it changes command-buffer boundaries on the batched path,
- * which C5's multi-turn gate did not cover. */
-int ds4_gpu_batch_cb_split_requested(void) {
-    static int cached = -1;
-    if (cached < 0) cached = getenv("DS4_GLM_TP_BATCH_CB_SPLIT") != NULL;
-    return cached;
-}
-
 /* Whether a decode token may be split across command buffers under tensor
  * parallelism. The original prohibition assumed one monotonic shared event per
  * token, where a command buffer running ahead could signal a sequence the
@@ -10401,18 +10392,15 @@ int ds4_gpu_batch_cb_split_requested(void) {
  * that still routes either direction through the shared event says no. */
 int ds4_gpu_tp_split_safe(uint32_t gate_slots) {
     if (!g_initialized || !g_tp_thread_running) return 0;
-    if (!g_tp_flag_gates) return 0;
-    /* S14.  Session batching was a blanket reject here, but the two sites that
-     * actually choose the transport have since been made batch-safe: arrival
-     * takes the shared event under batch mode only when !g_tp_fast_sync, and
-     * release only when !g_tp_fast_batch_sync.  With both live neither
-     * direction touches the shared event, so the criterion above is met and the
-     * reject is stricter than its own reason.  Still opt-in until measured --
-     * this is the guard that kept N>=2 off the split that paid 21.7% at N=1. */
-    if (g_tp_session_batch_mode &&
-        !(g_tp_fast_batch_sync && ds4_gpu_batch_cb_split_requested())) {
-        return 0;
-    }
+    /* Session batching stays a blanket reject.  S14 tried to narrow this on the
+     * grounds that the row-gate arrival (10498) and release (10576) sites both
+     * stop using the shared event once FAST_SYNC is on -- true, but incomplete:
+     * the BIG gate path that native batching actually uses keeps the shared
+     * event deliberately, because "a flag write carries no memory-visibility
+     * guarantee for the payload buffer".  So under batching a direction really
+     * does still route through the shared event and the criterion below holds
+     * as written.  See 2026-09-02-S14-RETRACTED.md. */
+    if (g_tp_session_batch_mode || !g_tp_flag_gates) return 0;
     if (!g_tp_fast_sync || g_tp_release_words == NULL) return 0;
     if (gate_slots == 0 || gate_slots > DS4_TP_FENCE_SLOTS) return 0;
     return 1;
