@@ -43396,10 +43396,16 @@ static uint32_t glm_graph_indexed_decode_split_blocks_for_cap(
     return glm_graph_split_blocks_for_limit(widest);
 }
 
+/* eff_n_head is the count this rank actually dispatches -- DS4_N_HEAD/2 under a
+ * TP head split -- not the model constant.  The clause below used DS4_N_HEAD,
+ * which is protected downstream (the Metal host refuses `n_head % 8 != 0` on the
+ * effective value) but is the wrong variable, and it made the announce print
+ * "n_head 64" on a run where the kernel received 32. */
 static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected,
-                                                          uint32_t ctx_cap) {
+                                                          uint32_t ctx_cap,
+                                                          uint32_t eff_n_head) {
 #ifndef __APPLE__
-    (void)n_selected; (void)ctx_cap;
+    (void)n_selected; (void)ctx_cap; (void)eff_n_head;
     return false;
 #else
     /* Same-build control for the D4 arm.  Without it the only way to measure
@@ -43419,7 +43425,7 @@ static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected,
            needed_blocks > 0 &&
            needed_blocks <= glm_graph_indexed_decode_split_blocks_for_cap(ctx_cap) &&
            glm_graph_indexed_decode_split_blocks_for_cap(ctx_cap) <= 64u &&
-           (DS4_N_HEAD % 8u) == 0 &&
+           eff_n_head != 0u && (eff_n_head % 8u) == 0u &&
            DS4_N_KV_LORA == 512u &&
            /* D4: n_rot 0 is GLM 5.3, which has no rope.  The kernel's rope work
             * is all keyed off rope_vecs = qk_rope >> 2 and vanishes at zero, so
@@ -43458,7 +43464,7 @@ static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected,
                     avail ? "ENGAGED" : "not available",
                     n_selected, block_rows, needed_blocks,
                     glm_graph_indexed_decode_split_blocks_for_cap(ctx_cap), 64u,
-                    (unsigned)DS4_N_HEAD, (unsigned)DS4_N_KV_LORA,
+                    eff_n_head, (unsigned)DS4_N_KV_LORA,
                     (unsigned)DS4_N_ROT,
                     (unsigned)glm_graph_compact_cache_is_f16(),
                     env_disabled ? " -- DISABLED BY ENV (control arm)" :
@@ -54569,7 +54575,9 @@ static bool glm_graph_forward_token(
                 ok = ds4_gpu_tensor_fill_f32(g->heads, 0.0f,
                                              (uint64_t)g->heads_dim) != 0;
             } else if (ok && glm_graph_indexed_decode_split_group8_available(last_indexer_selected_count,
-                                                            g->ctx_cap)) {
+                                                            g->ctx_cap,
+                                                            tp_split_layer_heads ?
+                                                                tp_head_count : DS4_N_HEAD)) {
                 const uint32_t split_block_rows =
                     glm_graph_indexed_decode_split_block_rows_for(last_indexer_selected_count);
                 const uint32_t split_blocks =
