@@ -13113,6 +13113,28 @@ static bool glm53_tp_dense_ffn_split_shape_ok(void) {
     return DS4_N_FF_DENSE >= 2u && (DS4_N_FF_DENSE % 64u) == 0u;
 }
 
+/* HC1 -- fuse the hc_pre tail: split+weighted-sum and the RMS norm are one
+ * kernel, `ds4_gpu_hc_split_weighted_sum_norm_tensor`, which the DeepSeek path
+ * has shipped at seven call sites.  GLM 5.3 issues them as two dispatches, and
+ * glm53_graph_hc_pre runs 90x per decode token, so that is 90 dispatches a
+ * token for nothing.
+ *
+ * The arithmetic is identical, not merely equivalent: the non-reference branch
+ * of metal_graph_decode_hc_pre IS ds4_gpu_hc_split_weighted_sum_tensor with
+ * these same constants, and the _norm_ variant is that kernel plus the norm it
+ * is already followed by.  A local probe measured the chain at 52-56 us/call
+ * dropping to 43 us, bit-identical (0/4096 differ).
+ *
+ * Found independently by two lenses of the 2026-09-03 perf sweep -- the
+ * dispatch-count lens and the occupancy lens, in separate runs.  Estimated
+ * +3.0% decode, but see the sweep's device-factor note: this is a
+ * latency-bound saving, so the 1.64x M1 Max -> M2 Ultra factor does NOT apply
+ * and the rig may show less. */
+static int glm53_hc_pre_fuse_requested(void) {
+    const char *env = getenv("DS4_GLM_HC_PRE_FUSE");
+    return env && env[0] && env[0] != '0';
+}
+
 /* S15 -- split the router (ffn_gate_inp) at DECODE.
  *
  * The model predicts this LOSES, and it is built anyway to measure the number
@@ -45877,6 +45899,37 @@ static bool glm53_graph_hc_pre(
                                          hc_dim,
                                          hc_mix,
                                          g->hc_flat);
+    /* HC1: one fused dispatch instead of split-weighted-sum then norm.  The
+     * reference decode path is excluded deliberately -- it swaps in a separate
+     * sinkhorn implementation for debugging and has no fused twin, so fusing
+     * there would silently stop honouring the escape hatch. */
+    const bool fuse_hc_norm = glm53_hc_pre_fuse_requested() &&
+                              !metal_graph_use_reference_hc_decode();
+    if (ok && fuse_hc_norm) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "ds4: GLM HC1 hc_pre norm fusion active "
+                    "(4 -> 3 dispatches per hc_pre, ~90 calls/token)\n");
+        }
+        ok = ds4_gpu_hc_split_weighted_sum_norm_tensor(collapsed,
+                                                       normalized,
+                                                       g->hc_split,
+                                                       g->hc_mix,
+                                                       residual_hc,
+                                                       model->map,
+                                                       model->size,
+                                                       scale->abs_offset,
+                                                       base->abs_offset,
+                                                       norm->abs_offset,
+                                                       DS4_N_EMBD,
+                                                       DS4_N_HC,
+                                                       DS4_N_HC_SINKHORN_ITER,
+                                                       DS4_HC_EPS,
+                                                       DS4_RMS_EPS) != 0;
+        return ok;
+    }
     if (ok) ok = metal_graph_decode_hc_pre(collapsed,
                                            g->hc_split,
                                            g->hc_mix,

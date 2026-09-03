@@ -26031,6 +26031,14 @@ uint64_t ds4_gpu_kslice_matvec_count(void) { return g_kslice_matvec_count; }
  * It is the fast path; the single-row and ragged shapes the cross-device and
  * tensor-parallel attention-output callers pass fall through to the matvec
  * path in the caller below. */
+/* M1: opt in to the 4-row routed-MoE pair kernel at DECODE.  Default off, like
+ * every other candidate in this campaign.  Read per call so an ABBA interleave
+ * can toggle it inside one process. */
+static int glm_moe_decode_pair4_enabled(void) {
+    const char *env = getenv("DS4_METAL_GLM_MOE_DECODE_PAIR4");
+    return env && env[0] && env[0] != '0';
+}
+
 static int ds4_gpu_matmul_q8_0_kslice_rows_mpp(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -38040,6 +38048,25 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             if (!gatebuf || !upbuf || !downbuf) return 0;
         }
 
+        /* M1: 4-row pair kernel at decode.  Read once -- the grid below must
+         * agree with the kernel chosen here, and two independent getenv reads
+         * are a trap the moment either side caches. */
+        const int use_pair4 = !use_stream_expert_addr_table && !gate_pair_q2 &&
+                              !gate_pair_q5 && glm_moe_decode_pair4_enabled();
+        {
+            static int announced;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: GLM routed-MoE decode pair kernel: %s "
+                        "(mid_dim %u -> %u threadgroups)\n",
+                        use_pair4 ? "swiglu4 (M1, 4 rows/simdgroup)"
+                                  : "swiglu2 (1 row/simdgroup)",
+                        (unsigned)expert_mid_dim,
+                        (unsigned)(use_pair4 ? (expert_mid_dim + 7u) / 8u
+                                             : (expert_mid_dim + 1u) / 2u));
+            }
+        }
         id<MTLComputePipelineState> pair_pipeline =
             (use_stream_split_deferred ?
              (gate_pair_q2 ?
@@ -38059,8 +38086,22 @@ int ds4_gpu_glm_routed_moe_one_tensor(
              gate_pair_q5 ?
              ds4_gpu_hot_pipeline(g_glm_q5_k_pair_swiglu_f32_pipeline,
                                   "kernel_glm_q5_K_pair_swiglu_f32") :
-             ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
-                                  "kernel_glm_q4_K_pair_swiglu2_f32"));
+             /* M1: the decode ternary had no swiglu4 branch at all, so decode
+              * took the 2-row kernel while PREFILL selects the 4-row twin
+              * (ds4_metal.m, q4_pair2 / enable_q4_pair4).  Same kernel family,
+              * same arithmetic; the 4-row form amortises the activation reload
+              * across four output rows, taking the grid from
+              * ceil(mid/2) = 1024 threadgroups to ceil(mid/8) = 256 at
+              * n_ff_exp 2048.  256 is still ~3.4 occupancy waves on an M2
+              * Ultra, so there is no starvation risk -- but the benefit is
+              * ALU-relief amortisation, which compresses on a higher
+              * core:bandwidth ratio, so discount the M1 Max delta rather than
+              * scaling it up. */
+             (use_pair4 ?
+              ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
+                                   "kernel_glm_q4_K_pair_swiglu4_f32") :
+              ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
+                                   "kernel_glm_q4_K_pair_swiglu2_f32")));
         id<MTLComputePipelineState> down_pipeline =
             (use_stream_expert_addr_table ?
              (down_scalar_q2 ?
@@ -38173,6 +38214,10 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                             (NSUInteger)((expert_mid_dim + 7u) / 8u)) :
             gate_pair_q5 ? (NSUInteger)((expert_mid_dim + 7u) / 8u) :
             use_stream_expert_addr_table ? (NSUInteger)((expert_mid_dim + 3u) / 4u) :
+            /* Must track the kernel chosen above: swiglu4 covers 4 output rows
+             * per pair, swiglu2 covers 1.  A mismatch here silently computes
+             * the wrong number of rows. */
+            use_pair4 ? (NSUInteger)((expert_mid_dim + 7u) / 8u) :
             (NSUInteger)((expert_mid_dim + 1u) / 2u);
         const NSUInteger pair_threadgroup_bytes = 0u;
         const NSUInteger pair_threads = 64u;
