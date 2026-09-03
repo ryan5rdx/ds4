@@ -981,6 +981,22 @@ static void test_prefill_watchdog_bound(void) {
              * so the cap is not secretly load-bearing at realistic shapes. */
             CHECK(ds4_test_glm_split_blocks_for_limit(8192u) == 64u,
                   "the large regime governs once it exceeds the small one");
+
+            /* n_selected does NOT come only from the top-k branch: while
+             * visible <= dense_limit (= ctx_cap = min(4096, ctx)) the decode
+             * path sets n_selected = visible, up to 4096 -- ABOVE the 2051
+             * limit split_blocks() is sized from. It still fits, but exactly:
+             * ceil(4096/128) = 32 = b. Zero margin, and coincidental. Pin it,
+             * because a silently-refused gate is how the first miss survived. */
+            {
+                const uint32_t dense_max = 4096u;      /* ctx_cap ceiling */
+                const uint32_t rows = 128u;            /* > 1024 regime */
+                const uint32_t needed = (dense_max + rows - 1u) / rows;
+                CHECK(needed == 32u,
+                      "the dense-branch maximum needs 32 blocks");
+                CHECK(needed <= b,
+                      "split_blocks() covers the dense maximum, not just top_k");
+            }
         }
 
         /* Totals, and that the mask still fits the slab.  34 KDA + 11 DSA

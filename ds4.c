@@ -875,9 +875,24 @@ static uint32_t glm_graph_indexed_decode_split_block_rows_for(uint32_t n_selecte
  * Halving this also halves the workspace: partial_lora is
  * blocks * n_head * kv_lora floats, so 65 -> 32 gives back ~4.3 MB.
  *
+ * NOTE the argument above reasons over `top_k`, but n_selected does NOT come
+ * only from the top-k branch: while visible <= dense_limit (= ctx_cap =
+ * min(4096, ctx_size)) the decode path sets n_selected = visible, which reaches
+ * 4096 -- above the 2051 limit this is sized from.  It still lands on 32,
+ * because ceil(4096/128) = 32 as well, but only exactly:
+ *
+ *   n_selected 1024 -> 32-row blocks -> 32  (small regime maximum)
+ *   n_selected 4096 -> 128-row blocks -> 32 (dense maximum, ZERO margin)
+ *
+ * Both maxima coincide at 32, which is luck rather than design.  If any of
+ * DS4_GLM_METAL_FULL_ATTN_DEFAULT_CONTEXT, the 1024 threshold or the two block
+ * sizes change, re-derive this -- the test pins both maxima for exactly that
+ * reason.
+ *
  * Under-allocation is impossible even if a regime is missed, because the
  * availability gate independently checks needed_blocks <= this value and simply
- * refuses split-K when it does not hold. */
+ * refuses split-K when it does not hold.  The failure mode is a silently
+ * disabled optimisation, which is how this went unnoticed the first time. */
 static uint32_t glm_graph_split_blocks_for_limit(uint32_t top_k) {
     const uint32_t small_n =
         top_k < DS4_GLM_SPLIT_SMALL_ROWS_MAX ? top_k : DS4_GLM_SPLIT_SMALL_ROWS_MAX;
