@@ -13215,6 +13215,11 @@ static int glm53_tp_dense_ffn_split_requested(void) {
     return !(env && env[0] == '0');
 }
 
+static int glm53_hc_pre_fuse_requested(void) {
+    const char *env = getenv("DS4_GLM_HC_PRE_FUSE");
+    return env && env[0] && env[0] != '0';
+}
+
 /* S8 -- split the replicated shared expert at PREFILL by token rows.
  *
  * Ported from the DeepSeek path (tp_row_split_ffn), which already does exactly
@@ -44901,6 +44906,14 @@ static bool glm53_graph_hc_pre(
                                          hc_dim,
                                          hc_mix,
                                          g->hc_flat);
+    if (ok && glm53_hc_pre_fuse_requested() &&
+        !metal_graph_use_reference_hc_decode()) {
+        return ds4_gpu_hc_split_weighted_sum_norm_tensor(
+                collapsed, normalized, g->hc_split, g->hc_mix, residual_hc,
+                model->map, model->size, scale->abs_offset, base->abs_offset,
+                norm->abs_offset, DS4_N_EMBD, DS4_N_HC,
+                DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS, DS4_RMS_EPS) != 0;
+    }
     if (ok) ok = metal_graph_decode_hc_pre(collapsed,
                                            g->hc_split,
                                            g->hc_mix,
