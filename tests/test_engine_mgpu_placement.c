@@ -100,6 +100,7 @@ void ds4_test_glm53_layer_tp_gates(uint32_t il,
                                    int dense_ffn_split,
                                    int *fires_attn,
                                    int *fires_ffn);
+uint32_t ds4_test_glm_split_blocks_for_limit(uint32_t top_k);
 void ds4_test_glm53_layer_tp_router_gate(uint32_t il,
                                          uint32_t n_layer,
                                          uint32_t n_nextn,
@@ -953,6 +954,34 @@ static void test_prefill_watchdog_bound(void) {
         CHECK((uint64_t)N_LAYER * DS4_TP_GATES_PER_LAYER <=
               (uint64_t)DS4_TP_GATE_MASK_WORDS * 64u,
               "GLM 5.3's slots fit the hello's gate mask");
+
+        /* Split-K worst-case block count. The availability gate hard-refuses
+         * above 64, and this value also sizes partial_lora/partial_ms, so it
+         * has to be the true maximum over BOTH block-size regimes -- 32-row
+         * blocks at n_selected <= 1024, 128-row above. Pairing the smallest
+         * block size with the largest row count describes a configuration the
+         * model never reaches: on GLM 5.3 that gave 65, one over the cap, and
+         * split-K was unreachable until an arm came back VOID. */
+        {
+            const uint32_t glm53_limit = 2048u + 4u - 1u;   /* top_k + POOL - 1 */
+            const uint32_t b = ds4_test_glm_split_blocks_for_limit(glm53_limit);
+            CHECK(b == 32u,
+                  "GLM 5.3 split-K worst case is 32 blocks "
+                  "(max of ceil(1024/32) and ceil(2051/128)), not ceil(2051/32)=65");
+            CHECK(b <= 64u,
+                  "GLM 5.3 split-K block count clears the availability gate's cap");
+            /* The regimes must not be conflated in either direction. */
+            CHECK(ds4_test_glm_split_blocks_for_limit(1024u) == 32u,
+                  "at the 1024 boundary the small-block regime governs");
+            CHECK(ds4_test_glm_split_blocks_for_limit(1025u) == 32u,
+                  "just past the boundary the small regime still bounds the max");
+            CHECK(ds4_test_glm_split_blocks_for_limit(512u) == 16u,
+                  "a small limit uses 32-row blocks only");
+            /* An 8192 top_k would need ceil(8192/128)=64: still inside the cap,
+             * so the cap is not secretly load-bearing at realistic shapes. */
+            CHECK(ds4_test_glm_split_blocks_for_limit(8192u) == 64u,
+                  "the large regime governs once it exceeds the small one");
+        }
 
         /* Totals, and that the mask still fits the slab.  34 KDA + 11 DSA
          * attention and 42 routed FFNs: 53 gates off, 87 on. */

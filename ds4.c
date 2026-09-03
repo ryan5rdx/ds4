@@ -842,6 +842,60 @@ static uint32_t directional_steering_layer_count(void) {
     return DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
 }
 
+/* Split-K block sizing.  Small selections get small blocks so the grid stays
+ * wide; large ones get big blocks so the block COUNT stays bounded. */
+#define DS4_GLM_SPLIT_SMALL_ROWS_MAX 1024u
+#define DS4_GLM_SPLIT_ROWS_SMALL       32u
+#define DS4_GLM_SPLIT_ROWS_LARGE      128u
+
+static uint32_t glm_graph_indexed_decode_split_block_rows_for(uint32_t n_selected) {
+    return n_selected <= DS4_GLM_SPLIT_SMALL_ROWS_MAX ?
+        DS4_GLM_SPLIT_ROWS_SMALL : DS4_GLM_SPLIT_ROWS_LARGE;
+}
+
+/* Worst-case split-K block count over every n_selected this model can produce.
+ * Used for two things: the partial_lora/partial_ms workspace size, and the
+ * `<= 64u` bound in glm_graph_indexed_decode_split_group8_available().
+ *
+ * This used to be ceil(selected_limit / 32), pairing the SMALLEST block size
+ * with the LARGEST row count.  Those never co-occur -- 32-row blocks apply only
+ * at n_selected <= 1024, and a count above that always uses 128-row blocks --
+ * so it computed a worst case that cannot happen:
+ *
+ *   GLM 5.3: selected_limit = top_k + POOL_SIZE - 1 = 2048 + 3 = 2051
+ *            old: ceil(2051/32)  = 65   -> `<= 64u` FAILS, split-K unreachable
+ *            new: max(ceil(1024/32), ceil(2051/128)) = max(32, 17) = 32
+ *
+ * That one-over-the-cap value is why D4 came back VOID on 2026-09-03 with the
+ * n_rot fix already in: the announce read "not available (n_selected 2049,
+ * blocks 17, n_rot 0)" -- 17 needed blocks, refused by a 65 that described a
+ * configuration the model never reaches.  Raising the cap or dropping the pool
+ * padding would both have masked the arithmetic error rather than fixing it.
+ *
+ * Halving this also halves the workspace: partial_lora is
+ * blocks * n_head * kv_lora floats, so 65 -> 32 gives back ~4.3 MB.
+ *
+ * Under-allocation is impossible even if a regime is missed, because the
+ * availability gate independently checks needed_blocks <= this value and simply
+ * refuses split-K when it does not hold. */
+static uint32_t glm_graph_split_blocks_for_limit(uint32_t top_k) {
+    const uint32_t small_n =
+        top_k < DS4_GLM_SPLIT_SMALL_ROWS_MAX ? top_k : DS4_GLM_SPLIT_SMALL_ROWS_MAX;
+    const uint32_t small_rows = glm_graph_indexed_decode_split_block_rows_for(small_n);
+    uint32_t blocks = small_n ? (small_n + small_rows - 1u) / small_rows : 0u;
+    if (top_k > DS4_GLM_SPLIT_SMALL_ROWS_MAX) {
+        const uint32_t large_rows = glm_graph_indexed_decode_split_block_rows_for(top_k);
+        const uint32_t large = (top_k + large_rows - 1u) / large_rows;
+        if (large > blocks) blocks = large;
+    }
+    return blocks;
+}
+
+/* Lives outside the DS4_NO_GPU guard deliberately: it is integer
+ * arithmetic on shape constants with no GPU dependency, and the CPU test
+ * build pins its answer (an off-by-one here made split-K unreachable and
+ * only surfaced as a VOID rig arm). */
+
 static bool ds4_glm53_layer_is_kda(uint32_t il) {
     return ds4_model_is_glm53() &&
            il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER &&
@@ -43311,20 +43365,10 @@ static bool glm_graph_small_prefill_stage_sync(
            n_tokens <= DS4_GLM_METAL_SMALL_PREFILL_STAGE_SYNC_TOKENS;
 }
 
-static uint32_t glm_graph_indexed_decode_split_min_block_rows(void) {
-    return 32u;
-}
-
 static uint32_t glm_graph_indexed_decode_split_blocks(void) {
-    const uint32_t block_rows = glm_graph_indexed_decode_split_min_block_rows();
-    const uint32_t top_k = ds4_model_is_glm53() ?
-        glm53_graph_indexer_selected_limit() :
-        glm_graph_indexer_top_k_limit();
-    return (top_k + block_rows - 1u) / block_rows;
-}
-
-static uint32_t glm_graph_indexed_decode_split_block_rows_for(uint32_t n_selected) {
-    return n_selected <= 1024u ? 32u : 128u;
+    return glm_graph_split_blocks_for_limit(
+        ds4_model_is_glm53() ? glm53_graph_indexer_selected_limit()
+                             : glm_graph_indexer_top_k_limit());
 }
 
 static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected) {
@@ -43369,11 +43413,24 @@ static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected)
         static int said_on, said_off;
         if (avail ? !said_on : !said_off) {
             if (avail) said_on = 1; else said_off = 1;
+            /* Print every clause's INPUT, not just n_selected.  The first
+             * version printed n_selected, needed_blocks and n_rot -- and the
+             * arm that came back VOID failed on none of them: needed_blocks
+             * was a healthy 17 and n_rot was the freshly-fixed 0, while the
+             * actual refusal was split_blocks() = 65 against the <= 64 cap, a
+             * value the line did not show.  The rig had to reverse-engineer it
+             * from source.  A gate that refuses silently needs to say which
+             * clause refused. */
             fprintf(stderr,
                     "ds4: GLM decode attention split-K %s (n_selected %u, "
-                    "blocks %u, n_rot %u)%s\n",
+                    "block_rows %u, needed_blocks %u, split_blocks %u/%u, "
+                    "n_head %u, kv_lora %u, n_rot %u, cache_f16 %u)%s\n",
                     avail ? "ENGAGED" : "not available",
-                    n_selected, needed_blocks, (unsigned)DS4_N_ROT,
+                    n_selected, block_rows, needed_blocks,
+                    glm_graph_indexed_decode_split_blocks(), 64u,
+                    (unsigned)DS4_N_HEAD, (unsigned)DS4_N_KV_LORA,
+                    (unsigned)DS4_N_ROT,
+                    (unsigned)glm_graph_compact_cache_is_f16(),
                     (!avail && n_selected <= 512u) ?
                         " -- n_selected <= 512, grows with position" : "");
         }
@@ -65257,6 +65314,15 @@ void ds4_test_glm53_layer_tp_router_gate(uint32_t il,
                          false, dense_ffn_split != 0, router_split != 0,
                          NULL, &router, NULL);
     if (fires_router) *fires_router = router ? 1 : 0;
+}
+
+/* Split-K worst-case block count, parameterised so the CPU test build (which
+ * compiles a different model) can pin GLM 5.3's answer.  Worth a test because
+ * getting this one over the hard `<= 64u` cap made split-K silently
+ * unreachable, and the failure mode was a gate that refuses rather than a
+ * crash -- nothing was wrong until an arm came back VOID. */
+uint32_t ds4_test_glm_split_blocks_for_limit(uint32_t top_k) {
+    return glm_graph_split_blocks_for_limit(top_k);
 }
 
 uint32_t ds4_test_glm53_tp_split_flags(void) {
