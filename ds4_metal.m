@@ -45622,10 +45622,18 @@ int ds4_gpu_glm53_matmul_bf16(
             &inner, "BF16 matrix");
         if (!weightbuf) return 0;
         const bool use_mv = n_rows <= 8u;
+        /* B1: split the contraction across simdgroups instead of giving one
+         * simdgroup a whole 16384-long row. Default off; needs a quality gate
+         * because the reduction order changes. */
+        const char *bf16_splitk_env = getenv("DS4_METAL_GLM53_BF16_MV_SPLITK");
+        const int bf16_splitk =
+            bf16_splitk_env && bf16_splitk_env[0] && bf16_splitk_env[0] != '0';
         const bool bc_inp = (in_dim % 32u) != 0u;
         const bool bc_out = (out_dim % 64u) != 0u || (n_rows % 32u) != 0u;
         id<MTLComputePipelineState> pipeline = use_mv
-            ? ds4_gpu_get_pipeline("kernel_glm53_mul_mv_bf16_f32")
+            ? ds4_gpu_get_pipeline(bf16_splitk ?
+                  "kernel_glm53_mul_mv_bf16_f32_splitk" :
+                  "kernel_glm53_mul_mv_bf16_f32")
             : ds4_gpu_get_mul_mm_pipeline(
                 "kernel_glm53_mul_mm_bf16_f32", bc_inp, bc_out);
         if (!pipeline) return 0;
@@ -45647,9 +45655,30 @@ int ds4_gpu_glm53_matmul_bf16(
                     offset:ds4_gpu_tensor_offset(x) atIndex:2];
             [enc setBuffer:ds4_gpu_tensor_buffer(out)
                     offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake((out_dim + nsg - 1u) / nsg,
-                                                  n_rows, 1)
-                threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1, 1)];
+            if (bf16_splitk) {
+                /* NR0 = 2 rows per threadgroup; the nsg simdgroups split K. */
+                [enc setThreadgroupMemoryLength:(NSUInteger)(nsg * sizeof(float))
+                                        atIndex:0];
+                static int announced;
+                if (!announced) {
+                    announced = 1;
+                    fprintf(stderr,
+                            "ds4: GLM53 BF16 matvec: splitk (B1) "
+                            "in_dim %u out_dim %u -> %u threadgroups "
+                            "(was %u), %u-way K\n",
+                            (unsigned)in_dim, (unsigned)out_dim,
+                            (unsigned)((out_dim + 1u) / 2u),
+                            (unsigned)((out_dim + nsg - 1u) / nsg),
+                            (unsigned)nsg);
+                }
+                [enc dispatchThreadgroups:MTLSizeMake((out_dim + 1u) / 2u,
+                                                      n_rows, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1, 1)];
+            } else {
+                [enc dispatchThreadgroups:MTLSizeMake((out_dim + nsg - 1u) / nsg,
+                                                      n_rows, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1, 1)];
+            }
         } else {
             ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(
                 in_dim, out_dim, n_rows, (uint64_t)in_dim * sizeof(uint16_t));
@@ -46446,8 +46475,28 @@ int ds4_gpu_glm53_kda_prefill(
             &norm_inner, "KDA output norm");
         id<MTLComputePipelineState> prep_pipeline =
             ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_prepare");
+        /* K1: four value rows per simdgroup, cutting the q/k/decay re-read.
+         * Default off. Same total work, fewer loads -- see the kernel comment;
+         * this is NOT an occupancy change. */
+        const char *kda_vpt4_env = getenv("DS4_METAL_GLM53_KDA_VPT4");
+        const int kda_vpt4 =
+            kda_vpt4_env && kda_vpt4_env[0] && kda_vpt4_env[0] != '0';
         id<MTLComputePipelineState> recurrence_pipeline =
-            ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_recurrence");
+            ds4_gpu_get_pipeline(kda_vpt4 ?
+                                 "kernel_glm53_kda_prefill_recurrence_vpt4" :
+                                 "kernel_glm53_kda_prefill_recurrence");
+        {
+            static int announced;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: GLM53 KDA prefill recurrence: %s "
+                        "(grid %u x %u)\n",
+                        kda_vpt4 ? "vpt4 (K1, 4 values/simdgroup)"
+                                 : "baseline (1 value/simdgroup)",
+                        (unsigned)n_heads, kda_vpt4 ? 8u : 32u);
+            }
+        }
         id<MTLComputePipelineState> output_pipeline =
             ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_output");
         if (!qw || !kw || !vw || !a_log || !dt_bias || !output_norm ||
@@ -46505,7 +46554,10 @@ int ds4_gpu_glm53_kda_prefill(
                 offset:ds4_gpu_tensor_offset(recurrent_state) atIndex:6];
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
                 offset:ds4_gpu_tensor_offset(out) atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake(n_heads, 32, 1)
+        /* 128 value rows per head. Baseline: 4 simdgroups x 1 value = 4 per
+         * threadgroup -> 32. K1: 4 simdgroups x 4 values = 16 -> 8. The grid
+         * MUST track the kernel or value rows are dropped or double-computed. */
+        [enc dispatchThreadgroups:MTLSizeMake(n_heads, kda_vpt4 ? 8 : 32, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
         [enc setComputePipelineState:output_pipeline];

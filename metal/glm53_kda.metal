@@ -311,6 +311,69 @@ kernel void kernel_glm53_kda_prefill_recurrence(
     *state_ptr = h;
 }
 
+/* K1: kernel_glm53_kda_prefill_recurrence with four value rows per simdgroup.
+ *
+ * q4, k4 and decay4 are indexed by (token, head, lane) and do NOT depend on
+ * `value`, so in the one-value-per-simdgroup form every one of the 128 value
+ * simdgroups for a head re-reads the same three float4s on every token. Four
+ * rows per simdgroup cuts those reads 4x. raw_beta is likewise per (token,
+ * head), so it is hoisted out of the value loop.
+ *
+ * Grid goes (n_heads, 32) -> (n_heads, 8) with the same 128 threads. Both forms
+ * launch the same total number of value-simdgroups' worth of work, so this is a
+ * traffic and load-issue reduction, NOT an occupancy change -- do not describe
+ * it as a wave-count win.
+ *
+ * Bit-identical to the original: the per-value arithmetic and the order of the
+ * two simd_sum reductions are untouched, and beta is loop-invariant. */
+kernel void kernel_glm53_kda_prefill_recurrence_vpt4(
+        constant glm53_kda_args &args,
+        device const float   *q,
+        device const float   *k,
+        device const float   *v,
+        device const float   *decay,
+        device const float   *raw_beta,
+        device float         *state,
+        device float         *out,
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint D = 128u;
+    constexpr uint VPT = 4u;
+    const uint head = tgpig.x;
+    const uint value0 = (tgpig.y * 4u + (uint)sg) * VPT;
+    if (head >= args.n_heads || value0 + VPT > D) return;
+    const uint projection = args.n_heads * D;
+    const uint k0 = lane * 4u;
+
+    device float4 *state_ptr[VPT];
+    float4 h[VPT];
+    for (uint i = 0; i < VPT; i++) {
+        state_ptr[i] = (device float4 *)(
+            state + ((ulong)(args.head_first + head) * D + value0 + i) * D + k0);
+        h[i] = *state_ptr[i];
+    }
+
+    for (uint token = 0; token < args.n_rows; token++) {
+        const ulong base = (ulong)token * projection + head * D;
+        const float4 q4 = *((device const float4 *)(q + base + k0));
+        const float4 k4 = *((device const float4 *)(k + base + k0));
+        const float4 decay4 =
+            *((device const float4 *)(decay + base + k0));
+        const float beta = 1.0f /
+            (1.0f + exp(-raw_beta[(ulong)token * args.n_heads + head]));
+        for (uint i = 0; i < VPT; i++) {
+            h[i] *= decay4;
+            const float hk = simd_sum(dot(h[i], k4));
+            const float delta_v = (v[base + value0 + i] - hk) * beta;
+            h[i] = fma(k4, float4(delta_v), h[i]);
+            const float result = simd_sum(dot(h[i], q4));
+            if (lane == 0u) out[base + value0 + i] = result;
+        }
+    }
+    for (uint i = 0; i < VPT; i++) *state_ptr[i] = h[i];
+}
+
 kernel void kernel_glm53_kda_prefill_output(
         constant glm53_kda_args &args,
         device float         *out,
