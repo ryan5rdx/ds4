@@ -234,6 +234,7 @@ static id<MTLComputePipelineState> g_glm_qk_lowrank_glm52_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_glm52_sg_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_batch_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_batch_glm52_t4_pipeline;
+static id<MTLComputePipelineState> g_glm_qk_lowrank_batch_glm53_t4_pipeline;
 static id<MTLComputePipelineState> g_glm_value_project_q8_0_pipeline;
 static id<MTLComputePipelineState> g_glm_value_project_q8_0_batch_heads_pipeline;
 static id<MTLComputePipelineState> g_glm_value_project_q8_0_batch_heads_mma_pipeline;
@@ -8811,6 +8812,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_batch");
         g_glm_qk_lowrank_batch_glm52_t4_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_batch_glm52_t4");
+        g_glm_qk_lowrank_batch_glm53_t4_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0_batch_glm53_t4");
         g_glm_value_project_q8_0_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_value_project_q8_0");
         g_glm_value_project_q8_0_batch_heads_pipeline =
@@ -8925,6 +8928,7 @@ int ds4_gpu_init(void) {
             !g_glm_qk_lowrank_glm52_sg_pipeline ||
             !g_glm_qk_lowrank_batch_pipeline ||
             !g_glm_qk_lowrank_batch_glm52_t4_pipeline ||
+            !g_glm_qk_lowrank_batch_glm53_t4_pipeline ||
             !g_glm_value_project_q8_0_pipeline ||
             !g_glm_value_project_q8_0_batch_heads_pipeline ||
             !g_glm_value_project_q8_0_batch_heads_mma_pipeline ||
@@ -11181,6 +11185,7 @@ void ds4_gpu_cleanup(void) {
         g_glm_qk_lowrank_glm52_sg_pipeline = nil;
         g_glm_qk_lowrank_batch_pipeline = nil;
         g_glm_qk_lowrank_batch_glm52_t4_pipeline = nil;
+        g_glm_qk_lowrank_batch_glm53_t4_pipeline = nil;
         g_glm_value_project_q8_0_pipeline = nil;
         g_glm_value_project_q8_0_batch_heads_pipeline = nil;
         g_glm_value_project_q8_0_batch_heads_mma_pipeline = nil;
@@ -35989,15 +35994,44 @@ int ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
                                       &weight_inner);
         if (!weightbuf) return 0;
 
-        const int use_glm52_t4 =
+        const int shape_common =
             n_tokens >= 4u &&
             n_head == 64u &&
             kv_lora_dim == 512u &&
-            qk_nope == 192u &&
             qk_dim == 256u &&
-            row_bytes == 204u &&
             weight_type == DS4_METAL_TENSOR_Q8_0;
+        const int use_glm52_t4 =
+            shape_common && qk_nope == 192u && row_bytes == 204u;
+        /* GLM 5.3 sets n_rot = 0, so q_nope = n_key_mla - n_rot = 256 and a
+         * Q8_0 row is 272 bytes.  It therefore failed the 5.2 predicate on BOTH
+         * counts and every DSA prefill layer fell to the generic scalar kernel:
+         * measured 31.0 GFLOP/s against 1613 for the tiled one, a 52x rate
+         * penalty on ~0.8% of prefill FLOPs that costs ~64% of prefill time. */
+        const int use_glm53_t4 =
+            shape_common && qk_nope == 256u && row_bytes == 272u;
+        const int use_t4 = use_glm52_t4 || use_glm53_t4;
+        /* Say once which way this went, and why.  The predicate depends on the
+         * weight TYPE as well as the shape, and attn_k_b's type cannot be read
+         * from source -- if a build lands on the generic path anyway, this line
+         * is what says so instead of the arm quietly measuring nothing. */
+        {
+            static int announced;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: GLM qk_lowrank batch kernel: %s "
+                        "(n_head %u kv_lora %u qk_nope %u qk_dim %u "
+                        "row_bytes %u type %u)\n",
+                        use_glm53_t4 ? "glm53_t4 tiled" :
+                        use_glm52_t4 ? "glm52_t4 tiled" : "GENERIC (slow path)",
+                        n_head, kv_lora_dim, qk_nope, qk_dim, row_bytes,
+                        weight_type);
+            }
+        }
         id<MTLComputePipelineState> pipeline =
+            use_glm53_t4 ?
+                ds4_gpu_hot_pipeline(g_glm_qk_lowrank_batch_glm53_t4_pipeline,
+                                     "kernel_glm_qk_lowrank_q8_0_batch_glm53_t4") :
             use_glm52_t4 ?
                 ds4_gpu_hot_pipeline(g_glm_qk_lowrank_batch_glm52_t4_pipeline,
                                      "kernel_glm_qk_lowrank_q8_0_batch_glm52_t4") :
@@ -36029,8 +36063,10 @@ int ds4_gpu_glm_qk_lowrank_typed_batch_tensor(
         [enc setBuffer:weightbuf offset:(NSUInteger)weight_inner atIndex:1];
         [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(qk_low) atIndex:3];
-        if (use_glm52_t4) {
-            [enc setThreadgroupMemoryLength:4u * 192u * sizeof(float) atIndex:0];
+        if (use_t4) {
+            /* tile_tokens(4) * qk_nope floats: 3072 B at 192, 4096 B at 256. */
+            [enc setThreadgroupMemoryLength:4u * (NSUInteger)qk_nope * sizeof(float)
+                                    atIndex:0];
             [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)head_count,
                                                   ((NSUInteger)n_tokens + 3u) / 4u,
                                                   1)

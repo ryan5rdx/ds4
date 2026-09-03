@@ -2600,6 +2600,114 @@ kernel void kernel_glm_qk_lowrank_q8_0_batch_glm52_t4(
     }
 }
 
+// GLM 5.3 variant of the tile-4 qk_lowrank kernel.  Identical structure; the
+// three constants differ only because GLM 5.3 sets n_rot = 0 (ds4.c:722), so
+// q_nope = n_key_mla - n_rot = 256 rather than 5.2's 192, and a Q8_0 row is
+// 8 blocks / 272 bytes rather than 6 / 204.
+//
+// Without this, GLM 5.3 fails the glm52_t4 predicate on BOTH qk_nope and
+// row_bytes and every DSA prefill layer falls to the generic scalar kernel.
+// Measured on an M1 Max (ds4/probes/probe_qklow.c in the scratch repo):
+// 1613 GFLOP/s specialised vs 31.0 generic -- a 52x rate penalty on a kernel
+// that is ~0.8% of prefill FLOPs but ~64% of prefill wall clock.
+//
+// Threadgroup memory grows with qk_nope: tile_tokens * qk_nope * 4 =
+// 4 * 256 * 4 = 4096 B, against 3072 B for the 5.2 shape.  The host must size
+// setThreadgroupMemoryLength to match -- see ds4_metal.m.
+kernel void kernel_glm_qk_lowrank_q8_0_batch_glm53_t4(
+        constant ds4_metal_args_glm_qk_lowrank_batch & args,
+        device const char *weight,
+        device const char *q,
+        device char *qk_low,
+        threadgroup float *x [[threadgroup(0)]],
+        uint tid [[thread_index_in_threadgroup]],
+        ushort3 ntg_u [[threads_per_threadgroup]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    constexpr uint n_head = 64u;
+    constexpr uint kv_lora_dim = 512u;
+    constexpr uint qk_nope = 256u;
+    constexpr uint qk_dim = 256u;
+    constexpr uint tile_tokens = 4u;
+    constexpr uint row_bytes = 272u;
+
+    const uint head = tgpig.x + args.head_base;
+    const uint token0 = tgpig.y * tile_tokens;
+    const uint nth = ntg_u.x;
+    const uint64_t q_token_stride = (uint64_t)n_head * qk_dim * sizeof(float);
+    const uint64_t low_token_stride = (uint64_t)n_head * kv_lora_dim * sizeof(float);
+
+    for (uint t = 0; t < tile_tokens; t++) {
+        const uint token = token0 + t;
+        threadgroup float *xt = x + t * qk_nope;
+        if (token < args.n_tokens) {
+            device const float *qh =
+                (device const float *)(q +
+                    (uint64_t)token * q_token_stride +
+                    (uint64_t)head * qk_dim * sizeof(float));
+            for (uint d = tid; d < qk_nope; d += nth) {
+                xt[d] = qh[d];
+            }
+        } else {
+            for (uint d = tid; d < qk_nope; d += nth) {
+                xt[d] = 0.0f;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = tid; j < kv_lora_dim; j += nth) {
+        device const char *row =
+            weight + ((uint64_t)head * kv_lora_dim + j) * row_bytes;
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        float acc2 = 0.0f;
+        float acc3 = 0.0f;
+        for (uint block = 0; block < 8u; block++) {
+            device const char *block_base = row + (uint64_t)block * 34u;
+            const float d = (float)(*((device const half *)block_base));
+            device const int8_t *qs = (device const int8_t *)(block_base + 2u);
+            const uint base = block << 5;
+            FOR_UNROLL (uint qi = 0; qi < 32u; qi++) {
+                const uint col = base + qi;
+                const float wq = d * (float)qs[qi];
+                acc0 += wq * x[col];
+                acc1 += wq * x[qk_nope + col];
+                acc2 += wq * x[2u * qk_nope + col];
+                acc3 += wq * x[3u * qk_nope + col];
+            }
+        }
+
+        if (token0 < args.n_tokens) {
+            device float *out0 =
+                (device float *)(qk_low +
+                    (uint64_t)token0 * low_token_stride +
+                    (uint64_t)head * kv_lora_dim * sizeof(float));
+            out0[j] = acc0;
+        }
+        if (token0 + 1u < args.n_tokens) {
+            device float *out1 =
+                (device float *)(qk_low +
+                    (uint64_t)(token0 + 1u) * low_token_stride +
+                    (uint64_t)head * kv_lora_dim * sizeof(float));
+            out1[j] = acc1;
+        }
+        if (token0 + 2u < args.n_tokens) {
+            device float *out2 =
+                (device float *)(qk_low +
+                    (uint64_t)(token0 + 2u) * low_token_stride +
+                    (uint64_t)head * kv_lora_dim * sizeof(float));
+            out2[j] = acc2;
+        }
+        if (token0 + 3u < args.n_tokens) {
+            device float *out3 =
+                (device float *)(qk_low +
+                    (uint64_t)(token0 + 3u) * low_token_stride +
+                    (uint64_t)head * kv_lora_dim * sizeof(float));
+            out3[j] = acc3;
+        }
+    }
+}
+
 kernel void kernel_glm_value_project_q8_0(
         constant ds4_metal_args_glm_qk_lowrank & args,
         device const char *weight,
