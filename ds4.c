@@ -43342,7 +43342,12 @@ static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected)
            glm_graph_indexed_decode_split_blocks() <= 64u &&
            (DS4_N_HEAD % 8u) == 0 &&
            DS4_N_KV_LORA == 512u &&
-           DS4_N_ROT == 64u &&
+           /* D4: n_rot 0 is GLM 5.3, which has no rope.  The kernel's rope work
+            * is all keyed off rope_vecs = qk_rope >> 2 and vanishes at zero, so
+            * this clause was the only thing keeping every DSA decode layer on
+            * the unsplit path -- n_head threadgroups (32 under TP2) rather than
+            * a 2D grid.  Same occupancy miss as D3, one clause away. */
+           (DS4_N_ROT == 64u || DS4_N_ROT == 0u) &&
            glm_graph_compact_cache_is_f16();
 #endif
 }
@@ -46809,6 +46814,13 @@ static bool glm_graph_encode_sparse_ffn_one(
                              glm53_tp_router_split_shape_ok(),
                          NULL, &router_gate_fires, NULL);
     const bool router_split =
+        /* decode_step is load-bearing here for the same reason S2 and S4
+         * document it: prefill reaches this function through the per-row
+         * fallback loop in glm_graph_forward_indexed_tokens, so without this
+         * the router gate fires once per ROW on the same layer slot and the
+         * ordinal walk desyncs immediately.  The schedule mask describes one
+         * decode token; only the caller knows which phase this is. */
+        decode_step &&
         router_gate_fires && g->tp_world == 2 && g->tp_out && g->tp_in &&
         /* SSD streaming takes the schedule's start/step branch, which fires one
          * FFN gate per sparse layer and no router gate at all.  Firing one here

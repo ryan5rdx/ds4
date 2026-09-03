@@ -9993,14 +9993,14 @@ static uint64_t g_tp_stat_kind_gates[DS4_TP_STAT_KIND_COUNT];
  * exchange_FFN - exchange_ATTN is the straggler's per-layer cost directly --
  * no cross-epoch subtraction, and it bounds any shared-expert rebalancing.
  * If the two measure equal, the imbalance is zero and all of them are dead. */
-static uint64_t g_tp_stat_slot_gates[2];
+static uint64_t g_tp_stat_slot_gates[DS4_TP_GATES_PER_LAYER];
 static uint32_t g_tp_stat_layers = 43u;   /* DeepSeek default; set per family */
 
 void ds4_gpu_tp_set_stat_layer_count(uint32_t layers) {
     if (layers) g_tp_stat_layers = layers;
 }
-static double   g_tp_stat_slot_gpu_wait_ms[2];
-static double   g_tp_stat_slot_exchange_ms[2];
+static double   g_tp_stat_slot_gpu_wait_ms[DS4_TP_GATES_PER_LAYER];
+static double   g_tp_stat_slot_exchange_ms[DS4_TP_GATES_PER_LAYER];
 static double g_tp_stat_kind_gpu_wait_ms[DS4_TP_STAT_KIND_COUNT];
 static double g_tp_stat_kind_exchange_ms[DS4_TP_STAT_KIND_COUNT];
 
@@ -10188,7 +10188,12 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
             g_tp_stat_kind_gates[kind]++;
             g_tp_stat_kind_gpu_wait_ms[kind] += wait_ms;
             g_tp_stat_kind_exchange_ms[kind] += exchange_ms;
-            if (kind == DS4_TP_STAT_ROW && req.gate < 2u) {  /* 0=ATTN, 1=FFN per ds4_tp.h */
+            /* Was `req.gate < 2u` with a literal 0=ATTN/1=FFN comment.  Once
+             * ROUTER took slot 1 and FFN moved to 2 that bound silently
+             * dropped every FFN gate from the statistic AND relabelled the
+             * router's numbers as the FFN's -- so the straggler figure was
+             * computed from the wrong pair.  Bound off the enum instead. */
+            if (kind == DS4_TP_STAT_ROW && req.gate < DS4_TP_GATES_PER_LAYER) {
                 g_tp_stat_slot_gates[req.gate]++;
                 g_tp_stat_slot_gpu_wait_ms[req.gate] += wait_ms;
                 g_tp_stat_slot_exchange_ms[req.gate] += exchange_ms;
@@ -10200,17 +10205,25 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                         g_tp_stat_gpu_wait_ms / (double)g_tp_stat_gates * 1000.0,
                         g_tp_stat_exchange_ms / (double)g_tp_stat_gates * 1000.0);
                 {
-                    /* ds4_tp.h is not visible here: 0 = ATTN, 1 = FFN. */
-                    const double a_n = (double)g_tp_stat_slot_gates[0];
-                    const double f_n = (double)g_tp_stat_slot_gates[1];
-                    const double a_x = a_n ? g_tp_stat_slot_exchange_ms[0] / a_n * 1000.0 : 0.0;
-                    const double f_x = f_n ? g_tp_stat_slot_exchange_ms[1] / f_n * 1000.0 : 0.0;
+                    /* The slot enum lives in ds4.h and IS visible here; it
+                     * used to be in ds4_tp.h, which is where the stale
+                     * "0 = ATTN, 1 = FFN" literal came from. */
+                    const double a_n = (double)g_tp_stat_slot_gates[DS4_TP_GATE_ATTN];
+                    const double r_n = (double)g_tp_stat_slot_gates[DS4_TP_GATE_ROUTER];
+                    const double f_n = (double)g_tp_stat_slot_gates[DS4_TP_GATE_FFN];
+                    const double a_x = a_n ? g_tp_stat_slot_exchange_ms[DS4_TP_GATE_ATTN] / a_n * 1000.0 : 0.0;
+                    const double r_x = r_n ? g_tp_stat_slot_exchange_ms[DS4_TP_GATE_ROUTER] / r_n * 1000.0 : 0.0;
+                    const double f_x = f_n ? g_tp_stat_slot_exchange_ms[DS4_TP_GATE_FFN] / f_n * 1000.0 : 0.0;
                     fprintf(stderr,
-                            "ds4: TP row gates by slot: attn %.0f x %.1f us, ffn %.0f x %.1f us, "
+                            "ds4: TP row gates by slot: attn %.0f x %.1f us, "
+                            "router %.0f x %.1f us, ffn %.0f x %.1f us, "
                             "exchange delta %+.1f us -> straggler %.2f ms/token "
                             "(over %u gated layers)\n",
-                            a_n, a_x, f_n, f_x, f_x - a_x,
-                            /* delta = E|s|/2 is already the per-layer excess on
+                            a_n, a_x, r_n, r_x, f_n, f_x, f_x - a_x,
+                            /* delta stays attn<->ffn even with a router gate
+                             * between them: it measures rank skew accumulated
+                             * across the layer, and those two still bracket it.
+                             * delta = E|s|/2 is already the per-layer excess on
                              * the critical path (the token advances at the
                              * slower rank's pace, so the cost is
                              * E[max] - E[mean] = E|s|/2).  One layer's worth
@@ -36520,7 +36533,11 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
         n_selected == 0 || cache_cap == 0 || n_selected > cache_cap ||
         n_head == 0 || (n_head % 8u) != 0 ||
         kv_lora_dim != 512u ||
-        qk_nope == 0 || qk_rope != 64u ||
+        /* Accept qk_rope 0 (GLM 5.3, n_rot = 0) as the non-split sibling
+         * already does with `(qk_rope & 1u) != 0`.  The freq_base/freq_scale
+         * checks below are already written `qk_rope != 0 && ...`, so this shape
+         * was anticipated here; only the hard 64 refused it. */
+        qk_nope == 0 || (qk_rope != 0u && qk_rope != 64u) ||
         value_dim == 0 || qk_dim < qk_nope ||
         block_rows == 0u || needed_blocks == 0u ||
         n_blocks < needed_blocks || n_blocks > 64u ||

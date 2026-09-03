@@ -3043,10 +3043,16 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
     const uint head_in_group = (uint)sg_u;
     const uint head = tgpig.x * group_heads + head_in_group;
     const uint block = tgpig.y;
+    /* qk_rope 0 is GLM 5.3 (n_rot = 0), which has no rope at all.  Every rope
+     * path in this kernel is already keyed off rope_vecs = qk_rope >> 2: at
+     * zero the staging loop runs zero iterations and every read sits behind
+     * `lane < rope_vecs`, so the shape only needed letting through.  The one
+     * exception is the YARN correction below, which divides by qk_rope.
+     * Other kernels in this file already spell the check this way. */
     if (args.n_selected == 0u ||
         args.cache_f16 == 0u ||
         args.kv_lora_dim != 512u ||
-        args.qk_rope != 64u ||
+        (args.qk_rope != 0u && args.qk_rope != 64u) ||
         args.block_rows == 0u ||
         block >= args.n_blocks) {
         return;
@@ -3086,7 +3092,11 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
     }
 
     float corr_dims[2] = {0.0f, 0.0f};
-    if (args.ext_factor != 0.0f) {
+    /* qk_rope != 0 is not redundant with ext_factor.  The caller passes
+     * ext_factor = 0.0f on GLM 5.3 today, but leaning on that would make a
+     * divide-by-zero inside glm_rope_yarn_corr_dims a caller's-argument bug
+     * rather than something this kernel refuses on its own terms. */
+    if (args.ext_factor != 0.0f && args.qk_rope != 0u) {
         glm_rope_yarn_corr_dims((int)args.qk_rope,
                                 (int)args.n_ctx_orig,
                                 args.freq_base,
