@@ -537,6 +537,7 @@ int ds4_gpu_embed_tokens_quant_tensor(
  * monotonic shared event. gate_slots is the total slot count the token will
  * use. Fails closed. */
 int ds4_gpu_tp_split_safe(uint32_t gate_slots);
+int ds4_gpu_batch_cb_split_requested(void);
 int ds4_gpu_tp_batch_split_safe(uint32_t gate_slots);
 
 void ds4_gpu_trace_tag(const char *tag);
