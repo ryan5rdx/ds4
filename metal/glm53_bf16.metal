@@ -91,6 +91,99 @@ kernel void kernel_glm53_mul_mv_bf16_f32(
                               tgpig, lane, sg, nsg);
 }
 
+/* B1: split-K BF16 matvec.
+ *
+ * The row kernel above gives ONE SIMDGROUP an entire in_dim-long row, so the
+ * threadgroup count is ceil(out_dim / nsg). At the hc_mix shape -- in_dim
+ * 16384, out_dim 24 -- that is 3 threadgroups on a 60-76 core GPU. The F16
+ * sibling for the identical shape already takes a split-K plain-mv path.
+ *
+ * Here each threadgroup owns NR0 output rows and its nsg simdgroups split the
+ * contraction, reducing through threadgroup memory. At out_dim 24, nsg 8:
+ * 12 threadgroups with an 8-way K split, against 3.
+ *
+ * NOT bit-identical to the row kernel: the contraction is summed in a
+ * different order (per-simdgroup partials combined in a tree, rather than one
+ * simdgroup accumulating the whole row through an 8-way unrolled fma chain).
+ * results.md C4 already retired byte-identity for this kernel's mv/mm fork, so
+ * a band is expected -- but this arm still needs a quality gate, unlike the
+ * other three in its bundle. */
+kernel void kernel_glm53_mul_mv_bf16_f32_splitk(
+        constant glm53_bf16_matmul_args &args,
+        device const ushort             *weights,
+        device const float              *x,
+        device float                    *out,
+        threadgroup float               *shmem [[threadgroup(0)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]],
+        ushort nsg  [[simdgroups_per_threadgroup]]) {
+    constexpr uint NR0 = 2u;
+    const uint row0  = tgpig.x * NR0;
+    const uint token = tgpig.y;
+    if (row0 >= args.out_dim || token >= args.n_rows) return;
+    device const float *xr = x + (ulong)token * args.in_dim;
+
+    for (uint r = 0; r < NR0; r++) {
+        const uint out_row = row0 + r;
+        float sum = 0.0f;
+        if (out_row < args.out_dim) {
+            device const ushort *w = weights + (ulong)out_row * args.in_dim;
+            /* Simdgroup sg walks lanes [32*sg, 32*sg+32) of each 32*nsg-wide
+             * chunk: coalesced inside a simdgroup, and the union over
+             * simdgroups covers the row exactly once.
+             *
+             * Keep the row kernel's EIGHT independent loads per iteration. A
+             * first cut used one load per iteration and measured 0.77x -- i.e.
+             * SLOWER than the 3-threadgroup kernel it replaces -- because the
+             * memory-level parallelism the row kernel's comment calls out is
+             * worth more here than the extra threadgroups. */
+            const uint stride = 32u * (uint)nsg;
+            uint k = lane + 32u * (uint)sg;
+            for (; k + 7u * stride < args.in_dim; k += 8u * stride) {
+                const ushort w0 = w[k];
+                const ushort w1 = w[k + stride];
+                const ushort w2 = w[k + 2u * stride];
+                const ushort w3 = w[k + 3u * stride];
+                const ushort w4 = w[k + 4u * stride];
+                const ushort w5 = w[k + 5u * stride];
+                const ushort w6 = w[k + 6u * stride];
+                const ushort w7 = w[k + 7u * stride];
+                const float x0 = xr[k];
+                const float x1 = xr[k + stride];
+                const float x2 = xr[k + 2u * stride];
+                const float x3 = xr[k + 3u * stride];
+                const float x4 = xr[k + 4u * stride];
+                const float x5 = xr[k + 5u * stride];
+                const float x6 = xr[k + 6u * stride];
+                const float x7 = xr[k + 7u * stride];
+                sum = fma(glm53_bf16_to_f32(w0), x0, sum);
+                sum = fma(glm53_bf16_to_f32(w1), x1, sum);
+                sum = fma(glm53_bf16_to_f32(w2), x2, sum);
+                sum = fma(glm53_bf16_to_f32(w3), x3, sum);
+                sum = fma(glm53_bf16_to_f32(w4), x4, sum);
+                sum = fma(glm53_bf16_to_f32(w5), x5, sum);
+                sum = fma(glm53_bf16_to_f32(w6), x6, sum);
+                sum = fma(glm53_bf16_to_f32(w7), x7, sum);
+            }
+            for (; k < args.in_dim; k += stride) {
+                sum = fma(glm53_bf16_to_f32(w[k]), xr[k], sum);
+            }
+        }
+        sum = simd_sum(sum);
+        if (lane == 0u) shmem[sg] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            float tot = lane < nsg ? shmem[lane] : 0.0f;
+            tot = simd_sum(tot);
+            if (lane == 0u && out_row < args.out_dim) {
+                out[(ulong)token * args.out_dim + out_row] = tot;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 kernel void kernel_glm53_mul_mv_bf16_f32_qkv(
         constant glm53_bf16_matmul_args &args,
         device const ushort             *weights_q,
