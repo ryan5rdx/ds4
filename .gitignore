@@ -46,3 +46,14 @@ __pycache__/
 /.claude/
 # Instruments captures; a single decode trace runs to tens of MB.
 *.trace/
+
+# Built test/bench executables. The sources are tracked, the binaries are not.
+# Two ~700 KB Mach-O files (tests/bench_kda_grid{,2}) were swept in by a
+# `git add -A` while a workflow was building probes under tests/.
+tests/test_*
+tests/bench_*
+!tests/*.c
+!tests/*.h
+!tests/*.sh
+!tests/*.py
+!tests/*.md

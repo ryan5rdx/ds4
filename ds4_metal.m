@@ -26039,6 +26039,51 @@ static int glm_moe_decode_pair4_enabled(void) {
     return env && env[0] && env[0] != '0';
 }
 
+/* Geometry validation shared by every k-slice path.
+ *
+ * This runs BEFORE the MPP attempt, deliberately.  MPP has its own alignment
+ * checks but validated only `n_rows * k_cnt` bytes and never looked at
+ * x_row_stride or x_col_off at all, so an invalid activation geometry reached
+ * it and could read out of bounds -- and only on M5, because M2 Ultra disables
+ * MPP, so the rig would never have caught it.  x_row_stride == 0 is the sharp
+ * case: nb11 becomes 0 and every row silently reads row 0.
+ *
+ * Same shape as the D4 OOB and the original D1 defect: a bound that a wider or
+ * degenerate input satisfies by accident. */
+static int ds4_gpu_kslice_rows_geometry_ok(
+        const ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              full_in_dim,
+        uint64_t              out_dim,
+        uint64_t              k_off,
+        uint64_t              k_cnt,
+        uint64_t              x_row_stride,
+        uint64_t              x_col_off,
+        uint64_t              n_rows) {
+    if (!out || !x || !model_map || n_rows == 0 || out_dim == 0 ||
+        n_rows > (uint64_t)INT32_MAX ||
+        (full_in_dim & 31u) != 0 || (k_off & 31u) != 0 ||
+        (k_cnt & 31u) != 0 || k_cnt == 0 ||
+        k_off > full_in_dim || k_cnt > full_in_dim - k_off ||
+        full_in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        k_cnt > UINT32_MAX ||
+        /* The window must fit inside a row, and the LAST row's window inside
+         * the buffer.  `bytes(x) < n_rows * k_cnt * 4` was a lower bound that
+         * any wider buffer satisfies -- which is how a full-width activation
+         * sailed through and the kernel walked half rows (D1). */
+        x_row_stride == 0 || x_row_stride < x_col_off + k_cnt ||
+        x_row_stride > UINT32_MAX ||
+        n_rows > UINT64_MAX / x_row_stride / sizeof(float) ||
+        n_rows > UINT64_MAX / out_dim / sizeof(float) ||
+        ds4_gpu_tensor_bytes(x) <
+            ((n_rows - 1u) * x_row_stride + x_col_off + k_cnt) * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < n_rows * out_dim * sizeof(float)) {
+        return 0;
+    }
+    return 1;
+}
+
 static int ds4_gpu_matmul_q8_0_kslice_rows_mpp(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -26074,7 +26119,11 @@ static int ds4_gpu_matmul_q8_0_kslice_rows_mpp(
          * and then the kernel strides across the wrong rows and reads garbage.
          * Silent, and only on M5 -- M2 Ultra disables MPP, so the rig never saw
          * it. Matches the matvec and tiled paths below. */
-        const uint64_t x_bytes = n_rows * k_cnt * sizeof(float);
+        /* Geometry and bounds are validated by
+         * ds4_gpu_kslice_rows_geometry_ok() before this is reached; only the
+         * MPP-specific alignment constraints are checked above. */
+        const uint64_t x_bytes =
+            ((n_rows - 1u) * x_row_stride + x_col_off + k_cnt) * sizeof(float);
         const uint64_t out_bytes = n_rows * out_dim * sizeof(float);
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
@@ -26155,33 +26204,19 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         uint64_t              x_row_stride,
         uint64_t              x_col_off,
         uint64_t              n_rows) {
+    /* Validate before dispatching ANYWHERE, including MPP.  This used to sit
+     * after the MPP attempt, so MPP ran against unvalidated geometry. */
+    if (!ds4_gpu_kslice_rows_geometry_ok(out, x, model_map, full_in_dim,
+                                         out_dim, k_off, k_cnt,
+                                         x_row_stride, x_col_off, n_rows)) {
+        return 0;
+    }
     if (ds4_gpu_matmul_q8_0_kslice_rows_mpp(out, model_map, model_size,
                                             weight_offset, full_in_dim,
                                             out_dim, k_off, k_cnt, x,
                                             x_row_stride, x_col_off,
                                             n_rows)) {
         return 1;
-    }
-    if (!out || !x || !model_map || n_rows == 0 || out_dim == 0 ||
-        n_rows > (uint64_t)INT32_MAX ||
-        (full_in_dim & 31u) != 0 || (k_off & 31u) != 0 ||
-        (k_cnt & 31u) != 0 || k_cnt == 0 ||
-        k_off > full_in_dim || k_cnt > full_in_dim - k_off ||
-        full_in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
-        k_cnt > UINT32_MAX ||
-        /* The window must fit inside a row, and the LAST row's window inside
-         * the buffer.  The old form was `bytes(x) < n_rows * k_cnt * 4`, a
-         * lower bound that any wider buffer satisfies -- which is exactly how
-         * a full-width activation sailed through and the kernel then walked
-         * half rows (D1). */
-        x_row_stride == 0 || x_row_stride < x_col_off + k_cnt ||
-        x_row_stride > UINT32_MAX ||
-        n_rows > UINT64_MAX / x_row_stride / sizeof(float) ||
-        n_rows > UINT64_MAX / out_dim / sizeof(float) ||
-        ds4_gpu_tensor_bytes(x) <
-            ((n_rows - 1u) * x_row_stride + x_col_off + k_cnt) * sizeof(float) ||
-        ds4_gpu_tensor_bytes(out) < n_rows * out_dim * sizeof(float)) {
-        return 0;
     }
 
     @autoreleasepool {
@@ -38139,7 +38174,10 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             (gate_pair_q2 ? "q2_stream_addr_swiglu" :
                             "q4_stream_addr_swiglu") :
             gate_pair_q2 ? "q2_scalar_swiglu" :
-            gate_pair_q5 ? "q5_pair_simd_swiglu" : "q4_pair2_simd_swiglu";
+            gate_pair_q5 ? "q5_pair_simd_swiglu" :
+            /* Must track the kernel actually dispatched, or the stage
+             * profile attributes M1's time to the kernel it replaced. */
+            use_pair4 ? "q4_pair4_simd_swiglu" : "q4_pair2_simd_swiglu";
         const char *glm_down_path =
             use_stream_expert_addr_table ?
             (down_scalar_q2 ? "q2_stream_addr_down" :
@@ -45626,8 +45664,21 @@ int ds4_gpu_glm53_matmul_bf16(
          * simdgroup a whole 16384-long row. Default off; needs a quality gate
          * because the reduction order changes. */
         const char *bf16_splitk_env = getenv("DS4_METAL_GLM53_BF16_MV_SPLITK");
+        /* Narrow to the case the finding is actually about: a WIDE contraction
+         * feeding a NARROW output, where one-simdgroup-per-row leaves the GPU
+         * starved. The hc_mix projection is 16384 -> 24, i.e. 3 threadgroups.
+         *
+         * Applying this to every BF16 matvec with n_rows <= 8 would be wrong in
+         * both directions: at a large out_dim the row kernel already fills the
+         * machine and split-K only adds a threadgroup reduction, and at a small
+         * in_dim there is nothing to split. The bar below (out_dim under two
+         * waves' worth of rows, in_dim >= 4096) keeps it to the starved
+         * shapes. */
+        const int bf16_splitk_shape =
+            out_dim <= 64u && in_dim >= 4096u && (in_dim % 32u) == 0u;
         const int bf16_splitk =
-            bf16_splitk_env && bf16_splitk_env[0] && bf16_splitk_env[0] != '0';
+            bf16_splitk_env && bf16_splitk_env[0] && bf16_splitk_env[0] != '0' &&
+            bf16_splitk_shape;
         const bool bc_inp = (in_dim % 32u) != 0u;
         const bool bc_out = (out_dim % 64u) != 0u || (n_rows % 32u) != 0u;
         id<MTLComputePipelineState> pipeline = use_mv

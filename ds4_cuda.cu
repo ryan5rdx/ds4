@@ -5072,6 +5072,57 @@ __global__ static void quantize_q8_0_f32_kernel(
         dst[threadIdx.x] = 0;
     }
 }
+/* Strided variant of quantize_q8_0_f32_kernel.
+ *
+ * The kernel above assumes the activation is COMPACT: row `tok` starts at
+ * `tok * in_dim` and the contracted window starts at element 0. The k-slice
+ * entry point can be handed a FULL-WIDTH activation whose rows are
+ * x_row_stride apart with the window starting at x_col_off -- that is the
+ * whole point of the D1 fix on the Metal side, and CUDA has to honour it too
+ * rather than merely accept the arguments.
+ *
+ * Added as a separate kernel rather than by extending the shared one, because
+ * that kernel has ten call sites and this cannot be compiled here (no nvcc on
+ * the dev box). One new kernel and one new call site is the smaller risk.
+ * NOTE: this file is UNCOMPILED as of this change -- it needs a build on a
+ * CUDA host before anyone runs the k-slice path there. */
+__global__ static void quantize_q8_0_f32_strided_kernel(
+        int8_t *xq,
+        float *xscale,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t blocks,
+        uint64_t x_row_stride,
+        uint64_t x_col_off) {
+    uint64_t b = blockIdx.x;
+    uint64_t tok = blockIdx.y;
+    if (b >= blocks) return;
+    uint64_t i0 = b * 32;
+    uint64_t bn = in_dim - i0 < 32 ? in_dim - i0 : 32;
+    const float *xr = x + tok * x_row_stride + x_col_off + i0;
+
+    float a = 0.0f;
+    if (threadIdx.x < bn) a = fabsf(xr[threadIdx.x]);
+    __shared__ float vals[32];
+    vals[threadIdx.x] = a;
+    __syncthreads();
+    for (uint32_t stride = 16; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) vals[threadIdx.x] = fmaxf(vals[threadIdx.x], vals[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float d = vals[0] / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    if (threadIdx.x == 0) xscale[tok * blocks + b] = d;
+    int8_t *dst = xq + (tok * blocks + b) * 32;
+    if (threadIdx.x < bn) {
+        int v = (int)lrintf(xr[threadIdx.x] * id);
+        v = v > 127 ? 127 : (v < -128 ? -128 : v);
+        dst[threadIdx.x] = (int8_t)v;
+    } else {
+        dst[threadIdx.x] = 0;
+    }
+}
+
 
 __global__ static void quantize_q8_0_group_slice_rows_kernel(
         int8_t *xq,
@@ -14972,6 +15023,8 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         uint64_t in_start,
         uint64_t in_count,
         const ds4_gpu_tensor *x,
+        uint64_t x_row_stride,
+        uint64_t x_col_off,
         uint64_t n_tok) {
     if (!out || !x || !model_map || in_dim == 0 || out_dim == 0 ||
         in_count == 0 || n_tok == 0 || n_tok > 65535u) return 0;
@@ -14985,8 +15038,15 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
     if (in_count > UINT64_MAX / n_tok || out_dim > UINT64_MAX / n_tok) {
         return 0;
     }
+    /* Same exact bound as the Metal path: the window must fit inside a row and
+     * the LAST row's window inside the buffer.  `n_tok * in_count` was a lower
+     * bound that a wider activation satisfies trivially. */
+    if (x_row_stride == 0 || x_row_stride < x_col_off + in_count) return 0;
+    if (x_row_stride > UINT64_MAX / 2 ||
+        n_tok > UINT64_MAX / x_row_stride / sizeof(float)) return 0;
     if (weight_bytes > model_size - weight_offset ||
-        x->bytes < n_tok * in_count * sizeof(float) ||
+        x->bytes < ((n_tok - 1u) * x_row_stride + x_col_off + in_count) *
+                   sizeof(float) ||
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const int logical_tier = ds4_tensor_device_idx(out);
     const unsigned char *wptr = reinterpret_cast<const unsigned char *>(
@@ -15004,12 +15064,14 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
     const dim3 qgrid((unsigned)slice_blocks, (unsigned)n_tok, 1u);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+    quantize_q8_0_f32_strided_kernel<<<qgrid, 32>>>(
             xq,
             xscale,
             (const float *)x->ptr,
             in_count,
-            slice_blocks);
+            slice_blocks,
+            x_row_stride,
+            x_col_off);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_kslice quantize launch")) return 0;
     const dim3 grid(((unsigned)out_dim + 7u) / 8u,
                     (unsigned)n_tok, 1u);

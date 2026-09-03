@@ -218,9 +218,13 @@ static int run_kslice_rows(void) {
             }
             step = step && ds4_gpu_tensor_write(tL, 0, xl,
                                                 (uint64_t)R * KHALF * sizeof(float));
+            /* tL is built COMPACT above -- row t is xf[t*KIN + lane*KHALF]
+             * copied to xl[t*KHALF] -- so the activation geometry is
+             * (KHALF, 0). k_off still offsets the WEIGHT. */
             step = step && ds4_gpu_matmul_q8_0_kslice_rows_tensor(
                     lane ? p1 : p0, kmodel, (uint64_t)kbytes + 4096, 0,
-                    KIN, KOUT, (uint64_t)lane * KHALF, KHALF, tL, R);
+                    KIN, KOUT, (uint64_t)lane * KHALF, KHALF, tL,
+                    KHALF, 0, R);
         }
         step = step && ds4_gpu_add_tensor(p0, p0, p1, (uint32_t)((uint64_t)R * KOUT));
         step = step && ds4_gpu_tensor_read(oF, 0, hf, (uint64_t)R * KOUT * sizeof(float));
@@ -654,6 +658,10 @@ int main(void) {
             k0,
             (uint64_t)TP_GROUPS * ATTN_RANK,
             tp_low_tensor,
+            /* compact: tp_low_count is TP_TEST_ROWS * TP_GROUPS *
+             * ATTN_RANK, so this rank's groups are packed at the base
+             * and the window is the whole row. k_off offsets the WEIGHT. */
+            (uint64_t)TP_GROUPS * ATTN_RANK, 0,
             TP_TEST_ROWS);
         ok = ok && ds4_gpu_tensor_read(
             tp_low_tensor, 0, tp_low_actual, tp_low_count * sizeof(float));
@@ -708,6 +716,10 @@ int main(void) {
             k0,
             (uint64_t)TP_GROUPS * ATTN_RANK,
             tp_low_tensor,
+            /* compact: tp_low_count is TP_TEST_ROWS * TP_GROUPS *
+             * ATTN_RANK, so this rank's groups are packed at the base
+             * and the window is the whole row. k_off offsets the WEIGHT. */
+            (uint64_t)TP_GROUPS * ATTN_RANK, 0,
             TP_TEST_ROWS);
         ok = ok && ds4_gpu_tensor_read(
             tp_low_tensor, 0, tp_low_actual, tp_low_count * sizeof(float));
