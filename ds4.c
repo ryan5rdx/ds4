@@ -66780,6 +66780,32 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
      * -0.34 ms it is worth measuring before it is worth defaulting. */
     e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA ||
                         glm53_tp_vocab_split_requested() != 0;
+    /* GLM MTP under TP does not fail -- it HANGS THE PAIR.
+     * ds4_session_glm_spec_cycle_impl() runs four kinds of gate-encoding graph
+     * forward (the 2-row verify, the indexed verify, two output heads, the
+     * draft) and makes ZERO TP calls: the worker is never told a cycle is
+     * happening, so the leader encodes gate waits nobody will ever satisfy.
+     * The nextn layer's routed experts are split 50/50 by the base design, not
+     * by a flag, so layer 45 must exchange even with every optional split off
+     * -- which is why the rig reproduced this with `split off`.  A big gate's
+     * wait is an unbounded encodeWaitForEvent (ds4_metal.m, no fence path, by
+     * design for payload ordering), so it blocks until the OS watchdog kills
+     * the command buffer and the transport resets: "both ranks must be
+     * restarted".
+     *
+     * The DeepSeek path mirrors the block to its peer explicitly
+     * (ds4_tp_send_verify -> ds4_session_tp_spec_cycle); GLM has no equivalent
+     * yet.  Refuse at bring-up until it does: a startup error costs one run, a
+     * watchdog costs the pair.  See 2026-09-02-MTP-WATCHDOG-ROOT-CAUSE.md. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && e->glm_mtp) {
+        snprintf(err, errlen,
+                 "GLM MTP is not supported under tensor parallelism: the "
+                 "speculative cycle does not mirror its verify block to the "
+                 "worker, so the leader waits on gates the peer never fires "
+                 "and the GPU watchdog kills both ranks. Run --mtp on a single "
+                 "node, or drop --mtp under TP.");
+        goto tp_bind_fail;
+    }
     /* S5 and GLM MTP are mutually exclusive, and the failure is silent rather
      * than loud, so refuse the combination outright.  The MTP cycle calls
      * glm_graph_forward_output_head() and then argmaxes the full vocabulary
