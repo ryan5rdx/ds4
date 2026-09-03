@@ -49148,7 +49148,14 @@ static bool glm_graph_encode_ffn_batch(
          * kick and the finish (glm_graph_prefill_stage_boundary), which would
          * both destroy the overlap and measure the wrong thing.  A profiling
          * run must not silently get a different schedule. */
-        if (ok && !shared_done && !g->ssd_streaming &&
+        /* n_tokens >= 34 mirrors S8's guard, for two reasons.  Substantively:
+         * this path is also reached by MTP verification (2 rows) and native
+         * session batches, where the exchange is a few tens of KB and there is
+         * nothing worth hiding under it.  Methodologically: S8 and P1 are
+         * alternatives that have to be compared in one interleaved arm, and
+         * they must activate on the same set of chunks or the comparison is
+         * between different workloads. */
+        if (ok && !shared_done && !g->ssd_streaming && n_tokens >= 34u &&
             !stage_profile && !stage_sync &&
             glm53_tp_ffn_overlap_requested()) {
             ffn_overlap_seq = glm_graph_tp_batch_ffn_kick(g, il, n_tokens);

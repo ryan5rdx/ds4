@@ -10091,10 +10091,9 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
          * out; yielding here measurably delays the release wake-up. */
         const double t0 = profile ? ds4_gpu_now_ms() : 0.0;
         uint32_t spins = 0;
-        if (req.big_bytes > 0 && req.event_arrival) {
-            /* Big gates signal arrival through the batch shared event unless
-             * P3's flag path is active (see ds4_gpu_tp_big_gate_kick): the
-             * event completion
+        if (req.big_bytes > 0) {
+            /* Big gates always signal arrival through the batch shared
+             * event (see ds4_gpu_tp_big_gate_kick): the event completion
              * semantics are what guarantee the bounce payload is visible
              * before the exchange reads it. */
             while (g_tp_batch_gpu_event.signaledValue < req.seq) {
@@ -10651,43 +10650,6 @@ int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
  * shared-event signal only fires after every preceding command completes,
  * which is exactly the payload ordering the exchange needs; the ~10 us
  * slower arrival detection is noise against a multi-ms exchange. */
-/* P3: flag arrival + fence release for BIG gates, opt-in and size-gated.
- *
- * The in-tree rule was that big gates must always use the shared event because
- * "a flag write carries no memory-visibility guarantee for the payload buffer
- * (measured: stale rows in the first sub-kick)".  Arm R1 re-tested that on the
- * shipping DIRECT path and found 0/200 stale at 1 MiB and 32 MiB in BOTH the
- * same-buffer and split-buffer arms -- the NIC is coherent with GPU writes, and
- * the 2026-07-18 stale rows were a CPU-staging artifact from before 745d7db.
- *
- * This matters because arrival and release are coupled (see the row-gate site:
- * "the fast release fence requires flag arrival because the host cannot observe
- * the shared-event signal while the command processor is spinning in the fence
- * kernel").  Event arrival has therefore been forcing event release too, and a
- * loaded 87-gate probe measures the event at 985 us/gate more than the fence --
- * ~1.2% of a prefill chunk across 87 gates.
- *
- * Size gate: R1's 16 KiB same-buffer cell was VOID (a flag-spin timeout), so
- * small payloads are unverified -- and 16 KiB is not synthetic, it is exactly
- * MTP's one-row layer-45 decode gate.  Require >= 1 MiB, the smallest size R1
- * actually cleared.
- *
- * One kick in flight only.  With the event, waiting on the last seq covers all
- * earlier kicks because the event value is monotonic; the fence has a separate
- * word per slot and carries no such implication.  So a kick issued while another
- * is pending falls back to the event, which is safe: the service thread is
- * in-order, so that later event wait also implies the earlier exchange landed. */
-static int      g_tp_big_flag_pending;
-static uint64_t g_tp_big_flag_seq;
-static uint32_t g_tp_big_flag_slot;
-static uint32_t g_tp_big_flag_value;
-
-static int ds4_gpu_tp_big_gate_flag_arrival_requested(void) {
-    static int cached = -1;
-    if (cached < 0) cached = getenv("DS4_TP_BIG_GATE_FLAG_ARRIVAL") != NULL;
-    return cached;
-}
-
 uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
                                   const ds4_gpu_tensor *out_t,
                                   ds4_gpu_tensor *in_t,
@@ -10702,49 +10664,8 @@ uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
         return 0;
     }
     const uint64_t seq = ++g_tp_batch_seq;
-    const uint32_t flag_slot = layer * 2u + 1u + DS4_TP_GPU_FLAG_BANK_SLOTS;
-    const uint32_t flag_value = ds4_gpu_tp_fence_value(seq);
-    const int use_flag =
-        ds4_gpu_tp_big_gate_flag_arrival_requested() &&
-        bytes >= (1u << 20) &&                 /* R1 cleared 1 MiB and 32 MiB */
-        !g_tp_big_flag_pending &&              /* one kick in flight only */
-        g_tp_flag_gates && g_tp_fast_batch_sync &&
-        g_tp_release_words != NULL &&
-        g_tp_slab_buffer != nil &&
-        flag_slot < DS4_TP_FENCE_SLOTS;
-    if (use_flag) {
-        int owned = 0;
-        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
-        id<MTLComputePipelineState> pipeline =
-            cb && !owned ? ds4_gpu_get_pipeline("kernel_dsv4_tp_flag_set_coherent")
-                         : nil;
-        if (!pipeline) return 0;
-        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:pipeline];
-        [enc setBuffer:g_tp_slab_buffer
-                offset:(NSUInteger)(g_tp_slab_buffer_off + g_tp_gpu_flags_off +
-                                    (uint64_t)flag_slot * 4u)
-               atIndex:0];
-        [enc setBytes:&flag_value length:sizeof(flag_value) atIndex:1];
-        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-        ds4_gpu_end_compute_encoder(cb, enc);
-        ds4_gpu_close_batch_encoder();
-        g_tp_big_flag_pending = 1;
-        g_tp_big_flag_seq = seq;
-        g_tp_big_flag_slot = flag_slot;
-        g_tp_big_flag_value = flag_value;
-        static int announced;
-        if (!announced) {
-            announced = 1;
-            fprintf(stderr,
-                    "ds4-tp: big gate arrival is FLAG + fence release "
-                    "(>= 1 MiB payloads; R1-cleared)\n");
-        }
-    } else {
-        ds4_gpu_close_batch_encoder();
-        [g_batch_cb encodeSignalEvent:g_tp_batch_gpu_event value:seq];
-    }
+    ds4_gpu_close_batch_encoder();
+    [g_batch_cb encodeSignalEvent:g_tp_batch_gpu_event value:seq];
     pthread_mutex_lock(&g_tp_mutex);
     if (g_tp_queue_count >= DS4_GPU_TP_QUEUE) {
         pthread_mutex_unlock(&g_tp_mutex);
@@ -10755,7 +10676,7 @@ uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
     g_tp_queue[tail].layer = layer;
     g_tp_queue[tail].gate = 1u;
     g_tp_queue[tail].rows = rows;
-    g_tp_queue[tail].event_arrival = use_flag ? 0u : 1u;
+    g_tp_queue[tail].event_arrival = 1u;
     g_tp_queue[tail].seq = seq;
     g_tp_queue[tail].big_out = out_ptr;
     g_tp_queue[tail].big_in = in_ptr;
@@ -10772,16 +10693,6 @@ uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
  * also covers every earlier kick. */
 int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
     if (!g_batch_cb || seq == 0) return 0;
-    if (g_tp_big_flag_pending && g_tp_big_flag_seq == seq) {
-        /* P3: this kick published arrival through the slab word, so the service
-         * thread releases through the fence word rather than the batch event.
-         * Waiting on the event here would strand the GPU forever. */
-        const uint32_t slot = g_tp_big_flag_slot;
-        const uint32_t want = g_tp_big_flag_value;
-        g_tp_big_flag_pending = 0;
-        ds4_gpu_close_batch_encoder();
-        return ds4_gpu_tp_release_fence_encode(slot, want);
-    }
     ds4_gpu_close_batch_encoder();
     [g_batch_cb encodeWaitForEvent:g_tp_batch_cpu_event value:seq];
     return 1;
