@@ -39408,7 +39408,7 @@ static uint64_t glm_graph_workspace_add_bytes(
     return ds4_add_sat_u64(total, ds4_mul_sat_u64(count, elem_bytes));
 }
 
-static uint32_t glm_graph_indexed_decode_split_blocks(void);
+static uint32_t glm_graph_indexed_decode_split_blocks_for_cap(uint32_t full_attention_cap);
 
 static uint64_t glm_graph_workspace_bytes_for_cap(
         uint32_t full_attention_cap,
@@ -39448,7 +39448,7 @@ static uint64_t glm_graph_workspace_bytes_for_cap(
     const uint64_t qk_low_elems =
         (uint64_t)DS4_N_HEAD * DS4_N_KV_LORA;
     const uint64_t split_attn_blocks =
-        glm_graph_indexed_decode_split_blocks();
+        glm_graph_indexed_decode_split_blocks_for_cap(full_attention_cap);
 
     uint64_t bytes =
         glm_graph_indexed_scratch_bytes_for_cap(full_attention_cap,
@@ -43380,15 +43380,26 @@ static bool glm_graph_small_prefill_stage_sync(
            n_tokens <= DS4_GLM_METAL_SMALL_PREFILL_STAGE_SYNC_TOKENS;
 }
 
-static uint32_t glm_graph_indexed_decode_split_blocks(void) {
-    return glm_graph_split_blocks_for_limit(
-        ds4_model_is_glm53() ? glm53_graph_indexer_selected_limit()
-                             : glm_graph_indexer_top_k_limit());
+/* full_attention_cap is the DENSE ceiling: while visible <= it, n_selected is
+ * `visible`, which can exceed the top-k limit.  It is 4096 resident but
+ * DS4_GLM_METAL_STREAMING_FULL_ATTN_CONTEXT = 8192 under SSD streaming, where
+ * ceil(8192/128) = 64 blocks -- double the 32 the top-k limit alone implies.
+ * Sizing from the limit only left streaming needing 64 against an allocation of
+ * 32, so the availability gate refused and split-K silently fell back to the
+ * unsplit path.  Same silent-disable failure mode as the 65-vs-64 miss, one
+ * configuration over. */
+static uint32_t glm_graph_indexed_decode_split_blocks_for_cap(
+        uint32_t full_attention_cap) {
+    const uint32_t limit = ds4_model_is_glm53() ?
+        glm53_graph_indexer_selected_limit() : glm_graph_indexer_top_k_limit();
+    const uint32_t widest = full_attention_cap > limit ? full_attention_cap : limit;
+    return glm_graph_split_blocks_for_limit(widest);
 }
 
-static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected) {
+static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected,
+                                                          uint32_t ctx_cap) {
 #ifndef __APPLE__
-    (void)n_selected;
+    (void)n_selected; (void)ctx_cap;
     return false;
 #else
     /* Same-build control for the D4 arm.  Without it the only way to measure
@@ -43396,10 +43407,9 @@ static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected)
      * need two builds; D3 got a disable env and its arm was cleaner for it.
      * Read per call, not cached: an ABBA interleave toggles it inside one
      * process and a cached read would compare the candidate against itself. */
-    {
-        const char *off = getenv("DS4_METAL_DISABLE_GLM_DECODE_SPLITK");
-        if (off && off[0] && off[0] != '0') return false;
-    }
+    const char *splitk_off = getenv("DS4_METAL_DISABLE_GLM_DECODE_SPLITK");
+    const bool env_disabled =
+        splitk_off && splitk_off[0] && splitk_off[0] != '0';
     const uint32_t block_rows = glm_graph_indexed_decode_split_block_rows_for(n_selected);
     const uint32_t needed_blocks =
         block_rows != 0u ? (n_selected + block_rows - 1u) / block_rows : 0u;
@@ -43407,8 +43417,8 @@ static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected)
            n_selected > 512u &&
            block_rows > 0 &&
            needed_blocks > 0 &&
-           needed_blocks <= glm_graph_indexed_decode_split_blocks() &&
-           glm_graph_indexed_decode_split_blocks() <= 64u &&
+           needed_blocks <= glm_graph_indexed_decode_split_blocks_for_cap(ctx_cap) &&
+           glm_graph_indexed_decode_split_blocks_for_cap(ctx_cap) <= 64u &&
            (DS4_N_HEAD % 8u) == 0 &&
            DS4_N_KV_LORA == 512u &&
            /* D4: n_rot 0 is GLM 5.3, which has no rope.  The kernel's rope work
@@ -43417,7 +43427,12 @@ static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected)
             * the unsplit path -- n_head threadgroups (32 under TP2) rather than
             * a 2D grid.  Same occupancy miss as D3, one clause away. */
            (DS4_N_ROT == 64u || DS4_N_ROT == 0u) &&
-           glm_graph_compact_cache_is_f16();
+           glm_graph_compact_cache_is_f16() &&
+           /* Last, so the announce below still fires for the control arm.  The
+            * env check used to `return false` before it, so a correctly
+            * configured control printed NOTHING -- and an arm whose control is
+            * silent is indistinguishable from one whose env never arrived. */
+           !env_disabled;
     /* Announce BOTH the first engaged call and the first refused one, not just
      * the first call.  n_selected grows with position and the gate needs it
      * above 512, so a run that starts below the threshold and crosses it later
@@ -43442,10 +43457,11 @@ static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected)
                     "n_head %u, kv_lora %u, n_rot %u, cache_f16 %u)%s\n",
                     avail ? "ENGAGED" : "not available",
                     n_selected, block_rows, needed_blocks,
-                    glm_graph_indexed_decode_split_blocks(), 64u,
+                    glm_graph_indexed_decode_split_blocks_for_cap(ctx_cap), 64u,
                     (unsigned)DS4_N_HEAD, (unsigned)DS4_N_KV_LORA,
                     (unsigned)DS4_N_ROT,
                     (unsigned)glm_graph_compact_cache_is_f16(),
+                    env_disabled ? " -- DISABLED BY ENV (control arm)" :
                     (!avail && n_selected <= 512u) ?
                         " -- n_selected <= 512, grows with position" : "");
         }
@@ -44808,7 +44824,11 @@ static bool glm_graph_alloc_slice(
         (uint64_t)indexer_selected_pools * sizeof(uint32_t);
     const uint64_t qk_low_bytes =
         (uint64_t)DS4_N_HEAD * DS4_N_KV_LORA * sizeof(float);
-    const uint32_t split_attn_blocks = glm_graph_indexed_decode_split_blocks();
+    /* Must match what glm_graph_indexed_decode_split_group8_available() checks
+     * against, or the gate refuses on a shape the allocation would have
+     * handled -- both key off the graph's own attention window. */
+    const uint32_t split_attn_blocks =
+        glm_graph_indexed_decode_split_blocks_for_cap(g->ctx_cap);
     const uint64_t attn_partial_lora_bytes =
         (uint64_t)split_attn_blocks * qk_low_bytes;
     const uint64_t attn_partial_ms_bytes =
@@ -54045,6 +54065,21 @@ static bool glm_graph_forward_token(
     const uint32_t indexer_top_k = glm_graph_indexer_top_k_limit();
     ds4_gpu_tensor *last_indexer_selected = NULL;
     uint32_t last_indexer_selected_count = 0;
+    /* Are ALL last_indexer_selected_count entries real cache rows?
+     *
+     * The GLM 5.3 pool expansion writes a FIXED 2051-slot list and pads unused
+     * tail slots with 0xffffffff (metal/dsv4_misc.metal:1557).  The split-K
+     * attention kernel is templated on assume_valid_rows, and under that
+     * template `valid_row = assume_valid_rows || row < cache_cap` -- so a
+     * hardcoded `true` lets a 0xffffffff row skip the bound check and index the
+     * KV cache at row 0xffffffff, a ~4 TB offset.
+     *
+     * This call site passed a literal `true`.  It was latent only because the
+     * availability gate refused split-K on GLM 5.3 for unrelated reasons; the
+     * D4 reachability fix exposed it.  The dense fill paths ARE fully valid, so
+     * track which branch produced the list rather than giving up the template
+     * everywhere. */
+    bool last_indexer_selected_dense = false;
 #define DS4_GLM_PROFILE_DECODE_STAGE(part_, name_) do { \
         if (ok && decode_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary((part_), (name_), il, pos, 1, &decode_stage_t0); \
@@ -54374,12 +54409,14 @@ static bool glm_graph_forward_token(
                     }
                     DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "indexer_fill");
                     last_indexer_selected_count = visible;
+                    last_indexer_selected_dense = true;   /* 0..visible-1, no padding */
                 } else if (ok && (decode_ablate & DS4_GLM_ABLATE_INDEXER)) {
                     /* Ablation: valid selected ids without the score/topk
                      * chain, so downstream attention timing stays real. */
                     ok = ds4_gpu_glm_fill_selected_range_tensor(g->indexer_selected,
                                                                 indexer_top_k) != 0;
                     last_indexer_selected_count = indexer_top_k;
+                    last_indexer_selected_dense = true;   /* 0..top_k-1, no padding */
                 } else if (ok) {
                     ok = g->glm53 ?
                         glm53_graph_matmul(
@@ -54486,6 +54523,10 @@ static bool glm_graph_forward_token(
                     DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "indexer_topk");
                     last_indexer_selected_count = g->glm53 ?
                         glm53_graph_indexer_selected_limit() : indexer_top_k;
+                    /* GLM 5.3 pads to selected_limit with 0xffffffff; the
+                     * non-5.3 top-k path is not audited for padding either, so
+                     * neither may skip the row bound check. */
+                    last_indexer_selected_dense = false;
                 }
                 if (ok) last_indexer_selected = g->indexer_selected;
             } else if (ok && (!last_indexer_selected || last_indexer_selected_count == 0)) {
@@ -54527,7 +54568,8 @@ static bool glm_graph_forward_token(
                  * rest of the layer stays finite (timing-only). */
                 ok = ds4_gpu_tensor_fill_f32(g->heads, 0.0f,
                                              (uint64_t)g->heads_dim) != 0;
-            } else if (ok && glm_graph_indexed_decode_split_group8_available(last_indexer_selected_count)) {
+            } else if (ok && glm_graph_indexed_decode_split_group8_available(last_indexer_selected_count,
+                                                            g->ctx_cap)) {
                 const uint32_t split_block_rows =
                     glm_graph_indexed_decode_split_block_rows_for(last_indexer_selected_count);
                 const uint32_t split_blocks =
@@ -54556,7 +54598,7 @@ static bool glm_graph_forward_token(
                                                                                     l->attn_v_b->type,
                                                                                     last_indexer_selected,
                                                                                     last_indexer_selected_count,
-                                                                                    true,
+                                                                                    last_indexer_selected_dense,
                                                                                     g->compact_cache_cap,
                                                                                     glm_graph_compact_cache_is_f16(),
                                                                                     tp_split_layer_heads ? tp_head_count : DS4_N_HEAD,
