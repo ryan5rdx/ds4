@@ -13229,10 +13229,19 @@ static int glm53_prefill_attnout_kslice(void) {
         static int warned;
         if (!warned) {
             warned = 1;
+            /* The old text here said the DISABLED path "produces incorrect
+             * logits (see rig arm E3)".  That was backwards, and it kept the
+             * corrupted path shipping as the default: E3's attribution was
+             * wrong, and rig arm D1 showed the opposite -- with the k-slice ON
+             * the model emitted visibly degraded text, and turning it OFF gave
+             * the clean answer.  The k-slice itself was fine; the CALL SITE
+             * passed a full-width activation to an API that assumed a compact
+             * one, so it walked half rows.  Fixed by making the activation
+             * geometry explicit; both paths now agree. */
             fprintf(stderr,
-                    "ds4: WARNING: GLM prefill attn-output k-slice disabled; "
-                    "this path produces incorrect logits (see rig arm E3) and "
-                    "exists only for comparison\n");
+                    "ds4: GLM prefill attn-output k-slice disabled; the "
+                    "full-width path is a slower equivalent, kept for A/B "
+                    "comparison\n");
         }
         return 0;
     }
@@ -32117,6 +32126,9 @@ static bool metal_graph_encode_layer_attention_batch(
                         (uint64_t)group0 * rank,
                         tp_low_dim,
                         metal_graph_batch_attn_low(g),
+                        /* compact: this rank's groups are packed at the buffer
+                         * base; k_off offsets the WEIGHT, not the activation */
+                        tp_low_dim, 0u,
                         n_tokens) != 0;
             }
             if (ok) ok = ds4_gpu_tp_batch_gate_encode(il, n_tokens) != 0;
@@ -45809,6 +45821,8 @@ static bool glm53_graph_kda_attention_rows(
                      lane.lane_rows,
                      lane.projection,
                      g->batch_kda_out,
+                     /* compact: this rank's lane is packed at the base */
+                     lane.projection, 0u,
                      rows) != 0;
         if (ok) ok = glm_graph_tp_batch_ffn_combine(g, il, attn_out, rows);
     } else if (ok) {
@@ -53019,6 +53033,13 @@ static bool glm_graph_forward_indexed_tokens(
                         (uint64_t)g->tp_rank * k_cnt,
                         k_cnt,
                         g->batch_heads,
+                        /* D1: batch_heads is FULL WIDTH -- rows are heads_dim
+                         * apart and this rank's half begins at column k_off,
+                         * not at the base.  The compact geometry every other
+                         * caller uses made the kernel walk half rows and
+                         * corrupt the output (2026-09-03-D1-RESULT.md). */
+                        g->heads_dim,
+                        (uint64_t)g->tp_rank * k_cnt,
                         sliced_rows) != 0;
                 if (ok && sliced_rows != n_tokens) {
                     const uint32_t tail_rows = n_tokens - sliced_rows;
@@ -72596,6 +72617,8 @@ static bool glm53_graph_encode_kda_session_batch(
                      lane.lane_rows,
                      lane.projection,
                      batch->batch_kda_out,
+                     /* compact: this rank's lane is packed at the base */
+                     lane.projection, 0u,
                      rows) != 0;
         if (ok) ok = glm_graph_tp_batch_ffn_combine(batch, il,
                                                     batch->batch_attn_out,
@@ -76385,7 +76408,7 @@ static bool metal_graph_encode_attn_post_session_batch(
                 &peer_out, model->map, model->size,
                 layer->attn_output_b->abs_offset,
                 low_dim, DS4_N_EMBD, tp_low_dim, tp_low_dim,
-                &peer_low, rows) != 0;
+                &peer_low, tp_low_dim, 0u, rows) != 0;
     }
     if (ds4_gpu_set_current_device(home) != 0) ok = false;
     if (ok) {
@@ -76401,7 +76424,7 @@ static bool metal_graph_encode_attn_post_session_batch(
                 &home_out, model->map, model->size,
                 layer->attn_output_b->abs_offset,
                 low_dim, DS4_N_EMBD, 0u, tp_low_dim,
-                &home_low, rows) != 0;
+                &home_low, tp_low_dim, 0u, rows) != 0;
     }
     if (ok) {
         ok = ds4_gpu_tensor_copy_xdev_default(

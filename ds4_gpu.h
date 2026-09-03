@@ -421,6 +421,21 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
 uint64_t ds4_gpu_kslice_tiled_count(void);
 uint64_t ds4_gpu_kslice_matvec_count(void);
 
+/* k_off offsets the WEIGHT's contraction window.  The activation geometry is
+ * separate and explicit: x_row_stride is the element distance between
+ * activation rows, x_col_off the first element of the contracted window inside
+ * a row.
+ *
+ *   activation already sliced (the common case):  (k_cnt, 0)
+ *   activation is full width:                     (full_in_dim, k_off)
+ *
+ * These were implicit -- every internal path assumed (k_cnt, 0) -- and the GLM
+ * prefill attn-output split passed a full-width activation whose rows are
+ * heads_dim apart.  The old size check was a lower bound, which a wider buffer
+ * trivially satisfies, so nothing caught it and the kernel walked half rows.
+ * See 2026-09-03-D1-RESULT.md: visibly degraded greedy output, and
+ * probe_kstride.c measuring max|err| 13.7 against 0.0000 for a compact
+ * activation. */
 int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         ds4_gpu_tensor       *out,
         const void           *model_map,
@@ -431,6 +446,8 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         uint64_t              k_off,
         uint64_t              k_cnt,
         const ds4_gpu_tensor *x,
+        uint64_t              x_row_stride,
+        uint64_t              x_col_off,
         uint64_t              n_rows);
 int ds4_gpu_matmul_quant_kslice_tensor(
         ds4_gpu_tensor       *out,
