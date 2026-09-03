@@ -45412,6 +45412,35 @@ static glm53_kda_lane glm53_kda_lane_prefill(const ds4_glm_gpu_graph *g) {
 static bool glm_graph_tp_batch_bounce_ready(ds4_glm_gpu_graph *g,
                                             uint32_t n_tokens);
 static void glm_graph_expert_balance_sample(ds4_glm_gpu_graph *g);
+/* P1: the kick/wait halves of the combine, so a caller with independent GPU
+ * work can put it INSIDE the exchange window.  ds4_gpu_tp_big_gate_encode is
+ * literally kick-then-wait with nothing between, and ds4_gpu.h documents the
+ * split as existing precisely so the caller can "interleave more GPU work with
+ * the wire exchange" -- but every caller used the fused wrapper and threw that
+ * overlap away.  At 32 MiB the exchange is ~9 ms and the prefill shared expert
+ * is ~5.5 ms of fully disjoint work sitting right behind it. */
+static uint64_t glm_graph_tp_batch_ffn_kick(ds4_glm_gpu_graph *g, uint32_t il,
+                                            uint32_t n_tokens) {
+    const uint64_t bytes = (uint64_t)n_tokens * DS4_N_EMBD * sizeof(float);
+    if (!g->tp_bounce_out || !g->tp_bounce_in) return 0;
+    return ds4_gpu_tp_big_gate_kick(il, n_tokens, g->tp_bounce_out,
+                                    g->tp_bounce_in, bytes);
+}
+
+static bool glm_graph_tp_batch_ffn_finish(ds4_glm_gpu_graph *g, uint64_t seq,
+                                          ds4_gpu_tensor *ffn_out,
+                                          uint32_t n_tokens) {
+    if (seq == 0 || !g->tp_bounce_out || !g->tp_bounce_in) return false;
+    if (!ds4_gpu_tp_big_gate_wait(seq)) return false;
+    return ds4_gpu_add_tensor(ffn_out, g->tp_bounce_out, g->tp_bounce_in,
+                              (uint32_t)((uint64_t)n_tokens * DS4_N_EMBD)) != 0;
+}
+
+static int glm53_tp_ffn_overlap_requested(void) {
+    const char *env = getenv("DS4_GLM_TP_FFN_OVERLAP");
+    return env && env[0] && env[0] != '0';
+}
+
 static bool glm_graph_tp_batch_ffn_combine(ds4_glm_gpu_graph *g,
                                            uint32_t           il,
                                            ds4_gpu_tensor    *ffn_out,
@@ -49078,6 +49107,7 @@ static bool glm_graph_encode_ffn_batch(
             (uint32_t)g->ffn_mid_elems,
             full_layer_prefill,
             false) != 0;
+    uint64_t ffn_overlap_seq = 0;
     if (ok && g->tp_world == 2) {
         if (ok && shared_row_split && shared_rows > 0) {
             /* Compute this rank's shared rows and fold them into its full-row
@@ -49105,8 +49135,41 @@ static bool glm_graph_encode_ffn_batch(
                         "(layer %u)\n", il);
             }
         }
-        ok = ok && glm_graph_tp_batch_ffn_combine(g, il, g->batch_ffn_out, n_tokens);
-        if (!ok) fprintf(stderr, "ds4: GLM TP batch gate failed (layer %u)\n", il);
+        /* P1: when the shared expert has NOT been folded into the payload
+         * (i.e. S8 is off), it is fully disjoint from the gate -- the gate
+         * touches tp_bounce_out/in and batch_ffn_out, the shared expert reads
+         * batch_ffn_norm and writes batch_ffn_gate/up/shared_mid/attn_out, all
+         * separately allocated.  So it can be encoded INSIDE the exchange
+         * window instead of behind it.  Mutually exclusive with S8 by
+         * construction: if shared_done, the shared rows are already in the
+         * payload and must precede the kick. */
+        ffn_overlap_seq = 0;
+        /* stage_profile/stage_sync insert a flush-or-sync boundary between the
+         * kick and the finish (glm_graph_prefill_stage_boundary), which would
+         * both destroy the overlap and measure the wrong thing.  A profiling
+         * run must not silently get a different schedule. */
+        if (ok && !shared_done && !g->ssd_streaming &&
+            !stage_profile && !stage_sync &&
+            glm53_tp_ffn_overlap_requested()) {
+            ffn_overlap_seq = glm_graph_tp_batch_ffn_kick(g, il, n_tokens);
+            if (ffn_overlap_seq == 0) {
+                fprintf(stderr,
+                        "ds4: GLM TP FFN overlap kick failed (layer %u); "
+                        "falling back to the fused combine\n", il);
+            } else {
+                static int announced;
+                if (!announced) {
+                    announced = 1;
+                    fprintf(stderr,
+                            "ds4: GLM P1 FFN-gate overlap active: shared expert "
+                            "encoded inside the exchange window\n");
+                }
+            }
+        }
+        if (ffn_overlap_seq == 0) {
+            ok = ok && glm_graph_tp_batch_ffn_combine(g, il, g->batch_ffn_out, n_tokens);
+            if (!ok) fprintf(stderr, "ds4: GLM TP batch gate failed (layer %u)\n", il);
+        }
     }
     if (ok) ok = glm_graph_prefill_stage_boundary(stage_profile,
                                                   stage_sync,
@@ -49116,7 +49179,9 @@ static bool glm_graph_encode_ffn_batch(
                                                   pos0,
                                                   n_tokens,
                                                   stage_t0);
-    if (ok) {
+    if (ok && ffn_overlap_seq == 0) {
+        /* Under P1's overlap batch_ffn_out is not combined until the finish
+         * below, so dumping it here would show the uncombined partial. */
         metal_graph_debug_dump_tensor("glm_ffn_routed_out",
                                       g->batch_ffn_out,
                                       (uint64_t)n_tokens * DS4_N_EMBD,
@@ -49125,6 +49190,22 @@ static bool glm_graph_encode_ffn_batch(
     }
     if (ok && !shared_done) DS4_GLM_ENCODE_FFN_BATCH_SHARED();
 #undef DS4_GLM_ENCODE_FFN_BATCH_SHARED
+    /* P1: close the exchange window now that the disjoint work is encoded. */
+    if (ffn_overlap_seq != 0) {
+        ok = ok && glm_graph_tp_batch_ffn_finish(g, ffn_overlap_seq,
+                                                 g->batch_ffn_out, n_tokens);
+        if (!ok) {
+            fprintf(stderr, "ds4: GLM TP overlapped batch gate failed "
+                            "(layer %u)\n", il);
+        }
+        if (ok) {
+            metal_graph_debug_dump_tensor("glm_ffn_routed_out",
+                                          g->batch_ffn_out,
+                                          (uint64_t)n_tokens * DS4_N_EMBD,
+                                          il,
+                                          pos0);
+        }
+    }
     if (ok) {
         metal_graph_debug_dump_tensor("glm_ffn_shared_out",
                                       g->batch_attn_out,
