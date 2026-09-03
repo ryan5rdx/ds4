@@ -66698,6 +66698,113 @@ static void ds4_engine_tp_storage_free(ds4_engine *e, bool shutdown_gate) {
 }
 #endif
 
+/* Does the NIC see GPU writes without a coherency mechanism?
+ *
+ * The question matters beyond ds4: if Apple's RDMA DMA is coherent with GPU
+ * caches, then anyone RDMA-ing directly out of a Metal buffer can skip MLX-style
+ * input_coherent entirely.  Our own evidence for needing it -- "stale rows in
+ * the first sub-kick" -- dates to 005afed (2026-07-18), when the bulk path still
+ * memcpy'd through the CPU.  745d7db (2026-09-02) made it DIRECT, so the CPU no
+ * longer reads the payload at all and that evidence no longer describes the
+ * shipping path.
+ *
+ * Design.  The bounce buffers already live inside the registered slab, so the
+ * exchange takes its DIRECT path and the NIC DMAs straight from GPU-written
+ * memory -- exactly the configuration in question.  Each iteration:
+ *
+ *   1. a GPU KERNEL writes a rank- and iteration-distinct sentinel into
+ *      bounce_out (ds4_gpu_add_tensor, not tensor_fill_f32 -- the latter is a
+ *      CPU loop and would prove nothing)
+ *   2. commit WITHOUT waiting, then sleep `delay_us`
+ *   3. exchange, and verify every float of bounce_in is the PEER's sentinel
+ *
+ * A stale read yields the previous iteration's sentinel, which is a distinct
+ * value, so staleness is detected rather than inferred.  Sweeping the delay
+ * turns a yes/no into a measurement: if mismatches vanish as the delay grows,
+ * that is a cache-drain window and we can state its length.  delay 0 is more
+ * adversarial than ds4 ever is in production -- production at least waits for a
+ * flag -- so a clean sweep at 0 settles the question outright.
+ *
+ * Both ranks must run identical loops: the exchange is symmetric and blocking.
+ */
+static void ds4_tp_coherency_selftest(ds4_engine *e) {
+    const char *env = getenv("DS4_TP_COHERENCY_SELFTEST");
+    if (!env || !env[0]) return;
+    int iters = atoi(env);
+    if (iters <= 0) iters = 200;
+
+    const uint64_t cap = ds4_tp_slab_prefill_bounce_bytes(e->tp.ctx);
+    static const uint64_t sizes[] = { 16u << 10, 1u << 20, 32u << 20 };
+    static const uint32_t delays[] = { 0u, 50u, 200u, 1000u };
+    const int rank = e->tp.rank;
+
+    fprintf(stderr,
+            "\nds4-tp: RDMA/Metal coherency self-test, rank %d, %s transport, "
+            "%d iters/cell, bounce cap %.1f MiB\n"
+            "  GPU-written slab buffer, committed but NOT waited on, then "
+            "exchanged after delay_us.\n"
+            "  A mismatch means the NIC read bytes the GPU had not yet made "
+            "visible.\n\n"
+            "  bytes    delay_us   mismatched_iters / total\n",
+            rank, ds4_tp_is_rdma(e->tp.ctx) ? "rdma" : "tcp", iters,
+            (double)cap / 1048576.0);
+
+    /* Sources for the GPU write.  b stays zero so dst == a exactly, which keeps
+     * verification an equality test rather than a tolerance. */
+    ds4_gpu_tensor *sa = ds4_gpu_tensor_alloc(sizes[2]);
+    ds4_gpu_tensor *sb = ds4_gpu_tensor_alloc(sizes[2]);
+    if (!sa || !sb) { fprintf(stderr, "  selftest: alloc failed\n"); goto done; }
+    (void)ds4_gpu_tensor_fill_f32(sb, 0.0f, sizes[2] / sizeof(float));
+
+    for (size_t si = 0; si < sizeof(sizes)/sizeof(sizes[0]); si++) {
+        const uint64_t bytes = sizes[si];
+        if (bytes > cap) { fprintf(stderr, "  %6llu KB  -- exceeds bounce cap, skipped\n",
+                                   (unsigned long long)(bytes >> 10)); continue; }
+        const uint64_t n = bytes / sizeof(float);
+        float *got = malloc(bytes);
+        if (!got) break;
+        for (size_t di = 0; di < sizeof(delays)/sizeof(delays[0]); di++) {
+            int bad = 0;
+            for (int it = 1; it <= iters; it++) {
+                const float mine = (float)(it * 2 + rank);
+                const float want = (float)(it * 2 + (1 - rank));
+                (void)ds4_gpu_tensor_fill_f32(sa, mine, n);
+                if (!ds4_gpu_begin_commands()) break;
+                /* GPU kernel writes the slab buffer. */
+                (void)ds4_gpu_add_tensor(e->tp.prefill_bounce_out, sa, sb, (uint32_t)n);
+                /* Commit and CONTINUE -- deliberately no wait. */
+                (void)ds4_gpu_flush_commands();
+                if (delays[di]) usleep(delays[di]);
+                if (!ds4_tp_big_gate_exchange(e->tp.ctx, 0, (uint64_t)it,
+                                              ds4_gpu_tensor_contents(e->tp.prefill_bounce_out),
+                                              ds4_gpu_tensor_contents(e->tp.prefill_bounce_in),
+                                              bytes)) {
+                    fprintf(stderr, "  exchange failed at iter %d; aborting cell\n", it);
+                    (void)ds4_gpu_end_commands();
+                    break;
+                }
+                (void)ds4_gpu_end_commands();
+                if (!ds4_gpu_tensor_read(e->tp.prefill_bounce_in, 0, got, bytes)) break;
+                for (uint64_t k = 0; k < n; k++) {
+                    if (got[k] != want) { bad++; break; }
+                }
+            }
+            fprintf(stderr, "  %6llu KB  %8u   %6d / %d%s\n",
+                    (unsigned long long)(bytes >> 10), delays[di], bad, iters,
+                    bad ? "   <-- NOT COHERENT at this delay" : "");
+        }
+        free(got);
+    }
+    fprintf(stderr,
+            "\n  All cells clean at delay 0 => the NIC observes GPU writes with no\n"
+            "  coherency step, and direct RDMA from Metal buffers can skip it.\n"
+            "  Mismatches that shrink with delay => a real drain window; record its\n"
+            "  length in APPLE-RDMA.md and keep the shared event for big gates.\n\n");
+done:
+    ds4_gpu_tensor_free(sb);
+    ds4_gpu_tensor_free(sa);
+}
+
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen) {
 #if defined(DS4_NO_GPU) || !defined(__APPLE__)
     (void)e; (void)tp;
@@ -66872,6 +66979,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     ds4_log(stderr, DS4_LOG_OK,
             "tensor parallelism bound: rank %d, 50/50 expert split, %s transport",
             e->tp.rank, ds4_tp_is_rdma(tp) ? "rdma" : "tcp");
+    ds4_tp_coherency_selftest(e);
     return 1;
 
 tp_bind_fail:
