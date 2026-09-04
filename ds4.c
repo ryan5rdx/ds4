@@ -17561,6 +17561,17 @@ static bool metal_graph_debug_wants(const char *name, uint32_t il, uint32_t pos)
     return metal_graph_debug_prefix_for(name, il, pos) != NULL;
 }
 
+/* Layer/pos-independent form.  Used where a fusion has to be disabled for the
+ * whole run because it would leave the dumped tensor stale, and the decision is
+ * taken somewhere `pos` is not in scope.  Disabling a fusion for an entire
+ * debug-dump run is the right trade: the dump exists to be believed. */
+static bool metal_graph_debug_wants_name(const char *name) {
+    const metal_graph_debug_config *cfg = metal_graph_debug_get_config();
+    if (!cfg->prefix) return false;
+    if (cfg->name && strstr(cfg->name, name) == NULL) return false;
+    return true;
+}
+
 static void metal_graph_debug_dump_tensor(
         const char       *name,
         ds4_gpu_tensor *t,
@@ -46210,6 +46221,10 @@ static bool glm53_graph_kda_attention(
             ok && g->glm53 && glm53_hc_kda_out_fuse_requested() &&
             g->directional_steering_attn_scale == 0.0f &&
             !metal_graph_use_reference_hc_decode() &&
+            /* attn_out is never written when the combine is deferred, so the
+             * dump downstream would print the previous layer's value.  Give up
+             * the fusion rather than the truth of the dump. */
+            !metal_graph_debug_wants_name("attn_out") &&
             g->hc_after_attn && g->hc_cur && g->hc_post && g->hc_comb;
         if (defer_kda_combine) {
             static int announced;
@@ -47592,6 +47607,9 @@ static bool glm_graph_encode_sparse_ffn_one(
                    g->directional_steering_ffn_scale == 0.0f &&
                    g->hc_next && g->hc_after_attn &&
                    g->hc_post && g->hc_comb &&
+                   /* g->next is never written when the copy is elided, so the
+                    * "ffn_out" dump downstream would print a stale value. */
+                   !metal_graph_debug_wants_name("ffn_out") &&
                    /* Only on the decode tail path, whose expand consumes this.
                     * This function has other callers with their own `next`;
                     * eliding the copy for one of those would both leave their
