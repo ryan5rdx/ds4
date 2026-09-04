@@ -13156,10 +13156,43 @@ static bool glm53_tp_dense_ffn_split_shape_ok(void) {
  * GLM g->next is per-layer scratch, consumed by the steering call (which this
  * predicate excludes), a debug dump, and the expand being fused away.  On any
  * path where g->next chains between layers this fusion would silently feed the
- * next layer stale data. */
+ * next layer stale data.
+ *
+ * INCOMPATIBLE WITH DS4_GLM_TP_SHARED_SPLIT, and not by a flag that could be
+ * relaxed.  Under the shared split (S2) the shared partial rides the routed
+ * exchange, so the order is  down -> ffn_sum -> exchange -> ffn_out -> add.
+ * A kernel that fuses down+add+expand would have to span the exchange, which
+ * cannot happen inside one dispatch.  Since TP2 with the shared split IS the
+ * production stack, HC2 does nothing there; it is reachable only single-node
+ * or with the shared split off.  glm53_hc_ffn_tail_report_inert() below makes
+ * that loud rather than letting it read as "measured no speedup". */
 static int glm53_hc_ffn_tail_fuse_requested(void) {
     const char *env = getenv("DS4_GLM_HC_FFN_TAIL_FUSE");
     return env && env[0] && env[0] != '0';
+}
+
+/* A feature asked for on the command line that never engages is the failure
+ * this campaign keeps paying for: the run completes, the number is flat, and
+ * the arm reads as "no speedup" instead of "never ran".  Say so, once, naming
+ * the condition that blocked it. */
+static void glm53_hc_ffn_tail_report_inert(int decode_step,
+                                           int shared_split,
+                                           int add_residual,
+                                           int type_ok,
+                                           int steering_off,
+                                           int buffers_ok) {
+    static int announced;
+    if (announced || !decode_step || !glm53_hc_ffn_tail_fuse_requested()) return;
+    announced = 1;
+    fprintf(stderr,
+            "ds4: GLM HC2 REQUESTED BUT INERT -- blocked by%s%s%s%s%s. "
+            "The shared split is structural: the routed exchange sits between "
+            "the down projection and the add, so the fusion cannot span it.\n",
+            shared_split   ? " DS4_GLM_TP_SHARED_SPLIT" : "",
+            add_residual   ? " add_residual" : "",
+            !type_ok       ? " ffn_down_shexp!=Q8_0" : "",
+            !steering_off  ? " directional_steering" : "",
+            !buffers_ok    ? " missing hc buffers" : "");
 }
 
 static int glm53_hc_kda_out_fuse_requested(void) {
@@ -46152,6 +46185,24 @@ static bool glm53_graph_kda_attention(
                     "ds4: GLM KDA head-split gate/combine failed (layer %u)\n",
                     il);
         }
+        /* This branch returns before the HC3 fusion below is ever considered,
+         * so DS4_GLM_TP_KDA_SPLIT silently disables HC3 -- and that split is
+         * part of the production TP2 stack.  Structural, like HC2: attn_out
+         * only exists after the exchange and combine, so a kernel fusing the
+         * projection with the HC expand would have to span the gate.  The
+         * fusion that IS available here is combine+expand, which is a
+         * different kernel and not yet built. */
+        if (glm53_hc_kda_out_fuse_requested()) {
+            static int announced;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: GLM HC3 REQUESTED BUT INERT -- the KDA head "
+                        "split (DS4_GLM_TP_KDA_SPLIT) owns this path and "
+                        "returns before the fusion. Measure HC3 only with the "
+                        "KDA split off, or build the combine+expand fusion.\n");
+            }
+        }
         return ok;
     }
     /* HC3: fuse the projection with the HC expand the decode loop would
@@ -47460,6 +47511,15 @@ static bool glm_graph_encode_sparse_ffn_one(
             g->directional_steering_ffn_scale == 0.0f &&
             !metal_graph_use_reference_hc_decode() &&
             g->hc_next && g->hc_after_attn && g->hc_split;
+        if (!fuse_ffn_tail_hc) {
+            glm53_hc_ffn_tail_report_inert(
+                decode_step && g->glm53,
+                shared_split,
+                add_residual,
+                l->ffn_down_shexp->type == DS4_TENSOR_Q8_0,
+                g->directional_steering_ffn_scale == 0.0f,
+                g->hc_next && g->hc_after_attn && g->hc_split);
+        }
         if (fuse_ffn_tail_hc) {
             static int announced;
             if (!announced) {
