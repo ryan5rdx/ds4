@@ -30415,10 +30415,40 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             ds4_gpu_hot_pipeline(g_dsv4_sort_i32_rows_asc_pipeline,
                                     "kernel_dsv4_sort_i32_rows_asc");
         const bool decode_one_token = n_tokens == 1u;
+        /* F1 (ds4f kernel audit, 2026-09-03): the ds4_gpu_mpp_available()
+         * clause is a device-GENERATION proxy, not a capability check. The
+         * heads16_dual kernel contains no MPP or TensorOps code -- only
+         * float4/half4 loads, threadgroup staging and the same
+         * dsv4_attend_shared_h4_row helpers as heads8. The decisive evidence is
+         * the init path: g_dsv4_indexed_attention_heads16_dual_pipeline is
+         * created UNCONDITIONALLY and appears in the init-failure list, so GPU
+         * init aborts if it does not compile. It therefore already compiles and
+         * validates on every M2 Ultra boot and is merely never dispatched -- a
+         * kernel that genuinely required MPP could not pass that check.
+         *
+         * Each head keeps private accumulators and walks the identical staged
+         * row sequence through the identical online-softmax association, so the
+         * swap should be bit-exact. UNVERIFIED HERE: there is no ds4f artifact
+         * on the dev box, so this is opt-in only and the rig owns the check. */
+        const bool prefill_dual_heads_force =
+            getenv("DS4_METAL_DS4F_PREFILL_DUAL_HEADS") != NULL;
         const bool prefill_dual_heads =
-            !decode_one_token && !g_quality_mode && ds4_gpu_mpp_available() &&
+            !decode_one_token && !g_quality_mode &&
+            (ds4_gpu_mpp_available() || prefill_dual_heads_force) &&
             n_head == 64u &&
             top_k == 512u && window == 128u && head_dim == 512u;
+        if (prefill_dual_heads_force) {
+            static int announced;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: F1 heads16_dual prefill attention forced on "
+                        "(n_head %u top_k %u window %u head_dim %u) -- %s\n",
+                        (unsigned)n_head, (unsigned)top_k, (unsigned)window,
+                        (unsigned)head_dim,
+                        prefill_dual_heads ? "ENGAGED" : "shape refused");
+            }
+        }
         /* Split-K count for the one-token indexed attention reduce. 12 was
          * chosen on unsplit hardware, where 64 heads in groups of 8 give
          * 8 x 12 = 96 threadgroups. Under tensor parallelism each rank holds
@@ -43075,7 +43105,13 @@ int ds4_gpu_routed_moe_batch_tensor(
             down_type == DS4_METAL_TENSOR_MXFP4 &&
             n_expert == 6 &&
             !g_ssd_streaming_mode &&
-            g_tp_split_world == 1 &&
+            /* F3 (ds4f kernel audit): the world == 1 clause is merge-time
+             * conservatism, not a measurement -- the audit found no comment or
+             * commit message justifying it, and this is an instantiation of the
+             * same kernel_mul_mm_id template TP2 already runs. Opt-in until the
+             * rig confirms; UNVERIFIED HERE, no ds4f artifact on the dev box. */
+            (g_tp_split_world == 1 ||
+             getenv("DS4_METAL_DS4F_MXFP4_DOWN_LUT_TP") != NULL) &&
             (use_pre_m5_mxfp4_mm_id_down_half_lut_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT) != 0u);
         if (use_mm_id) {
