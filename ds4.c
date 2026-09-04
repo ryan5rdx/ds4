@@ -13060,8 +13060,10 @@ typedef enum {
 } glm53_kda_split_mode;
 
 static glm53_kda_split_mode glm53_tp_kda_split_mode(void) {
+    /* Default BOTH. DS4_GLM_TP_KDA_SPLIT=0 disables, =decode narrows it. */
     const char *env = getenv("DS4_GLM_TP_KDA_SPLIT");
-    if (!env || !env[0] || env[0] == '0') return GLM53_KDA_SPLIT_OFF;
+    if (!env || !env[0]) return GLM53_KDA_SPLIT_BOTH;
+    if (env[0] == '0') return GLM53_KDA_SPLIT_OFF;
     if (strcmp(env, "decode") == 0) return GLM53_KDA_SPLIT_DECODE;
     return GLM53_KDA_SPLIT_BOTH;
 }
