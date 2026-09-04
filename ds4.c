@@ -71031,10 +71031,10 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->checkpoint_valid = false;
             s->mtp_draft_valid = false;
             /* Re-prefilling a different history invalidates any snapshot taken
-             * against the old one, even at the same length -- unless a hold is
-             * in force, where the token hash adjudicates instead.  See
-             * ds4_session_invalidate(). */
-            if (!s->glm53_rollback_held) ds4_session_glm53_rollback_drop(s);
+             * against the old one, even at the same length.  Unconditional for
+             * the same reason as ds4_session_invalidate(): both ranks must
+             * reach the same state, and the worker has no hold. */
+            ds4_session_glm53_rollback_drop(s);
             ds4_session_glm_reset_dense_cache(s);
             if (!ds4_session_glm_reset_kda_state(s)) {
                 snprintf(err, errlen, "%s GLM KDA state reset failed", backend_name);
@@ -80285,13 +80285,20 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_image_count = 0;
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
-    /* The snapshot describes a timeline this session no longer has -- UNLESS a
-     * hold is in force.  The canonicalization rebuild invalidates and re-syncs
-     * a prompt that shares the client's prefix, so the snapshot at that prefix
-     * is very likely still good; its recorded token hash decides at restore
-     * time, and refuses if the re-tokenization moved.  Dropping it here instead
-     * left a canonicalized-by-rebuild turn with no rollback point at all. */
-    if (!s->glm53_rollback_held) ds4_session_glm53_rollback_drop(s);
+    /* Unconditional, INCLUDING under a hold.
+     *
+     * Preserving it under a hold was coordinator-only and therefore unsafe: the
+     * hold is a local session flag, but this function also sends a plain
+     * INVALIDATE to the worker, whose handler has no hold and drops its
+     * snapshot.  The leader would then keep a snapshot the worker does not
+     * have, mirror KEEP for it, and the worker -- unable to serve a restore it
+     * was ordered to perform -- marks the transport permanently failed.
+     *
+     * Mirroring a preserve flag would fix the asymmetry but adds another
+     * two-rank mode to a protocol that has already cost several rounds of
+     * lockstep defects, to buy back one narrow case.  Dropping on both ranks is
+     * symmetric by construction. */
+    ds4_session_glm53_rollback_drop(s);
     ds4_session_dspark_scheduler_begin_request(s);
     if (!ds4_session_is_cpu(s) && !ds4_session_is_glm(s)) {
         metal_graph_dspark_cache_reset(&s->graph);

@@ -13670,6 +13670,30 @@ decode_again:
                                      prompt_tokens, completion);
     }
     if (job_cancelled(j)) response_ok = false;
+    /* Test hook: treat the next N terminal writes as failed, so the
+     * cancel-rollback path runs deterministically *after* canonicalization.
+     *
+     * There is no client-side way to reach that ordering.  Closing the socket
+     * early trips the disconnect watcher within ~100 ms, which cancels
+     * generation before canonicalization ever runs -- so a test that closes
+     * early exercises the plain cancel path and silently reports it as the
+     * canonicalized one.  Off unless DS4_SERVER_TEST_FAIL_FINAL_WRITE is set to
+     * a positive count; it counts down so a retry in the same run succeeds.
+     * Racy across worker threads by design -- it is a single-slot test aid. */
+    {
+        static int fail_final_writes = -1;
+        if (fail_final_writes < 0) {
+            const char *v = getenv("DS4_SERVER_TEST_FAIL_FINAL_WRITE");
+            fail_final_writes = v ? atoi(v) : 0;
+        }
+        if (response_ok && fail_final_writes > 0) {
+            fail_final_writes--;
+            response_ok = false;
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: TEST HOOK forcing terminal write failure "
+                       "(%d remaining)", fail_final_writes);
+        }
+    }
     if (!response_ok) {
         job_mark_cancelled(j);
         final_finish = "error";
