@@ -2574,6 +2574,19 @@ static void ds4_gpu_pipeline_coverage_report(void) {
      * (DS4_METAL_PIPELINE_COVERAGE_RECORD=1); a missing baseline under STRICT
      * is a failure, not a free pass. */
     const int record = getenv("DS4_METAL_PIPELINE_COVERAGE_RECORD") != NULL;
+    /* RECORD writes the baseline from THIS run, so a STRICT check against it
+     * is a diff against itself and passes by construction. Refuse the
+     * combination outright rather than silently certifying the candidate. */
+    if (record && strict) {
+        fprintf(stderr,
+                "ds4: pipeline-coverage: STRICT FAILS -- RECORD and STRICT "
+                "together would diff this run against a baseline taken from "
+                "this run. Record on a trusted run, then gate on a later "
+                "one.\n");
+        fflush(stderr);
+        free(zero); free(bound);
+        _exit(3);
+    }
     if (baseline_path && record) {
         FILE *f = fopen(baseline_path, "w");
         if (f) {
@@ -2593,10 +2606,12 @@ static void ds4_gpu_pipeline_coverage_report(void) {
 
     /* baseline - current: previously bound, not bound now. */
     uint32_t n_missing = 0, n_baseline = 0;
+    int baseline_readable = 0;
     const char **missing = NULL;
     if (have_baseline) {
         char line[512];
         FILE *f = fopen(baseline_path, "r");
+        baseline_readable = f != NULL;
         size_t cap = 64;
         missing = calloc(cap, sizeof(*missing));
         while (f && missing && fgets(line, sizeof(line), f)) {
@@ -2656,6 +2671,19 @@ static void ds4_gpu_pipeline_coverage_report(void) {
                     "it is deliberately not created here, because a baseline "
                     "taken from the candidate would pass by construction.\n",
                     baseline_path);
+            fail = 1;
+        }
+        else if (!baseline_readable) {
+            fprintf(stderr,
+                    "ds4: pipeline-coverage: STRICT FAILS -- baseline %s "
+                    "exists but could not be read.\n", baseline_path);
+            fail = 1;
+        } else if (n_baseline == 0) {
+            /* An empty baseline makes `baseline - current` trivially empty,
+             * so the gate would pass on any run at all. */
+            fprintf(stderr,
+                    "ds4: pipeline-coverage: STRICT FAILS -- baseline %s is "
+                    "empty, so the diff is vacuous.\n", baseline_path);
             fail = 1;
         }
         if (n_missing) fail = 1;

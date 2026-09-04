@@ -47220,6 +47220,21 @@ static bool glm_graph_encode_shared_swiglu_one(
                                                0u, (uint32_t)DS4_N_FF_EXP);
 }
 
+/* Announce where the work is actually SKIPPED, not where the mask is parsed.
+ * glm_decode_ablate_mask() prints "ablation active (mask 0x..)" the moment the
+ * env is read, which proves only that the request was understood. The
+ * 2026-09-03 S2-remeasure trusted that line while the shared expert ran
+ * anyway, because its guard was on the !shared_first path and the shipping
+ * stack sets shared_first. A null measured through a no-op ablation looks
+ * exactly like a null measured through a real one. */
+static void glm_ablate_shared_announce(void) {
+    static int announced;
+    if (announced) return;
+    announced = 1;
+    fprintf(stderr,
+            "ds4: GLM shared expert SKIPPED by ablation -- timing only\n");
+}
+
 /* HC2s.  Both FFN tails end the same way at decode:
  *     next = copy(ffn_out)   then   HC expand reads next
  * and in both the expand can read ffn_out directly, so the copy goes away.
@@ -47490,7 +47505,18 @@ static bool glm_graph_encode_sparse_ffn_one(
             }
         }
     }
-    if (ok && shared_first) {
+    /* DS4_GLM_ABLATE_SHARED must be honoured on BOTH shared-expert paths.
+     * It used to guard only the !shared_first path below, and shared_first is
+     * true whenever DS4_GLM_TP_SHARED_SPLIT is set -- which the shipping stack
+     * does -- so the ablation silently did nothing on the production
+     * configuration while still printing its "ablation active (mask 0x20)"
+     * line. That announce reports the mask being PARSED, not the work being
+     * skipped, and the 2026-09-03 S2-remeasure null was measured through it.
+     * The null is retracted; see 2026-09-03-S2REMEASURE-RETRACTED.md. */
+    const bool ablate_shared =
+        (glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED) != 0;
+    if (ok && shared_first && ablate_shared) glm_ablate_shared_announce();
+    if (ok && shared_first && !ablate_shared) {
         ok = glm_graph_encode_shared_swiglu_lane(ffn_mid,
                                                 ffn_gate,
                                                 ffn_up,
@@ -47638,8 +47664,8 @@ static bool glm_graph_encode_sparse_ffn_one(
                                          pos,
                                          1,
                                          stage_t0);
-    if (ok && !shared_first &&
-        !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED)) {
+    if (ok && !shared_first && ablate_shared) glm_ablate_shared_announce();
+    if (ok && !shared_first && !ablate_shared) {
         ok = glm_graph_encode_shared_swiglu_one(ffn_mid,
                                                 ffn_gate,
                                                 ffn_up,
