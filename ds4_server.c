@@ -10947,6 +10947,31 @@ static void trace_write_cache_diag(
  * computation at the call site.  It must be measured as old_pos - common, the
  * tail actually thrown away, which for the shrinking shape equals
  * old_pos - prompt_len and for the diverging shape is larger. */
+/* Can this backend reuse anything after a rewind?
+ *
+ * Three cases, and the middle one is the trap:
+ *
+ *   GLM-5.2  yes -- the dense KV cache truncates cleanly.
+ *   GLM-5.3  NO.  Its KDA layers hold a running recurrence rather than a
+ *            per-token cache, so ds4_session_rewind() has nothing to truncate
+ *            and drops the checkpoint instead.  It still leaves
+ *            checkpoint.len == pos, so ds4_session_pos() reports a prefix that
+ *            is worth zero, and a caller that believes it charges ahead with a
+ *            cached count the next sync will not honour.
+ *   Flash    only while the discarded tail has not wrapped a ring row the
+ *            rewound tail still needs.
+ *
+ * Split out from the call site so the GLM-5.3 refusal is a tested property
+ * rather than a clause someone can reorder. */
+static bool live_prefix_backend_can_rewind(bool is_glm, bool is_glm53,
+                                           uint32_t raw_budget,
+                                           uint32_t align_slack,
+                                           uint32_t discard) {
+    if (is_glm) return !is_glm53;
+    return raw_budget > align_slack && discard > 0 &&
+           discard + align_slack < raw_budget;
+}
+
 static int live_prefix_rewind_target(bool backend_can_rewind,
                                      int old_pos, int prompt_len, int common) {
     if (!backend_can_rewind || prompt_len <= 1 || old_pos <= 0) return -1;
@@ -12311,11 +12336,24 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         return;
     } else if (cached == 0) {
         const bool is_glm = ds4_engine_is_glm_dsa(s->engine);
-        /* GLM's dense KV cache can always rewind: ds4_session_glm_cap_dense_cache()
+        /* GLM-5.2's dense KV cache can always rewind: ds4_session_glm_cap_dense_cache()
          * keeps it consistent. Flash's raw SWA cache is a ring buffer instead
          * (see ds4_session_raw_rewind_budget()), so only rewind it while the
          * discarded tail is still guaranteed not to have wrapped a row the
          * rewound tail will need. */
+        /* GLM-5.3 is neither: its KDA layers hold a running recurrence rather
+         * than a per-token cache, so there is nothing to truncate and
+         * ds4_session_rewind() drops the checkpoint outright, leaving the next
+         * ds4_session_sync() to re-prefill from zero.  It still sets
+         * checkpoint.len = pos, so ds4_session_pos() reports a reusable prefix
+         * that is worth nothing.  Claiming it is actively harmful: the request
+         * logs a short ctx span for a full-length prefill, reports a bogus
+         * cache_read, renders a progress bar that sits at 0% until the engine
+         * passes the phantom offset, and -- because every remaining recovery
+         * path below is gated on `cached == 0` -- suppresses the
+         * thinking-visible, live-text and disk lookups that could produce a
+         * real hit.  The rewind buys nothing here, so do not take it. */
+        const bool is_glm53 = ds4_engine_is_glm53(s->engine);
         const uint32_t raw_budget = is_glm ? 0 : ds4_session_raw_rewind_budget(slot->session);
         /* Budget against the tail actually discarded, old_pos - common, not
          * old_pos - prompt_len.  They coincide for a shrinking prompt; for one
@@ -12332,9 +12370,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * discovering it as an over-deep rewind. */
         const uint32_t align_slack = is_glm ? 0u :
             ds4_session_rewind_align(slot->session) - 1u;
-        const bool can_rewind = is_glm ||
-            (raw_budget > align_slack && discard > 0 &&
-             discard + align_slack < raw_budget);
+        const bool can_rewind = live_prefix_backend_can_rewind(
+            is_glm, is_glm53, raw_budget, align_slack, discard);
         const int rewind_to = live_prefix_rewind_target(
             can_rewind, old_pos, j->req.prompt.len, common);
         if (rewind_to >= 0) {
@@ -18732,6 +18769,31 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_live_prefix_backend_can_rewind(void) {
+    /* GLM-5.3 must always refuse.  Rewinding it drops the checkpoint, so the
+     * landing position ds4_session_pos() reports back is a phantom: the caller
+     * logs a short ctx span for a full-length prefill, reports a cache read
+     * that never happened, and skips the cached==0 recovery paths that could
+     * have produced a real hit.  The raw-cache arguments are irrelevant for
+     * GLM and must not be able to talk it back into rewinding. */
+    TEST_ASSERT(!live_prefix_backend_can_rewind(true, true, 0, 0, 0));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(true, true, 4224, 0, 1300));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(true, true, 99999, 7, 3077));
+
+    /* GLM-5.2 always may: the dense KV cache truncates cleanly. */
+    TEST_ASSERT(live_prefix_backend_can_rewind(true, false, 0, 0, 0));
+    TEST_ASSERT(live_prefix_backend_can_rewind(true, false, 0, 0, 3077));
+
+    /* Flash: budget-gated on the tail actually discarded. */
+    TEST_ASSERT(live_prefix_backend_can_rewind(false, false, 4224, 0, 1300));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 4224, 0, 0));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 4224, 0, 4224));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 0, 0, 1300));
+    /* Alignment slack is charged against the budget, not ignored. */
+    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 1301, 7, 1300));
+    TEST_ASSERT(live_prefix_backend_can_rewind(false, false, 1400, 7, 1300));
+}
+
 static void test_live_prefix_rewind_target(void) {
     /* Shrinking prompt: strict prefix of the checkpoint, capped one short so
      * the following sync still has a token to evaluate. */
@@ -20328,6 +20390,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
+    test_live_prefix_backend_can_rewind();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
