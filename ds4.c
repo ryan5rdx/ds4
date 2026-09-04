@@ -13202,6 +13202,13 @@ static void glm53_hc_ffn_tail_report_inert(int decode_step,
             !buffers_ok    ? " missing hc buffers" : "");
 }
 
+/* DF2: pair the Q8_0 q/k decode projections. Opt-in rather than a disable
+ * escape, so the rig can A/B it the same way as HC1/M1/B1/HC2s/HC3s. */
+static int glm53_q8_qk_pair_requested(void) {
+    const char *env = getenv("DS4_METAL_GLM53_Q8_QK_PAIR");
+    return env && env[0] && env[0] != '0';
+}
+
 static int glm53_hc_kda_out_fuse_requested(void) {
     const char *env = getenv("DS4_GLM_HC_KDA_OUT_FUSE");
     return env && env[0] && env[0] != '0';
@@ -46117,6 +46124,47 @@ static bool glm53_graph_kda_attention(
 #else
     const bool qkv_paired = false;
 #endif
+#if defined(__APPLE__)
+    /* DF2.  The q8kda artifact makes kda_q/kda_k Q8_0, and the pair matvec
+     * merges their two memory streams and interleaves two dot chains so each
+     * hides the other's latency.  Probe on M1 Max, at these exact shapes:
+     * KDA 8192+8192  223.3 -> 217.3 us, DSA 1536+512  34.03 -> 29.28 us, and
+     * BIT-EXACT against two separate calls (maxrel 0.00e+00 at both).
+     *
+     * The mechanism is NOT launch count -- a 4096->32 control prices a
+     * dispatch at ~2 us while the real shapes save 5-8 us -- so it does not
+     * generalise downward: at nsg=2 with small out dims the pair is slower.
+     *
+     * No !lane.split clause, unlike the BF16 and CUDA pairs above: off_q/off_k
+     * are already lane-shifted by glm53_graph_weight_row_offset and the two
+     * out dims stay equal under the split, which is what the pair requires.
+     * That is what makes this reachable on the production stack, where
+     * DS4_GLM_TP_KDA_SPLIT=both is set. */
+    if (!qkv_paired && !qk_paired &&
+        glm53_q8_qk_pair_requested() &&
+        l->kda_q->type == DS4_TENSOR_Q8_0 &&
+        l->kda_k->type == DS4_TENSOR_Q8_0) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "ds4: GLM DF2 KDA q/k Q8_0 pair matvec active "
+                    "(34 KDA layers, 2 -> 1 dispatch)\n");
+        }
+        qk_paired = ds4_gpu_matmul_q8_0_pair_tensor(
+                g->kda_q,
+                g->kda_k,
+                model->map,
+                model->size,
+                off_q,
+                off_k,
+                DS4_N_EMBD,
+                projection,
+                projection,
+                g->attn_norm,
+                1) != 0;
+    }
+#endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     if (!lane.split &&
         l->kda_q->type == DS4_TENSOR_Q4_K &&
@@ -54503,8 +54551,45 @@ static bool glm_graph_forward_token(
             goto glm53_attention_done;
         }
         const uint32_t decode_ablate = glm_decode_ablate_mask();
+        /* Hoisted above the q_a projection so DF2 can tell whether the kv_a
+         * projection is even going to be issued in this block: the profiling
+         * path defers it to the `!fuse_qkv_norm && !fuse_qkv_norm_store` site
+         * below and must not be paired. */
+        const bool fuse_qkv_norm_store = use_indexed_attention &&
+                                         !decode_stage_profile &&
+                                         g->compact_cache_cap != 0;
+        const bool fuse_qkv_norm = !decode_stage_profile && !fuse_qkv_norm_store;
+        bool qkv_pair_done = false;
+#if defined(__APPLE__)
+        /* DF2, DSA half.  The same pair matvec as the KDA q/k above, here on
+         * attn_q_a (4096 -> 1536) and attn_kv_a_mqa (4096 -> kv_raw_dim).
+         * Probe on M1 Max at this shape: 34.03 -> 29.28 us, bit-exact.  Only
+         * 11 DSA layers, so roughly a fifth of DF2 -- it rides with the KDA
+         * half rather than being separable.
+         *
+         * If the pair refuses, qkv_pair_done stays false and both separate
+         * projections below run as before. */
+        if (ok && (fuse_qkv_norm_store || fuse_qkv_norm) &&
+            glm53_q8_qk_pair_requested() &&
+            !(decode_ablate & DS4_GLM_ABLATE_QPATH) &&
+            l->attn_q_a->type == DS4_TENSOR_Q8_0 &&
+            l->attn_kv_a_mqa->type == DS4_TENSOR_Q8_0) {
+            qkv_pair_done = ds4_gpu_matmul_q8_0_pair_tensor(
+                    g->q_rank,
+                    g->kv_raw,
+                    model->map,
+                    model->size,
+                    l->attn_q_a->abs_offset,
+                    l->attn_kv_a_mqa->abs_offset,
+                    DS4_N_EMBD,
+                    DS4_N_LORA_Q,
+                    kv_raw_dim,
+                    g->attn_norm,
+                    1) != 0;
+        }
+#endif
         DS4_GLM_FT_STAGE("DSA q_a projection");
-        if (ok && !(decode_ablate & DS4_GLM_ABLATE_QPATH)) {
+        if (ok && !qkv_pair_done && !(decode_ablate & DS4_GLM_ABLATE_QPATH)) {
             ok = glm_graph_matmul_q8_0_decode_profiled_tensor(g->q_rank,
                                                               model,
                                                               l->attn_q_a->abs_offset,
@@ -54516,13 +54601,10 @@ static bool glm_graph_forward_token(
                                                               "attn_q_a",
                                                               g->ssd_streaming) != 0;
         }
-        const bool fuse_qkv_norm_store = use_indexed_attention &&
-                                         !decode_stage_profile &&
-                                         g->compact_cache_cap != 0;
-        const bool fuse_qkv_norm = !decode_stage_profile && !fuse_qkv_norm_store;
         if (ok && fuse_qkv_norm_store) {
             DS4_GLM_FT_STAGE("DSA fused q/kv norm and store");
-            ok = glm_graph_matmul_q8_0_decode_profiled_tensor(g->kv_raw,
+            if (!qkv_pair_done) {
+                ok = glm_graph_matmul_q8_0_decode_profiled_tensor(g->kv_raw,
                                                               model,
                                                               l->attn_kv_a_mqa->abs_offset,
                                                               DS4_N_EMBD,
@@ -54532,6 +54614,7 @@ static bool glm_graph_forward_token(
                                                               pos,
                                                               "attn_kv_a_store",
                                                               g->ssd_streaming) != 0;
+            }
             if (ok) {
                 ok = ds4_gpu_glm_qkv_norm_store_compact_kv_tensor(
                         g->q_rank_norm,
@@ -54555,7 +54638,8 @@ static bool glm_graph_forward_token(
             }
         } else if (ok && fuse_qkv_norm) {
             DS4_GLM_FT_STAGE("DSA fused q/kv norm");
-            ok = glm_graph_matmul_q8_0_decode_profiled_tensor(g->kv_raw,
+            if (!qkv_pair_done) {
+                ok = glm_graph_matmul_q8_0_decode_profiled_tensor(g->kv_raw,
                                                               model,
                                                               l->attn_kv_a_mqa->abs_offset,
                                                               DS4_N_EMBD,
@@ -54565,6 +54649,7 @@ static bool glm_graph_forward_token(
                                                               pos,
                                                               "attn_kv_a_norm",
                                                               g->ssd_streaming) != 0;
+            }
             if (ok) {
                 ok = ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(g->q_rank_norm,
                                                            g->q_rank,
@@ -55101,10 +55186,37 @@ static bool glm_graph_forward_token(
                         g->heads,
                         k_off);
                 if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_ATTN) != 0;
-                if (ok) ok = ds4_gpu_add_tensor(g->attn_out,
-                                                g->tp_out[slot],
-                                                g->tp_in[slot],
-                                                DS4_N_EMBD) != 0;
+                /* HC4: the DSA twin of HC3s, and it reuses HC3s' deferral
+                 * fields because the HC expand that consumes them is the same
+                 * site for both layer kinds.  11 DSA layers against HC3s' 34,
+                 * so ~+0.065% -- below the rig's resolution, which is why it
+                 * shares HC3s' flag instead of being its own arm.
+                 *
+                 * g->glm53 is required here where HC3s did not need it: this
+                 * branch is not GLM-only, and the !g->glm53 path downstream
+                 * still reads g->attn_out, which deferring never writes. */
+                const bool defer_dsa_combine =
+                    ok && g->glm53 && glm53_hc_kda_out_fuse_requested() &&
+                    g->directional_steering_attn_scale == 0.0f &&
+                    !metal_graph_use_reference_hc_decode() &&
+                    !metal_graph_debug_wants_name("attn_out") &&
+                    g->hc_after_attn && g->hc_cur && g->hc_post && g->hc_comb;
+                if (defer_dsa_combine) {
+                    static int announced;
+                    if (!announced) {
+                        announced = 1;
+                        fprintf(stderr,
+                                "ds4: GLM HC4 DSA combine+HC-expand fusion "
+                                "active (11 DSA layers, 2 -> 1 dispatch)\n");
+                    }
+                    g->kda_combine_a = g->tp_out[slot];
+                    g->kda_combine_b = g->tp_in[slot];
+                } else if (ok) {
+                    ok = ds4_gpu_add_tensor(g->attn_out,
+                                            g->tp_out[slot],
+                                            g->tp_in[slot],
+                                            DS4_N_EMBD) != 0;
+                }
             } else {
                 ok = glm_graph_matmul_q8_0_decode_profiled_tensor(g->attn_out,
                                                                   model,
