@@ -5090,17 +5090,24 @@ kernel void kernel_glm_router_select_one_simd(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid < k_used) token_selected[tid] = sel_idx[tid];
+    // STRIDED, not `if (tid < k_used)`. The sorting kernel this replaces runs
+    // sort_width threads so a one-thread-per-slot write covered every slot;
+    // this one runs 32, so a guarded write silently leaves slots 32.. zero
+    // whenever n_expert_used > 32. GLM 5.3 uses 8 and ds4f 6, but the API
+    // accepts up to n_expert and a caller at 40 got zeros for slots 32-39.
+    for (uint i = tid; i < k_used; i += 32u) {
+        token_selected[i] = sel_idx[i];
+    }
 
     // Verbatim from the sorting kernel, including the summation order, so the
     // weights are bit-identical and not merely equivalent.
-    if (tid < k_used) {
+    for (uint i = tid; i < k_used; i += 32u) {
         float sum = 0.0f;
-        for (uint i = 0; i < k_used; i++) {
-            sum += token_probs[(uint)sel_idx[i]];
+        for (uint j = 0; j < k_used; j++) {
+            sum += token_probs[(uint)sel_idx[j]];
         }
         sum = max(sum, 6.103515625e-5f);
-        token_weights[tid] = token_probs[(uint)sel_idx[tid]] / sum * args.expert_weight_scale;
+        token_weights[i] = token_probs[(uint)sel_idx[i]] / sum * args.expert_weight_scale;
     }
 }
 

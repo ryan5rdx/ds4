@@ -52480,6 +52480,7 @@ static bool glm_graph_forward_indexed_tokens(
      * Needs at least 2 rows per rank to be meaningful, and the same batch-kernel
      * prerequisites, since it reuses the same slice loop and bounce buffer. */
     const bool tp_attn_row_split =
+        g->glm53 &&   /* the combine and the bounce below are GLM-only */
         g->tp_world == 2 && g->tp_out && g->tp_in &&
         !g->ssd_streaming &&
         use_batch_attn_kernel &&
@@ -53289,9 +53290,18 @@ static bool glm_graph_forward_indexed_tokens(
                 if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ATTN_CORE)) { /* ablate */ } else if (ok && use_split_value_proj) {
                     int rc = 0;
 #if defined(__APPLE__) || (!defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU))
+                    /* !tp_attn_row_split as well as !tp_attn_head_split.
+                     * The head split forces the non-compact path because the
+                     * compact kernel has no head range; a ROW split leaves all
+                     * 64 heads present, so compact would become legal again --
+                     * and S10-A's A/B would then be measuring a partition
+                     * change AND a kernel-family change at once. Keep the
+                     * kernel fixed so the arm measures one thing. Compact on
+                     * top of the row split is a legitimate follow-on and would
+                     * stack, but it is a separate measurement. */
                     if (slice_causal &&
                         glm_graph_use_dense_compact_attention_prefill(slice) &&
-                        !tp_attn_head_split) {
+                        !tp_attn_head_split && !tp_attn_row_split) {
                         rc = ds4_gpu_glm_attention_dense_compact_lora_causal_tensor(
                                 attn_lora_view,
                                 qk_low_view,
@@ -67536,8 +67546,15 @@ uint32_t ds4_engine_tp_split_flags(ds4_engine *e) {
      * before bring-up; the NULL guard covers only the test hook at
      * ds4.c:64993.  Bit 5 is retired (S14), so this takes bit 8. */
     if (e && e->glm_mtp) f |= 1u << 8;
-    /* Bit 9 left free so the three replicated-decode arms (router, DSA
-     * head-shared projections, indexer) can take a contiguous 10/11/12. */
+    /* S10-A takes bit 9, and it MUST ride the hello. It is a partition split
+     * that also DISABLES the head split, so a one-sided pair has one rank
+     * producing complete values for half the rows and the other producing
+     * head partials for every row. The exchange adds them, so the output is
+     * silently wrong rather than a hang -- the same failure mode S8/S9 were
+     * added here for. (Bit 9 was reserved for the three replicated-decode
+     * arms; S15 already measured negative and took 10, so the contiguity that
+     * reservation was protecting no longer exists.) */
+    if (glm53_tp_dsa_row_split_requested()) f |= 1u << 9;
     /* S15 is a partition split feeding top-k: a one-sided pair would have one
      * rank selecting experts from 144 real logits and 144 zeros.  That is not
      * a hang and not a last-bit band -- it silently routes to the wrong
