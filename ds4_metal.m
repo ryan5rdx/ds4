@@ -47302,9 +47302,9 @@ int ds4_gpu_glm53_kda_prefill(
         /* K1: four value rows per simdgroup, cutting the q/k/decay re-read.
          * Default off. Same total work, fewer loads -- see the kernel comment;
          * this is NOT an occupancy change. */
+        /* Default ON. Set DS4_METAL_GLM53_KDA_VPT4=0 to disable. */
         const char *kda_vpt4_env = getenv("DS4_METAL_GLM53_KDA_VPT4");
-        const int kda_vpt4 =
-            kda_vpt4_env && kda_vpt4_env[0] && kda_vpt4_env[0] != '0';
+        const int kda_vpt4 = !(kda_vpt4_env && kda_vpt4_env[0] == '0');
         id<MTLComputePipelineState> recurrence_pipeline =
             ds4_gpu_get_pipeline(kda_vpt4 ?
                                  "kernel_glm53_kda_prefill_recurrence_vpt4" :
