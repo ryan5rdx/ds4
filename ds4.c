@@ -13372,8 +13372,9 @@ static uint32_t glm53_tp_exact_prefill_max(void) {
  * rather than a reduction split -- each row is computed exactly once -- so
  * unlike S2/S4 there is no last-bit band to expect. */
 static int glm53_tp_prefill_shared_split_requested(void) {
+    /* Default ON. Set DS4_GLM_TP_PREFILL_SHARED_SPLIT=0 to disable. */
     const char *env = getenv("DS4_GLM_TP_PREFILL_SHARED_SPLIT");
-    return env && env[0] && env[0] != '0';
+    return !(env && env[0] == '0');
 }
 
 /* S9: prefill dense-FFN row split.  Separate knob from S4 (which splits the
