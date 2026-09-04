@@ -13173,8 +13173,9 @@ static bool glm53_tp_dense_ffn_split_shape_ok(void) {
  * or with the shared split off.  glm53_hc_ffn_tail_report_inert() below makes
  * that loud rather than letting it read as "measured no speedup". */
 static int glm53_hc_ffn_tail_fuse_requested(void) {
+    /* Default ON. Set DS4_GLM_HC_FFN_TAIL_FUSE=0 to disable. */
     const char *env = getenv("DS4_GLM_HC_FFN_TAIL_FUSE");
-    return env && env[0] && env[0] != '0';
+    return !(env && env[0] == '0');
 }
 
 /* A feature asked for on the command line that never engages is the failure
