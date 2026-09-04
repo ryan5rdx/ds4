@@ -9597,6 +9597,15 @@ static void request_live_state_clear(server *s, server_slot *slot) {
 static void request_cancel_rollback(server *s, server_slot *slot,
                                     int committed_frontier) {
     request_live_state_clear(s, slot);
+    /* GLM-5.3 cannot rewind: ds4_session_rewind() drops the checkpoint rather
+     * than truncating the KDA recurrence, so rolling back here would trade a
+     * valid checkpoint at the interrupted frontier for an invalid one and buy
+     * nothing.  It is strictly worse than doing nothing.  Leaving the
+     * abandoned tail in place keeps ds4_session_common_prefix() able to score
+     * it -- which makes the next miss log say how far the prompt diverged
+     * instead of claiming a divergence at token 0 -- and lets a client that
+     * replays its own partial output cache-hit outright. */
+    if (ds4_engine_is_glm53(s->engine)) return;
     pthread_mutex_lock(&s->inference_mu);
     /* Safe to rewind under tensor parallelism as well, because this is only
      * reachable once the prompt sync has *succeeded*: an interrupted or failed
@@ -11469,7 +11478,7 @@ static int server_session_sync(server *s, server_slot *slot,
     }
 
     pthread_mutex_lock(&s->inference_mu);
-    int live = ds4_session_pos(slot->session);
+    int live = ds4_session_reusable_pos(slot->session);
     int common = ds4_session_common_prefix(slot->session, prompt);
     pthread_mutex_unlock(&s->inference_mu);
     int done = common == live && prompt->len >= live ? live : 0;
@@ -11859,7 +11868,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
 
     ds4_tokens canonical = {0};
     ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
-    const int live_len = ds4_session_pos(slot->session);
+    const int live_len = ds4_session_reusable_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &canonical);
     if (common == live_len && canonical.len == live_len) goto done;
 
@@ -12246,7 +12255,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         pthread_mutex_unlock(&s->inference_mu);
         request_live_state_clear(s, slot);
     }
-    const int old_pos = ds4_session_pos(slot->session);
+    /* Reusable, not raw: an invalidated checkpoint keeps its length, and
+     * believing it makes the miss log report a token divergence at index 0
+     * against two identical tokens ("diverge=154822/154822"). */
+    const int old_pos = ds4_session_reusable_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
     /* Position of the committed prefill frontier once the prompt is synced and
      * before generation appends any sampled tokens.  A cancelled generation
@@ -12380,7 +12392,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             /* Read the landing position back: the alignment can put it below
              * the requested one, and reporting the request as `cached` would
              * claim rows the session no longer has. */
-            const int landed = ds4_session_pos(slot->session);
+            const int landed = ds4_session_reusable_pos(slot->session);
             pthread_mutex_unlock(&s->inference_mu);
             cached = landed;
             cache_source = "memory-rewind";
@@ -13703,7 +13715,10 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
      * nothing to lose -- and saying so here keeps every path below free to
      * dereference it. */
     if (!slot->session) return SLOT_BAND_EMPTY;
-    const int live = ds4_session_pos(slot->session);
+    /* An invalidated checkpoint is as empty as no checkpoint: nothing in it can
+     * be reused, so banding the slot as occupied only protects bytes the next
+     * request would have to re-prefill anyway. */
+    const int live = ds4_session_reusable_pos(slot->session);
     if (live <= 0) return SLOT_BAND_EMPTY;
 
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);

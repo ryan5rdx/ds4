@@ -587,6 +587,10 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
+/* checkpoint.len, but 0 when the checkpoint has been invalidated.  Use this,
+ * not ds4_session_pos(), for any cache-reuse decision or cache diagnostic:
+ * a GLM-5.3 rewind leaves the length set on an invalid checkpoint. */
+int ds4_session_reusable_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 uint32_t ds4_session_raw_rewind_budget(const ds4_session *s);

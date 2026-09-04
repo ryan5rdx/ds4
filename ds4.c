@@ -80007,6 +80007,22 @@ int ds4_session_pos(ds4_session *s) {
     return s->checkpoint.len;
 }
 
+/* How much of the live prefix a caller may actually reuse.
+ *
+ * ds4_session_pos() reports checkpoint.len unconditionally, and an invalidated
+ * checkpoint keeps its length -- ds4_session_rewind() on GLM-5.3 sets
+ * checkpoint.len = pos and checkpoint_valid = false together, because the KDA
+ * recurrence cannot be truncated.  Callers that size cache reuse off
+ * ds4_session_pos() therefore see a prefix that ds4_session_sync() will not
+ * honour and ds4_session_common_prefix() already scores as 0, which reads
+ * downstream as "the two token streams diverged at index 0" rather than "there
+ * is no checkpoint".  Use this instead wherever the number feeds a reuse
+ * decision or a cache diagnostic. */
+int ds4_session_reusable_pos(ds4_session *s) {
+    if (!s || !s->checkpoint_valid) return 0;
+    return s->checkpoint.len;
+}
+
 int ds4_session_ctx(ds4_session *s) {
     return s->ctx_size;
 }
