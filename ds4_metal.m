@@ -2601,8 +2601,13 @@ static void ds4_gpu_pipeline_coverage_report(void) {
         }
     }
 
+    /* On a RECORD run the baseline was just written from THIS run, so the
+     * diff below is against itself and is vacuously 0. Reporting "0 of N NO
+     * LONGER BOUND" there reads as a passing gate and is not one -- it is how
+     * the 2026-09-04 re-record looked clean while silently baselining the
+     * wrong router kernel. */
     const int have_baseline =
-        baseline_path && access(baseline_path, F_OK) == 0;
+        baseline_path && !record && access(baseline_path, F_OK) == 0;
 
     /* baseline - current: previously bound, not bound now. */
     uint32_t n_missing = 0, n_baseline = 0;
@@ -2643,6 +2648,13 @@ static void ds4_gpu_pipeline_coverage_report(void) {
                 "ds4: pipeline-coverage: WARNING %u bindings of unregistered "
                 "pipelines -- the bound count is low by an unknown amount\n",
                 g_pipeline_obj_unknown);
+    }
+    if (record) {
+        fprintf(stderr,
+                "ds4: pipeline-coverage: RECORD run -- no comparison performed "
+                "(a baseline written from this run cannot validate it). Verify "
+                "the bound list names the kernels this configuration should "
+                "select.\n");
     }
     if (have_baseline) {
         fprintf(stderr,
