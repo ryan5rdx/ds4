@@ -13089,8 +13089,9 @@ static bool glm53_tp_kda_split_shape_ok(void) {
  * That is deliberate given S6b -- a prefill split trades half a matmul for
  * rows * n_embd * 4 bytes per layer and loses. */
 static int glm53_tp_shared_split_requested(void) {
+    /* Default ON. Set DS4_GLM_TP_SHARED_SPLIT=0 to disable. */
     const char *env = getenv("DS4_GLM_TP_SHARED_SPLIT");
-    return env && env[0] && env[0] != '0';
+    return !(env && env[0] == '0');
 }
 
 static bool glm53_tp_shared_split_shape_ok(void) {
