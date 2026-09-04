@@ -13224,7 +13224,29 @@ static void glm53_hc_ffn_tail_report_inert(int decode_step,
  * What does NOT split: the kv_a projection and KV store stay replicated,
  * because rank 1's rows attend to keys produced from rank 0's rows. Only the
  * query-row-parallel work moves -- attention core, indexer scoring, q path,
- * which M1's 2k profile puts at 14.22 of 17.76 ms. */
+ * which M1's 2k profile puts at 14.22 of 17.76 ms.
+ *
+ * MEASURED NEGATIVE ON THE RIG AND RETIRED -- kept default-off as the
+ * counter-example, not as a candidate. Do not re-enable without re-reading
+ * 2026-09-04-S10A-RESULT.md.
+ *
+ *   prefill -1.71% mean, negative at every ctx (-3.07 / -3.52 / -1.01 /
+ *   -0.42 / -0.51% over 2048..32768), decode flat. Engagement was correct:
+ *   coord owned rows [0,1024), worker [1024,2048), split_flags 0x40025e vs
+ *   0x40005e, so bit 9 armed and the head split really was replaced.
+ *
+ * The shape is the finding. The prediction was that the delta would GROW with
+ * context, because the head-shared fraction does; it SHRANK, worst at 4096
+ * and near-flat by 16384. So the DSA attention core is latency-bound, not
+ * work-bound: halving the rows removes work that was not on the critical path,
+ * while giving up the head split's 6% head-parallelism. Row-splitting the
+ * indexer and q path -- the follow-on this arm was meant to justify -- is moot
+ * for the same reason.
+ *
+ * Second instance of the pattern after DF2: a change that strictly reduces
+ * work per rank measures negative because the work was not the bottleneck.
+ * The two biggest wins in this campaign (D4 +27%, B1 +6%) both ADDED
+ * parallelism. Prefer occupancy over work reduction on this graph. */
 static int glm53_tp_dsa_row_split_requested(void) {
     const char *env = getenv("DS4_GLM_TP_DSA_ROW_SPLIT");
     return env && env[0] && env[0] != '0';
