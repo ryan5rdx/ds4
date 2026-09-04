@@ -2496,6 +2496,19 @@ static int ds4_gpu_pipeline_cov_cmp(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
+/* Is this name still in the library at all? Distinguishes "compiled but no
+ * longer selected" from "renamed or deleted" in the regression report. */
+static int ds4_gpu_pipeline_cov_compiled(const char *name) {
+    const uint32_t h = ds4_gpu_pipeline_cov_hash(name);
+    for (uint32_t i = 0; i < DS4_PIPELINE_COV_SLOTS; i++) {
+        const ds4_gpu_pipeline_cov_entry *e =
+            &g_pipeline_cov[(h + i) & (DS4_PIPELINE_COV_SLOTS - 1u)];
+        if (!e->name) return 0;
+        if (strcmp(e->name, name) == 0) return 1;
+    }
+    return 0;
+}
+
 static void ds4_gpu_pipeline_coverage_report(void) {
     if (!g_pipeline_cov_on) return;
 
@@ -2546,72 +2559,118 @@ static void ds4_gpu_pipeline_coverage_report(void) {
         }
     }
 
-    /* No baseline: write one if asked, otherwise just describe the run. Most
-     * of the zero-hit list is other models' kernels and means nothing. */
-    if (baseline_path && access(baseline_path, F_OK) != 0) {
+    /* The baseline is the BOUND set, not the zero-hit set.
+     *
+     * It used to be the zero-hit names, which failed open twice over. A
+     * missing baseline was silently created from the candidate run and then
+     * diffed against itself, so an unvalidated run self-certified and exited
+     * 0. And a kernel that was DELETED or RENAMED never appears in the current
+     * registry at all, so it can never show up as zero-hit -- the exact
+     * regression the gate is for was structurally invisible.
+     *
+     * Comparing bound sets fixes both: `baseline - current` is non-empty
+     * whether the kernel stopped being selected, was renamed, or was removed
+     * from the library. Recording is now explicit
+     * (DS4_METAL_PIPELINE_COVERAGE_RECORD=1); a missing baseline under STRICT
+     * is a failure, not a free pass. */
+    const int record = getenv("DS4_METAL_PIPELINE_COVERAGE_RECORD") != NULL;
+    if (baseline_path && record) {
         FILE *f = fopen(baseline_path, "w");
         if (f) {
-            for (uint32_t i = 0; i < n_zero; i++) fprintf(f, "%s\n", zero[i]);
+            for (uint32_t i = 0; i < n_hit; i++) fprintf(f, "%s\n", bound[i]);
             fclose(f);
             fprintf(stderr,
-                    "ds4: pipeline-coverage: wrote baseline %s (%u zero-hit "
-                    "names). Re-run with the same path to detect regressions.\n",
-                    baseline_path, n_zero);
+                    "ds4: pipeline-coverage: recorded baseline %s (%u bound "
+                    "kernels)\n", baseline_path, n_hit);
         } else {
             fprintf(stderr, "ds4: pipeline-coverage: cannot write baseline %s\n",
                     baseline_path);
         }
     }
 
-    uint32_t n_new = 0;
-    const char **fresh = calloc(n_zero ? n_zero : 1, sizeof(*fresh));
-    if (baseline_path && fresh && access(baseline_path, F_OK) == 0) {
-        /* Names in the baseline were already zero-hit when it was recorded, so
-         * only the difference is a regression. */
+    const int have_baseline =
+        baseline_path && access(baseline_path, F_OK) == 0;
+
+    /* baseline - current: previously bound, not bound now. */
+    uint32_t n_missing = 0, n_baseline = 0;
+    const char **missing = NULL;
+    if (have_baseline) {
         char line[512];
-        for (uint32_t i = 0; i < n_zero; i++) {
-            FILE *f = fopen(baseline_path, "r");
-            int seen = 0;
-            while (f && fgets(line, sizeof(line), f)) {
-                line[strcspn(line, "\r\n")] = '\0';
-                if (strcmp(line, zero[i]) == 0) { seen = 1; break; }
+        FILE *f = fopen(baseline_path, "r");
+        size_t cap = 64;
+        missing = calloc(cap, sizeof(*missing));
+        while (f && missing && fgets(line, sizeof(line), f)) {
+            line[strcspn(line, "\r\n")] = '\0';
+            if (!line[0]) continue;
+            n_baseline++;
+            int still = 0;
+            for (uint32_t i = 0; i < n_hit; i++)
+                if (strcmp(bound[i], line) == 0) { still = 1; break; }
+            if (still) continue;
+            if (n_missing == cap) {
+                cap *= 2;
+                const char **grown = realloc(missing, cap * sizeof(*missing));
+                if (!grown) break;
+                missing = grown;
             }
-            if (f) fclose(f);
-            if (!seen) fresh[n_new++] = zero[i];
+            missing[n_missing++] = strdup(line);
         }
+        if (f) fclose(f);
     }
 
     fprintf(stderr,
             "\nds4: pipeline-coverage: %u compiled, %u bound, %u zero-hit%s\n",
             g_pipeline_cov_count, n_hit, n_zero,
-            baseline_path ? "" : " (no baseline: most are other models')");
+            have_baseline ? "" : " (no baseline: zero-hit alone means nothing,"
+                                 " most are other models' kernels)");
     if (g_pipeline_obj_unknown) {
         fprintf(stderr,
                 "ds4: pipeline-coverage: WARNING %u bindings of unregistered "
-                "pipelines -- the count below is low by an unknown amount\n",
+                "pipelines -- the bound count is low by an unknown amount\n",
                 g_pipeline_obj_unknown);
     }
-    if (baseline_path && access(baseline_path, F_OK) == 0) {
-        fprintf(stderr, "ds4: pipeline-coverage: %u NEWLY zero-hit vs %s\n",
-                n_new, baseline_path);
-        for (uint32_t i = 0; i < n_new; i++)
-            fprintf(stderr, "ds4: pipeline-coverage: newly-zero-hit %s\n",
-                    fresh[i]);
-    } else {
-        for (uint32_t i = 0; i < n_zero; i++)
-            fprintf(stderr, "ds4: pipeline-coverage: zero-hit %s\n", zero[i]);
+    if (have_baseline) {
+        fprintf(stderr,
+                "ds4: pipeline-coverage: %u of %u baseline kernels NO LONGER "
+                "BOUND vs %s\n", n_missing, n_baseline, baseline_path);
+        for (uint32_t i = 0; i < n_missing; i++)
+            fprintf(stderr, "ds4: pipeline-coverage: no-longer-bound %s%s\n",
+                    missing[i],
+                    ds4_gpu_pipeline_cov_compiled(missing[i])
+                        ? "" : "  (also GONE from the library)");
     }
 
-    const int fail = strict && baseline_path && n_new > 0;
-    if (strict && !baseline_path) {
-        fprintf(stderr,
-                "ds4: pipeline-coverage: STRICT ignored -- it needs "
-                "DS4_METAL_PIPELINE_COVERAGE_BASELINE. Without one, every "
-                "kernel this model does not use would fail the build.\n");
+    int fail = 0;
+    if (strict) {
+        if (!baseline_path) {
+            fprintf(stderr,
+                    "ds4: pipeline-coverage: STRICT FAILS -- no "
+                    "DS4_METAL_PIPELINE_COVERAGE_BASELINE. A gate with nothing "
+                    "to compare against is not a gate.\n");
+            fail = 1;
+        } else if (!have_baseline) {
+            fprintf(stderr,
+                    "ds4: pipeline-coverage: STRICT FAILS -- baseline %s does "
+                    "not exist. Record one with "
+                    "DS4_METAL_PIPELINE_COVERAGE_RECORD=1 on a run you trust; "
+                    "it is deliberately not created here, because a baseline "
+                    "taken from the candidate would pass by construction.\n",
+                    baseline_path);
+            fail = 1;
+        }
+        if (n_missing) fail = 1;
+        if (g_pipeline_obj_unknown) {
+            fprintf(stderr,
+                    "ds4: pipeline-coverage: STRICT FAILS -- %u unregistered "
+                    "bindings mean the bound set is incomplete, so an empty "
+                    "diff proves nothing.\n", g_pipeline_obj_unknown);
+            fail = 1;
+        }
     }
+    for (uint32_t i = 0; i < n_missing; i++) free((void *)missing[i]);
+    free(missing);
     free(zero);
     free(bound);
-    free(fresh);
     if (fail) {
         fflush(stderr);
         _exit(3); /* skips remaining atexit handlers, by design: CI gate */

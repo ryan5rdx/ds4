@@ -46144,13 +46144,6 @@ static bool glm53_graph_kda_attention(
         glm53_q8_qk_pair_requested() &&
         l->kda_q->type == DS4_TENSOR_Q8_0 &&
         l->kda_k->type == DS4_TENSOR_Q8_0) {
-        static int announced;
-        if (!announced) {
-            announced = 1;
-            fprintf(stderr,
-                    "ds4: GLM DF2 KDA q/k Q8_0 pair matvec active "
-                    "(34 KDA layers, 2 -> 1 dispatch)\n");
-        }
         qk_paired = ds4_gpu_matmul_q8_0_pair_tensor(
                 g->kda_q,
                 g->kda_k,
@@ -46163,6 +46156,29 @@ static bool glm53_graph_kda_attention(
                 projection,
                 g->attn_norm,
                 1) != 0;
+        /* Announce only on success. Announcing before the call meant a refusal
+         * fell through to the two separate matmuls while the harness still
+         * read the line and scored the arm as engaged -- a false pass, which
+         * is worse than a void because it looks like a measurement. */
+        if (qk_paired) {
+            static int announced;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: GLM DF2 KDA q/k Q8_0 pair matvec active "
+                        "(34 KDA layers, 2 -> 1 dispatch, %u+%u rows)\n",
+                        projection, projection);
+            }
+        } else {
+            static int refused;
+            if (!refused) {
+                refused = 1;
+                fprintf(stderr,
+                        "ds4: GLM DF2 KDA pair REFUSED at %u+%u rows -- "
+                        "falling back to two separate matvecs\n",
+                        projection, projection);
+            }
+        }
     }
 #endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
@@ -54586,6 +54602,28 @@ static bool glm_graph_forward_token(
                     kv_raw_dim,
                     g->attn_norm,
                     1) != 0;
+            /* Its own announce, on success only. The DSA half used to have
+             * none at all, so an arm could engage the KDA half, silently miss
+             * this one, and still be scored as fully engaged. */
+            if (qkv_pair_done) {
+                static int announced;
+                if (!announced) {
+                    announced = 1;
+                    fprintf(stderr,
+                            "ds4: GLM DF2 DSA q_a/kv_a Q8_0 pair matvec active "
+                            "(11 DSA layers, 2 -> 1 dispatch, %u+%u rows)\n",
+                            (uint32_t)DS4_N_LORA_Q, kv_raw_dim);
+                }
+            } else {
+                static int refused;
+                if (!refused) {
+                    refused = 1;
+                    fprintf(stderr,
+                            "ds4: GLM DF2 DSA pair REFUSED at %u+%u rows -- "
+                            "falling back to two separate matvecs\n",
+                            (uint32_t)DS4_N_LORA_Q, kv_raw_dim);
+                }
+            }
         }
 #endif
         DS4_GLM_FT_STAGE("DSA q_a projection");
