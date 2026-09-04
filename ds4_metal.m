@@ -2801,8 +2801,9 @@ static int ds4_gpu_glm_router_select_simd(void) {
     static int initialized;
     static int enabled;
     if (!initialized) {
+        /* Default ON. Set DS4_METAL_GLM_ROUTER_SIMD=0 to disable. */
         const char *v = getenv("DS4_METAL_GLM_ROUTER_SIMD");
-        enabled = v && v[0] && v[0] != '0';
+        enabled = !(v && v[0] == '0');
         initialized = 1;
     }
     return enabled;
