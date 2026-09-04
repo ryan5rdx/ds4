@@ -11993,10 +11993,12 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
 
     char err[160] = {0};
     pthread_mutex_lock(&s->inference_mu);
-    /* NOT held.  Canonicalization now runs only after the response was
-     * delivered, so the client will replay this turn and the canonical frontier
-     * is a legitimate -- indeed better -- snapshot position than the prompt
-     * frontier.  Holding it here is what the pre-delivery ordering required. */
+    /* Held for the whole rewrite, both branches.  The append-only branch syncs
+     * internally; the REBUILD_NEEDED branch invalidates and re-syncs from zero.
+     * Neither may move or discard the snapshot: it must still be sitting at the
+     * client's prompt frontier if the response write then fails and the cancel
+     * rollback needs it. */
+    ds4_session_rollback_hold(slot->session, true);
     ds4_session_rewrite_result rr =
         ds4_session_rewrite_from_common(slot->session, &canonical, common,
                                         err, sizeof(err));
@@ -12072,10 +12074,11 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(slot->session, server_progress_cb, &rebuild_progress);
         ds4_session_set_display_progress(slot->session, server_progress_cb, &rebuild_progress);
-        /* NOT held: see the append-only branch above.  This also fixes the
-         * rebuild case specifically -- ds4_session_invalidate() just dropped the
-         * snapshot, and holding this sync meant no replacement was ever taken,
-         * so a canonicalized-by-rebuild turn had no rollback point at all. */
+        /* Still held from the rewrite above, so the invalidate just above did
+         * NOT discard the snapshot and this sync will not replace it.  The
+         * snapshot's recorded token hash decides at restore time whether the
+         * rebuilt prefix still matches at that position; if the canonical
+         * re-tokenization merged across the boundary, it refuses. */
         const int rebuild_rc = server_session_sync(s, slot, sync_prompt,
                                                    sync_err, sizeof(sync_err));
         if (rebuild_rc == 0) {
@@ -12116,6 +12119,10 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     }
 
 done:
+    /* Unconditional, and after both branches: every `goto done` above either
+     * never took the hold or must release it.  Leaving it set would silently
+     * disable rollback capture for the rest of the session. */
+    ds4_session_rollback_hold(slot->session, false);
     ds4_tokens_free(&canonical);
     buf_free(&rendered);
     free(suffix_text);
@@ -13567,21 +13574,30 @@ decode_again:
      * reasoning.  Responses deliberately skips this path because its
      * previous_response_id contract binds the next turn to live state.
      *
-     * DECIDED here, PERFORMED after the response is delivered.  Canonicalizing
-     * first was the root of a whole family of cache bugs: it advances the
-     * session past the prompt the client sent, and if the write then fails the
-     * cancel rollback has nothing at that prompt frontier to roll back to, so
-     * the retry re-prefills the entire conversation.  Deferring it means the
-     * only two outcomes are "delivered, so canonicalize and let the snapshot
-     * follow" and "not delivered, so the snapshot is still where the client's
-     * prompt ended".  The live-state clears below stay here: dropping a binding
-     * early only forgoes a continuation, it never corrupts one. */
+     * Runs BEFORE the response is written, and must.  Deferring it until after
+     * delivery looked like it removed a family of cache bugs -- the session no
+     * longer advances past the client's prompt before a write that might fail
+     * -- but post-delivery work is not free to run here: disconnect
+     * cancellation stays armed until the job returns, so an ordinary client
+     * closing its socket after Content-Length or [DONE] cancels the rebuild;
+     * the rebuild's progress callback writes SSE keepalives after [DONE]; and
+     * the slot stays busy, so an immediate tool-result follow-up is routed to a
+     * different slot and the rebuild finishes somewhere nobody will use it.
+     *
+     * The cache bugs are instead fixed where they belong -- the rollback
+     * snapshot is pinned at the client's prompt frontier for the whole of
+     * canonicalization (ds4_session_rollback_hold), including across the
+     * REBUILD_NEEDED branch's invalidate, with the snapshot's token hash
+     * deciding at restore time whether the rebuilt prefix still matches. */
     const bool want_canonicalize =
         j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls,
                                             dsml_recovery_attempted);
     if (want_canonicalize) {
+        canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
+                                     parsed_content ? parsed_content : "",
+                                     parsed_reasoning, &parsed_calls);
         thinking_live_clear(s, slot);
         /* Canonicalization rewrites the session, so the frontier recorded by
          * the *_live_remember calls just above no longer exists.  Drop those
@@ -13668,14 +13684,6 @@ decode_again:
                    ctx_span,
                    req_flags[0] ? " " : "",
                    req_flags);
-    } else if (want_canonicalize) {
-        /* Delivered, so the client will replay this turn: rewriting the live
-         * checkpoint into the form it will send is now unambiguously right, and
-         * so is letting the rollback snapshot follow to that frontier.  See the
-         * decision site above for why this cannot run before the write. */
-        canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "",
-                                     parsed_reasoning, &parsed_calls);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
