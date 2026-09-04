@@ -13202,8 +13202,27 @@ static void glm53_hc_ffn_tail_report_inert(int decode_step,
             !buffers_ok    ? " missing hc buffers" : "");
 }
 
-/* DF2: pair the Q8_0 q/k decode projections. Opt-in rather than a disable
- * escape, so the rig can A/B it the same way as HC1/M1/B1/HC2s/HC3s. */
+/* DF2: pair the Q8_0 q/k decode projections.
+ *
+ * MEASURED NEGATIVE ON THE RIG AND RETIRED -- kept default-off as the
+ * counter-example, not as a candidate. Do not re-enable without re-reading
+ * 2026-09-03-DF2-RETIRED.md.
+ *
+ *   probe, in isolation, corrected geometry:  1.18x (KDA) / 1.10x (DSA),
+ *                                             bit-exact, ~400-490 us/token
+ *   rig, 3 interleaved pairs, engagement
+ *   verified on both halves and both ranks:   -1.15% decode (-326 us/token)
+ *
+ * The ~730-810 us gap is scheduling overlap that the two SEPARATE dispatches
+ * were providing. That is the whole lesson: kda_q and kda_k are INDEPENDENT,
+ * so the graph was already running them concurrently, and fusing them
+ * serialises work that was overlapping. Every fusion that has won here
+ * (HC1, HC2s, HC3s) joined DEPENDENT stages, where the second could not start
+ * until the first finished and the boundary was pure overhead. The two
+ * biggest wins in the campaign (B1 +6%, D4 +27%) went the other way entirely
+ * and SPLIT work to add parallelism.
+ *
+ * So dispatch count is not the thing to optimise; available parallelism is. */
 static int glm53_q8_qk_pair_requested(void) {
     const char *env = getenv("DS4_METAL_GLM53_Q8_QK_PAIR");
     return env && env[0] && env[0] != '0';
