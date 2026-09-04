@@ -201,6 +201,8 @@ typedef enum {
 
 int ds4_tp_send_rewind_mode(ds4_tp *tp, uint64_t session_id, int pos,
                             ds4_tp_rewind_mode mode);
+/* Acknowledged; the ack status is 0 when the worker captured at `pos`. */
+int ds4_tp_send_rollback_capture(ds4_tp *tp, uint64_t session_id, int pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
 /* Abort the mirrored prefill the worker is currently running for this session.
  * Only meaningful between a SYNC and its COMMAND_ACK; see DS4_TP_FRAME_CANCEL. */
@@ -253,6 +255,16 @@ typedef enum {
      * On receipt the worker stops at its next chunk boundary, leaving its
      * checkpoint at the pre-sync length the leader also holds. */
     DS4_TP_FRAME_CANCEL = 19,
+    /* Leader -> worker, acknowledged.  Take a GLM-5.3 rollback snapshot at
+     * `value`, which must be the worker's current frontier.
+     *
+     * The worker must NOT capture on its own at the end of its sync.  If it
+     * did, a sync the worker finished while the leader was cancelled would
+     * overwrite the previous frontier's snapshot -- the exact one the leader is
+     * about to ask it to restore, because the leader rewinds to its pre-sync
+     * length.  Capturing only on this command keeps the two snapshots at the
+     * same frontier at all times. */
+    DS4_TP_FRAME_ROLLBACK_CAPTURE = 20,
 } ds4_tp_frame_type;
 
 typedef struct {

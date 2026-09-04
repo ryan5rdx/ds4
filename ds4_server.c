@@ -11000,30 +11000,46 @@ static void trace_write_cache_diag(
  * Three cases, and the middle one is the trap:
  *
  *   GLM-5.2  yes -- the dense KV cache truncates cleanly.
- *   GLM-5.3  NO.  Its KDA layers hold a running recurrence rather than a
- *            per-token cache, so ds4_session_rewind() has nothing to truncate
- *            and drops the checkpoint instead.  It still leaves
- *            checkpoint.len == pos, so ds4_session_pos() reports a prefix that
- *            is worth zero, and a caller that believes it charges ahead with a
- *            cached count the next sync will not honour.
+ *   GLM-5.3  only at ONE position: the rollback frontier.  Its KDA layers hold
+ *            a running recurrence rather than a per-token cache, so a rewind
+ *            anywhere else has nothing to truncate and drops the checkpoint,
+ *            leaving checkpoint.len == pos on an invalid checkpoint -- a prefix
+ *            ds4_session_pos() reports and the next sync will not honour.
+ *            `rollback_frontier` is that position, or negative when there is
+ *            no snapshot.  See live_prefix_rewind_target(), which is what
+ *            actually confines the target to it.
  *   Flash    only while the discarded tail has not wrapped a ring row the
  *            rewound tail still needs.
  *
- * Split out from the call site so the GLM-5.3 refusal is a tested property
+ * Split out from the call site so the GLM-5.3 restriction is a tested property
  * rather than a clause someone can reorder. */
 static bool live_prefix_backend_can_rewind(bool is_glm, bool is_glm53,
                                            uint32_t raw_budget,
                                            uint32_t align_slack,
-                                           uint32_t discard) {
-    if (is_glm) return !is_glm53;
+                                           uint32_t discard,
+                                           int rollback_frontier) {
+    if (is_glm) return is_glm53 ? rollback_frontier > 0 : true;
     return raw_budget > align_slack && discard > 0 &&
            discard + align_slack < raw_budget;
 }
 
 static int live_prefix_rewind_target(bool backend_can_rewind,
-                                     int old_pos, int prompt_len, int common) {
+                                     int old_pos, int prompt_len, int common,
+                                     int rollback_frontier) {
     if (!backend_can_rewind || prompt_len <= 1 || old_pos <= 0) return -1;
     if (common <= 0) return -1;
+    /* GLM-5.3 can only land on its rollback frontier; anywhere else drops the
+     * checkpoint and re-prefills the conversation, which is strictly worse than
+     * not rewinding.  Take it when it is still inside what the two sides share
+     * -- for a follow-up that diverges inside the previous assistant turn, that
+     * turns a full re-prefill into one of the generated tail. */
+    if (rollback_frontier > 0) {
+        if (rollback_frontier > common || rollback_frontier >= old_pos ||
+            rollback_frontier >= prompt_len) {
+            return -1;
+        }
+        return rollback_frontier;
+    }
     /* Kill switch.  This path is default-on and it is the one that increases
      * mirrored REWIND traffic under TP, so it needs to be removable without a
      * rebuild when bisecting a control-plane fault. */
@@ -12393,9 +12409,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * discarded tail is still guaranteed not to have wrapped a row the
          * rewound tail will need. */
         /* GLM-5.3 is neither: its KDA layers hold a running recurrence rather
-         * than a per-token cache, so there is nothing to truncate and
-         * ds4_session_rewind() drops the checkpoint outright, leaving the next
-         * ds4_session_sync() to re-prefill from zero.  It still sets
+         * than a per-token cache, so a rewind to an arbitrary position has
+         * nothing to truncate and drops the checkpoint outright, leaving the
+         * next ds4_session_sync() to re-prefill from zero.  It still sets
          * checkpoint.len = pos, so ds4_session_pos() reports a reusable prefix
          * that is worth nothing.  Claiming it is actively harmful: the request
          * logs a short ctx span for a full-length prefill, reports a bogus
@@ -12403,8 +12419,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * passes the phantom offset, and -- because every remaining recovery
          * path below is gated on `cached == 0` -- suppresses the
          * thinking-visible, live-text and disk lookups that could produce a
-         * real hit.  The rewind buys nothing here, so do not take it. */
+         * real hit.
+         *
+         * The one exception is the rollback frontier, where a snapshot lets the
+         * rewind restore.  For a follow-up that diverges inside the previous
+         * assistant turn -- a stripped think block, a re-rendered tool call --
+         * that turns a full re-prefill into one of the generated tail. */
         const bool is_glm53 = ds4_engine_is_glm53(s->engine);
+        const int rollback_frontier = is_glm53 ?
+            ds4_session_rollback_frontier(slot->session) : -1;
         const uint32_t raw_budget = is_glm ? 0 : ds4_session_raw_rewind_budget(slot->session);
         /* Budget against the tail actually discarded, old_pos - common, not
          * old_pos - prompt_len.  They coincide for a shrinking prompt; for one
@@ -12422,9 +12445,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         const uint32_t align_slack = is_glm ? 0u :
             ds4_session_rewind_align(slot->session) - 1u;
         const bool can_rewind = live_prefix_backend_can_rewind(
-            is_glm, is_glm53, raw_budget, align_slack, discard);
+            is_glm, is_glm53, raw_budget, align_slack, discard,
+            rollback_frontier);
         const int rewind_to = live_prefix_rewind_target(
-            can_rewind, old_pos, j->req.prompt.len, common);
+            can_rewind, old_pos, j->req.prompt.len, common,
+            is_glm53 ? rollback_frontier : -1);
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_rewind(slot->session, rewind_to);
@@ -18884,51 +18909,80 @@ static void test_cache_miss_reason_names_an_invalid_checkpoint(void) {
 }
 
 static void test_live_prefix_backend_can_rewind(void) {
-    /* GLM-5.3 must always refuse.  Rewinding it drops the checkpoint, so the
-     * landing position ds4_session_pos() reports back is a phantom: the caller
-     * logs a short ctx span for a full-length prefill, reports a cache read
-     * that never happened, and skips the cached==0 recovery paths that could
-     * have produced a real hit.  The raw-cache arguments are irrelevant for
-     * GLM and must not be able to talk it back into rewinding. */
-    TEST_ASSERT(!live_prefix_backend_can_rewind(true, true, 0, 0, 0));
-    TEST_ASSERT(!live_prefix_backend_can_rewind(true, true, 4224, 0, 1300));
-    TEST_ASSERT(!live_prefix_backend_can_rewind(true, true, 99999, 7, 3077));
+    /* GLM-5.3 with no snapshot must refuse.  Rewinding it drops the checkpoint,
+     * so the landing position ds4_session_pos() reports back is a phantom: the
+     * caller logs a short ctx span for a full-length prefill, reports a cache
+     * read that never happened, and skips the cached==0 recovery paths that
+     * could have produced a real hit.  The raw-cache arguments are irrelevant
+     * for GLM and must not be able to talk it back into rewinding. */
+    TEST_ASSERT(!live_prefix_backend_can_rewind(true, true, 0, 0, 0, -1));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(true, true, 4224, 0, 1300, -1));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(true, true, 99999, 7, 3077, -1));
+    /* Frontier 0 is not a frontier: a rewind to 0 reuses nothing. */
+    TEST_ASSERT(!live_prefix_backend_can_rewind(true, true, 0, 0, 0, 0));
+
+    /* With a snapshot it may -- but only onto that frontier, which is
+     * live_prefix_rewind_target()'s job to enforce. */
+    TEST_ASSERT(live_prefix_backend_can_rewind(true, true, 0, 0, 0, 17343));
 
     /* GLM-5.2 always may: the dense KV cache truncates cleanly. */
-    TEST_ASSERT(live_prefix_backend_can_rewind(true, false, 0, 0, 0));
-    TEST_ASSERT(live_prefix_backend_can_rewind(true, false, 0, 0, 3077));
+    TEST_ASSERT(live_prefix_backend_can_rewind(true, false, 0, 0, 0, -1));
+    TEST_ASSERT(live_prefix_backend_can_rewind(true, false, 0, 0, 3077, -1));
 
     /* Flash: budget-gated on the tail actually discarded. */
-    TEST_ASSERT(live_prefix_backend_can_rewind(false, false, 4224, 0, 1300));
-    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 4224, 0, 0));
-    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 4224, 0, 4224));
-    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 0, 0, 1300));
+    TEST_ASSERT(live_prefix_backend_can_rewind(false, false, 4224, 0, 1300, -1));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 4224, 0, 0, -1));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 4224, 0, 4224, -1));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 0, 0, 1300, -1));
     /* Alignment slack is charged against the budget, not ignored. */
-    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 1301, 7, 1300));
-    TEST_ASSERT(live_prefix_backend_can_rewind(false, false, 1400, 7, 1300));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 1301, 7, 1300, -1));
+    TEST_ASSERT(live_prefix_backend_can_rewind(false, false, 1400, 7, 1300, -1));
+}
+
+static void test_live_prefix_rewind_target_glm53_frontier(void) {
+    /* The reported re-render case: live 20623, new prompt 20639, diverging at
+     * 17546 inside the previous assistant turn, snapshot at the prompt frontier
+     * 17343.  GLM-5.3 must land on the snapshot, not on the divergence -- any
+     * other target drops the checkpoint and re-prefills all 20639. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 20639, 17546, 17343)
+                == 17343);
+
+    /* Outside the common prefix: restoring there would resume over tokens the
+     * new prompt does not have. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 20639, 17000, 17343) < 0);
+    /* Not a rewind at all. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 17343, 20639, 17546, 17343) < 0);
+    /* Must leave the prompt something to evaluate. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 17343, 17546, 17343) < 0);
+    /* No snapshot -> no GLM-5.3 rewind, whatever the common prefix says. */
+    TEST_ASSERT(live_prefix_rewind_target(false, 20623, 20639, 17546, -1) < 0);
+
+    /* Exactly at the divergence is fine -- it is still within the prefix. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 20639, 17343, 17343)
+                == 17343);
 }
 
 static void test_live_prefix_rewind_target(void) {
     /* Shrinking prompt: strict prefix of the checkpoint, capped one short so
      * the following sync still has a token to evaluate. */
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
-    TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
-    TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8, -1) == 7);
+    TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379, -1) == 48378);
+    TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8, -1) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8, -1) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1, -1) == -1);
 
     /* Diverging tail: shares a prefix, then differs before its own end.  This
      * used to score zero and re-prefill everything.  Real numbers from an
      * abandoned assistant turn: live=50561 prompt=49326 common=49274, i.e.
      * re-evaluate 52 tokens rather than 49326. */
-    TEST_ASSERT(live_prefix_rewind_target(true, 50561, 49326, 49274) == 49274);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == 7);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 20, 7) == 7);
+    TEST_ASSERT(live_prefix_rewind_target(true, 50561, 49326, 49274, -1) == 49274);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7, -1) == 7);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 20, 7, -1) == 7);
 
     /* Whole checkpoint already matches -- the plain prefix path owns it. */
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 20, 17) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 20, 17, -1) == -1);
     /* Nothing shared: a rewind to 0 discards the DSpark caches for no reuse. */
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 20, 0) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 20, 0, -1) == -1);
 
     /* The target must always leave a token to evaluate, never move the session
      * forward, and never exceed what the two sides share. */
@@ -18936,7 +18990,7 @@ static void test_live_prefix_rewind_target(void) {
         for (int prompt_len = 0; prompt_len < 12; prompt_len++) {
             const int cap = old_pos < prompt_len ? old_pos : prompt_len;
             for (int common = 0; common <= cap; common++) {
-                const int t = live_prefix_rewind_target(true, old_pos, prompt_len, common);
+                const int t = live_prefix_rewind_target(true, old_pos, prompt_len, common, -1);
                 if (t < 0) continue;
                 TEST_ASSERT(t < prompt_len);
                 TEST_ASSERT(t < old_pos);
@@ -20508,6 +20562,7 @@ static void ds4_server_unit_tests_run(void) {
     test_cache_miss_reason_names_an_invalid_checkpoint();
     test_live_prefix_backend_can_rewind();
     test_live_prefix_rewind_target();
+    test_live_prefix_rewind_target_glm53_frontier();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();

@@ -598,6 +598,16 @@ const ds4_tokens *ds4_session_reusable_tokens(ds4_session *s);
 /* Apply a rewind whose GLM-5.3 restore-vs-invalidate outcome was decided by
  * the TP leader.  Workers only; everyone else calls ds4_session_rewind(). */
 void ds4_session_rewind_mode(ds4_session *s, int pos, bool want_restore);
+/* GLM-5.3 rollback snapshot at the current frontier.  A TP worker calls these
+ * only from the mirrored DS4_TP_FRAME_ROLLBACK_CAPTURE handler -- capturing
+ * from its own sync would overwrite the frontier the leader may rewind to. */
+bool ds4_session_glm53_rollback_capture(ds4_session *s);
+void ds4_session_glm53_rollback_drop(ds4_session *s);
+/* The one position a GLM-5.3 rewind can restore rather than re-prefill, or -1
+ * if there is none.  A caller choosing a rewind target should prefer this over
+ * a deeper one whenever it still lies inside the common prefix: on GLM-5.3 any
+ * other target costs the whole conversation. */
+int ds4_session_rollback_frontier(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 uint32_t ds4_session_raw_rewind_budget(const ds4_session *s);

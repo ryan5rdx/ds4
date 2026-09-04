@@ -58466,6 +58466,29 @@ static bool ds4_session_is_glm(const ds4_session *s) {
     return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
 }
 
+/* Whether the GLM-5.3 rollback snapshot is in play.  Deliberately outside the
+ * GPU guard: ds4_engine_tp_split_flags() must report it in the hello on every
+ * build, because the two ranks have to agree and a rank that silently dropped
+ * the bit would pair with one that sets it. */
+static bool ds4_glm53_rollback_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_GLM_KDA_ROLLBACK");
+        on = (v && v[0] == '0' && v[1] == '\0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+#ifdef DS4_NO_GPU
+/* ds4_tp.o is built once and linked into both the GPU and CPU binaries, and
+ * its worker loop handles DS4_TP_FRAME_ROLLBACK_CAPTURE unconditionally.  A
+ * CPU-only rank has no KDA state to snapshot, so it always refuses -- which
+ * the leader reads as "no snapshot on the peer" and handles by dropping its
+ * own. */
+bool ds4_session_glm53_rollback_capture(ds4_session *s) { (void)s; return false; }
+void ds4_session_glm53_rollback_drop(ds4_session *s) { (void)s; }
+#endif
+
 #ifndef DS4_NO_GPU
 static void ds4_session_glm_reset_dense_cache(ds4_session *s) {
     if (!s) return;
@@ -58612,15 +58635,6 @@ static void ds4_session_glm_note_dense_cache(ds4_session *s,
  * The copy is deliberately not the MTP backup buffer: MTP can be active at the
  * same time and owns its own.
  * ------------------------------------------------------------------------ */
-
-static bool ds4_glm53_rollback_enabled(void) {
-    static int on = -1;
-    if (on < 0) {
-        const char *v = getenv("DS4_GLM_KDA_ROLLBACK");
-        on = (v && v[0] == '0' && v[1] == '\0') ? 0 : 1;
-    }
-    return on != 0;
-}
 
 static bool ds4_session_glm53_rollback_supported(const ds4_session *s) {
     return s && s->glm_graph_ready && s->glm_graph.glm53 &&
@@ -67820,6 +67834,20 @@ uint32_t ds4_engine_tp_split_flags(ds4_engine *e) {
      * (the router gate changes WHICH gates fire), but the flag names it. */
     if (glm53_tp_router_split_requested() && glm53_tp_router_split_shape_ok())
         f |= 1u << 10;
+    /* The GLM-5.3 rollback snapshot is a two-rank protocol: the leader decides
+     * restore-vs-invalidate and the worker must hold a snapshot at the same
+     * frontier to obey.  A pair where only one side has it enabled restores on
+     * one rank while the other invalidates, and the next sync then prefills
+     * different chunk counts and hangs on a gate.  This is a silent divergence,
+     * not a band, so it must be refused at bring-up.  Setting the bit also
+     * makes a mixed old/new pair mismatch, because an old binary cannot set
+     * it -- which is the fail-closed behaviour the REWIND frame cannot provide
+     * on its own, since it kept its wire size.
+     *
+     * Bit 11, not 9: bit 9 is S10-A here.  (S10-A is retired on metal-fork-v4,
+     * which frees 9 there -- but the two branches must agree, so both use 11.) */
+    if (ds4_glm53_rollback_enabled() && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA)
+        f |= 1u << 11;
     /* Not a split, but a one-sided value makes the two ranks choose different
      * prefill paths, and S2/S4 make those paths gate-bearing.  Carrying the
      * value (not just "is it set") catches a mismatch in either direction. */
@@ -68762,6 +68790,11 @@ static void ds4_session_print_dspark_stats(const ds4_session *s) {
 
 static bool ds4_session_tp_leader(const ds4_session *s) {
     return s && s->engine && s->engine->tp.active && s->engine->tp.rank == 0;
+}
+
+/* A non-TP session is neither leader nor worker. */
+static bool ds4_session_tp_worker(const ds4_session *s) {
+    return s && s->engine && s->engine->tp.active && s->engine->tp.rank != 0;
 }
 
 static int ds4_session_tp_register(ds4_session *s) {
@@ -70712,8 +70745,37 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
      *
      * It also happens to be the frontier both hot rewinds target: a cancelled
      * generation rolls back to the post-prompt frontier, and an interrupted
-     * prefill rolls back to the previous sync's frontier. */
-    if (rc == 0) (void)ds4_session_glm53_rollback_capture(s);
+     * prefill rolls back to the previous sync's frontier.
+     *
+     * A TP worker must not capture from its own sync: it does not know whether
+     * the leader's sync succeeded, and a sync it completed while the leader was
+     * cancelled would overwrite the previous frontier -- the one the leader is
+     * about to rewind to.  It captures on DS4_TP_FRAME_ROLLBACK_CAPTURE only,
+     * which the leader sends from here. */
+    if (rc == 0 && !ds4_session_tp_worker(s)) {
+        const bool local_ok = ds4_session_glm53_rollback_capture(s);
+        if (ds4_session_tp_leader(s) && ds4_session_glm53_rollback_supported(s) &&
+            !ds4_tp_failed(s->engine->tp.ctx)) {
+            char terr[160] = "";
+            int wstatus = -1;
+            const bool sent = ds4_tp_send_rollback_capture(
+                s->engine->tp.ctx, s->tp_session_id, s->checkpoint.len);
+            const bool acked = sent &&
+                ds4_tp_wait_command_ack_status(
+                    s->engine->tp.ctx, s->tp_session_id, "rollback capture",
+                    &wstatus, terr, sizeof(terr));
+            if (!local_ok || !sent || !acked || wstatus != 0) {
+                /* Either rank without a snapshot means neither may claim one:
+                 * a later RESTORE the peer cannot serve costs a forced
+                 * invalidate of both.  Drop ours and fall back to the old
+                 * re-prefill behaviour for this frontier. */
+                ds4_session_glm53_rollback_drop(s);
+                if (!sent) ds4_tp_mark_failed(s->engine->tp.ctx);
+            }
+        } else if (!local_ok) {
+            ds4_session_glm53_rollback_drop(s);
+        }
+    }
 #endif
     return rc;
 }
@@ -80190,28 +80252,38 @@ static void ds4_session_rewind_core(ds4_session *s, int pos,
         const uint32_t align = ds4_compressor_rewind_align();
         if (align > 1u) pos -= pos % (int)align;
     }
-#ifndef DS4_NO_GPU
     bool glm53_state_ok = true;
+    bool glm53_restore = false;
+    (void)glm53_state_ok;
+#ifndef DS4_NO_GPU
     const bool glm53 = ds4_session_is_glm(s) && s->glm_graph.glm53;
-    /* Decide restore-vs-invalidate BEFORE mirroring and send the decision, so
-     * both ranks apply the same one.  Deciding locally on each side is what
-     * lets validity diverge: a leader stopped exactly at `pos` skips the
-     * invalidating branch below (pos == checkpoint.len) while a worker that ran
-     * further takes it, leaving the leader believing in a checkpoint the worker
-     * has dropped.  The mirrored mode removes that entirely -- INVALIDATE is
-     * always safe and always wins. */
-    const bool glm53_can = glm53 &&
-        ds4_session_glm53_rollback_can_restore(s, pos);
-    bool glm53_restore = decided ? (want_restore && glm53) : glm53_can;
-    if (glm53_restore && !glm53_can) {
-        /* The leader asked for a restore this rank cannot serve.  The capture
-         * points are mirrored, so this should be unreachable; treat it as a
-         * protocol fault rather than silently diverging. */
-        fprintf(stderr,
-                "ds4: tp: rewind RESTORE to %d has no matching rollback "
-                "snapshot on this rank; invalidating\n", pos);
-        glm53_restore = false;
-        if (s->engine && s->engine->tp.ctx) ds4_tp_mark_failed(s->engine->tp.ctx);
+    /* Perform the restore BEFORE mirroring, and mirror what actually happened.
+     *
+     * Two things go wrong if the decision is only predicted.  Deciding locally
+     * on each rank lets validity diverge: a leader stopped exactly at `pos`
+     * skips the invalidating branch below while a worker that ran further takes
+     * it, leaving the leader trusting a checkpoint the worker dropped.  And
+     * announcing an intention that then fails locally is just as bad in the
+     * other direction -- the worker restores while this rank invalidates.
+     *
+     * So: try it here, send the outcome, and let the caller reconcile the
+     * worker's ack.  INVALIDATE is always safe and always wins. */
+    const bool glm53_want = decided ? want_restore
+                                    : ds4_session_glm53_rollback_can_restore(s, pos);
+    if (glm53 && glm53_want) {
+        glm53_restore = ds4_session_glm53_rollback_restore(s, pos);
+        if (!glm53_restore) {
+            fprintf(stderr,
+                    "ds4: glm53 rollback restore failed at %d%s; invalidating\n",
+                    pos, decided ? " (requested by the TP leader)" : "");
+            /* A worker that cannot honour the leader's RESTORE must not carry
+             * on: the ranks are now in different states and only the leader can
+             * put them back.  Report it, and let the acknowledged rewind
+             * surface it. */
+            if (decided && s->engine && s->engine->tp.ctx) {
+                ds4_tp_mark_failed(s->engine->tp.ctx);
+            }
+        }
     }
 #else
     (void)decided; (void)want_restore;
@@ -80249,12 +80321,36 @@ static void ds4_session_rewind_core(ds4_session *s, int pos,
 #endif
     if (!decided && ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
-        if (!ds4_tp_send_rewind_mode(s->engine->tp.ctx, s->tp_session_id, pos,
-                                     glm53_restore ?
-                                         DS4_TP_REWIND_RESTORE :
-                                         DS4_TP_REWIND_INVALIDATE)) {
-            fprintf(stderr, "ds4: tp: session rewind send failed\n");
-            ds4_tp_mark_failed(s->engine->tp.ctx);
+        /* Send the outcome, then wait for the worker to confirm it applied the
+         * same one.  Unacknowledged, a worker that could not restore would keep
+         * running with an invalid checkpoint while this rank believes in a
+         * valid one; the next sync then prefills different chunk counts on the
+         * two ranks and hangs on a gate. */
+        char terr[160] = "";
+        int wstatus = -1;
+        const bool sent = ds4_tp_send_rewind_mode(
+            s->engine->tp.ctx, s->tp_session_id, pos,
+            glm53_restore ? DS4_TP_REWIND_RESTORE : DS4_TP_REWIND_INVALIDATE);
+        const bool acked = sent &&
+            ds4_tp_wait_command_ack_status(s->engine->tp.ctx, s->tp_session_id,
+                                           "session rewind", &wstatus,
+                                           terr, sizeof(terr));
+        /* status is the worker's applied mode; anything else means it did not
+         * do what we did. */
+        const int want = glm53_restore ? (int)DS4_TP_REWIND_RESTORE
+                                       : (int)DS4_TP_REWIND_INVALIDATE;
+        if (!sent || !acked || wstatus != want) {
+            fprintf(stderr,
+                    "ds4: tp: session rewind not confirmed (sent=%d acked=%d "
+                    "worker=%d wanted=%d)%s%s; invalidating both ranks\n",
+                    (int)sent, (int)acked, wstatus, want,
+                    terr[0] ? ": " : "", terr);
+            /* Collapse to the one state both ranks can reach unilaterally. */
+            glm53_state_ok = false;
+            glm53_restore = false;
+            if (!ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id)) {
+                ds4_tp_mark_failed(s->engine->tp.ctx);
+            }
         }
     }
     s->checkpoint.len = pos;
@@ -80290,17 +80386,8 @@ static void ds4_session_rewind_core(ds4_session *s, int pos,
 #ifndef DS4_NO_GPU
     s->glm_mtp_have = 0;
     s->glm_mtp_rollback_valid = false;
-    if (glm53_restore) {
-        /* Put the recurrence and the indexer pool back to exactly what they
-         * held at `pos`, so the shortened checkpoint describes the state again
-         * and the next sync can resume from it instead of rebuilding. */
-        if (!ds4_session_glm53_rollback_restore(s, pos)) {
-            fprintf(stderr,
-                    "ds4: glm53 rollback restore failed at %d; "
-                    "invalidating the checkpoint\n", pos);
-            glm53_state_ok = false;
-        }
-    }
+    /* The restore itself already ran, above, before the outcome was mirrored. */
+    if (glm53 && !glm53_restore) glm53_state_ok = false;
     if (!glm53_state_ok) {
         s->checkpoint_valid = false;
         ds4_session_glm53_rollback_drop(s);
@@ -80342,6 +80429,17 @@ int ds4_session_reusable_pos(ds4_session *s) {
 const ds4_tokens *ds4_session_reusable_tokens(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return NULL;
     return &s->checkpoint;
+}
+
+int ds4_session_rollback_frontier(ds4_session *s) {
+#ifndef DS4_NO_GPU
+    if (!s || !s->checkpoint_valid) return -1;
+    if (!ds4_session_glm53_rollback_can_restore(s, s->glm53_rollback_pos)) return -1;
+    return s->glm53_rollback_pos;
+#else
+    (void)s;
+    return -1;
+#endif
 }
 
 int ds4_session_ctx(ds4_session *s) {

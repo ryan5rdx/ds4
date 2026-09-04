@@ -2298,6 +2298,16 @@ int ds4_tp_send_rewind_mode(ds4_tp *tp, uint64_t session_id, int pos,
     return ok;
 }
 
+int ds4_tp_send_rollback_capture(ds4_tp *tp, uint64_t session_id, int pos) {
+    ds4_tp_value_command msg = { session_id, (int32_t)pos, 0 };
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_frame(tp->control_fd,
+                                 DS4_TP_FRAME_ROLLBACK_CAPTURE,
+                                 &msg, sizeof(msg));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
+}
+
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id) {
     pthread_mutex_lock(&tp->control_lock);
     const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_INVALIDATE,
@@ -2578,6 +2588,7 @@ static int ds4_tp_recv_command_unlocked(ds4_tp *tp, ds4_tp_command *command,
                                           err, errlen);
         break;
     case DS4_TP_FRAME_SESSION_CREATE:
+    case DS4_TP_FRAME_ROLLBACK_CAPTURE:
     case DS4_TP_FRAME_REWIND: {
         ds4_tp_value_command msg;
         if (bytes != sizeof(msg)) { ok = 0; break; }
@@ -3090,10 +3101,35 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
                 rc = 1;
             }
         } else if (command.type == DS4_TP_FRAME_REWIND) {
-            /* Obey the leader's mode rather than re-deriving one: see
-             * ds4_tp_rewind_mode. */
-            ds4_session_rewind_mode(session, command.value,
-                                    command.flags == DS4_TP_REWIND_RESTORE);
+            /* Obey the leader's mode rather than re-deriving one, then report
+             * what was actually applied -- not that the frame was received.
+             * The leader compares the two and invalidates both ranks if they
+             * differ, so a restore this rank could not perform must come back
+             * as INVALIDATE.  See ds4_tp_rewind_mode. */
+            const bool want = command.flags == DS4_TP_REWIND_RESTORE;
+            ds4_session_rewind_mode(session, command.value, want);
+            const int applied =
+                (want && ds4_session_reusable_pos(session) > 0) ?
+                    (int)DS4_TP_REWIND_RESTORE : (int)DS4_TP_REWIND_INVALIDATE;
+            if (!ds4_tp_send_command_ack(tp, command.session_id, applied)) rc = 1;
+        } else if (command.type == DS4_TP_FRAME_ROLLBACK_CAPTURE) {
+            /* Capture only where the leader says, and only if we are where it
+             * thinks we are.  A position mismatch means the two ranks are not
+             * at the same frontier, which is the one thing the snapshot
+             * protocol assumes; refuse rather than record a snapshot the leader
+             * would later ask us to restore from the wrong place. */
+            int status = 0;
+            if (ds4_session_pos(session) != command.value) {
+                fprintf(stderr,
+                        "ds4: tp: rollback capture at %d but this rank is at "
+                        "%d; refusing\n",
+                        command.value, ds4_session_pos(session));
+                status = 1;
+            } else if (!ds4_session_glm53_rollback_capture(session)) {
+                status = 1;
+            }
+            if (status != 0) ds4_session_glm53_rollback_drop(session);
+            if (!ds4_tp_send_command_ack(tp, command.session_id, status)) rc = 1;
         } else if (command.type == DS4_TP_FRAME_INVALIDATE) {
             ds4_session_invalidate(session);
         } else if (command.type == DS4_TP_FRAME_EVAL_BATCH ||
