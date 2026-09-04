@@ -73,6 +73,10 @@ tests/bench_*
 !tests/*.sh
 !tests/*.py
 !tests/*.md
+/tests/test_indexer_scorer
+/tests/test_topk_stream512
+/tests/test_glm53_kda
+/tests/test_metal_session_batch
 
 # stamp used by the scratch repo probe runner to detect stale objects
 .probe-objects.stamp
