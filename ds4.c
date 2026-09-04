@@ -13184,11 +13184,18 @@ static void glm53_hc_ffn_tail_report_inert(int decode_step,
     static int announced;
     if (announced || !decode_step || !glm53_hc_ffn_tail_fuse_requested()) return;
     announced = 1;
+    if (shared_split) {
+        /* Not inert, just a different fusion: the full down+add+expand cannot
+         * span the routed exchange, but HC2s elides the copy into g->next. */
+        fprintf(stderr,
+                "ds4: GLM HC2 full fusion unavailable under "
+                "DS4_GLM_TP_SHARED_SPLIT (the routed exchange sits between the "
+                "down projection and the add); HC2s copy elision applies "
+                "instead\n");
+        return;
+    }
     fprintf(stderr,
-            "ds4: GLM HC2 REQUESTED BUT INERT -- blocked by%s%s%s%s%s. "
-            "The shared split is structural: the routed exchange sits between "
-            "the down projection and the add, so the fusion cannot span it.\n",
-            shared_split   ? " DS4_GLM_TP_SHARED_SPLIT" : "",
+            "ds4: GLM HC2 REQUESTED BUT INERT -- blocked by%s%s%s%s\n",
             add_residual   ? " add_residual" : "",
             !type_ok       ? " ffn_down_shexp!=Q8_0" : "",
             !steering_off  ? " directional_steering" : "",
@@ -42770,6 +42777,10 @@ typedef struct ds4_glm_gpu_graph {
      * consumed and cleared unconditionally at the expand site. */
     const ds4_gpu_tensor *kda_combine_a;
     const ds4_gpu_tensor *kda_combine_b;
+    /* HC2s: set when the shared-split copy into g->next was elided, so the FFN
+     * HC expand must read ffn_out directly.  Cleared unconditionally at the
+     * expand site, same per-layer discipline as the fields above. */
+    const ds4_gpu_tensor *ffn_expand_from;
     ds4_imatrix_collector *imatrix;
     ds4_gpu_tensor *directional_steering_dirs_by_tier[DS4_MAX_GPUS];
     float directional_steering_attn_scale;
@@ -47577,6 +47588,35 @@ static bool glm_graph_encode_sparse_ffn_one(
          * shared together -- so adding it again would double-count it. */
         if (add_residual) {
             ok = ds4_gpu_add_tensor(next, after_attn, ffn_out, DS4_N_EMBD) != 0;
+        } else if (glm53_hc_ffn_tail_fuse_requested() && decode_step &&
+                   g->directional_steering_ffn_scale == 0.0f &&
+                   g->hc_next && g->hc_after_attn &&
+                   g->hc_post && g->hc_comb &&
+                   /* Only on the decode tail path, whose expand consumes this.
+                    * This function has other callers with their own `next`;
+                    * eliding the copy for one of those would both leave their
+                    * buffer stale and leak ffn_expand_from into the next
+                    * layer's expand, since no expand follows to clear it. */
+                   next == g->next && ffn_out == g->ffn_out) {
+            /* HC2s.  Under the shared split this copy exists only to move
+             * ffn_out into the buffer the HC expand reads, and the expand can
+             * simply read ffn_out instead.  Worth more than one dispatch:
+             * ds4_gpu_tensor_copy closes the open compute encoder and opens a
+             * BLIT encoder, so this removes an encoder switch on each of the
+             * 42 sparse layers.
+             *
+             * Same reachability argument as HC2's own comment -- on GLM
+             * g->next is per-layer scratch (the cur/next swap at ~55033 is
+             * guarded !g->glm53) whose only consumers are the ffn_out debug
+             * dump, the steering call excluded just above, and this expand. */
+            static int announced;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: GLM HC2s shared-split copy elided into the HC "
+                        "expand (42 sparse layers, blit encoder removed)\n");
+            }
+            g->ffn_expand_from = ffn_out;
         } else {
             ok = ds4_gpu_tensor_copy(next, 0, ffn_out, 0,
                                      (uint64_t)DS4_N_EMBD * sizeof(float)) != 0;
@@ -47883,9 +47923,13 @@ static bool glm53_graph_encode_ffn_tail_one(
          * true would skip a real expand on the next layer, silently. */
         const bool ffn_hc_already = g->ffn_tail_hc_fused;
         g->ffn_tail_hc_fused = false;
+        /* HC2s: the shared-split branch may have elided the copy into g->next
+         * and left ffn_out for us to read instead. */
+        const ds4_gpu_tensor *expand_src = g->ffn_expand_from;
+        g->ffn_expand_from = NULL;
         ok = ffn_hc_already ? ok :
              ds4_gpu_hc_expand_tensor(g->hc_next,
-                                      g->next,
+                                      expand_src ? expand_src : g->next,
                                       g->hc_after_attn,
                                       g->hc_post,
                                       g->hc_comb,
