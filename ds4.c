@@ -13290,8 +13290,9 @@ static int glm53_hc_kda_out_fuse_requested(void) {
 }
 
 static int glm53_hc_pre_fuse_requested(void) {
+    /* Default ON. Set DS4_GLM_HC_PRE_FUSE=0 to disable. */
     const char *env = getenv("DS4_GLM_HC_PRE_FUSE");
-    return env && env[0] && env[0] != '0';
+    return !(env && env[0] == '0');
 }
 
 /* S15 -- split the router (ffn_gate_inp) at DECODE.
