@@ -13202,6 +13202,34 @@ static void glm53_hc_ffn_tail_report_inert(int decode_step,
             !buffers_ok    ? " missing hc buffers" : "");
 }
 
+/* S10-A: partition DSA PREFILL by token row instead of by head.
+ *
+ * The head split (S7) owns 32 of 64 heads per rank, but DSA is absorbed MLA
+ * with n_head_kv = 1, so the latent KV read is head-SHARED and does not halve;
+ * S7 measured the attention kernel only ~6% head-parallel, and the indexer is
+ * left entirely replicated. A query-row split halves both.
+ *
+ * It REPLACES the head split rather than composing with it. Composing would
+ * leave each rank owning a quadrant of (rows x heads) and the other two
+ * quadrants computed by nobody, which with two ranks needs a redistribution
+ * exchange per DSA layer -- 11 extra big gates per chunk, and S9a showed three
+ * cost ~0.8% of prefill.
+ *
+ * It reuses the EXISTING exchange unchanged. The DSA combine is
+ * add_tensor(out, tp_bounce_out, tp_bounce_in) over a full-size buffer, so if
+ * each rank zeroes the rows it does not own, the add IS the gather. No new
+ * exchange semantics, and the attn-output k-slice (and its D1 history) is not
+ * needed on this path at all.
+ *
+ * What does NOT split: the kv_a projection and KV store stay replicated,
+ * because rank 1's rows attend to keys produced from rank 0's rows. Only the
+ * query-row-parallel work moves -- attention core, indexer scoring, q path,
+ * which M1's 2k profile puts at 14.22 of 17.76 ms. */
+static int glm53_tp_dsa_row_split_requested(void) {
+    const char *env = getenv("DS4_GLM_TP_DSA_ROW_SPLIT");
+    return env && env[0] && env[0] != '0';
+}
+
 /* DF2: pair the Q8_0 q/k decode projections.
  *
  * MEASURED NEGATIVE ON THE RIG AND RETIRED -- kept default-off as the
@@ -52448,7 +52476,18 @@ static bool glm_graph_forward_indexed_tokens(
      * output projection yields partials combined over the big-gate
      * exchange (same commutative add as the routed-FFN combine). Only the
      * split-value-proj batch chain has head ownership. */
+    /* S10-A takes precedence: the two partitions are alternatives, not layers.
+     * Needs at least 2 rows per rank to be meaningful, and the same batch-kernel
+     * prerequisites, since it reuses the same slice loop and bounce buffer. */
+    const bool tp_attn_row_split =
+        g->tp_world == 2 && g->tp_out && g->tp_in &&
+        !g->ssd_streaming &&
+        use_batch_attn_kernel &&
+        glm53_tp_dsa_row_split_requested() &&
+        n_tokens >= glm_tp_head_split_min() &&
+        n_tokens >= 4u;
     const bool tp_attn_head_split =
+        !tp_attn_row_split &&
         g->tp_world == 2 &&
         use_batch_attn_kernel &&
         use_split_value_proj &&
@@ -52456,6 +52495,24 @@ static bool glm_graph_forward_indexed_tokens(
         n_tokens >= glm_tp_head_split_min(); /* small batches replicate;
                           * the floor is env-tunable for correctness
                           * isolation (DS4_GLM_TP_HEAD_SPLIT_MIN). */
+    /* Contiguous halves. Rank 1 takes the remainder so an odd n_tokens is
+     * still covered exactly once between the two ranks. */
+    const uint32_t row_split_lo =
+        tp_attn_row_split ? (g->tp_rank == 0 ? 0u : n_tokens / 2u) : 0u;
+    const uint32_t row_split_hi =
+        tp_attn_row_split ? (g->tp_rank == 0 ? n_tokens / 2u : n_tokens)
+                          : n_tokens;
+    if (tp_attn_row_split) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "ds4: GLM S10-A DSA prefill ROW split active "
+                    "(11 DSA layers, rank %u owns rows [%u,%u) of %u; "
+                    "head split disabled)\n",
+                    g->tp_rank, row_split_lo, row_split_hi, n_tokens);
+        }
+    }
     const bool use_batch_q_rank_proj = true;
     const bool use_batch_q_proj = true;
     const bool use_batch_indexer_k_proj = true;
@@ -53188,9 +53245,11 @@ static bool glm_graph_forward_indexed_tokens(
         if (use_batch_attn_kernel) {
             const uint32_t attn_slice_cap =
                 glm_graph_indexed_prefill_batch_attn_slice_tokens();
-            for (uint32_t t0 = 0; ok && t0 < n_tokens; ) {
+            /* S10-A: this loop already walks row ranges and builds row views,
+             * so the row split is just a narrower bound on it. */
+            for (uint32_t t0 = row_split_lo; ok && t0 < row_split_hi; ) {
                 const uint32_t slice_pos = pos0 + t0;
-                uint32_t slice = n_tokens - t0;
+                uint32_t slice = row_split_hi - t0;
                 if (slice > attn_slice_cap) slice = attn_slice_cap;
                 const bool slice_causal = slice_pos < dense_limit;
                 if (slice_causal && slice > dense_limit - slice_pos) {
@@ -53440,7 +53499,7 @@ static bool glm_graph_forward_indexed_tokens(
                                       (uint64_t)n_tokens * g->heads_dim,
                                       il,
                                       pos0);
-        if (ok && tp_attn_head_split) {
+        if (ok && (tp_attn_head_split || tp_attn_row_split)) {
             ok = glm_graph_tp_batch_bounce_ready(g, n_tokens);
         }
         if (ok) {
@@ -53448,7 +53507,18 @@ static bool glm_graph_forward_indexed_tokens(
              * unowned head columns, so the result is this rank's partial;
              * it must land in the shared bounce tensor for the exchange. */
             ds4_gpu_tensor *attn_out_dst =
-                tp_attn_head_split ? g->tp_bounce_out : g->batch_attn_out;
+                (tp_attn_head_split || tp_attn_row_split) ? g->tp_bounce_out
+                                                          : g->batch_attn_out;
+            /* S10-A: this rank projects ONLY its own rows, so every other row
+             * of the bounce must be zero -- the exchange's add then acts as a
+             * gather. Zeroing the whole buffer first is one fill dispatch
+             * against n_tokens x n_embd floats and avoids having to reason
+             * about which rows the peer will fill. */
+            if (ok && tp_attn_row_split) {
+                ok = ds4_gpu_tensor_fill_f32(
+                        attn_out_dst, 0.0f,
+                        (uint64_t)n_tokens * DS4_N_EMBD) != 0;
+            }
             if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ATTN_OUT)) { /* ablate */ } else
             /* Required for correctness, not an optimization -- see
              * glm53_prefill_attnout_kslice().  Each rank projects only its own
@@ -53457,7 +53527,36 @@ static bool glm_graph_forward_indexed_tokens(
              * per chunk, and rig arm 2026-09-01-E3 shows they are not: the two
              * paths disagree by max|delta| 7.74 with argmax flips, against a
              * 0.017 control. */
-            if (tp_attn_head_split &&
+            if (ok && tp_attn_row_split) {
+                /* Full width -- every head column of these rows belongs to
+                 * this rank, so there is no k-slice and no partial. */
+                const uint32_t rows = row_split_hi - row_split_lo;
+                ds4_gpu_tensor *heads_rows = ds4_gpu_tensor_view(
+                        g->batch_heads,
+                        (uint64_t)row_split_lo * g->heads_dim * sizeof(float),
+                        (uint64_t)rows * g->heads_dim * sizeof(float));
+                ds4_gpu_tensor *out_rows = ds4_gpu_tensor_view(
+                        attn_out_dst,
+                        (uint64_t)row_split_lo * DS4_N_EMBD * sizeof(float),
+                        (uint64_t)rows * DS4_N_EMBD * sizeof(float));
+                if (!heads_rows || !out_rows) {
+                    fprintf(stderr,
+                            "ds4: GLM S10-A row-split attn-out views failed "
+                            "(layer %u rows %u..%u)\n",
+                            il, row_split_lo, row_split_hi);
+                    ok = false;
+                } else {
+                    ok = glm_graph_matmul_q8_0_tensor(out_rows,
+                                                      model,
+                                                      l->attn_output->abs_offset,
+                                                      g->heads_dim,
+                                                      DS4_N_EMBD,
+                                                      heads_rows,
+                                                      rows) != 0;
+                }
+                ds4_gpu_tensor_free(out_rows);
+                ds4_gpu_tensor_free(heads_rows);
+            } else if (tp_attn_head_split &&
                 !g->quality &&
                 glm53_prefill_attnout_kslice() &&
                 n_tokens >= 32u) {
@@ -53520,7 +53619,11 @@ static bool glm_graph_forward_indexed_tokens(
                                                         n_tokens));
             }
         }
-        if (ok && tp_attn_head_split) {
+        /* S10-A rides the identical combine: add(bounce_out, bounce_in). Under
+         * the head split those are two partials of every row; under the row
+         * split they are disjoint row ranges with zeros elsewhere, so the same
+         * add reconstructs the full batch. */
+        if (ok && (tp_attn_head_split || tp_attn_row_split)) {
             ok = glm_graph_tp_batch_ffn_combine(g, il, g->batch_attn_out, n_tokens);
         }
 glm53_indexed_attention_done:
