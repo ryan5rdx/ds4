@@ -1408,6 +1408,10 @@ static uint64_t ds4_gpu_effective_model_max_tensor_bytes(uint64_t map_size, uint
 }
 
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_name);
+/* Pipeline coverage; see the block comment above ds4_gpu_get_pipeline. Each
+ * specialised family (mul_mm, mul_mv, flash_attn) keeps its own cache and so
+ * needs its own note -- get_pipeline alone would miss all of them. */
+static inline void ds4_gpu_pipeline_cov_note(const char *name);
 static int ds4_gpu_warm_model_views(void);
 static double ds4_gpu_gib(uint64_t bytes);
 
@@ -2240,6 +2244,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_pipeline(
         const char *function_name,
         bool        bc_inp,
         bool        bc_out) {
+    ds4_gpu_pipeline_cov_note(function_name);
     NSString *key = [NSString stringWithFormat:@"%s_bci=%d_bco=%d",
                      function_name, bc_inp ? 1 : 0, bc_out ? 1 : 0];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
@@ -2275,6 +2280,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_pipeline(
 static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_id_pipeline(
         const char *function_name,
         bool        bc_inp) {
+    ds4_gpu_pipeline_cov_note(function_name);
     NSString *key = [NSString stringWithFormat:@"%s_bci=%d",
                      function_name, bc_inp ? 1 : 0];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
@@ -2346,8 +2352,188 @@ static void ds4_gpu_pipeline_fast_insert(
     /* Bucket full: the dictionary path still answers correctly. */
 }
 
+/* ---- Pipeline coverage (DS4_METAL_PIPELINE_COVERAGE=1) --------------------
+ *
+ * Catches the defect this campaign hit six times running: a specialised kernel
+ * is compiled into the library but no call site ever selects it at the
+ * shipping shape, so the slower sibling runs and nothing reports it.
+ *
+ * DENOMINATOR is every function name in the Metal library, snapshotted at
+ * load. That is the only honest set. Registering names as pipelines are
+ * *created* would miss exactly the kernels of interest, because an unreachable
+ * call site never creates its pipeline -- there would be nothing to report.
+ *
+ * NUMERATOR counts a call site SELECTING a pipeline, which is not the same as
+ * creating one. ds4_gpu_init eagerly creates 83 pipelines up front; counting
+ * those as hits would mark most of the library "reached" before a single token
+ * is decoded, hiding the very defect this is for. So hits are recorded only
+ * after g_pipeline_cov_init_done is set at the end of init. That flag is set
+ * only when coverage is enabled, so the hot-path cost when it is off is one
+ * load and one predictable branch.
+ *
+ * KNOWN GAP: 56 encode sites use [enc setComputePipelineState:g_x_pipeline] on
+ * an eagerly-created global, bypassing both accessors. Their 43 distinct
+ * kernels are listed in g_pipeline_cov_expected[] below. All 43 are generic
+ * always-used kernels (get_rows, cpy, add, rms_norm) rather than specialised
+ * variants, so excluding them costs no coverage of the target class -- but a
+ * zero-hit report for one of them would be meaningless, hence the table.
+ * Routing those sites through a counting helper would retire the exclusion.
+ */
+enum { DS4_PIPELINE_COV_SLOTS = 2048u };
+
+typedef struct {
+    const char *name;
+    uint64_t hits;
+} ds4_gpu_pipeline_cov_entry;
+
+static ds4_gpu_pipeline_cov_entry g_pipeline_cov[DS4_PIPELINE_COV_SLOTS];
+static uint32_t g_pipeline_cov_count;
+static int g_pipeline_cov_init_done;
+static const char *g_pipeline_cov_unregistered[64];
+static uint32_t g_pipeline_cov_unregistered_n;
+
+static const struct { const char *name; const char *reason; }
+g_pipeline_cov_expected[] = {
+#include "ds4_metal_pipeline_cov_expected.inc"
+};
+
+static int ds4_gpu_pipeline_coverage_enabled(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        enabled = getenv("DS4_METAL_PIPELINE_COVERAGE") != NULL;
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static uint32_t ds4_gpu_pipeline_cov_hash(const char *name) {
+    uint32_t h = 2166136261u;
+    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+        h ^= *p;
+        h *= 16777619u;
+    }
+    return h & (DS4_PIPELINE_COV_SLOTS - 1u);
+}
+
+static void ds4_gpu_pipeline_cov_register(const char *name) {
+    const uint32_t h = ds4_gpu_pipeline_cov_hash(name);
+    for (uint32_t i = 0; i < DS4_PIPELINE_COV_SLOTS; i++) {
+        ds4_gpu_pipeline_cov_entry *e =
+            &g_pipeline_cov[(h + i) & (DS4_PIPELINE_COV_SLOTS - 1u)];
+        if (!e->name) {
+            e->name = strdup(name);
+            e->hits = 0;
+            g_pipeline_cov_count++;
+            return;
+        }
+        if (strcmp(e->name, name) == 0) return;
+    }
+}
+
+static void ds4_gpu_pipeline_cov_hit(const char *name) {
+    const uint32_t h = ds4_gpu_pipeline_cov_hash(name);
+    for (uint32_t i = 0; i < DS4_PIPELINE_COV_SLOTS; i++) {
+        ds4_gpu_pipeline_cov_entry *e =
+            &g_pipeline_cov[(h + i) & (DS4_PIPELINE_COV_SLOTS - 1u)];
+        if (!e->name) break;
+        if (strcmp(e->name, name) == 0) { e->hits++; return; }
+    }
+    /* A selection whose name is not in the library snapshot. Silently dropping
+     * it would let the report under-count without saying so, which is the one
+     * failure this tool must not have -- a missed hit reads as a zero-hit
+     * kernel, and a missed hit on a name we never registered reads as nothing
+     * at all. Record the name so the report can show it. */
+    if (g_pipeline_cov_unregistered_n <
+        (uint32_t)(sizeof(g_pipeline_cov_unregistered) /
+                   sizeof(g_pipeline_cov_unregistered[0]))) {
+        for (uint32_t i = 0; i < g_pipeline_cov_unregistered_n; i++)
+            if (strcmp(g_pipeline_cov_unregistered[i], name) == 0) return;
+        g_pipeline_cov_unregistered[g_pipeline_cov_unregistered_n++] = strdup(name);
+    }
+}
+
+/* Hot path. g_pipeline_cov_init_done stays 0 forever when coverage is off. */
+static inline void ds4_gpu_pipeline_cov_note(const char *name) {
+    if (!g_pipeline_cov_init_done) return;
+    ds4_gpu_pipeline_cov_hit(name);
+}
+
+static int ds4_gpu_pipeline_cov_is_expected(const char *name,
+                                            const char **reason_out) {
+    const size_t n = sizeof(g_pipeline_cov_expected) /
+                     sizeof(g_pipeline_cov_expected[0]);
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(g_pipeline_cov_expected[i].name, name) == 0) {
+            if (reason_out) *reason_out = g_pipeline_cov_expected[i].reason;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int ds4_gpu_pipeline_cov_cmp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+static void ds4_gpu_pipeline_coverage_report(void) {
+    if (!ds4_gpu_pipeline_coverage_enabled()) return;
+
+    const char **zero = calloc(DS4_PIPELINE_COV_SLOTS, sizeof(*zero));
+    if (!zero) return;
+    uint32_t n_zero = 0, n_hit = 0, n_excluded = 0;
+    for (uint32_t i = 0; i < DS4_PIPELINE_COV_SLOTS; i++) {
+        const ds4_gpu_pipeline_cov_entry *e = &g_pipeline_cov[i];
+        if (!e->name) continue;
+        if (e->hits) { n_hit++; continue; }
+        if (ds4_gpu_pipeline_cov_is_expected(e->name, NULL)) {
+            n_excluded++;
+            continue;
+        }
+        zero[n_zero++] = e->name;
+    }
+    qsort(zero, n_zero, sizeof(*zero), ds4_gpu_pipeline_cov_cmp);
+
+    fprintf(stderr,
+            "\nds4: pipeline-coverage: %u compiled, %u selected, "
+            "%u expected-unreachable, %u UNEXPECTED zero-hit\n",
+            g_pipeline_cov_count, n_hit, n_excluded, n_zero);
+    for (uint32_t i = 0; i < n_zero; i++)
+        fprintf(stderr, "ds4: pipeline-coverage: zero-hit %s\n", zero[i]);
+    if (n_zero) {
+        fprintf(stderr,
+                "ds4: pipeline-coverage: a zero-hit kernel is compiled but no "
+                "call site selected it on this run. Either a selector is "
+                "gated wrong, or add it to g_pipeline_cov_expected[] with a "
+                "reason.\n");
+    }
+    for (uint32_t i = 0; i < g_pipeline_cov_unregistered_n; i++) {
+        fprintf(stderr,
+                "ds4: pipeline-coverage: UNREGISTERED selection %s -- selected "
+                "but absent from the library snapshot, so hits on it are not "
+                "counted anywhere\n",
+                g_pipeline_cov_unregistered[i]);
+    }
+    free(zero);
+
+    if (n_zero && getenv("DS4_METAL_PIPELINE_COVERAGE_STRICT")) {
+        fflush(stderr);
+        _exit(3); /* skips remaining atexit handlers, by design: CI gate */
+    }
+}
+
+static void ds4_gpu_pipeline_coverage_register_library(id<MTLLibrary> library) {
+    if (!ds4_gpu_pipeline_coverage_enabled() || !library) return;
+    for (NSString *fn in [library functionNames]) {
+        const char *c = [fn UTF8String];
+        if (c) ds4_gpu_pipeline_cov_register(c);
+    }
+    atexit(ds4_gpu_pipeline_coverage_report);
+}
+
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
         const char *function_name) {
+    ds4_gpu_pipeline_cov_note(function_name);
     const uint32_t slot = ds4_gpu_pipeline_slot(function_name);
     for (uint32_t probe = 0; probe < DS4_PIPELINE_FAST_PROBES; probe++) {
         ds4_gpu_pipeline_fast_entry *e =
@@ -2396,6 +2582,7 @@ static int ds4_gpu_disable_hot_pipeline_statics(void) {
 static id<MTLComputePipelineState> ds4_gpu_hot_pipeline(
         id<MTLComputePipelineState> pipeline,
         const char *fallback_name) {
+    ds4_gpu_pipeline_cov_note(fallback_name);
     if (!ds4_gpu_disable_hot_pipeline_statics()) return pipeline;
     return ds4_gpu_get_pipeline(fallback_name);
 }
@@ -2917,6 +3104,7 @@ int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled) {
 static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_pipeline(
         const char *function_name,
         int16_t     nsg) {
+    ds4_gpu_pipeline_cov_note(function_name);
     uint16_t fast_name_len = 0;
     uint64_t fast_hash = 0;
     const bool fast_key_valid =
@@ -2984,6 +3172,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_pipeline(
 static id<MTLComputePipelineState> ds4_gpu_new_mul_mv_tg_multiple_pipeline(
         const char *function_name,
         int16_t     nsg) {
+    ds4_gpu_pipeline_cov_note(function_name);
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
 
@@ -3196,6 +3385,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_ext_pipeline(
         const char *function_name,
         int16_t     nsg,
         int16_t     nxpsg) {
+    ds4_gpu_pipeline_cov_note(function_name);
     uint16_t fast_name_len = 0;
     uint64_t fast_hash = 0;
     const bool fast_key_valid =
@@ -3254,6 +3444,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_ext_pipeline(
 static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pad_pipeline(
         bool    has_mask,
         int32_t ncpsg) {
+    ds4_gpu_pipeline_cov_note("kernel_flash_attn_ext_pad");
     /*
      * Decode calls this once per layer with identical arguments, so memoize
      * the last hit and skip the NSString key + dictionary lookup on the hot
@@ -3313,6 +3504,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pad_pipeline(
 static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_blk_pipeline(
         int32_t nqptg,
         int32_t ncpsg) {
+    ds4_gpu_pipeline_cov_note("kernel_flash_attn_ext_blk");
     /*
      * Decode calls this once per layer with identical arguments, so memoize
      * the last hit and skip the NSString key + dictionary lookup on the hot
@@ -3380,6 +3572,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_pipeline(
         int32_t     ns10,
         int32_t     ns20,
         int32_t     nsg) {
+    ds4_gpu_pipeline_cov_note(function_name);
     /*
      * Prefill and batched decode call this once per layer with identical
      * arguments, so memoize the last hit and skip the NSString key + dictionary
@@ -3475,6 +3668,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
         int32_t     ns20,
         int32_t     nsg,
         int32_t     nwg) {
+    ds4_gpu_pipeline_cov_note(function_name);
     /*
      * Decode calls this once per layer with identical arguments, so memoize
      * the last hit and skip the NSString key + dictionary lookup on the hot
@@ -3556,6 +3750,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_vec_pipeline(
 static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_rope_pipeline(
         int32_t dv,
         int32_t nwg) {
+    ds4_gpu_pipeline_cov_note("kernel_flash_attn_ext_vec_reduce_rope");
     static int32_t memo_dv, memo_nwg;
     static id<MTLComputePipelineState> memo_pipeline;
     if (memo_pipeline && memo_dv == dv && memo_nwg == nwg) {
@@ -3606,6 +3801,7 @@ int ds4_gpu_decode_attn_rope_fuse_available(void) {
 static id<MTLComputePipelineState> ds4_gpu_get_flash_attn_reduce_pipeline(
         int32_t dv,
         int32_t nwg) {
+    ds4_gpu_pipeline_cov_note("kernel_flash_attn_ext_vec_reduce");
     /* Same per-layer memo pattern as the vec getter above. */
     static int32_t memo_dv, memo_nwg;
     static id<MTLComputePipelineState> memo_pipeline;
@@ -6769,6 +6965,7 @@ int ds4_gpu_init(void) {
             return 0;
         }
         g_library = library;
+        ds4_gpu_pipeline_coverage_register_library(library);
 
         id<MTLFunction> fn = [library newFunctionWithName:@"kernel_get_rows_f32"];
         if (!fn) {
@@ -8976,6 +9173,9 @@ int ds4_gpu_init(void) {
         }
 
         g_initialized = 1;
+        /* Eager pipeline creation above is finished; from here a
+         * get_pipeline/hot_pipeline call means a call site chose a kernel. */
+        if (ds4_gpu_pipeline_coverage_enabled()) g_pipeline_cov_init_done = 1;
     }
 
     return 1;
