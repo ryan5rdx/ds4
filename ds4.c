@@ -53519,15 +53519,27 @@ static bool glm_graph_forward_indexed_tokens(
             ds4_gpu_tensor *attn_out_dst =
                 (tp_attn_head_split || tp_attn_row_split) ? g->tp_bounce_out
                                                           : g->batch_attn_out;
-            /* S10-A: this rank projects ONLY its own rows, so every other row
-             * of the bounce must be zero -- the exchange's add then acts as a
-             * gather. Zeroing the whole buffer first is one fill dispatch
-             * against n_tokens x n_embd floats and avoids having to reason
-             * about which rows the peer will fill. */
+            /* S10-A: this rank projects ONLY its own rows, so the rows it does
+             * NOT own must be zero for the exchange's add to act as a gather.
+             *
+             * Zero exactly the un-owned range, on the GPU. The first cut used
+             * ds4_gpu_tensor_fill_f32 over the whole buffer, which is a CPU
+             * loop -- at 4096 tokens that is 67 MB of serial CPU stores per
+             * DSA layer, ~738 MB per chunk, which would have swamped the
+             * partition it was meant to measure. The owned half needs no
+             * zeroing: the projection below overwrites it. */
             if (ok && tp_attn_row_split) {
-                ok = ds4_gpu_tensor_fill_f32(
-                        attn_out_dst, 0.0f,
-                        (uint64_t)n_tokens * DS4_N_EMBD) != 0;
+                const uint64_t lo = (uint64_t)row_split_lo * DS4_N_EMBD;
+                const uint64_t hi = (uint64_t)row_split_hi * DS4_N_EMBD;
+                const uint64_t all = (uint64_t)n_tokens * DS4_N_EMBD;
+                if (lo > 0) {
+                    ok = ds4_gpu_tensor_fill_f32_range(attn_out_dst, 0.0f,
+                                                       0, lo) != 0;
+                }
+                if (ok && hi < all) {
+                    ok = ds4_gpu_tensor_fill_f32_range(attn_out_dst, 0.0f,
+                                                       hi, all - hi) != 0;
+                }
             }
             if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ATTN_OUT)) { /* ablate */ } else
             /* Required for correctness, not an optimization -- see

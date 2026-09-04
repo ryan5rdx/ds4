@@ -215,3 +215,18 @@ kernel void kernel_add3_f32(
     if (i >= args.n) return;
     out[i] = a[i] + b[i] + c[i];
 }
+
+// GPU fill. S10-A needs to zero the half of the attention bounce it does not
+// own, so the exchange's add acts as a gather over disjoint row ranges.
+//
+// ds4_gpu_tensor_fill_f32 exists but writes from the CPU in a loop -- fine for
+// the allocation-time state init it was written for, catastrophic in a prefill
+// inner loop: at 4096 tokens the non-owned half is 33 MB, and eleven DSA
+// layers would be a third of a gigabyte of serial CPU stores per chunk.
+kernel void kernel_fill_f32(
+        constant uint  & n,
+        constant float & value,
+        device   float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid < n) dst[gid] = value;
+}

@@ -51,6 +51,15 @@ void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
+
+/* GPU-side fill of a sub-range, in elements. Unlike ds4_gpu_tensor_fill_f32
+ * (a CPU loop, for allocation-time init) this encodes a dispatch, so it is
+ * ordered with surrounding GPU work and costs no CPU time. */
+int ds4_gpu_tensor_fill_f32_range(
+        ds4_gpu_tensor *tensor,
+        float             value,
+        uint64_t          offset_elems,
+        uint64_t          count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,

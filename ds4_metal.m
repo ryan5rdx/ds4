@@ -9542,6 +9542,46 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     return (uint8_t *)[obj.buffer contents] + obj.offset;
 }
 
+int ds4_gpu_tensor_fill_f32_range(ds4_gpu_tensor *tensor,
+                                  float value,
+                                  uint64_t offset_elems,
+                                  uint64_t count) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!tensor) return 0;
+    if (count == 0) return 1;
+    const uint64_t cap = ds4_gpu_tensor_bytes(tensor) / sizeof(float);
+    if (offset_elems > cap || count > cap - offset_elems) return 0;
+    if (count > UINT32_MAX) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> buf = ds4_gpu_tensor_buffer(tensor);
+        if (!buf) return 0;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_fill_f32");
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        const uint32_t n = (uint32_t)count;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        DS4_SET_PIPE(enc, pipeline);
+        [enc setBytes:&n length:sizeof(n) atIndex:0];
+        [enc setBytes:&value length:sizeof(value) atIndex:1];
+        [enc setBuffer:buf
+                offset:ds4_gpu_tensor_offset(tensor) +
+                       (NSUInteger)(offset_elems * sizeof(float))
+               atIndex:2];
+        const NSUInteger tg = 256;
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((count + tg - 1) / tg, 1, 1)
+                      threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "fill f32 range")) return 0;
+    }
+    return 1;
+}
+
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
     if (!tensor || count > ds4_gpu_tensor_bytes(tensor) / sizeof(float)) return 0;
     float *p = ds4_gpu_tensor_contents(tensor);
