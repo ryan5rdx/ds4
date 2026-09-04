@@ -13288,8 +13288,9 @@ static int glm53_q8_qk_pair_requested(void) {
 }
 
 static int glm53_hc_kda_out_fuse_requested(void) {
+    /* Default ON. Set DS4_GLM_HC_KDA_OUT_FUSE=0 to disable. */
     const char *env = getenv("DS4_GLM_HC_KDA_OUT_FUSE");
-    return env && env[0] && env[0] != '0';
+    return !(env && env[0] == '0');
 }
 
 static int glm53_hc_pre_fuse_requested(void) {
