@@ -13389,8 +13389,9 @@ static int glm53_tp_prefill_dense_split_requested(void) {
 }
 
 static int glm53_tp_vocab_split_requested(void) {
+    /* Default ON. Set DS4_GLM_TP_VOCAB_SPLIT=0 to disable. */
     const char *env = getenv("DS4_GLM_TP_VOCAB_SPLIT");
-    return env && env[0] && env[0] != '0';
+    return !(env && env[0] == '0');
 }
 
 typedef enum {
