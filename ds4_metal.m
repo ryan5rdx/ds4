@@ -46447,7 +46447,8 @@ int ds4_gpu_glm53_matmul_bf16(
         const int bf16_splitk_shape =
             out_dim <= 64u && in_dim >= 4096u && (in_dim % 32u) == 0u;
         const int bf16_splitk =
-            bf16_splitk_env && bf16_splitk_env[0] && bf16_splitk_env[0] != '0' &&
+            /* Default ON; DS4_METAL_GLM53_BF16_MV_SPLITK=0 disables. */
+            !(bf16_splitk_env && bf16_splitk_env[0] == '0') &&
             bf16_splitk_shape;
         const bool bc_inp = (in_dim % 32u) != 0u;
         const bool bc_out = (out_dim % 64u) != 0u || (n_rows % 32u) != 0u;
