@@ -591,6 +591,13 @@ int ds4_session_pos(ds4_session *s);
  * not ds4_session_pos(), for any cache-reuse decision or cache diagnostic:
  * a GLM-5.3 rewind leaves the length set on an invalid checkpoint. */
 int ds4_session_reusable_pos(ds4_session *s);
+/* The live token vector, or NULL when the checkpoint has been invalidated.
+ * Companion to ds4_session_reusable_pos(); ds4_session_tokens() hands back the
+ * stale vector regardless of validity. */
+const ds4_tokens *ds4_session_reusable_tokens(ds4_session *s);
+/* Apply a rewind whose GLM-5.3 restore-vs-invalidate outcome was decided by
+ * the TP leader.  Workers only; everyone else calls ds4_session_rewind(). */
+void ds4_session_rewind_mode(ds4_session *s, int pos, bool want_restore);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 uint32_t ds4_session_raw_rewind_budget(const ds4_session *s);

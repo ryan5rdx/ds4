@@ -57461,6 +57461,24 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
+#ifndef DS4_NO_GPU
+    /* GLM-5.3 rollback snapshot.  The KDA layers hold a running recurrence and
+     * the DSA indexer keeps a rolling pool, so neither can be truncated the way
+     * the append-only compressed KV can; without a copy of them a rewind has to
+     * throw the whole checkpoint away.  Captured at the frontier of a
+     * successful sync, restored when a rewind targets exactly that frontier.
+     * See ds4_session_glm53_rollback_capture(). */
+    ds4_gpu_tensor *glm53_rollback_kda;
+    ds4_gpu_tensor *glm53_rollback_index;
+    float *glm53_rollback_logits;
+    int glm53_rollback_pos;
+    uint32_t glm53_rollback_dense_len;
+    /* Hash of checkpoint tokens [0, pos) at capture.  A snapshot is only valid
+     * for the timeline that produced it; re-prefilling different tokens to the
+     * same length must not be able to restore into it. */
+    uint64_t glm53_rollback_token_hash;
+    bool glm53_rollback_valid;
+#endif
 };
 
 #ifndef DS4_NO_GPU
@@ -58575,6 +58593,212 @@ static void ds4_session_glm_note_dense_cache(ds4_session *s,
     if (s->glm_graph_ready && end > s->glm_graph.ctx_cap) end = s->glm_graph.ctx_cap;
     s->glm_dense_cache_len = end;
     ds4_session_glm_cap_dense_cache(s);
+}
+
+/* ---------------------------------------------------------------------------
+ * GLM-5.3 rollback snapshot
+ *
+ * Two pieces of GLM-5.3 state are not append-only and so cannot be truncated
+ * by a rewind: the KDA conv/recurrent state (a running recurrence) and the DSA
+ * indexer tail (a rolling pool).  The compressed KV either side of them is
+ * append-only and only needs its live length capped.  Copying those two, plus
+ * the logits, is therefore enough to reconstruct the exact state at a frontier.
+ *
+ * Sized on this shape: 34 KDA layers x (4 MiB recurrent + 288 KiB conv) plus 11
+ * DSA layers x 4 KiB of indexer tail, i.e. ~146 MB, against re-prefills that
+ * measured 48-80 s.  One blit per successful sync buys back every rewind that
+ * lands on that frontier.
+ *
+ * The copy is deliberately not the MTP backup buffer: MTP can be active at the
+ * same time and owns its own.
+ * ------------------------------------------------------------------------ */
+
+static bool ds4_glm53_rollback_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *v = getenv("DS4_GLM_KDA_ROLLBACK");
+        on = (v && v[0] == '0' && v[1] == '\0') ? 0 : 1;
+    }
+    return on != 0;
+}
+
+static bool ds4_session_glm53_rollback_supported(const ds4_session *s) {
+    return s && s->glm_graph_ready && s->glm_graph.glm53 &&
+           ds4_glm53_rollback_enabled();
+}
+
+static uint64_t glm53_graph_index_tail_bytes(const ds4_glm_gpu_graph *g) {
+    if (!g || !g->glm53) return 0;
+    uint64_t total = 0;
+    for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
+        if (!glm_graph_layer_uses_full_indexer(il)) continue;
+        total += ds4_gpu_tensor_bytes(g->layer_indexer_tail_k[il]);
+    }
+    return total;
+}
+
+/* Copy the indexer tail to (save) or from (restore) the backing tensor.  The
+ * gate is a view into the same allocation as the key, so one span per layer
+ * covers both. */
+static bool glm53_graph_copy_index_tail(ds4_glm_gpu_graph *g,
+                                        ds4_gpu_tensor *backup,
+                                        bool save) {
+    if (!g || !g->glm53 || !backup) return false;
+    const uint64_t expected = glm53_graph_index_tail_bytes(g);
+    if (expected == 0) return true;
+    if (ds4_gpu_tensor_bytes(backup) < expected) return false;
+    bool ok = glm_graph_begin_commands_if_needed();
+    uint64_t offset = 0;
+    for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
+        if (!glm_graph_layer_uses_full_indexer(il)) continue;
+        ds4_gpu_tensor *t = g->layer_indexer_tail_k[il];
+        const uint64_t bytes = ds4_gpu_tensor_bytes(t);
+        if (bytes == 0) continue;
+        ok = save ? ds4_gpu_tensor_copy(backup, offset, t, 0, bytes) != 0
+                  : ds4_gpu_tensor_copy(t, 0, backup, offset, bytes) != 0;
+        offset += bytes;
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    return ok && offset == expected;
+}
+
+/* Same copy loop as glm53_graph_copy_kda_state(), against the rollback buffer
+ * rather than the MTP one. */
+static bool glm53_graph_copy_kda_state_to(ds4_glm_gpu_graph *g,
+                                          ds4_gpu_tensor *backup,
+                                          bool save) {
+    if (!g || !g->glm53 || !backup) return false;
+    const uint64_t expected = glm53_graph_kda_state_bytes(g);
+    if (expected == 0 || ds4_gpu_tensor_bytes(backup) < expected) return false;
+    bool ok = glm_graph_begin_commands_if_needed();
+    uint64_t offset = 0;
+    for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
+        if (!ds4_glm53_layer_is_kda(il)) continue;
+        ds4_gpu_tensor *state[2] = {
+            g->layer_kda_conv_state[il],
+            g->layer_kda_recurrent_state[il],
+        };
+        for (uint32_t i = 0; ok && i < 2; i++) {
+            const uint64_t bytes = ds4_gpu_tensor_bytes(state[i]);
+            ok = save ? ds4_gpu_tensor_copy(backup, offset, state[i], 0, bytes) != 0
+                      : ds4_gpu_tensor_copy(state[i], 0, backup, offset, bytes) != 0;
+            offset += bytes;
+        }
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    return ok && offset == expected;
+}
+
+static uint64_t ds4_session_token_hash(const ds4_tokens *t, int n) {
+    uint64_t h = UINT64_C(1469598103934665603);
+    if (!t) return h;
+    if (n > t->len) n = t->len;
+    for (int i = 0; i < n; i++) {
+        h ^= (uint64_t)(uint32_t)t->v[i];
+        h *= UINT64_C(1099511628211);
+    }
+    return h;
+}
+
+void ds4_session_glm53_rollback_drop(ds4_session *s) {
+    if (!s) return;
+    s->glm53_rollback_valid = false;
+    s->glm53_rollback_pos = -1;
+    s->glm53_rollback_token_hash = 0;
+}
+
+/* Capture the state at the current checkpoint frontier.
+ *
+ * MUST be called at a position both TP ranks agree on, because the restore
+ * decision is taken independently on each side and then reconciled by the
+ * mirrored rewind mode.  The only such point is the frontier of a sync that
+ * both ranks completed; see ds4_session_sync(). */
+bool ds4_session_glm53_rollback_capture(ds4_session *s) {
+    if (!ds4_session_glm53_rollback_supported(s)) return false;
+    if (!s->checkpoint_valid || s->checkpoint.len <= 0) return false;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+
+    const uint64_t kda_bytes = glm53_graph_kda_state_bytes(g);
+    const uint64_t idx_bytes = glm53_graph_index_tail_bytes(g);
+    if (kda_bytes == 0) return false;
+
+    if (!s->glm53_rollback_kda) {
+        s->glm53_rollback_kda = ds4_gpu_tensor_alloc(kda_bytes);
+        if (!s->glm53_rollback_kda) {
+            fprintf(stderr,
+                    "ds4: glm53 rollback: could not allocate %llu bytes of KDA "
+                    "snapshot; rewinds will re-prefill\n",
+                    (unsigned long long)kda_bytes);
+            return false;
+        }
+    }
+    if (idx_bytes != 0 && !s->glm53_rollback_index) {
+        s->glm53_rollback_index = ds4_gpu_tensor_alloc(idx_bytes);
+        if (!s->glm53_rollback_index) {
+            fprintf(stderr,
+                    "ds4: glm53 rollback: could not allocate %llu bytes of "
+                    "indexer snapshot; rewinds will re-prefill\n",
+                    (unsigned long long)idx_bytes);
+            return false;
+        }
+    }
+    if (!s->glm53_rollback_logits) {
+        s->glm53_rollback_logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+        if (!s->glm53_rollback_logits) return false;
+    }
+
+    if (!glm53_graph_copy_kda_state_to(g, s->glm53_rollback_kda, true) ||
+        (idx_bytes != 0 &&
+         !glm53_graph_copy_index_tail(g, s->glm53_rollback_index, true)))
+    {
+        ds4_session_glm53_rollback_drop(s);
+        return false;
+    }
+    if (s->logits) {
+        memcpy(s->glm53_rollback_logits, s->logits,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+    }
+    s->glm53_rollback_pos = s->checkpoint.len;
+    s->glm53_rollback_dense_len = s->glm_dense_cache_len;
+    s->glm53_rollback_token_hash =
+        ds4_session_token_hash(&s->checkpoint, s->checkpoint.len);
+    s->glm53_rollback_valid = true;
+    return true;
+}
+
+/* Can a rewind to `pos` be served from the snapshot?  Pure predicate: the
+ * leader evaluates it to choose the mirrored rewind mode. */
+static bool ds4_session_glm53_rollback_can_restore(const ds4_session *s, int pos) {
+    if (!ds4_session_glm53_rollback_supported(s)) return false;
+    if (!s->glm53_rollback_valid || s->glm53_rollback_pos != pos) return false;
+    if (pos < 0 || pos > s->checkpoint.len) return false;
+    /* Same length is not the same history. */
+    return ds4_session_token_hash(&s->checkpoint, pos) ==
+           s->glm53_rollback_token_hash;
+}
+
+static bool ds4_session_glm53_rollback_restore(ds4_session *s, int pos) {
+    if (!ds4_session_glm53_rollback_can_restore(s, pos)) return false;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    const uint64_t idx_bytes = glm53_graph_index_tail_bytes(g);
+    if (!glm53_graph_copy_kda_state_to(g, s->glm53_rollback_kda, false) ||
+        (idx_bytes != 0 &&
+         !glm53_graph_copy_index_tail(g, s->glm53_rollback_index, false)))
+    {
+        /* A half-applied restore is worse than none: the caller must fall back
+         * to invalidating. */
+        ds4_session_glm53_rollback_drop(s);
+        return false;
+    }
+    if (s->logits && s->glm53_rollback_logits) {
+        memcpy(s->logits, s->glm53_rollback_logits,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+    }
+    s->glm_dense_cache_len = s->glm53_rollback_dense_len;
+    s->glm_graph.kda_state_exchange_pending = 0;
+    return true;
 }
 #endif
 
@@ -68926,6 +69150,9 @@ void ds4_session_free(ds4_session *s) {
 #ifndef DS4_NO_GPU
     free(s->glm_mtp_hc);
     free(s->glm_mtp_logits0);
+    ds4_gpu_tensor_free(s->glm53_rollback_kda);
+    ds4_gpu_tensor_free(s->glm53_rollback_index);
+    free(s->glm53_rollback_logits);
 #endif
     free(s->mtp_logits);
 #ifndef DS4_NO_GPU
@@ -70442,6 +70669,12 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
          * dropped its state, so no shared position is left to rewind to. */
         if (rc == DS4_SESSION_SYNC_INTERRUPTED && logits_ok &&
             (worker_status == 0 || worker_status == DS4_SESSION_SYNC_INTERRUPTED)) {
+            /* On GLM-5.3 this rewind used to be a guaranteed loss -- it dropped
+             * the checkpoint, so an interrupted prefill cost the whole
+             * conversation.  pre_sync_len is the frontier of the previous
+             * successful sync, which is exactly where the rollback snapshot
+             * sits, so it now restores.  The leader mirrors the decision, so a
+             * worker that ran further still lands in the same state. */
             ds4_session_rewind(s, pre_sync_len);
             return rc;
         }
@@ -70467,6 +70700,21 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         snprintf(err, errlen, "unable to retain image prompt identity");
         return 1;
     }
+#ifndef DS4_NO_GPU
+    /* Take the GLM-5.3 rollback snapshot here and only here.
+     *
+     * This is the one position both TP ranks are known to share: the leader has
+     * already collected the worker's ack above, so reaching this line means
+     * both completed the same sync and both sit at prompt->len.  A capture
+     * anywhere else -- at sync entry, mid-prefill, after generation -- can land
+     * on a position only one rank holds, and then the two disagree about
+     * whether a later rewind can restore.
+     *
+     * It also happens to be the frontier both hot rewinds target: a cancelled
+     * generation rolls back to the post-prompt frontier, and an interrupted
+     * prefill rolls back to the previous sync's frontier. */
+    if (rc == 0) (void)ds4_session_glm53_rollback_capture(s);
+#endif
     return rc;
 }
 
@@ -70651,6 +70899,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
             s->mtp_draft_valid = false;
+            /* Re-prefilling a different history invalidates any snapshot taken
+             * against the old one, even at the same length. */
+            ds4_session_glm53_rollback_drop(s);
             ds4_session_glm_reset_dense_cache(s);
             if (!ds4_session_glm_reset_kda_state(s)) {
                 snprintf(err, errlen, "%s GLM KDA state reset failed", backend_name);
@@ -79901,6 +80152,8 @@ void ds4_session_invalidate(ds4_session *s) {
     s->checkpoint_image_count = 0;
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
+    /* The snapshot describes a timeline this session no longer has. */
+    ds4_session_glm53_rollback_drop(s);
     ds4_session_dspark_scheduler_begin_request(s);
     if (!ds4_session_is_cpu(s) && !ds4_session_is_glm(s)) {
         metal_graph_dspark_cache_reset(&s->graph);
@@ -79910,7 +80163,12 @@ void ds4_session_invalidate(ds4_session *s) {
 #endif
 }
 
-void ds4_session_rewind(ds4_session *s, int pos) {
+/* `decided` selects who chooses the GLM-5.3 restore-vs-invalidate outcome.
+ * false: this rank decides and (if leader) mirrors the decision.
+ * true:  apply `want_restore`, which arrived from the leader, and do not
+ *        mirror it onward. */
+static void ds4_session_rewind_core(ds4_session *s, int pos,
+                                    bool decided, bool want_restore) {
     /* Clamp before mirroring, not after.  Both ranks clamp the value they end
      * up applying to their own checkpoint length, so sending the raw pos let
      * the leader land on min(pos, leader_len) while the worker landed on
@@ -79934,8 +80192,32 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     }
 #ifndef DS4_NO_GPU
     bool glm53_state_ok = true;
-    if (ds4_session_is_glm(s) && s->glm_graph.glm53 &&
-        pos < s->checkpoint.len) {
+    const bool glm53 = ds4_session_is_glm(s) && s->glm_graph.glm53;
+    /* Decide restore-vs-invalidate BEFORE mirroring and send the decision, so
+     * both ranks apply the same one.  Deciding locally on each side is what
+     * lets validity diverge: a leader stopped exactly at `pos` skips the
+     * invalidating branch below (pos == checkpoint.len) while a worker that ran
+     * further takes it, leaving the leader believing in a checkpoint the worker
+     * has dropped.  The mirrored mode removes that entirely -- INVALIDATE is
+     * always safe and always wins. */
+    const bool glm53_can = glm53 &&
+        ds4_session_glm53_rollback_can_restore(s, pos);
+    bool glm53_restore = decided ? (want_restore && glm53) : glm53_can;
+    if (glm53_restore && !glm53_can) {
+        /* The leader asked for a restore this rank cannot serve.  The capture
+         * points are mirrored, so this should be unreachable; treat it as a
+         * protocol fault rather than silently diverging. */
+        fprintf(stderr,
+                "ds4: tp: rewind RESTORE to %d has no matching rollback "
+                "snapshot on this rank; invalidating\n", pos);
+        glm53_restore = false;
+        if (s->engine && s->engine->tp.ctx) ds4_tp_mark_failed(s->engine->tp.ctx);
+    }
+#else
+    (void)decided; (void)want_restore;
+#endif
+#ifndef DS4_NO_GPU
+    if (glm53 && pos < s->checkpoint.len && !glm53_restore) {
         (void)ds4_session_glm_mtp_rewind(s, pos);
         /* The KDA layers hold a running recurrence, not a per-token cache, so
          * unlike the compressed KV there is nothing here to truncate: the state
@@ -79945,21 +80227,32 @@ void ds4_session_rewind(ds4_session *s, int pos) {
          * sees a valid shorter checkpoint, resumes at `pos`, and feeds the
          * recurrence tokens it has already consumed.
          *
+         * ds4_session_glm53_rollback_capture() now takes a copy at every sync
+         * frontier, so the common rewinds -- a cancelled generation, an
+         * interrupted prefill -- land on a snapshot and restore instead.  This
+         * branch is the fallback for a rewind to any other position.
+         *
          * There is no cheap way back, so drop the checkpoint and let
          * ds4_session_sync() take its reset branch, which zeroes the KDA state
          * and re-prefills from scratch.  That is the same recovery this
          * function already performs when the compressor state cannot be
          * rewound, and it makes GLM rewind correct at the cost of the reuse it
          * was trying to buy.  Restoring instead of re-prefilling needs a state
-         * snapshot; worth adding only if rewind turns out to be hot, since the
-         * ordinary multi-turn append never reaches here (ds4_session_sync
-         * resumes from the common prefix without rewinding). */
+         * snapshot; that snapshot now exists -- see above. */
+        glm53_state_ok = false;
+    } else if (glm53 && !glm53_restore) {
+        /* pos == checkpoint.len with no snapshot.  The old code left the
+         * checkpoint alone here, which is exactly the asymmetry that let the
+         * two ranks disagree about validity.  Drop it on both sides instead. */
         glm53_state_ok = false;
     }
 #endif
-    if (ds4_session_tp_leader(s) &&
+    if (!decided && ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
-        if (!ds4_tp_send_rewind(s->engine->tp.ctx, s->tp_session_id, pos)) {
+        if (!ds4_tp_send_rewind_mode(s->engine->tp.ctx, s->tp_session_id, pos,
+                                     glm53_restore ?
+                                         DS4_TP_REWIND_RESTORE :
+                                         DS4_TP_REWIND_INVALIDATE)) {
             fprintf(stderr, "ds4: tp: session rewind send failed\n");
             ds4_tp_mark_failed(s->engine->tp.ctx);
         }
@@ -79997,10 +80290,33 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 #ifndef DS4_NO_GPU
     s->glm_mtp_have = 0;
     s->glm_mtp_rollback_valid = false;
-    if (!glm53_state_ok) s->checkpoint_valid = false;
+    if (glm53_restore) {
+        /* Put the recurrence and the indexer pool back to exactly what they
+         * held at `pos`, so the shortened checkpoint describes the state again
+         * and the next sync can resume from it instead of rebuilding. */
+        if (!ds4_session_glm53_rollback_restore(s, pos)) {
+            fprintf(stderr,
+                    "ds4: glm53 rollback restore failed at %d; "
+                    "invalidating the checkpoint\n", pos);
+            glm53_state_ok = false;
+        }
+    }
+    if (!glm53_state_ok) {
+        s->checkpoint_valid = false;
+        ds4_session_glm53_rollback_drop(s);
+    }
     ds4_session_dspark_scheduler_begin_request(s);
     ds4_session_glm_cap_dense_cache(s);
 #endif
+}
+
+void ds4_session_rewind(ds4_session *s, int pos) {
+    ds4_session_rewind_core(s, pos, false, false);
+}
+
+/* Worker-side entry: the leader already chose the outcome. */
+void ds4_session_rewind_mode(ds4_session *s, int pos, bool want_restore) {
+    ds4_session_rewind_core(s, pos, true, want_restore);
 }
 
 int ds4_session_pos(ds4_session *s) {
@@ -80021,6 +80337,11 @@ int ds4_session_pos(ds4_session *s) {
 int ds4_session_reusable_pos(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
     return s->checkpoint.len;
+}
+
+const ds4_tokens *ds4_session_reusable_tokens(ds4_session *s) {
+    if (!s || !s->checkpoint_valid) return NULL;
+    return &s->checkpoint;
 }
 
 int ds4_session_ctx(ds4_session *s) {

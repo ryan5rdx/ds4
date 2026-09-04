@@ -2286,8 +2286,11 @@ int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
     return ok;
 }
 
-int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos) {
-    ds4_tp_value_command msg = { session_id, (int32_t)pos, 0 };
+int ds4_tp_send_rewind_mode(ds4_tp *tp, uint64_t session_id, int pos,
+                            ds4_tp_rewind_mode mode) {
+    /* The mode rides the previously-unused `reserved` word, so the frame keeps
+     * its size and the decoder keeps its exact-length check. */
+    ds4_tp_value_command msg = { session_id, (int32_t)pos, (uint32_t)mode };
     pthread_mutex_lock(&tp->control_lock);
     const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_REWIND,
                                  &msg, sizeof(msg));
@@ -2581,6 +2584,7 @@ static int ds4_tp_recv_command_unlocked(ds4_tp *tp, ds4_tp_command *command,
         memcpy(&msg, payload, sizeof(msg));
         command->session_id = msg.session_id;
         command->value = msg.value;
+        command->flags = msg.reserved;
         break;
     }
     case DS4_TP_FRAME_SESSION_DESTROY:
@@ -3086,7 +3090,10 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
                 rc = 1;
             }
         } else if (command.type == DS4_TP_FRAME_REWIND) {
-            ds4_session_rewind(session, command.value);
+            /* Obey the leader's mode rather than re-deriving one: see
+             * ds4_tp_rewind_mode. */
+            ds4_session_rewind_mode(session, command.value,
+                                    command.flags == DS4_TP_REWIND_RESTORE);
         } else if (command.type == DS4_TP_FRAME_INVALIDATE) {
             ds4_session_invalidate(session);
         } else if (command.type == DS4_TP_FRAME_EVAL_BATCH ||

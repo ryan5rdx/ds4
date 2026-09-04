@@ -85,7 +85,9 @@
 >
 > * a chat turn ending in a tool call, truncation or cancellation rewinds to the
 >   committed prefill frontier instead of discarding the live KV cache and
->   re-prefilling from token zero
+>   re-prefilling from token zero. GLM-5.3 gets there by a different route: its
+>   KDA recurrence and DSA indexer pool cannot be truncated, so a snapshot of
+>   both is taken at each sync frontier and restored when a rewind lands on it
 > * cache-miss diagnostics that say how many tokens were lost, where the
 >   divergence began, and the token ids on each side
 > * slot routing by prefix match, and prefill issued in bounded quanta

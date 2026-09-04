@@ -9594,18 +9594,42 @@ static void request_live_state_clear(server *s, server_slot *slot) {
  * `committed_frontier` must be the position captured after the prompt sync, not
  * effective_prompt.len: the latter is 0 for a fresh request and would wipe the
  * checkpoint entirely. */
+/* Where a cancelled generation should land the session.
+ *
+ * GLM-5.3 lands on the frontier exactly: ds4_session_rewind() restores the
+ * rollback snapshot the prompt sync took there, and that snapshot carries the
+ * logits, so an identical retry samples what the prompt produced.
+ *
+ * Everything else has no snapshot.  Landing on the frontier exactly would give
+ * an identical retry nothing to evaluate -- ds4_session_sync() runs zero
+ * forward passes when the prompt equals the checkpoint -- so it would sample
+ * logits left behind by the cancelled generation and calmly resume producing
+ * the output that was just cancelled.  Leave it one token to re-evaluate, the
+ * way live_prefix_rewind_target() caps at prompt_len - 1. */
+static int cancel_rollback_target(bool is_glm53, int committed_frontier) {
+    if (committed_frontier <= 0) return 0;
+    return is_glm53 ? committed_frontier : committed_frontier - 1;
+}
+
 static void request_cancel_rollback(server *s, server_slot *slot,
                                     int committed_frontier) {
     request_live_state_clear(s, slot);
-    /* GLM-5.3 cannot rewind: ds4_session_rewind() drops the checkpoint rather
-     * than truncating the KDA recurrence, so rolling back here would trade a
-     * valid checkpoint at the interrupted frontier for an invalid one and buy
-     * nothing.  It is strictly worse than doing nothing.  Leaving the
-     * abandoned tail in place keeps ds4_session_common_prefix() able to score
-     * it -- which makes the next miss log say how far the prompt diverged
-     * instead of claiming a divergence at token 0 -- and lets a client that
-     * replays its own partial output cache-hit outright. */
-    if (ds4_engine_is_glm53(s->engine)) return;
+    /* Where to land.
+     *
+     * GLM-5.3 rewinds to the frontier exactly: ds4_session_rewind() restores
+     * the rollback snapshot taken at that same frontier by the prompt sync,
+     * and the snapshot carries the logits, so the retry samples the logits the
+     * prompt produced rather than the abandoned generation's.
+     *
+     * Everything else has no snapshot and no restored logits, so landing on the
+     * frontier exactly would leave the next identical retry with nothing to
+     * evaluate -- ds4_session_sync() does zero forward passes when the prompt
+     * equals the checkpoint -- and it would sample stale logits and simply
+     * carry on producing the output that was just cancelled.  Give it a token
+     * to re-evaluate, the same way live_prefix_rewind_target() caps at
+     * prompt_len - 1. */
+    const int target = cancel_rollback_target(ds4_engine_is_glm53(s->engine),
+                                              committed_frontier);
     pthread_mutex_lock(&s->inference_mu);
     /* Safe to rewind under tensor parallelism as well, because this is only
      * reachable once the prompt sync has *succeeded*: an interrupted or failed
@@ -9615,11 +9639,11 @@ static void request_cancel_rollback(server *s, server_slot *slot,
      * per token, and canonicalize_tool_checkpoint() mutates only through
      * ds4_session_sync()/ds4_session_invalidate(), which mirror too -- so both
      * are at the same length here and clamp the same way. */
-    ds4_session_rewind(slot->session, committed_frontier);
+    ds4_session_rewind(slot->session, target);
     /* Clamp against where the rewind actually landed, not what was asked for:
      * it snaps down to a compressor-window boundary and can end below
      * committed_frontier. */
-    const int landed = ds4_session_pos(slot->session);
+    const int landed = ds4_session_reusable_pos(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
     /* The rewind also un-does the continued-store high-water mark: leaving it
      * above the frontier makes the next generation skip its disk snapshot at
@@ -10370,7 +10394,7 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
 static void kv_cache_store_current(server *s, server_slot *slot,
                                    const char *reason) {
     if (!s || !slot) return;
-    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+    const ds4_tokens *tokens = ds4_session_reusable_tokens(slot->session);
     if (!tokens) return;
 
     char *visible_text = NULL;
@@ -10476,7 +10500,7 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!s || !slot) return;
     kv_disk_cache *kc = &s->kv;
-    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+    const ds4_tokens *tokens = ds4_session_reusable_tokens(slot->session);
     if (!tokens) return;
     const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
     if (target == 0) return;
@@ -10534,7 +10558,11 @@ static int live_text_prefix_prompt(server *s, server_slot *slot,
                                    const request *req,
                                    ds4_tokens *effective_prompt) {
     if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
-    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
+    /* Reusable, not raw.  An invalidated GLM-5.3 checkpoint keeps its tokens,
+     * and rendering them would produce a byte-prefix match and a non-zero
+     * return -- a phantom hit that recreates the mislabelled ctx span and the
+     * stuck progress bar, and suppresses the disk fallback below it. */
+    const ds4_tokens *live_tokens = ds4_session_reusable_tokens(slot->session);
     if (!live_tokens || live_tokens->len <= 0) return 0;
 
     size_t live_text_len = 0;
@@ -10773,8 +10801,19 @@ static void trace_cache_capture(
     memset(d, 0, sizeof(*d));
     d->valid = true;
     d->rewind_to = -1;
+    /* Reconcile old_pos against the token vector we were actually handed,
+     * rather than trusting it.  Callers source it from a session, and an
+     * invalidated GLM-5.3 checkpoint reports a stale length while
+     * ds4_session_reusable_tokens() correctly reports nothing -- pairing those
+     * two is what produced "leading-block-divergence diverge=154822/154822",
+     * a divergence at index 0 between two identical tokens.  Deriving the
+     * bound here makes that combination unrepresentable. */
+    const int live_avail = live ? live->len : 0;
+    if (old_pos > live_avail) old_pos = live_avail;
+    if (old_pos < 0) old_pos = 0;
     d->old_pos = old_pos;
     d->prompt_len = prompt ? prompt->len : 0;
+    if (common > old_pos) common = old_pos;
     d->common = common;
 
     const int live_len = live ? live->len : 0;
@@ -11575,7 +11614,7 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
                                                    char *err, size_t errlen) {
     if (tokens_appended) *tokens_appended = 0;
     if (!s || !slot || !suffix || !suffix[0]) return true;
-    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    const ds4_tokens *live = ds4_session_reusable_tokens(slot->session);
     if (!live) {
         if (err && errlen) snprintf(err, errlen, "live session is unavailable");
         return false;
@@ -11874,7 +11913,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
 
     size_t live_text_len = 0;
     char *live_text = render_tokens_text(s->engine,
-                                         ds4_session_tokens(slot->session),
+                                         ds4_session_reusable_tokens(slot->session),
                                          &live_text_len);
     if (live_text_len == rendered.len &&
         (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
@@ -12267,7 +12306,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * cache-hit on the prompt instead of re-prefilling from scratch. */
     int committed_frontier = 0;
     trace_cache_diag cache_diag = {0};
-    trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
+    trace_cache_capture(&cache_diag, ds4_session_reusable_tokens(slot->session),
                         &j->req.prompt, old_pos, common);
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
@@ -15067,7 +15106,7 @@ int main(int argc, char **argv) {
 
     for (int i = 0; s.kv.enabled && i < s.slot_count; i++) {
         server_slot *slot = &s.slots[i];
-        const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+        const ds4_tokens *tokens = ds4_session_reusable_tokens(slot->session);
         if (!tokens || tokens->len < s.kv.opt.min_tokens) continue;
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting resident KV cache before shutdown slot=%d tokens=%d",
@@ -18784,6 +18823,66 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_cancel_rollback_target(void) {
+    /* Non-GLM-5.3 must leave a token to re-evaluate.  Landing on the frontier
+     * exactly makes an identical retry a zero-token sync, which samples the
+     * cancelled generation's logits and resumes it. */
+    TEST_ASSERT(cancel_rollback_target(false, 32050) == 32049);
+    TEST_ASSERT(cancel_rollback_target(false, 1) == 0);
+    /* GLM-5.3 lands exactly: the restored snapshot carries the logits. */
+    TEST_ASSERT(cancel_rollback_target(true, 32050) == 32050);
+    TEST_ASSERT(cancel_rollback_target(true, 1) == 1);
+    /* Never negative, whichever model. */
+    TEST_ASSERT(cancel_rollback_target(false, 0) == 0);
+    TEST_ASSERT(cancel_rollback_target(true, 0) == 0);
+    TEST_ASSERT(cancel_rollback_target(false, -5) == 0);
+    TEST_ASSERT(cancel_rollback_target(true, -5) == 0);
+}
+
+static void test_cache_miss_reason_names_an_invalid_checkpoint(void) {
+    /* The reported misdiagnosis.  An invalidated GLM-5.3 checkpoint used to
+     * arrive here as old_pos=32050 with common=0 -- because
+     * ds4_session_common_prefix() returns 0 without comparing anything when the
+     * checkpoint is invalid -- and got classified as the client injecting a
+     * per-request block into its system prompt.  Feeding old_pos from
+     * ds4_session_reusable_pos() makes it 0, and the reason names the real
+     * cause. */
+    int ids[4] = {154822, 17, 18, 19};
+    ds4_tokens prompt = { ids, 4, 4 };
+    trace_cache_diag d;
+
+    /* Exactly the reported shape: a stale old_pos alongside no live tokens.
+     * trace_cache_capture() must reconcile the two rather than believe the
+     * caller, so this cannot be reported as a token divergence. */
+    trace_cache_capture(&d, NULL, &prompt, 32050, 0);
+    TEST_ASSERT(d.old_pos == 0);
+    TEST_ASSERT(!strcmp(trace_cache_miss_reason(&d), "no-live-checkpoint"));
+
+    trace_cache_capture(&d, NULL, &prompt, 0, 0);
+    TEST_ASSERT(!strcmp(trace_cache_miss_reason(&d), "no-live-checkpoint"));
+
+    /* With no live side the diverge pair must not invent one.  The old log
+     * printed "diverge=154822/154822" -- the same token on both sides,
+     * reported as the point where they differ. */
+    int live_tok = 0, prompt_tok = 0;
+    trace_cache_diverge_tokens(&d, &live_tok, &prompt_tok);
+    TEST_ASSERT(live_tok == -1);
+    TEST_ASSERT(!trace_cache_memory_reusable(&d));
+
+    /* A genuine leading-block divergence must still be classified as one, so
+     * the fix does not simply mute the reason. */
+    int live_ids[64];
+    for (int i = 0; i < 64; i++) live_ids[i] = 1000 + i;
+    int diff_ids[64];
+    for (int i = 0; i < 64; i++) diff_ids[i] = (i < 3) ? live_ids[i] : 9000 + i;
+    ds4_tokens live = { live_ids, 64, 64 };
+    ds4_tokens diff = { diff_ids, 64, 64 };
+    trace_cache_capture(&d, &live, &diff, 64, 3);
+    TEST_ASSERT(!strcmp(trace_cache_miss_reason(&d), "leading-block-divergence"));
+    trace_cache_diverge_tokens(&d, &live_tok, &prompt_tok);
+    TEST_ASSERT(live_tok != prompt_tok);
+}
+
 static void test_live_prefix_backend_can_rewind(void) {
     /* GLM-5.3 must always refuse.  Rewinding it drops the checkpoint, so the
      * landing position ds4_session_pos() reports back is a phantom: the caller
@@ -20405,6 +20504,8 @@ static void ds4_server_unit_tests_run(void) {
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
+    test_cancel_rollback_target();
+    test_cache_miss_reason_names_an_invalid_checkpoint();
     test_live_prefix_backend_can_rewind();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();

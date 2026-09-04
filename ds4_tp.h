@@ -189,7 +189,18 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
                                 uint32_t image_count);
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token, uint32_t flags);
-int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
+/* How a mirrored rewind must leave the checkpoint.  The leader decides and
+ * sends it rather than each rank deciding locally: on GLM-5.3 the decision
+ * depends on whether a rollback snapshot covers `pos`, and a rank that stopped
+ * exactly at `pos` would otherwise keep a checkpoint the other rank drops.
+ * INVALIDATE is always safe, so it is the value to send when in doubt. */
+typedef enum {
+    DS4_TP_REWIND_INVALIDATE = 0,
+    DS4_TP_REWIND_RESTORE    = 1,
+} ds4_tp_rewind_mode;
+
+int ds4_tp_send_rewind_mode(ds4_tp *tp, uint64_t session_id, int pos,
+                            ds4_tp_rewind_mode mode);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
 /* Abort the mirrored prefill the worker is currently running for this session.
  * Only meaningful between a SYNC and its COMMAND_ACK; see DS4_TP_FRAME_CANCEL. */
