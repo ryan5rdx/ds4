@@ -2780,6 +2780,21 @@ static id<MTLComputePipelineState> ds4_gpu_hot_pipeline(
     return ds4_gpu_get_pipeline(fallback_name);
 }
 
+/* ROUTER-SIMD: iterative simdgroup top-k instead of a 512-wide bitonic sort.
+ * Bit-identical selections and weights -- ds4_glm_router_better is a total
+ * order, so the top-k under it is unique and uniquely ordered. Opt-in until
+ * the rig confirms. */
+static int ds4_gpu_glm_router_select_simd(void) {
+    static int initialized;
+    static int enabled;
+    if (!initialized) {
+        const char *v = getenv("DS4_METAL_GLM_ROUTER_SIMD");
+        enabled = v && v[0] && v[0] != '0';
+        initialized = 1;
+    }
+    return enabled;
+}
+
 static int ds4_gpu_use_compressor_pair_nr4(void) {
     static int initialized;
     static int enabled;
@@ -37990,10 +38005,24 @@ int ds4_gpu_glm_router_select_tensor(
                                      &bias_inner);
         if (!biasbuf) return 0;
 
+        const int router_simd = ds4_gpu_glm_router_select_simd();
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_hot_pipeline(g_glm_router_select_one_pipeline,
-                                 "kernel_glm_router_select_one");
+            router_simd
+                ? ds4_gpu_get_pipeline("kernel_glm_router_select_one_simd")
+                : ds4_gpu_hot_pipeline(g_glm_router_select_one_pipeline,
+                                       "kernel_glm_router_select_one");
         if (!pipeline) return 0;
+        {
+            static int announced;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: GLM router select kernel: %s (%u experts, top %u)\n",
+                        router_simd ? "simd (ROUTER-SIMD, 1 barrier)"
+                                    : "bitonic (45 barriers)",
+                        (unsigned)n_expert, (unsigned)n_expert_used);
+            }
+        }
 
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -38014,8 +38043,11 @@ int ds4_gpu_glm_router_select_tensor(
         [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:3];
         [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:4];
         [enc setBuffer:probsbuf offset:ds4_gpu_tensor_offset(probs) atIndex:5];
-        const NSUInteger router_threads = n_expert > 256u ? 512u : 256u;
-        [enc setThreadgroupMemoryLength:router_threads *
+        /* The SIMD kernel is one simdgroup regardless of expert count, but it
+         * still indexes sel_idx at sort_width, so the allocation is unchanged. */
+        const NSUInteger sort_width = n_expert > 256u ? 512u : 256u;
+        const NSUInteger router_threads = router_simd ? 32u : sort_width;
+        [enc setThreadgroupMemoryLength:sort_width *
              (sizeof(float) + sizeof(int32_t)) atIndex:0];
         [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(router_threads, 1, 1)];
@@ -38076,10 +38108,24 @@ int ds4_gpu_glm_router_select_batch_tensor(
                                                          &bias_inner);
         if (!biasbuf) return 0;
 
+        const int router_simd = ds4_gpu_glm_router_select_simd();
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_hot_pipeline(g_glm_router_select_one_pipeline,
-                                 "kernel_glm_router_select_one");
+            router_simd
+                ? ds4_gpu_get_pipeline("kernel_glm_router_select_one_simd")
+                : ds4_gpu_hot_pipeline(g_glm_router_select_one_pipeline,
+                                       "kernel_glm_router_select_one");
         if (!pipeline) return 0;
+        {
+            static int announced;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: GLM router select kernel: %s (%u experts, top %u)\n",
+                        router_simd ? "simd (ROUTER-SIMD, 1 barrier)"
+                                    : "bitonic (45 barriers)",
+                        (unsigned)n_expert, (unsigned)n_expert_used);
+            }
+        }
 
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -38100,8 +38146,11 @@ int ds4_gpu_glm_router_select_batch_tensor(
         [enc setBuffer:selectedbuf offset:ds4_gpu_tensor_offset(selected) atIndex:3];
         [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:4];
         [enc setBuffer:probsbuf offset:ds4_gpu_tensor_offset(probs) atIndex:5];
-        const NSUInteger router_threads = n_expert > 256u ? 512u : 256u;
-        [enc setThreadgroupMemoryLength:router_threads *
+        /* The SIMD kernel is one simdgroup regardless of expert count, but it
+         * still indexes sel_idx at sort_width, so the allocation is unchanged. */
+        const NSUInteger sort_width = n_expert > 256u ? 512u : 256u;
+        const NSUInteger router_threads = router_simd ? 32u : sort_width;
+        [enc setThreadgroupMemoryLength:sort_width *
              (sizeof(float) + sizeof(int32_t)) atIndex:0];
         [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(router_threads, 1, 1)];

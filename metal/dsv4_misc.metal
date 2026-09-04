@@ -5014,6 +5014,96 @@ kernel void kernel_glm_router_select_one(
     }
 }
 
+// ROUTER-SIMD: same selection, without sorting 512 entries to read 8 of them.
+//
+// The kernel above runs a full bitonic sort over sort_width (512 for GLM 5.3's
+// 288 experts) purely to take the top k_used = 8. That is
+// sum(log2(k)) for k = 2..512 = 45 threadgroup barriers, on a threadgroup of
+// 512 threads, once per token per sparse layer.
+//
+// ds4_glm_router_better is a TOTAL order -- score descending, index ascending
+// on ties -- so "the top 8 under it" is a unique, uniquely-ordered set. An
+// iterative selection therefore produces bit-identical selections to the sort,
+// and the weight loop below is copied verbatim so the weights are identical
+// too. This is not an approximation.
+//
+// One simdgroup per token. Each lane owns the strided subset e = tid, tid+32,
+// ... and keeps a bitmask of which of its own entries are already taken, so
+// masking needs no threadgroup traffic. The cross-lane max is a 5-step
+// butterfly on (score, index) with simd_shuffle_xor, which needs no barriers
+// at all: 1 barrier total (after filling the scores) instead of 45.
+kernel void kernel_glm_router_select_one_simd(
+        constant ds4_metal_args_glm_router_select_one & args,
+        device const float *logits,
+        device const float *bias,
+        device int32_t *selected,
+        device float *weights,
+        device float *probs,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint token [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]]) {
+    const uint sort_width = args.n_expert > 256u ? 512u : 256u;
+    threadgroup float   *sel_scores = scratch;
+    threadgroup int32_t *sel_idx    = (threadgroup int32_t *)(scratch + sort_width);
+
+    device const float *token_logits   = logits   + (uint64_t)token * args.n_expert;
+    device int32_t     *token_selected = selected + (uint64_t)token * args.n_expert_used;
+    device float       *token_weights  = weights  + (uint64_t)token * args.n_expert_used;
+    device float       *token_probs    = probs    + (uint64_t)token * args.n_expert;
+
+    const uint n_expert = min(args.n_expert, 512u);
+    const uint k_used   = min(args.n_expert_used, n_expert);
+
+    for (uint e = tid; e < n_expert; e += 32u) {
+        const float p = ds4_glm_router_sigmoid(token_logits[e]);
+        token_probs[e] = p;
+        sel_scores[e]  = p + bias[e];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint taken = 0u;   // bit s set => this lane's entry (tid + 32*s) is spent
+    for (uint r = 0; r < k_used; r++) {
+        float best_s = -INFINITY;
+        int   best_i = 0x7fffffff;
+        uint  slot   = 0u;
+        uint  s      = 0u;
+        for (uint e = tid; e < n_expert; e += 32u, s++) {
+            if (taken & (1u << s)) continue;
+            const float sc = sel_scores[e];
+            // Identical predicate to ds4_glm_router_better.
+            if (sc > best_s || (sc == best_s && (int)e < best_i)) {
+                best_s = sc; best_i = (int)e; slot = s;
+            }
+        }
+        for (uint off = 16u; off > 0u; off >>= 1) {
+            const float os = simd_shuffle_xor(best_s, off);
+            const int   oi = simd_shuffle_xor(best_i, off);
+            if (os > best_s || (os == best_s && oi < best_i)) {
+                best_s = os; best_i = oi;
+            }
+        }
+        // Every lane now holds the winner. The lane that owns it retires that
+        // entry; `slot` is still its own pre-reduction slot, which is the
+        // right one precisely because the winner was that lane's local best.
+        if ((uint)best_i % 32u == tid) taken |= (1u << slot);
+        if (tid == 0u) sel_idx[r] = best_i;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < k_used) token_selected[tid] = sel_idx[tid];
+
+    // Verbatim from the sorting kernel, including the summation order, so the
+    // weights are bit-identical and not merely equivalent.
+    if (tid < k_used) {
+        float sum = 0.0f;
+        for (uint i = 0; i < k_used; i++) {
+            sum += token_probs[(uint)sel_idx[i]];
+        }
+        sum = max(sum, 6.103515625e-5f);
+        token_weights[tid] = token_probs[(uint)sel_idx[tid]] / sum * args.expert_weight_scale;
+    }
+}
+
 // Batched Flash-router weight finalization after selection is already known.
 // Six active lanes deliberately match kernel_sum_rows_f32_f32's reduction
 // topology. The denominator and divided weights cross threadgroup storage
