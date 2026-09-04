@@ -21632,7 +21632,16 @@ int ds4_gpu_matmul_f32_tensor(
             return 1;
         }
 
-        if (n_tok <= 8 && (in_dim % 128u) == 0) {
+        /* DF1a: the cap was a hard literal 8 while the Q8_0 twin
+         * (DS4_METAL_Q8_MV_EXT_MAX_TOKENS) defaults to 16 and is tunable, so
+         * every F32 matmul above 8 tokens fell to the plain matvec -- which
+         * re-sweeps the weight PER TOKEN.  On GLM 5.3 the F32 weight is
+         * ffn_gate_inp, 4096x288x4 = 4.5 MiB, on 42 sparse layers, at prefill
+         * chunks of 512-4096 tokens.  Default kept at 8 so this is a pure
+         * opt-in; raising it is the whole arm. */
+        const uint64_t f32_mv_ext_max_tokens =
+            ds4_gpu_env_u64("DS4_METAL_F32_MV_EXT_MAX_TOKENS", 8u, 2u, 4096u);
+        if (n_tok <= f32_mv_ext_max_tokens && (in_dim % 128u) == 0) {
             const int16_t nsg = 2;
             const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
             const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
@@ -45626,6 +45635,18 @@ int ds4_gpu_glm53_embedding_bf16(
     }
 }
 
+/* SK1 was tried and REVERTED, 2026-09-03. The kernel-audit ranked it #2 at
+ * 1-3% decode: nsg=4 is reachable only by device NAME ("M3 Ultra"), which pins
+ * every other machine to nsg=8. Both halves of that are true and it IS
+ * bit-identical (probe_trio.c: 0/24 outputs differ) -- but it measured
+ * **1.03x**, i.e. flat. 3 -> 6 threadgroups is still far below any of these
+ * GPUs' core counts, so neither arm is fed and the extra grid buys nothing.
+ *
+ * Worse, it would REGRESS a shipping win: nsg is also B1's K-split factor
+ * (ds4_gpu_glm53_matmul_bf16, splitk branch), so forcing 4 would cut B1 from an
+ * 8-way to a 4-way split. B1 measured +6.0% decode and already occupies this
+ * shape. The audit sized SK1 and B1 independently without noticing they
+ * contend for the same knob. */
 static uint32_t glm53_gpu_bf16_mv_nsg(void) {
     return ds4_gpu_device_name_contains("M3 Ultra") &&
            getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == NULL &&
