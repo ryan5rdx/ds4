@@ -42762,6 +42762,14 @@ typedef struct ds4_glm_gpu_graph {
      * standalone expand must be skipped.  Same per-layer discipline as
      * kda_attn_hc_fused: cleared unconditionally where it is consumed. */
     bool ffn_tail_hc_fused;
+    /* HC3s: the KDA head-split variant.  On the split path the projection
+     * cannot be fused with the expand (the RDMA exchange sits between them),
+     * but the COMBINE can: the expand kernel already folds one extra addend
+     * via has_add.  Non-NULL means "the combine has been deferred; the expand
+     * owes attn_out = a + b".  Same per-layer discipline as the flags above:
+     * consumed and cleared unconditionally at the expand site. */
+    const ds4_gpu_tensor *kda_combine_a;
+    const ds4_gpu_tensor *kda_combine_b;
     ds4_imatrix_collector *imatrix;
     ds4_gpu_tensor *directional_steering_dirs_by_tier[DS4_MAX_GPUS];
     float directional_steering_attn_scale;
@@ -46176,32 +46184,42 @@ static bool glm53_graph_kda_attention(
                                                    g->kda_out,
                                                    0);
         if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_ATTN) != 0;
-        if (ok) ok = ds4_gpu_add_tensor(g->attn_out,
-                                        g->tp_out[attn_slot],
-                                        g->tp_in[attn_slot],
-                                        DS4_N_EMBD) != 0;
-        if (!ok) {
-            fprintf(stderr,
-                    "ds4: GLM KDA head-split gate/combine failed (layer %u)\n",
-                    il);
-        }
-        /* This branch returns before the HC3 fusion below is ever considered,
-         * so DS4_GLM_TP_KDA_SPLIT silently disables HC3 -- and that split is
-         * part of the production TP2 stack.  Structural, like HC2: attn_out
-         * only exists after the exchange and combine, so a kernel fusing the
-         * projection with the HC expand would have to span the gate.  The
-         * fusion that IS available here is combine+expand, which is a
-         * different kernel and not yet built. */
-        if (glm53_hc_kda_out_fuse_requested()) {
+        /* HC3s.  The projection cannot be fused with the HC expand here -- the
+         * exchange sits between them -- but the combine can, because the
+         * expand kernel already folds one extra addend (args.has_add).  Defer
+         * it and let the expand site do  attn_out = tp_out + tp_in  inline,
+         * turning 2 dispatches into 1 on all 34 KDA layers.
+         *
+         * Safe only because attn_out is dead on the GLM path after the expand:
+         * both remaining reads (ds4.c ~55059, ~55147) are in !glm53 branches,
+         * and the two GLM consumers between here and the expand are the
+         * directional steering call, excluded below, and the attn_out debug
+         * dump, which will show the pre-combine value while this is on. */
+        const bool defer_kda_combine =
+            ok && g->glm53 && glm53_hc_kda_out_fuse_requested() &&
+            g->directional_steering_attn_scale == 0.0f &&
+            !metal_graph_use_reference_hc_decode() &&
+            g->hc_after_attn && g->hc_cur && g->hc_post && g->hc_comb;
+        if (defer_kda_combine) {
             static int announced;
             if (!announced) {
                 announced = 1;
                 fprintf(stderr,
-                        "ds4: GLM HC3 REQUESTED BUT INERT -- the KDA head "
-                        "split (DS4_GLM_TP_KDA_SPLIT) owns this path and "
-                        "returns before the fusion. Measure HC3 only with the "
-                        "KDA split off, or build the combine+expand fusion.\n");
+                        "ds4: GLM HC3s KDA combine+HC-expand fusion active "
+                        "(34 KDA layers, 2 -> 1 dispatch)\n");
             }
+            g->kda_combine_a = g->tp_out[attn_slot];
+            g->kda_combine_b = g->tp_in[attn_slot];
+        } else if (ok) {
+            ok = ds4_gpu_add_tensor(g->attn_out,
+                                    g->tp_out[attn_slot],
+                                    g->tp_in[attn_slot],
+                                    DS4_N_EMBD) != 0;
+        }
+        if (!ok) {
+            fprintf(stderr,
+                    "ds4: GLM KDA head-split gate/combine failed (layer %u)\n",
+                    il);
         }
         return ok;
     }
@@ -55035,7 +55053,23 @@ glm53_attention_done:
              * would skip a REAL expand on the next layer, silently. */
             const bool hc_already_expanded = g->kda_attn_hc_fused;
             g->kda_attn_hc_fused = false;
+            /* HC3s: the head-split path deferred its combine to here.  Cleared
+             * unconditionally for the same reason as the flag above -- a stale
+             * pair would silently expand the previous layer's operands. */
+            const ds4_gpu_tensor *combine_a = g->kda_combine_a;
+            const ds4_gpu_tensor *combine_b = g->kda_combine_b;
+            g->kda_combine_a = NULL;
+            g->kda_combine_b = NULL;
             ok = hc_already_expanded ? ok :
+                 combine_a ?
+                 ds4_gpu_hc_expand_add_tensor(g->hc_after_attn,
+                                              combine_a,
+                                              combine_b,
+                                              g->hc_cur,
+                                              g->hc_post,
+                                              g->hc_comb,
+                                              DS4_N_EMBD,
+                                              DS4_N_HC) != 0 :
                  ds4_gpu_hc_expand_tensor(g->hc_after_attn,
                                           g->attn_out,
                                           g->hc_cur,
