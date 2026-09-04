@@ -2500,18 +2500,51 @@ static void ds4_gpu_pipeline_coverage_report(void) {
     if (!g_pipeline_cov_on) return;
 
     const char **zero = calloc(DS4_PIPELINE_COV_SLOTS, sizeof(*zero));
-    if (!zero) return;
+    const char **bound = calloc(DS4_PIPELINE_COV_SLOTS, sizeof(*bound));
+    if (!zero || !bound) { free(zero); free(bound); return; }
     uint32_t n_zero = 0, n_hit = 0;
     for (uint32_t i = 0; i < DS4_PIPELINE_COV_SLOTS; i++) {
         const ds4_gpu_pipeline_cov_entry *e = &g_pipeline_cov[i];
         if (!e->name) continue;
-        if (e->hits) { n_hit++; continue; }
+        if (e->hits) { bound[n_hit++] = e->name; continue; }
         zero[n_zero++] = e->name;
     }
     qsort(zero, n_zero, sizeof(*zero), ds4_gpu_pipeline_cov_cmp);
+    qsort(bound, n_hit, sizeof(*bound), ds4_gpu_pipeline_cov_cmp);
 
     const char *baseline_path = getenv("DS4_METAL_PIPELINE_COVERAGE_BASELINE");
     const int strict = getenv("DS4_METAL_PIPELINE_COVERAGE_STRICT") != NULL;
+
+    /* The BOUND set, with a hit count each, is the audit payload -- the whole
+     * reason this exists. The zero-hit list is mostly other models' kernels and
+     * is only useful as a regression baseline; what answers "is the specialised
+     * kernel actually running, and how often" is this list. Written to a file
+     * rather than stderr because it is meant to be diffed and committed. */
+    const char *bound_path = getenv("DS4_METAL_PIPELINE_COVERAGE_BOUND");
+    if (bound_path) {
+        FILE *bf = fopen(bound_path, "w");
+        if (bf) {
+            for (uint32_t i = 0; i < n_hit; i++) {
+                uint64_t hits = 0;
+                const uint32_t bh = ds4_gpu_pipeline_cov_hash(bound[i]);
+                for (uint32_t j = 0; j < DS4_PIPELINE_COV_SLOTS; j++) {
+                    const ds4_gpu_pipeline_cov_entry *c =
+                        &g_pipeline_cov[(bh + j) & (DS4_PIPELINE_COV_SLOTS - 1u)];
+                    if (!c->name) break;
+                    if (strcmp(c->name, bound[i]) == 0) { hits = c->hits; break; }
+                }
+                fprintf(bf, "%12llu  %s\n", (unsigned long long)hits, bound[i]);
+            }
+            fclose(bf);
+            fprintf(stderr,
+                    "ds4: pipeline-coverage: wrote bound list %s (%u kernels "
+                    "with hit counts)\n", bound_path, n_hit);
+        } else {
+            fprintf(stderr,
+                    "ds4: pipeline-coverage: cannot write bound list %s\n",
+                    bound_path);
+        }
+    }
 
     /* No baseline: write one if asked, otherwise just describe the run. Most
      * of the zero-hit list is other models' kernels and means nothing. */
@@ -2577,6 +2610,7 @@ static void ds4_gpu_pipeline_coverage_report(void) {
                 "kernel this model does not use would fail the build.\n");
     }
     free(zero);
+    free(bound);
     free(fresh);
     if (fail) {
         fflush(stderr);
