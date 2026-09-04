@@ -11052,6 +11052,23 @@ static int live_prefix_rewind_target(bool backend_can_rewind,
                                      int rollback_frontier) {
     if (!backend_can_rewind || prompt_len <= 1 || old_pos <= 0) return -1;
     if (common <= 0) return -1;
+    /* Kill switch.  This path is default-on and it is the one that increases
+     * mirrored REWIND traffic under TP, so it needs to be removable without a
+     * rebuild when bisecting a control-plane fault. */
+    {
+        static int disabled = -1;
+        if (disabled < 0) disabled = getenv("DS4_DISABLE_LIVE_PREFIX_REWIND") != NULL;
+        if (disabled) return -1;
+    }
+    /* The whole checkpoint already matches: the plain prefix-match path scores
+     * that higher than any rewind.
+     *
+     * This MUST stay ahead of the GLM-5.3 snapshot branch below.  An ordinary
+     * multi-turn append arrives here with common == old_pos and a snapshot
+     * sitting at the PREVIOUS prompt frontier, far below both; the snapshot
+     * branch would happily "rewind" there and re-prefill the answer the session
+     * already holds.  That is the single most common request shape there is. */
+    if (common >= old_pos) return -1;
     /* GLM-5.3 can only land on its rollback frontier; anywhere else drops the
      * checkpoint and re-prefills the conversation, which is strictly worse than
      * not rewinding.  Take it when it is still inside what the two sides share
@@ -11068,17 +11085,7 @@ static int live_prefix_rewind_target(bool backend_can_rewind,
         }
         return rollback_frontier;
     }
-    /* Kill switch.  This path is default-on and it is the one that increases
-     * mirrored REWIND traffic under TP, so it needs to be removable without a
-     * rebuild when bisecting a control-plane fault. */
-    {
-        static int disabled = -1;
-        if (disabled < 0) disabled = getenv("DS4_DISABLE_LIVE_PREFIX_REWIND") != NULL;
-        if (disabled) return -1;
-    }
-    /* The whole checkpoint already matches: the plain prefix-match path scores
-     * that higher than any rewind. */
-    if (common >= old_pos) return -1;
+    /* Reached only by the non-GLM-5.3 backends. */
     const int target = common < prompt_len ? common : prompt_len - 1;
     if (target <= 0 || target >= old_pos) return -1;
     return target;
@@ -11986,14 +11993,13 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
 
     char err[160] = {0};
     pthread_mutex_lock(&s->inference_mu);
-    /* Held: the append-only branch of the rewrite runs ds4_session_sync()
-     * internally, which would otherwise move the rollback snapshot to the
-     * canonical frontier.  See the hold rationale in request_cancel_rollback. */
-    ds4_session_rollback_hold(slot->session, true);
+    /* NOT held.  Canonicalization now runs only after the response was
+     * delivered, so the client will replay this turn and the canonical frontier
+     * is a legitimate -- indeed better -- snapshot position than the prompt
+     * frontier.  Holding it here is what the pre-delivery ordering required. */
     ds4_session_rewrite_result rr =
         ds4_session_rewrite_from_common(slot->session, &canonical, common,
                                         err, sizeof(err));
-    ds4_session_rollback_hold(slot->session, false);
     pthread_mutex_unlock(&s->inference_mu);
     if (rr == DS4_SESSION_REWRITE_OK) {
         server_log(DS4_LOG_KVCACHE,
@@ -12066,15 +12072,12 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(slot->session, server_progress_cb, &rebuild_progress);
         ds4_session_set_display_progress(slot->session, server_progress_cb, &rebuild_progress);
-        /* Held, like every other internal sync.  A previous revision left this
-         * one free on the theory that the canonical frontier is a better
-         * snapshot position -- it is, but only for a turn the client actually
-         * receives, and the consumer of the snapshot is the cancel path, which
-         * by definition runs when it did not. */
-        ds4_session_rollback_hold(slot->session, true);
+        /* NOT held: see the append-only branch above.  This also fixes the
+         * rebuild case specifically -- ds4_session_invalidate() just dropped the
+         * snapshot, and holding this sync meant no replacement was ever taken,
+         * so a canonicalized-by-rebuild turn had no rollback point at all. */
         const int rebuild_rc = server_session_sync(s, slot, sync_prompt,
                                                    sync_err, sizeof(sync_err));
-        ds4_session_rollback_hold(slot->session, false);
         if (rebuild_rc == 0) {
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
@@ -13557,20 +13560,28 @@ decode_again:
      * which exact DSML replay cannot repair -- is folded into
      * should_canonicalize_tool_checkpoint so the whole decision stays in one
      * tested pure function. */
-    if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+    /* Chat/completions has no protocol object that binds the next request to
+     * this live KV state.  Canonicalize only the fallback tool-call path where
+     * we lack exact sampled DSML replay; when raw DSML is known, replaying
+     * those bytes keeps future prompts aligned without rebuilding hidden
+     * reasoning.  Responses deliberately skips this path because its
+     * previous_response_id contract binds the next turn to live state.
+     *
+     * DECIDED here, PERFORMED after the response is delivered.  Canonicalizing
+     * first was the root of a whole family of cache bugs: it advances the
+     * session past the prompt the client sent, and if the write then fails the
+     * cancel rollback has nothing at that prompt frontier to roll back to, so
+     * the retry re-prefills the entire conversation.  Deferring it means the
+     * only two outcomes are "delivered, so canonicalize and let the snapshot
+     * follow" and "not delivered, so the snapshot is still where the client's
+     * prompt ended".  The live-state clears below stay here: dropping a binding
+     * early only forgoes a continuation, it never corrupts one. */
+    const bool want_canonicalize =
+        j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
         should_canonicalize_tool_checkpoint(s, &parsed_calls,
-                                            dsml_recovery_attempted))
-    {
-        /* Chat/completions has no protocol object that binds the next request
-         * to this live KV state.  Canonicalize only the fallback tool-call
-         * path where we lack exact sampled DSML replay; when raw DSML is known,
-         * replaying those bytes keeps future prompts aligned without rebuilding
-         * hidden reasoning.  Responses deliberately skips this path because its
-         * previous_response_id contract binds the next turn to live state. */
-        canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "",
-                                     parsed_reasoning, &parsed_calls);
+                                            dsml_recovery_attempted);
+    if (want_canonicalize) {
         thinking_live_clear(s, slot);
         /* Canonicalization rewrites the session, so the frontier recorded by
          * the *_live_remember calls just above no longer exists.  Drop those
@@ -13657,6 +13668,14 @@ decode_again:
                    ctx_span,
                    req_flags[0] ? " " : "",
                    req_flags);
+    } else if (want_canonicalize) {
+        /* Delivered, so the client will replay this turn: rewriting the live
+         * checkpoint into the form it will send is now unambiguously right, and
+         * so is letting the rollback snapshot follow to that frontier.  See the
+         * decision site above for why this cannot run before the write. */
+        canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
+                                     parsed_content ? parsed_content : "",
+                                     parsed_reasoning, &parsed_calls);
     }
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
@@ -19056,6 +19075,18 @@ static void test_live_prefix_backend_can_rewind(void) {
 }
 
 static void test_live_prefix_rewind_target_glm53_frontier(void) {
+    /* An ORDINARY multi-turn append must not be turned into a rewind.  The
+     * whole live checkpoint matches (common == old_pos) and the snapshot sits
+     * at the PREVIOUS prompt frontier, far below both -- an earlier ordering
+     * checked the snapshot branch first and happily "rewound" there, throwing
+     * away the answer already in the cache and re-prefilling it.  That is the
+     * single most common request shape there is. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 22000, 20623, 17343) < 0);
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 20624, 20623, 17343) < 0);
+    /* Same shape without a snapshot, for contrast: also -1, via the plain
+     * prefix-match path. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 22000, 20623, -1) < 0);
+
     /* The reported re-render case: live 20623, new prompt 20639, diverging at
      * 17546 inside the previous assistant turn, snapshot at the prompt frontier
      * 17343.  GLM-5.3 must land on the snapshot, not on the divergence -- any
