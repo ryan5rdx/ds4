@@ -9608,34 +9608,31 @@ static void request_live_state_clear(server *s, server_slot *slot) {
  * way live_prefix_rewind_target() caps at prompt_len - 1. */
 /* Where a cancelled generation should land the session.
  *
- * GLM-5.3 lands on the rollback snapshot, because that is the only position it
- * can rewind to without discarding the conversation.  `snapshot_frontier` is
- * where the snapshot actually sits, or negative when there is none.
+ * ALWAYS the frontier of the prompt the client actually sent.  This function is
+ * only reached when the turn was not delivered, so the retry will send that
+ * same prompt again and nothing past it can be reused -- see the caller, whose
+ * comment has said so all along: "The client never received this turn, so it
+ * will retry without it."
  *
- * It is not always `committed_frontier`, and the two ways it can differ pull in
- * opposite directions -- which is why this takes both:
+ * That is why every internal sync is held (ds4_session_rollback_hold): the
+ * rollback snapshot must still be sitting at this frontier when we get here.
+ * A previous revision let canonicalization move the snapshot forward, on the
+ * (true) grounds that the canonical frontier matches what a client replays --
+ * but only for a turn the client received.  Following it here pointed the
+ * rewind at tokens the retry does not contain, so the rewind was rejected and
+ * the whole conversation re-prefilled: the exact regression this path exists to
+ * prevent.
  *
- *   AHEAD.  A canonical rewrite re-syncs the tool call into the form the client
- *           will replay.  Its frontier is a strictly better snapshot position
- *           than the raw prompt frontier, so follow it.
- *   BEHIND. A tool-recovery suffix appends text we generated and the client
- *           will never send.  A snapshot there would fall outside the next
- *           request's common prefix and be rejected, so that sync is held
- *           (ds4_session_rollback_hold) and the snapshot stays put -- at or
- *           behind committed_frontier, and we use committed_frontier.
- *
- * Everything else has no snapshot.  Landing on the frontier exactly would give
- * an identical retry nothing to evaluate -- ds4_session_sync() runs zero
- * forward passes when the prompt equals the checkpoint -- so it would sample
- * logits left behind by the cancelled generation and calmly resume producing
- * the output that was just cancelled.  Leave it one token to re-evaluate, the
- * way live_prefix_rewind_target() caps at prompt_len - 1. */
-static int cancel_rollback_target(bool is_glm53, int committed_frontier,
-                                  int snapshot_frontier) {
+ * GLM-5.3 lands on the frontier exactly, because the restored snapshot carries
+ * the logits.  Everything else has none: landing exactly would give an
+ * identical retry nothing to evaluate -- ds4_session_sync() runs zero forward
+ * passes when the prompt equals the checkpoint -- so it would sample logits
+ * left behind by the cancelled generation and calmly resume producing the
+ * output that was just cancelled.  Leave it one token to re-evaluate, the way
+ * live_prefix_rewind_target() caps at prompt_len - 1. */
+static int cancel_rollback_target(bool is_glm53, int committed_frontier) {
     if (committed_frontier <= 0) return 0;
-    if (!is_glm53) return committed_frontier - 1;
-    return snapshot_frontier > committed_frontier ? snapshot_frontier
-                                                  : committed_frontier;
+    return is_glm53 ? committed_frontier : committed_frontier - 1;
 }
 
 static void request_cancel_rollback(server *s, server_slot *slot,
@@ -9655,10 +9652,8 @@ static void request_cancel_rollback(server *s, server_slot *slot,
      * carry on producing the output that was just cancelled.  Give it a token
      * to re-evaluate, the same way live_prefix_rewind_target() caps at
      * prompt_len - 1. */
-    const bool glm53 = ds4_engine_is_glm53(s->engine);
-    const int target = cancel_rollback_target(
-        glm53, committed_frontier,
-        glm53 ? ds4_session_rollback_frontier(slot->session) : -1);
+    const int target = cancel_rollback_target(ds4_engine_is_glm53(s->engine),
+                                              committed_frontier);
     pthread_mutex_lock(&s->inference_mu);
     /* Safe to rewind under tensor parallelism as well, because this is only
      * reachable once the prompt sync has *succeeded*: an interrupted or failed
@@ -11991,9 +11986,14 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
 
     char err[160] = {0};
     pthread_mutex_lock(&s->inference_mu);
+    /* Held: the append-only branch of the rewrite runs ds4_session_sync()
+     * internally, which would otherwise move the rollback snapshot to the
+     * canonical frontier.  See the hold rationale in request_cancel_rollback. */
+    ds4_session_rollback_hold(slot->session, true);
     ds4_session_rewrite_result rr =
         ds4_session_rewrite_from_common(slot->session, &canonical, common,
                                         err, sizeof(err));
+    ds4_session_rollback_hold(slot->session, false);
     pthread_mutex_unlock(&s->inference_mu);
     if (rr == DS4_SESSION_REWRITE_OK) {
         server_log(DS4_LOG_KVCACHE,
@@ -12066,16 +12066,15 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(slot->session, server_progress_cb, &rebuild_progress);
         ds4_session_set_display_progress(slot->session, server_progress_cb, &rebuild_progress);
-        /* Deliberately NOT held.  Canonicalization exists to make the live
-         * checkpoint match what the client will send next, so its frontier is a
-         * *better* snapshot position than the pre-canonicalization one, not a
-         * worse one.  Holding it here left the snapshot behind the canonical
-         * frontier and gave up the reuse the rewrite had just bought.
-         *
-         * Contrast append_rendered_suffix_to_live_session(), which appends text
-         * we generated and the client will never replay -- that one is held. */
+        /* Held, like every other internal sync.  A previous revision left this
+         * one free on the theory that the canonical frontier is a better
+         * snapshot position -- it is, but only for a turn the client actually
+         * receives, and the consumer of the snapshot is the cancel path, which
+         * by definition runs when it did not. */
+        ds4_session_rollback_hold(slot->session, true);
         const int rebuild_rc = server_session_sync(s, slot, sync_prompt,
                                                    sync_err, sizeof(sync_err));
+        ds4_session_rollback_hold(slot->session, false);
         if (rebuild_rc == 0) {
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
@@ -18957,27 +18956,28 @@ static void test_cancel_rollback_target(void) {
     /* Non-GLM-5.3 must leave a token to re-evaluate.  Landing on the frontier
      * exactly makes an identical retry a zero-token sync, which samples the
      * cancelled generation's logits and resumes it. */
-    TEST_ASSERT(cancel_rollback_target(false, 32050, -1) == 32049);
-    TEST_ASSERT(cancel_rollback_target(false, 1, -1) == 0);
+    TEST_ASSERT(cancel_rollback_target(false, 32050) == 32049);
+    TEST_ASSERT(cancel_rollback_target(false, 1) == 0);
 
-    /* GLM-5.3 lands on the snapshot; it carries the logits, so exact is fine. */
-    TEST_ASSERT(cancel_rollback_target(true, 32050, 32050) == 32050);
-
-    /* Snapshot AHEAD: a canonical rewrite re-synced the tool call into the form
-     * the client will replay, so its frontier is the better one. */
-    TEST_ASSERT(cancel_rollback_target(true, 32050, 32360) == 32360);
-
-    /* Snapshot BEHIND or absent: the tool-recovery sync is held, so this means
-     * the snapshot never moved.  Use the request frontier -- chasing a lower
-     * one would discard committed prompt tokens for nothing. */
-    TEST_ASSERT(cancel_rollback_target(true, 32050, 31000) == 32050);
-    TEST_ASSERT(cancel_rollback_target(true, 32050, -1) == 32050);
+    /* GLM-5.3 lands on the client's prompt frontier exactly: the restored
+     * snapshot carries the logits, and every internal sync is held so the
+     * snapshot is still sitting there.
+     *
+     * It must NOT chase a snapshot that moved forward.  A canonical rewrite
+     * produces a frontier matching what a client replays -- but only for a turn
+     * the client received, and this function only runs when it did not.  A
+     * revision that followed it forward pointed the rewind at tokens the retry
+     * does not contain, so the rewind was rejected and the conversation
+     * re-prefilled: exactly the regression this path exists to prevent.  There
+     * is no snapshot argument any more, so that cannot be reintroduced here. */
+    TEST_ASSERT(cancel_rollback_target(true, 32050) == 32050);
+    TEST_ASSERT(cancel_rollback_target(true, 1) == 1);
 
     /* Never negative, whichever model. */
-    TEST_ASSERT(cancel_rollback_target(false, 0, -1) == 0);
-    TEST_ASSERT(cancel_rollback_target(true, 0, 0) == 0);
-    TEST_ASSERT(cancel_rollback_target(false, -5, -1) == 0);
-    TEST_ASSERT(cancel_rollback_target(true, -5, -5) == 0);
+    TEST_ASSERT(cancel_rollback_target(false, 0) == 0);
+    TEST_ASSERT(cancel_rollback_target(true, 0) == 0);
+    TEST_ASSERT(cancel_rollback_target(false, -5) == 0);
+    TEST_ASSERT(cancel_rollback_target(true, -5) == 0);
 }
 
 static void test_cache_miss_reason_names_an_invalid_checkpoint(void) {

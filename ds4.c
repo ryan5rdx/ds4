@@ -58498,6 +58498,12 @@ static bool ds4_glm53_rollback_enabled(void) {
 bool ds4_session_glm53_rollback_capture(ds4_session *s) { (void)s; return false; }
 void ds4_session_glm53_rollback_drop(ds4_session *s) { (void)s; }
 void ds4_session_rollback_hold(ds4_session *s, bool hold) { (void)s; (void)hold; }
+/* No snapshot exists without the GPU backend, so an interrupted sync always
+ * lands where it started.  See the real one next to the rollback helpers. */
+static int ds4_session_interrupt_rewind_target(ds4_session *s, int pre_sync_len) {
+    (void)s;
+    return pre_sync_len;
+}
 #endif
 
 #ifndef DS4_NO_GPU
@@ -58738,6 +58744,7 @@ void ds4_session_rollback_hold(ds4_session *s, bool hold) {
     if (s) s->glm53_rollback_held = hold;
 }
 
+
 /* Capture the state at the current checkpoint frontier.
  *
  * MUST be called at a position both TP ranks agree on, because the restore
@@ -58828,6 +58835,33 @@ static bool ds4_session_glm53_rollback_restore(ds4_session *s, int pos) {
     s->glm_dense_cache_len = s->glm53_rollback_dense_len;
     s->glm_graph.kda_state_exchange_pending = 0;
     return true;
+}
+
+/* Where an INTERRUPTED sync should land.
+ *
+ * Normally `pre_sync_len` -- the frontier the sync started from, which for an
+ * external sync is where the snapshot sits, so it restores.
+ *
+ * A HELD sync is internal, and its pre_sync_len is past the snapshot: the
+ * session has advanced by generation and possibly a recovery suffix since the
+ * client's prompt ended.  Rewinding there finds no snapshot and invalidates the
+ * whole conversation.  The snapshot's own frontier is below it and IS
+ * restorable, so land there instead -- strictly more preserved than nothing,
+ * and callers already read the landing position back rather than assuming it.
+ *
+ * Deliberately scoped to held syncs.  Letting any rewind quietly land deeper
+ * than asked is a much wider change than this recovers. */
+static int ds4_session_interrupt_rewind_target(ds4_session *s, int pre_sync_len) {
+#ifndef DS4_NO_GPU
+    if (s && s->glm53_rollback_held && s->glm53_rollback_valid &&
+        s->glm53_rollback_pos > 0 && s->glm53_rollback_pos < pre_sync_len &&
+        ds4_session_glm53_rollback_can_restore(s, s->glm53_rollback_pos))
+    {
+        return s->glm53_rollback_pos;
+    }
+#endif
+    (void)s;
+    return pre_sync_len;
 }
 #endif
 
@@ -70743,7 +70777,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
              * successful sync, which is exactly where the rollback snapshot
              * sits, so it now restores.  The leader mirrors the decision, so a
              * worker that ran further still lands in the same state. */
-            ds4_session_rewind(s, pre_sync_len);
+            ds4_session_rewind(s, ds4_session_interrupt_rewind_target(s, pre_sync_len));
             return rc;
         }
         if (rc != 0 || !worker_ok || !logits_ok) {
@@ -80289,7 +80323,7 @@ static void ds4_session_rewind_core(ds4_session *s, int pos,
     }
     bool glm53_state_ok = true;
     bool glm53_restore = false;
-    (void)glm53_state_ok;
+    (void)glm53_state_ok; (void)glm53_restore;
 #ifndef DS4_NO_GPU
     const bool glm53 = ds4_session_is_glm(s) && s->glm_graph.glm53;
     /* Perform the restore BEFORE mirroring, and mirror what actually happened.
