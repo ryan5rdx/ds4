@@ -13144,6 +13144,24 @@ static bool glm53_tp_dense_ffn_split_shape_ok(void) {
  * buffer and the fused form is equivalent.
  *
  * Same family as HC1, which measured +3.1% at decode. */
+/* HC2 -- fold shared-down + routed-add + HC expand into one kernel.
+ *
+ * GLM issues three dispatches on all 42 sparse layers: the shared-down matvec,
+ * the routed add, and the HC expand.  ds4_gpu_shared_down_hc_expand_q8_0_tensor
+ * does all three and the DeepSeek graph has called it since ds4.c:25775.
+ *
+ * The fused kernel writes shared_out and out_hc but NOT the intermediate sum,
+ * which GLM currently materialises in g->next.  That is safe here and only
+ * here: the cur/next pointer swap at ds4.c:55033 is guarded `!g->glm53`, so on
+ * GLM g->next is per-layer scratch, consumed by the steering call (which this
+ * predicate excludes), a debug dump, and the expand being fused away.  On any
+ * path where g->next chains between layers this fusion would silently feed the
+ * next layer stale data. */
+static int glm53_hc_ffn_tail_fuse_requested(void) {
+    const char *env = getenv("DS4_GLM_HC_FFN_TAIL_FUSE");
+    return env && env[0] && env[0] != '0';
+}
+
 static int glm53_hc_kda_out_fuse_requested(void) {
     const char *env = getenv("DS4_GLM_HC_KDA_OUT_FUSE");
     return env && env[0] && env[0] != '0';
@@ -42706,6 +42724,11 @@ typedef struct ds4_glm_gpu_graph {
      * must be skipped.  Per layer: set in glm53_graph_kda_attention, consumed
      * and cleared at the expand site in the same layer iteration. */
     bool kda_attn_hc_fused;
+    /* HC2: set when the shared-down projection already produced hc_next via
+     * the fused down+add+expand kernel, so both the routed add and the
+     * standalone expand must be skipped.  Same per-layer discipline as
+     * kda_attn_hc_fused: cleared unconditionally where it is consumed. */
+    bool ffn_tail_hc_fused;
     ds4_imatrix_collector *imatrix;
     ds4_gpu_tensor *directional_steering_dirs_by_tier[DS4_MAX_GPUS];
     float directional_steering_attn_scale;
@@ -47424,6 +47447,35 @@ static bool glm_graph_encode_sparse_ffn_one(
                                                 g->ssd_streaming,
                                                 stage_profile,
                                                 stage_t0);
+        /* HC2: replace the down matvec, the routed add and the HC expand with
+         * one kernel.  !add_residual and !shared_split are correctness
+         * conditions, not tuning: with a residual there is a third addend the
+         * fused kernel does not take, and under shared_split ffn_sum is already
+         * inside ffn_out so the kernel's internal add would double-count it. */
+        const bool fuse_ffn_tail_hc =
+            ok && decode_step && g->glm53 &&
+            glm53_hc_ffn_tail_fuse_requested() &&
+            !add_residual && !shared_split &&
+            l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 &&
+            g->directional_steering_ffn_scale == 0.0f &&
+            !metal_graph_use_reference_hc_decode() &&
+            g->hc_next && g->hc_after_attn && g->hc_split;
+        if (fuse_ffn_tail_hc) {
+            static int announced;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: GLM HC2 shared-down+add+HC-expand fusion active "
+                        "(42 sparse layers, 3 -> 1 dispatch)\n");
+            }
+            ok = ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+                    g->hc_next, ffn_sum, model->map, model->size,
+                    l->ffn_down_shexp->abs_offset,
+                    DS4_N_FF_EXP, DS4_N_EMBD,
+                    ffn_mid, ffn_out, g->hc_after_attn, g->hc_split,
+                    DS4_N_EMBD, DS4_N_HC) != 0;
+            if (ok) g->ffn_tail_hc_fused = true;
+        } else
         if (ok) ok = glm_graph_matmul_q8_0_decode_profiled_tensor(ffn_sum,
                                                                   model,
                                                                   l->ffn_down_shexp->abs_offset,
@@ -47466,7 +47518,8 @@ static bool glm_graph_encode_sparse_ffn_one(
                                         after_attn,
                                         tmp,
                                         DS4_N_EMBD) != 0;
-    } else if (ok) {
+    } else if (ok && !g->ffn_tail_hc_fused) {
+        /* HC2 folded this add into the down projection. */
         ok = ds4_gpu_add_tensor(next,
                                 ffn_out,
                                 ffn_sum,
@@ -47747,7 +47800,13 @@ static bool glm53_graph_encode_ffn_tail_one(
         ok = glm_graph_apply_directional_steering_ffn(g, g->next, il, 1);
     }
     if (ok) {
-        ok = ds4_gpu_hc_expand_tensor(g->hc_next,
+        /* HC2: hc_next may already have been produced by the fused
+         * down+add+expand.  Cleared unconditionally -- per layer, and a stale
+         * true would skip a real expand on the next layer, silently. */
+        const bool ffn_hc_already = g->ffn_tail_hc_fused;
+        g->ffn_tail_hc_fused = false;
+        ok = ffn_hc_already ? ok :
+             ds4_gpu_hc_expand_tensor(g->hc_next,
                                       g->next,
                                       g->hc_after_attn,
                                       g->hc_post,
