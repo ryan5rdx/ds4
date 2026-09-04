@@ -47137,6 +47137,33 @@ static bool glm_graph_encode_shared_swiglu_one(
                                                0u, (uint32_t)DS4_N_FF_EXP);
 }
 
+/* HC2s.  Both FFN tails end the same way at decode:
+ *     next = copy(ffn_out)   then   HC expand reads next
+ * and in both the expand can read ffn_out directly, so the copy goes away.
+ * That matters more than a dispatch: ds4_gpu_tensor_copy closes the open
+ * compute encoder and opens a BLIT encoder, and the rig priced an encoder
+ * switch at 8.2 us against 1.7 us for a plain dispatch -- HC2s measured +1.19%
+ * on 42 sparse layers where HC3s measured +0.20% for removing a dispatch on 34
+ * (2026-09-03-HC2S-HC3S-RESULT.md).
+ *
+ * The pointer equality is the reachability guard: these functions have callers
+ * other than the decode tail, and eliding the copy for one of those would both
+ * leave their buffer stale and leak ffn_expand_from into the next layer's
+ * expand, since no expand follows to clear it. */
+static bool glm53_hc_can_elide_ffn_copy(const ds4_glm_gpu_graph *g,
+                                        bool                     decode_step,
+                                        const ds4_gpu_tensor    *next,
+                                        const ds4_gpu_tensor    *ffn_out) {
+    return g && g->glm53 && decode_step &&
+           glm53_hc_ffn_tail_fuse_requested() &&
+           g->directional_steering_ffn_scale == 0.0f &&
+           g->hc_next && g->hc_after_attn && g->hc_post && g->hc_comb &&
+           /* g->next is never written when the copy is elided, so the
+            * "ffn_out" dump downstream would print a stale value. */
+           !metal_graph_debug_wants_name("ffn_out") &&
+           next == g->next && ffn_out == g->ffn_out;
+}
+
 static bool glm_graph_encode_sparse_ffn_one(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -47603,19 +47630,7 @@ static bool glm_graph_encode_sparse_ffn_one(
          * shared together -- so adding it again would double-count it. */
         if (add_residual) {
             ok = ds4_gpu_add_tensor(next, after_attn, ffn_out, DS4_N_EMBD) != 0;
-        } else if (glm53_hc_ffn_tail_fuse_requested() && decode_step &&
-                   g->directional_steering_ffn_scale == 0.0f &&
-                   g->hc_next && g->hc_after_attn &&
-                   g->hc_post && g->hc_comb &&
-                   /* g->next is never written when the copy is elided, so the
-                    * "ffn_out" dump downstream would print a stale value. */
-                   !metal_graph_debug_wants_name("ffn_out") &&
-                   /* Only on the decode tail path, whose expand consumes this.
-                    * This function has other callers with their own `next`;
-                    * eliding the copy for one of those would both leave their
-                    * buffer stale and leak ffn_expand_from into the next
-                    * layer's expand, since no expand follows to clear it. */
-                   next == g->next && ffn_out == g->ffn_out) {
+        } else if (glm53_hc_can_elide_ffn_copy(g, decode_step, next, ffn_out)) {
             /* HC2s.  Under the shared split this copy exists only to move
              * ffn_out into the buffer the HC expand reads, and the expand can
              * simply read ffn_out instead.  Worth more than one dispatch:
@@ -47864,6 +47879,13 @@ static bool glm_graph_encode_ffn_one_normed_from(
                                     after_attn,
                                     ffn_out,
                                     DS4_N_EMBD) != 0;
+        } else if (ok && glm53_hc_can_elide_ffn_copy(g, decode_step, next,
+                                                     ffn_out)) {
+            /* Dense twin of the sparse elision above.  Only the 3 leading
+             * dense layers, so ~3/42 of HC2s's +1.19% -- below what the rig
+             * can resolve, and folded into the same flag rather than queued as
+             * its own arm.  Free: same machinery, bit-identical. */
+            g->ffn_expand_from = ffn_out;
         } else if (ok) {
             ok = ds4_gpu_tensor_copy(next,
                                      0,
