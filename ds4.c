@@ -47171,7 +47171,7 @@ static void glm_ablate_shared_announce(void) {
  * compute encoder and opens a BLIT encoder, and the rig priced an encoder
  * switch at 8.2 us against 1.7 us for a plain dispatch -- HC2s measured +1.19%
  * on 42 sparse layers where HC3s measured +0.20% for removing a dispatch on 34
- * (2026-09-03-HC2S-HC3S-RESULT.md).
+ *.
  *
  * The pointer equality is the reachability guard: these functions have callers
  * other than the decode tail, and eliding the copy for one of those would both
@@ -47440,8 +47440,7 @@ static bool glm_graph_encode_sparse_ffn_one(
      * does -- so the ablation silently did nothing on the production
      * configuration while still printing its "ablation active (mask 0x20)"
      * line. That announce reports the mask being PARSED, not the work being
-     * skipped, and the 2026-09-03 S2-remeasure null was measured through it.
-     * The null is retracted; see 2026-09-03-S2REMEASURE-RETRACTED.md. */
+     * skipped, and the 2026-09-03 S2-remeasure null was measured through it. */
     const bool ablate_shared =
         (glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED) != 0;
     if (ok && shared_first && ablate_shared) glm_ablate_shared_announce();
@@ -53421,7 +53420,7 @@ static bool glm_graph_forward_indexed_tokens(
                          * apart and this rank's half begins at column k_off,
                          * not at the base.  The compact geometry every other
                          * caller uses made the kernel walk half rows and
-                         * corrupt the output (2026-09-03-D1-RESULT.md). */
+                         * corrupt the output. */
                         g->heads_dim,
                         (uint64_t)g->tp_rank * k_cnt,
                         sliced_rows) != 0;
@@ -68304,7 +68303,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
      * The DeepSeek path mirrors the block to its peer explicitly
      * (ds4_tp_send_verify -> ds4_session_tp_spec_cycle); GLM has no equivalent
      * yet.  Refuse at bring-up until it does: a startup error costs one run, a
-     * watchdog costs the pair.  See 2026-09-02-MTP-WATCHDOG-ROOT-CAUSE.md. */
+     * watchdog costs the pair. */
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA && e->glm_mtp &&
         getenv("DS4_GLM_MTP_TP_ALLOW") == NULL) {
         snprintf(err, errlen,

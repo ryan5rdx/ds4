@@ -10878,7 +10878,7 @@ int ds4_gpu_tp_split_safe(uint32_t gate_slots) {
      * event deliberately, because "a flag write carries no memory-visibility
      * guarantee for the payload buffer".  So under batching a direction really
      * does still route through the shared event and the criterion below holds
-     * as written.  See 2026-09-02-S14-RETRACTED.md. */
+     * as written. */
     if (g_tp_session_batch_mode || !g_tp_flag_gates) return 0;
     if (!g_tp_fast_sync || g_tp_release_words == NULL) return 0;
     if (gate_slots == 0 || gate_slots > DS4_TP_FENCE_SLOTS) return 0;
