@@ -13108,8 +13108,9 @@ static bool glm53_tp_shared_split_shape_ok(void) {
  * comfortably -- but it does mean the gate schedule changes, which is where S6a
  * went wrong twice. glm53_layer_tp_gates() owns that rule for both sides. */
 static int glm53_tp_dense_ffn_split_requested(void) {
+    /* Default ON. Set DS4_GLM_TP_DENSE_FFN_SPLIT=0 to disable. */
     const char *env = getenv("DS4_GLM_TP_DENSE_FFN_SPLIT");
-    return env && env[0] && env[0] != '0';
+    return !(env && env[0] == '0');
 }
 
 /* The graph used to carry this check while the schedule did not, so a shape with
@@ -47902,8 +47903,17 @@ static bool glm_graph_encode_ffn_one_normed_from(
          * dense layers have no batched path at all, so without this the gate
          * would fire once per token on the same layer slot and the ordinal walk
          * would desync immediately. */
+        /* g->glm53 is load-bearing, and this helper is shared: the GLM-5.2
+         * gate schedule builds its mask from DS4_N_LEADING_DENSE upward
+         * (glm_graph_tp_gate_schedule's non-5.3 branch), so it does not expect
+         * an FFN gate on the leading dense layers at all.  Firing one here
+         * shifts every subsequent ordinal and the first decode dies with
+         * "gate order broke".  Latent while this split was opt-in; enabling it
+         * by default is what exposes it.  The 5.3 mask asks the same two
+         * predicates below, so those stay in sync -- only the family check was
+         * missing. */
         const bool dense_split =
-            decode_step &&
+            decode_step && g->glm53 &&
             g->tp_world == 2 && g->tp_out && g->tp_in && !g->ssd_streaming &&
             glm53_tp_dense_ffn_split_requested() &&
             glm53_tp_dense_ffn_split_shape_ok() &&
