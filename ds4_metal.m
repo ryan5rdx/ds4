@@ -26610,8 +26610,9 @@ uint64_t ds4_gpu_kslice_matvec_count(void) { return g_kslice_matvec_count; }
  * every other candidate in this campaign.  Read per call so an ABBA interleave
  * can toggle it inside one process. */
 static int glm_moe_decode_pair4_enabled(void) {
+    /* Default ON. Set DS4_METAL_GLM_MOE_DECODE_PAIR4=0 to disable. */
     const char *env = getenv("DS4_METAL_GLM_MOE_DECODE_PAIR4");
-    return env && env[0] && env[0] != '0';
+    return !(env && env[0] == '0');
 }
 
 /* Geometry validation shared by every k-slice path.
