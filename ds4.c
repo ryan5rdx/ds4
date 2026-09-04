@@ -13130,6 +13130,25 @@ static bool glm53_tp_dense_ffn_split_shape_ok(void) {
  * +3.0% decode, but see the sweep's device-factor note: this is a
  * latency-bound saving, so the 1.64x M1 Max -> M2 Ultra factor does NOT apply
  * and the rig may show less. */
+/* HC3 -- fold the KDA output projection into the HC expand.
+ *
+ * ds4_gpu_matmul_q8_0_hc_expand_tensor does matmul + expand in one and the
+ * DeepSeek graph has called it since ds4.c:24815.  GLM issues them as two
+ * dispatches on all 34 KDA layers: the projection in glm53_graph_kda_attention
+ * and the expand far downstream in the decode loop.
+ *
+ * The two expand formulations look different -- GLM's standalone
+ * ds4_gpu_hc_expand_tensor takes `post` and `comb` while the fused kernel takes
+ * a single `split` -- but hc_post and hc_comb are VIEWS of hc_split
+ * (ds4.c:18322/18325) and hc_split is the only allocation, so they are the same
+ * buffer and the fused form is equivalent.
+ *
+ * Same family as HC1, which measured +3.1% at decode. */
+static int glm53_hc_kda_out_fuse_requested(void) {
+    const char *env = getenv("DS4_GLM_HC_KDA_OUT_FUSE");
+    return env && env[0] && env[0] != '0';
+}
+
 static int glm53_hc_pre_fuse_requested(void) {
     const char *env = getenv("DS4_GLM_HC_PRE_FUSE");
     return env && env[0] && env[0] != '0';
@@ -42682,6 +42701,11 @@ typedef struct ds4_glm_gpu_graph {
      * A bitmap rather than a flag because prefill is chunked: the exchange must
      * happen on the first chunk that touches the layer and not again. */
     uint64_t kda_state_exchange_pending;
+    /* HC3: set when the KDA output projection already produced hc_after_attn
+     * via the fused matmul+expand kernel, so the standalone expand downstream
+     * must be skipped.  Per layer: set in glm53_graph_kda_attention, consumed
+     * and cleared at the expand site in the same layer iteration. */
+    bool kda_attn_hc_fused;
     ds4_imatrix_collector *imatrix;
     ds4_gpu_tensor *directional_steering_dirs_by_tier[DS4_MAX_GPUS];
     float directional_steering_attn_scale;
@@ -46105,6 +46129,39 @@ static bool glm53_graph_kda_attention(
                     "ds4: GLM KDA head-split gate/combine failed (layer %u)\n",
                     il);
         }
+        return ok;
+    }
+    /* HC3: fuse the projection with the HC expand the decode loop would
+     * otherwise issue separately.  Refused when directional steering is armed
+     * (it mutates attn_out between the two) or under the reference HC hatch,
+     * which exists to compare against exactly this kind of fusion. */
+    const bool fuse_kda_out_hc =
+        ok && g->glm53 && glm53_hc_kda_out_fuse_requested() &&
+        l->kda_output->type == DS4_TENSOR_Q8_0 &&
+        g->directional_steering_attn_scale == 0.0f &&
+        !metal_graph_use_reference_hc_decode() &&
+        g->hc_after_attn && g->hc_cur && g->hc_split;
+    if (fuse_kda_out_hc) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "ds4: GLM HC3 KDA output+HC-expand fusion active "
+                    "(34 KDA layers, 2 -> 1 dispatch)\n");
+        }
+        ok = ds4_gpu_matmul_q8_0_hc_expand_tensor(g->hc_after_attn,
+                                                  g->attn_out,
+                                                  model->map,
+                                                  model->size,
+                                                  l->kda_output->abs_offset,
+                                                  projection,
+                                                  DS4_N_EMBD,
+                                                  g->kda_out,
+                                                  g->hc_cur,
+                                                  g->hc_split,
+                                                  DS4_N_EMBD,
+                                                  DS4_N_HC) != 0;
+        if (ok) g->kda_attn_hc_fused = true;
         return ok;
     }
     if (ok) ok = glm53_graph_matmul(g->attn_out,
@@ -54853,7 +54910,14 @@ glm53_attention_done:
                     g, g->attn_out, il, 1);
         }
         if (ok && g->glm53) {
-            ok = ds4_gpu_hc_expand_tensor(g->hc_after_attn,
+            /* HC3: the KDA output projection may already have produced
+             * hc_after_attn through the fused kernel.  Cleared
+             * unconditionally -- the flag is per layer and a stale true
+             * would skip a REAL expand on the next layer, silently. */
+            const bool hc_already_expanded = g->kda_attn_hc_fused;
+            g->kda_attn_hc_fused = false;
+            ok = hc_already_expanded ? ok :
+                 ds4_gpu_hc_expand_tensor(g->hc_after_attn,
                                           g->attn_out,
                                           g->hc_cur,
                                           g->hc_post,
