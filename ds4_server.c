@@ -11993,11 +11993,16 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
 
     char err[160] = {0};
     pthread_mutex_lock(&s->inference_mu);
-    /* Held for the whole rewrite, both branches.  The append-only branch syncs
-     * internally; the REBUILD_NEEDED branch invalidates and re-syncs from zero.
-     * Neither may move or discard the snapshot: it must still be sitting at the
-     * client's prompt frontier if the response write then fails and the cancel
-     * rollback needs it. */
+    /* Held for the whole rewrite.  The hold suppresses rollback *capture*, so
+     * the append-only branch -- which syncs internally -- leaves the snapshot
+     * sitting at the client's prompt frontier, where the cancel rollback needs
+     * it if the response write then fails.
+     *
+     * It does NOT survive the REBUILD_NEEDED branch: that invalidates, and the
+     * drop is unconditional on both ranks by design (see
+     * ds4_session_invalidate() -- preserving it was coordinator-only and could
+     * brick the TP pair).  A REBUILD-canonicalized turn therefore has no
+     * rollback point; that is a known gap, not an oversight. */
     ds4_session_rollback_hold(slot->session, true);
     ds4_session_rewrite_result rr =
         ds4_session_rewrite_from_common(slot->session, &canonical, common,
@@ -12074,11 +12079,11 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(slot->session, server_progress_cb, &rebuild_progress);
         ds4_session_set_display_progress(slot->session, server_progress_cb, &rebuild_progress);
-        /* Still held from the rewrite above, so the invalidate just above did
-         * NOT discard the snapshot and this sync will not replace it.  The
-         * snapshot's recorded token hash decides at restore time whether the
-         * rebuilt prefix still matches at that position; if the canonical
-         * re-tokenization merged across the boundary, it refuses. */
+        /* Still held, so this sync will not capture a NEW snapshot at the
+         * canonical frontier -- but the invalidate just above already dropped
+         * the old one, on both ranks.  So a turn canonicalized down this branch
+         * ends with no rollback point at all, and a cancel after it costs a
+         * full re-prefill.  Known gap; see ds4_session_invalidate(). */
         const int rebuild_rc = server_session_sync(s, slot, sync_prompt,
                                                    sync_err, sizeof(sync_err));
         if (rebuild_rc == 0) {
@@ -13584,11 +13589,12 @@ decode_again:
      * the slot stays busy, so an immediate tool-result follow-up is routed to a
      * different slot and the rebuild finishes somewhere nobody will use it.
      *
-     * The cache bugs are instead fixed where they belong -- the rollback
-     * snapshot is pinned at the client's prompt frontier for the whole of
-     * canonicalization (ds4_session_rollback_hold), including across the
-     * REBUILD_NEEDED branch's invalidate, with the snapshot's token hash
-     * deciding at restore time whether the rebuilt prefix still matches. */
+     * The cache bugs are instead fixed where they belong: the rollback snapshot
+     * is pinned at the client's prompt frontier across canonicalization
+     * (ds4_session_rollback_hold suppresses capture), so a write that fails
+     * afterwards still has somewhere to roll back to.  The REBUILD_NEEDED
+     * branch is the exception -- it invalidates, which drops the snapshot on
+     * both ranks -- and that case falls back to a full re-prefill. */
     const bool want_canonicalize =
         j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
