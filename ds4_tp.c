@@ -2298,13 +2298,13 @@ int ds4_tp_send_rewind_mode(ds4_tp *tp, uint64_t session_id, int pos,
     return ok;
 }
 
-int ds4_tp_rewind_ack_status(bool want_restore, int requested_pos,
+int ds4_tp_rewind_ack_status(bool want_keep, int requested_pos,
                              int reusable_pos) {
-    /* Position equality, not "still reusable": the rewind clamps to this rank's
-     * own checkpoint length, so a worker holding less than the leader lands
-     * lower and must not report that as a restore. */
-    const bool restored = requested_pos > 0 && reusable_pos == requested_pos;
-    return want_restore == restored ? 0 : 1;
+    /* Position equality, not "still reusable > 0": the rewind clamps to this
+     * rank's own checkpoint length, so a worker holding less than the leader
+     * lands lower and must not report that as a match. */
+    const int expected = want_keep ? requested_pos : 0;
+    return reusable_pos == expected ? 0 : 1;
 }
 
 int ds4_tp_send_rollback_capture(ds4_tp *tp, uint64_t session_id, int pos) {
@@ -3115,7 +3115,7 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
              * The leader compares the two and invalidates both ranks if they
              * differ, so a restore this rank could not perform must come back
              * as INVALIDATE.  See ds4_tp_rewind_mode. */
-            const bool want = command.flags == DS4_TP_REWIND_RESTORE;
+            const bool want = command.flags == DS4_TP_REWIND_KEEP;
             ds4_session_rewind_mode(session, command.value, want);
             const int status = ds4_tp_rewind_ack_status(
                 want, command.value, ds4_session_reusable_pos(session));

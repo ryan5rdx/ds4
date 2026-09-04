@@ -57481,6 +57481,13 @@ struct ds4_session {
      * same length must not be able to restore into it. */
     uint64_t glm53_rollback_token_hash;
     bool glm53_rollback_valid;
+    /* Set while an INTERNAL sync runs -- a tool-recovery suffix, a canonical
+     * rewrite, a cold-checkpoint prefix.  Those advance the session past the
+     * prompt the client actually sent, and the next request will not contain
+     * the tokens they added, so a snapshot taken at their frontier is outside
+     * the next request's common prefix and cannot be reused.  Hold the snapshot
+     * at the externally supplied prompt frontier instead. */
+    bool glm53_rollback_held;
 #endif
 };
 
@@ -58490,6 +58497,7 @@ static bool ds4_glm53_rollback_enabled(void) {
  * own. */
 bool ds4_session_glm53_rollback_capture(ds4_session *s) { (void)s; return false; }
 void ds4_session_glm53_rollback_drop(ds4_session *s) { (void)s; }
+void ds4_session_rollback_hold(ds4_session *s, bool hold) { (void)s; (void)hold; }
 #endif
 
 #ifndef DS4_NO_GPU
@@ -58724,6 +58732,10 @@ void ds4_session_glm53_rollback_drop(ds4_session *s) {
     s->glm53_rollback_valid = false;
     s->glm53_rollback_pos = -1;
     s->glm53_rollback_token_hash = 0;
+}
+
+void ds4_session_rollback_hold(ds4_session *s, bool hold) {
+    if (s) s->glm53_rollback_held = hold;
 }
 
 /* Capture the state at the current checkpoint frontier.
@@ -70775,7 +70787,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
      * cancelled would overwrite the previous frontier -- the one the leader is
      * about to rewind to.  It captures on DS4_TP_FRAME_ROLLBACK_CAPTURE only,
      * which the leader sends from here. */
-    if (rc == 0 && !ds4_session_tp_worker(s)) {
+    if (rc == 0 && !ds4_session_tp_worker(s) && !s->glm53_rollback_held) {
         const bool local_ok = ds4_session_glm53_rollback_capture(s);
         if (ds4_session_tp_leader(s) && ds4_session_glm53_rollback_supported(s) &&
             !ds4_tp_failed(s->engine->tp.ctx)) {
@@ -80342,41 +80354,6 @@ static void ds4_session_rewind_core(ds4_session *s, int pos,
         glm53_state_ok = false;
     }
 #endif
-    if (!decided && ds4_session_tp_leader(s) &&
-        !ds4_tp_failed(s->engine->tp.ctx)) {
-        /* Send the outcome, then wait for the worker to confirm it applied the
-         * same one.  Unacknowledged, a worker that could not restore would keep
-         * running with an invalid checkpoint while this rank believes in a
-         * valid one; the next sync then prefills different chunk counts on the
-         * two ranks and hangs on a gate. */
-        char terr[160] = "";
-        int wstatus = -1;
-        const bool sent = ds4_tp_send_rewind_mode(
-            s->engine->tp.ctx, s->tp_session_id, pos,
-            glm53_restore ? DS4_TP_REWIND_RESTORE : DS4_TP_REWIND_INVALIDATE);
-        const bool acked = sent &&
-            ds4_tp_wait_command_ack_status(s->engine->tp.ctx, s->tp_session_id,
-                                           "session rewind", &wstatus,
-                                           terr, sizeof(terr));
-        /* The worker acks 0 iff it applied the mode we sent; the ack reader
-         * already turns any other status into !acked, so this is the whole
-         * test.  (Encoding the applied mode *in* the status does not work --
-         * status 1 reads as a failed command.) */
-        if (!sent || !acked) {
-            fprintf(stderr,
-                    "ds4: tp: session rewind not confirmed (sent=%d acked=%d "
-                    "worker_status=%d mode=%s)%s%s; invalidating both ranks\n",
-                    (int)sent, (int)acked, wstatus,
-                    glm53_restore ? "restore" : "invalidate",
-                    terr[0] ? ": " : "", terr);
-            /* Collapse to the one state both ranks can reach unilaterally. */
-            glm53_state_ok = false;
-            glm53_restore = false;
-            if (!ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id)) {
-                ds4_tp_mark_failed(s->engine->tp.ctx);
-            }
-        }
-    }
     s->checkpoint.len = pos;
     s->mtp_draft_valid = false;
 #ifndef DS4_NO_GPU
@@ -80419,6 +80396,49 @@ static void ds4_session_rewind_core(ds4_session *s, int pos,
     ds4_session_dspark_scheduler_begin_request(s);
     ds4_session_glm_cap_dense_cache(s);
 #endif
+
+    /* Mirror LAST, and mirror the state we ended up in rather than the one we
+     * intended.  Everything above can still move the outcome -- a failed
+     * compressor rewind zeroes the length, a failed GLM-5.3 restore drops the
+     * checkpoint -- so announcing earlier lets this rank promise the worker an
+     * outcome it then does not reach.
+     *
+     * The mode is "is the checkpoint still reusable at pos", NOT "did GLM-5.3
+     * restore".  Those coincide only on GLM-5.3: an ordinary truncating rewind
+     * on Flash or GLM-5.2 keeps the checkpoint too, and calling that
+     * INVALIDATE made the worker's honest "still valid at pos" read as a
+     * mismatch, so every non-GLM-5.3 TP rewind invalidated both ranks. */
+    if (!decided && ds4_session_tp_leader(s) &&
+        !ds4_tp_failed(s->engine->tp.ctx)) {
+        const bool keep = ds4_session_reusable_pos(s) == pos;
+        char terr[160] = "";
+        int wstatus = -1;
+        const bool sent = ds4_tp_send_rewind_mode(
+            s->engine->tp.ctx, s->tp_session_id, pos,
+            keep ? DS4_TP_REWIND_KEEP : DS4_TP_REWIND_INVALIDATE);
+        /* The worker acks 0 iff it reached the same state; the ack reader turns
+         * any other status into !acked, so this is the whole test. */
+        const bool acked = sent &&
+            ds4_tp_wait_command_ack_status(s->engine->tp.ctx, s->tp_session_id,
+                                           "session rewind", &wstatus,
+                                           terr, sizeof(terr));
+        if (!sent || !acked) {
+            fprintf(stderr,
+                    "ds4: tp: session rewind not confirmed (sent=%d acked=%d "
+                    "worker_status=%d mode=%s)%s%s; invalidating both ranks\n",
+                    (int)sent, (int)acked, wstatus,
+                    keep ? "keep" : "invalidate",
+                    terr[0] ? ": " : "", terr);
+            /* Collapse to the one state both ranks can reach unilaterally. */
+            s->checkpoint_valid = false;
+#ifndef DS4_NO_GPU
+            ds4_session_glm53_rollback_drop(s);
+#endif
+            if (!ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id)) {
+                ds4_tp_mark_failed(s->engine->tp.ctx);
+            }
+        }
+    }
 }
 
 void ds4_session_rewind(ds4_session *s, int pos) {

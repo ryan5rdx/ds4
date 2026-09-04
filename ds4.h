@@ -603,6 +603,13 @@ void ds4_session_rewind_mode(ds4_session *s, int pos, bool want_restore);
  * from its own sync would overwrite the frontier the leader may rewind to. */
 bool ds4_session_glm53_rollback_capture(ds4_session *s);
 void ds4_session_glm53_rollback_drop(ds4_session *s);
+/* Suppress rollback capture for the duration of an INTERNAL sync -- one that
+ * advances the session past the prompt the client sent (tool-recovery suffix,
+ * canonical rewrite, cold-checkpoint prefix).  The next request will not carry
+ * the tokens those add, so a snapshot at their frontier falls outside its
+ * common prefix and is unusable; the snapshot must stay pinned at the external
+ * prompt frontier.  Always pair with a matching `false`. */
+void ds4_session_rollback_hold(ds4_session *s, bool hold);
 /* The one position a GLM-5.3 rewind can restore rather than re-prefill, or -1
  * if there is none.  A caller choosing a rewind target should prefer this over
  * a deeper one whenever it still lies inside the common prefix: on GLM-5.3 any

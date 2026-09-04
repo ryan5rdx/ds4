@@ -193,10 +193,16 @@ int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
  * sends it rather than each rank deciding locally: on GLM-5.3 the decision
  * depends on whether a rollback snapshot covers `pos`, and a rank that stopped
  * exactly at `pos` would otherwise keep a checkpoint the other rank drops.
- * INVALIDATE is always safe, so it is the value to send when in doubt. */
+ * INVALIDATE is always safe, so it is the value to send when in doubt.
+ *
+ * KEEP means "the checkpoint is still reusable at pos", NOT "GLM-5.3 restored a
+ * snapshot".  Those are the same thing only on GLM-5.3; an ordinary truncating
+ * rewind on Flash or GLM-5.2 also keeps it.  Conflating the two made the leader
+ * send INVALIDATE for every non-GLM-5.3 rewind while both ranks actually kept
+ * their checkpoints, so the ack never matched and both were invalidated. */
 typedef enum {
     DS4_TP_REWIND_INVALIDATE = 0,
-    DS4_TP_REWIND_RESTORE    = 1,
+    DS4_TP_REWIND_KEEP       = 1,
 } ds4_tp_rewind_mode;
 
 int ds4_tp_send_rewind_mode(ds4_tp *tp, uint64_t session_id, int pos,
@@ -209,10 +215,13 @@ int ds4_tp_send_rollback_capture(ds4_tp *tp, uint64_t session_id, int pos);
  *
  * The ack channel reserves 0 for success and the reader rejects every other
  * value, so the *applied mode* cannot be encoded in the status -- doing that
- * made a successful RESTORE (mode 1) read as a failed command, and the leader
- * fell into invalidate-both every single time.  Exposed so that stays a tested
- * property rather than a comment. */
-int ds4_tp_rewind_ack_status(bool want_restore, int requested_pos,
+ * made a successful KEEP (mode 1) read as a failed command, and the leader fell
+ * into invalidate-both every single time.  Exposed so that stays a tested
+ * property rather than a comment.
+ *
+ * `want_keep` is model-independent: the expected reusable position is `pos` for
+ * a keep (ordinary rewind or GLM-5.3 restore alike) and 0 for an invalidation. */
+int ds4_tp_rewind_ack_status(bool want_keep, int requested_pos,
                              int reusable_pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
 /* Abort the mirrored prefill the worker is currently running for this session.

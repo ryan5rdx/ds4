@@ -9606,22 +9606,19 @@ static void request_live_state_clear(server *s, server_slot *slot) {
  * logits left behind by the cancelled generation and calmly resume producing
  * the output that was just cancelled.  Leave it one token to re-evaluate, the
  * way live_prefix_rewind_target() caps at prompt_len - 1. */
-/* `snapshot_frontier` is where the session's rollback snapshot actually sits, or
- * negative when there is none.  It is NOT always `committed_frontier`: an
- * internal tool-recovery sync (append_rendered_suffix_to_live_session) runs a
- * second public sync before decode resumes, which moves the snapshot forward.
- * Rolling back to the stale frontier would then find nothing and invalidate.
- * Following the snapshot is also the better landing point -- it discards only
- * the generation, keeping the committed tool output the client will replay. */
-static int cancel_rollback_target(bool is_glm53, int committed_frontier,
-                                  int snapshot_frontier) {
+/* Land on the frontier the CLIENT's prompt ended at, which is where the
+ * rollback snapshot is pinned (ds4_session_rollback_hold).
+ *
+ * An earlier version chased the session's latest snapshot instead, on the
+ * theory that an internal tool-recovery sync had moved it forward.  That is the
+ * wrong direction: the tokens such a sync appends are ours, so the next request
+ * does not contain them, and a rewind to that frontier lands outside the next
+ * request's common prefix and gets rejected -- a full re-prefill either way.
+ * Holding the snapshot at the external frontier is the fix; this function then
+ * just needs the frontier the request recorded. */
+static int cancel_rollback_target(bool is_glm53, int committed_frontier) {
     if (committed_frontier <= 0) return 0;
-    if (is_glm53) {
-        return snapshot_frontier > 0 && snapshot_frontier >= committed_frontier
-                   ? snapshot_frontier
-                   : committed_frontier;
-    }
-    return committed_frontier - 1;
+    return is_glm53 ? committed_frontier : committed_frontier - 1;
 }
 
 static void request_cancel_rollback(server *s, server_slot *slot,
@@ -9641,10 +9638,8 @@ static void request_cancel_rollback(server *s, server_slot *slot,
      * carry on producing the output that was just cancelled.  Give it a token
      * to re-evaluate, the same way live_prefix_rewind_target() caps at
      * prompt_len - 1. */
-    const bool glm53 = ds4_engine_is_glm53(s->engine);
-    const int target = cancel_rollback_target(
-        glm53, committed_frontier,
-        glm53 ? ds4_session_rollback_frontier(slot->session) : -1);
+    const int target = cancel_rollback_target(ds4_engine_is_glm53(s->engine),
+                                              committed_frontier);
     pthread_mutex_lock(&s->inference_mu);
     /* Safe to rewind under tensor parallelism as well, because this is only
      * reachable once the prompt sync has *succeeded*: an interrupted or failed
@@ -11658,7 +11653,14 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
     ds4_tokens target = {0};
     build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
     const int before = ds4_session_pos(slot->session);
+    /* Internal: the tokens this appends are ours, not the client's, so the next
+     * request will not contain them.  A rollback snapshot taken at this
+     * frontier would sit outside that request's common prefix and be rejected,
+     * turning a recoverable cancel into a full re-prefill.  Keep the snapshot
+     * pinned where the client's prompt ended. */
+    ds4_session_rollback_hold(slot->session, true);
     bool ok = server_session_sync(s, slot, &target, err, errlen) == 0;
+    ds4_session_rollback_hold(slot->session, false);
     if (ok && tokens_appended) {
         int delta = ds4_session_pos(slot->session) - before;
         *tokens_appended = delta > 0 ? delta : 0;
@@ -12045,8 +12047,13 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(slot->session, server_progress_cb, &rebuild_progress);
         ds4_session_set_display_progress(slot->session, server_progress_cb, &rebuild_progress);
-        if (server_session_sync(s, slot, sync_prompt,
-                                sync_err, sizeof(sync_err)) == 0) {
+        /* Internal: a canonical rewrite of what we already hold, not the
+         * client's prompt.  See append_rendered_suffix_to_live_session(). */
+        ds4_session_rollback_hold(slot->session, true);
+        const int rebuild_rc = server_session_sync(s, slot, sync_prompt,
+                                                   sync_err, sizeof(sync_err));
+        ds4_session_rollback_hold(slot->session, false);
+        if (rebuild_rc == 0) {
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             const double rebuild_sec = now_sec() - rebuild_t0;
@@ -12671,7 +12678,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
+        /* Internal: a strict prefix of the prompt, synced only so the cold
+         * checkpoint lands on the right boundary.  The full sync follows and
+         * takes the snapshot at the real frontier. */
+        ds4_session_rollback_hold(slot->session, true);
+        const int cold_rc = server_session_sync(s, slot, &prefix, err, sizeof(err));
+        ds4_session_rollback_hold(slot->session, false);
+        if (cold_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
@@ -18883,53 +18896,57 @@ static void test_model_metadata_clamps_completion_to_context(void) {
 }
 
 static void test_tp_rewind_ack_status(void) {
-    /* 0 means "I did what you asked" -- the ack reader rejects every non-zero
-     * status, so the applied mode must NOT be encoded here.  Returning the mode
-     * made a successful RESTORE (1) read as a failed command, and the leader
-     * invalidated both ranks on every restore: the feature never once worked
-     * under TP.  These four lines are the whole contract. */
+    /* 0 means "I reached the state you asked for".  The ack reader rejects
+     * every non-zero status, so the applied mode must NOT be encoded here --
+     * doing that made a successful KEEP (mode 1) read as a failed command and
+     * the leader invalidated both ranks on every restore. */
     TEST_ASSERT(ds4_tp_rewind_ack_status(true, 32050, 32050) == 0);
     TEST_ASSERT(ds4_tp_rewind_ack_status(false, 32050, 0) == 0);
     TEST_ASSERT(ds4_tp_rewind_ack_status(true, 32050, 0) != 0);
-    TEST_ASSERT(ds4_tp_rewind_ack_status(false, 32050, 32050) != 0);
 
-    /* Position equality, not "still reusable".  A worker holding a shorter
-     * checkpoint clamps lower, and reporting that as a restore would leave the
-     * two ranks at different frontiers both believing they matched. */
+    /* KEEP is "still reusable at pos", NOT "GLM-5.3 restored a snapshot".  An
+     * ordinary truncating rewind on Flash or GLM-5.2 keeps the checkpoint too,
+     * and it is the common case: treating that as a mismatch made EVERY
+     * non-GLM-5.3 TP rewind invalidate both ranks.  An earlier version of this
+     * test asserted the broken behaviour here. */
+    TEST_ASSERT(ds4_tp_rewind_ack_status(true, 49274, 49274) == 0);
+    /* The leader kept its checkpoint but the worker dropped one it should have
+     * held: a real mismatch, and still caught. */
+    TEST_ASSERT(ds4_tp_rewind_ack_status(true, 49274, 0) != 0);
+    /* The leader invalidated but the worker kept: the other direction. */
+    TEST_ASSERT(ds4_tp_rewind_ack_status(false, 49274, 49274) != 0);
+
+    /* Position equality, not "reusable at all".  A worker holding a shorter
+     * checkpoint clamps lower; reporting that as a match would leave the two
+     * ranks at different frontiers both believing they agreed. */
     TEST_ASSERT(ds4_tp_rewind_ack_status(true, 32050, 31000) != 0);
     TEST_ASSERT(ds4_tp_rewind_ack_status(true, 32050, 32051) != 0);
 
-    /* A rewind to 0 reuses nothing, so it can never be a restore. */
+    /* Rewind to 0: keeping a zero-length checkpoint and invalidating are the
+     * same observable state, so both ack clean. */
     TEST_ASSERT(ds4_tp_rewind_ack_status(false, 0, 0) == 0);
-    TEST_ASSERT(ds4_tp_rewind_ack_status(true, 0, 0) != 0);
+    TEST_ASSERT(ds4_tp_rewind_ack_status(true, 0, 0) == 0);
 }
 
 static void test_cancel_rollback_target(void) {
     /* Non-GLM-5.3 must leave a token to re-evaluate.  Landing on the frontier
      * exactly makes an identical retry a zero-token sync, which samples the
      * cancelled generation's logits and resumes it. */
-    TEST_ASSERT(cancel_rollback_target(false, 32050, -1) == 32049);
-    TEST_ASSERT(cancel_rollback_target(false, 1, -1) == 0);
-    /* GLM-5.3 lands exactly: the restored snapshot carries the logits. */
-    TEST_ASSERT(cancel_rollback_target(true, 32050, 32050) == 32050);
-    TEST_ASSERT(cancel_rollback_target(true, 1, 1) == 1);
+    TEST_ASSERT(cancel_rollback_target(false, 32050) == 32049);
+    TEST_ASSERT(cancel_rollback_target(false, 1) == 0);
 
-    /* An internal tool-recovery sync moves the snapshot past the frontier
-     * captured for the request.  Follow the snapshot: rolling back to the stale
-     * frontier finds nothing there and invalidates the whole conversation. */
-    TEST_ASSERT(cancel_rollback_target(true, 32050, 32360) == 32360);
-    /* A snapshot BEHIND the request frontier is not this request's; do not jump
-     * backwards past committed prompt tokens to reach it. */
-    TEST_ASSERT(cancel_rollback_target(true, 32050, 31000) == 32050);
-    /* No snapshot at all -- still land on the frontier and let the rewind
-     * invalidate honestly. */
-    TEST_ASSERT(cancel_rollback_target(true, 32050, -1) == 32050);
+    /* GLM-5.3 lands exactly on the frontier the CLIENT's prompt ended at: the
+     * snapshot is pinned there (internal syncs are held), and it carries the
+     * logits.  Chasing a later internal-sync frontier would land outside the
+     * next request's common prefix and be rejected. */
+    TEST_ASSERT(cancel_rollback_target(true, 32050) == 32050);
+    TEST_ASSERT(cancel_rollback_target(true, 1) == 1);
 
     /* Never negative, whichever model. */
-    TEST_ASSERT(cancel_rollback_target(false, 0, -1) == 0);
-    TEST_ASSERT(cancel_rollback_target(true, 0, 0) == 0);
-    TEST_ASSERT(cancel_rollback_target(false, -5, -1) == 0);
-    TEST_ASSERT(cancel_rollback_target(true, -5, -5) == 0);
+    TEST_ASSERT(cancel_rollback_target(false, 0) == 0);
+    TEST_ASSERT(cancel_rollback_target(true, 0) == 0);
+    TEST_ASSERT(cancel_rollback_target(false, -5) == 0);
+    TEST_ASSERT(cancel_rollback_target(true, -5) == 0);
 }
 
 static void test_cache_miss_reason_names_an_invalid_checkpoint(void) {
