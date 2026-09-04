@@ -203,6 +203,17 @@ int ds4_tp_send_rewind_mode(ds4_tp *tp, uint64_t session_id, int pos,
                             ds4_tp_rewind_mode mode);
 /* Acknowledged; the ack status is 0 when the worker captured at `pos`. */
 int ds4_tp_send_rollback_capture(ds4_tp *tp, uint64_t session_id, int pos);
+
+/* Ack status a worker must report for a mirrored rewind: 0 iff it applied the
+ * outcome the leader asked for, non-zero otherwise.
+ *
+ * The ack channel reserves 0 for success and the reader rejects every other
+ * value, so the *applied mode* cannot be encoded in the status -- doing that
+ * made a successful RESTORE (mode 1) read as a failed command, and the leader
+ * fell into invalidate-both every single time.  Exposed so that stays a tested
+ * property rather than a comment. */
+int ds4_tp_rewind_ack_status(bool want_restore, int requested_pos,
+                             int reusable_pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
 /* Abort the mirrored prefill the worker is currently running for this session.
  * Only meaningful between a SYNC and its COMMAND_ACK; see DS4_TP_FRAME_CANCEL. */

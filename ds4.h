@@ -608,6 +608,9 @@ void ds4_session_glm53_rollback_drop(ds4_session *s);
  * a deeper one whenever it still lies inside the common prefix: on GLM-5.3 any
  * other target costs the whole conversation. */
 int ds4_session_rollback_frontier(ds4_session *s);
+/* Bytes the rollback snapshot costs PER SESSION (0 when it does not apply).
+ * Every resident slot that has synced holds one, so multiply by slot count. */
+uint64_t ds4_glm53_rollback_session_bytes(void);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 uint32_t ds4_session_raw_rewind_budget(const ds4_session *s);

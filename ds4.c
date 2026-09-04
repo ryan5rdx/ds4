@@ -811,6 +811,10 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_INDEXER_HEAD            (g_ds4_shape.n_indexer_head)
 #define DS4_N_INDEXER_HEAD_DIM        (g_ds4_shape.n_indexer_head_dim)
 #define DS4_N_INDEXER_TOP_K           (g_ds4_shape.n_indexer_top_k)
+/* Rows in the GLM-5.3 DSA indexer tail pool.  Lives with the shape macros
+ * rather than beside the Metal graph constants because the rollback-snapshot
+ * size estimate needs it in the CPU-only build too. */
+#define DS4_GLM53_INDEX_POOL_SIZE     4u
 #define DS4_N_HC                      (g_ds4_shape.n_hc)
 #define DS4_N_HC_SINKHORN_ITER        (g_ds4_shape.n_hc_sinkhorn_iter)
 #define DS4_N_NEXTN_PREDICT           (g_ds4_shape.n_nextn_predict)
@@ -39247,7 +39251,6 @@ static uint32_t glm53_graph_resume_prefill_min_tokens(void) {
 #define DS4_GLM_METAL_LONG_CONTEXT_THRESHOLD 65536u
 #define DS4_GLM_METAL_LONG_CONTEXT_FULL_ATTN_CONTEXT 4096u
 #define DS4_GLM_METAL_INDEXED_PREFILL_CHUNK_TOKENS 4096u
-#define DS4_GLM53_INDEX_POOL_SIZE 4u
 
 
 static uint32_t glm_graph_full_attention_cap(uint32_t ctx_size,
@@ -67855,6 +67858,26 @@ uint32_t ds4_engine_tp_split_flags(ds4_engine *e) {
     return f;
 }
 
+/* Per-SESSION cost of the GLM-5.3 rollback snapshot, or 0 when it does not
+ * apply.  Per session, not per rank: every resident slot that has run a sync
+ * holds its own, so a server with many warmed slots multiplies this. */
+uint64_t ds4_glm53_rollback_session_bytes(void) {
+    if (!ds4_model_is_glm53() || !ds4_glm53_rollback_enabled()) return 0;
+    const uint64_t proj = (uint64_t)DS4_N_KDA_HEAD * DS4_N_KDA_HEAD_DIM;
+    const uint64_t conv =
+        3ull * (uint64_t)(DS4_N_KDA_CONV - 1u) * proj * sizeof(float);
+    const uint64_t recurrent = proj * DS4_N_KDA_HEAD_DIM * sizeof(float);
+    const uint64_t tail = 2ull * (uint64_t)DS4_GLM53_INDEX_POOL_SIZE *
+                          (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+    uint64_t total = 0;
+    for (uint32_t il = 0; il < (uint32_t)DS4_N_LAYER; il++) {
+        total += ds4_glm53_layer_is_kda(il) ? (conv + recurrent) : tail;
+    }
+    /* Host-side, but it is still a per-session allocation. */
+    total += (uint64_t)DS4_N_VOCAB * sizeof(float);
+    return total;
+}
+
 int ds4_engine_embd_dim(ds4_engine *e) {
     (void)e;
     return (int)DS4_N_EMBD;
@@ -80335,15 +80358,16 @@ static void ds4_session_rewind_core(ds4_session *s, int pos,
             ds4_tp_wait_command_ack_status(s->engine->tp.ctx, s->tp_session_id,
                                            "session rewind", &wstatus,
                                            terr, sizeof(terr));
-        /* status is the worker's applied mode; anything else means it did not
-         * do what we did. */
-        const int want = glm53_restore ? (int)DS4_TP_REWIND_RESTORE
-                                       : (int)DS4_TP_REWIND_INVALIDATE;
-        if (!sent || !acked || wstatus != want) {
+        /* The worker acks 0 iff it applied the mode we sent; the ack reader
+         * already turns any other status into !acked, so this is the whole
+         * test.  (Encoding the applied mode *in* the status does not work --
+         * status 1 reads as a failed command.) */
+        if (!sent || !acked) {
             fprintf(stderr,
                     "ds4: tp: session rewind not confirmed (sent=%d acked=%d "
-                    "worker=%d wanted=%d)%s%s; invalidating both ranks\n",
-                    (int)sent, (int)acked, wstatus, want,
+                    "worker_status=%d mode=%s)%s%s; invalidating both ranks\n",
+                    (int)sent, (int)acked, wstatus,
+                    glm53_restore ? "restore" : "invalidate",
                     terr[0] ? ": " : "", terr);
             /* Collapse to the one state both ranks can reach unilaterally. */
             glm53_state_ok = false;
