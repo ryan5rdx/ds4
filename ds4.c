@@ -80305,7 +80305,12 @@ static void ds4_session_rewind_core(ds4_session *s, int pos,
      * worker's ack.  INVALIDATE is always safe and always wins. */
     const bool glm53_want = decided ? want_restore
                                     : ds4_session_glm53_rollback_can_restore(s, pos);
-    if (glm53 && glm53_want) {
+    /* `pos > 0` is load-bearing, not defensive.  A rewind to zero leaves
+     * reusable_pos == pos == 0, which read as "keep" and was mirrored as such;
+     * the worker then tried to restore a snapshot that cannot exist at zero,
+     * failed, and marked the transport permanently failed.  An interrupted
+     * FIRST prefill hits this every time, because pre_sync_len is 0. */
+    if (glm53 && glm53_want && pos > 0) {
         glm53_restore = ds4_session_glm53_rollback_restore(s, pos);
         if (!glm53_restore) {
             fprintf(stderr,
@@ -80410,7 +80415,10 @@ static void ds4_session_rewind_core(ds4_session *s, int pos,
      * mismatch, so every non-GLM-5.3 TP rewind invalidated both ranks. */
     if (!decided && ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
-        const bool keep = ds4_session_reusable_pos(s) == pos;
+        /* `pos > 0`: a rewind to zero keeps nothing by definition, and both
+         * ranks reach that state unilaterally.  Reporting it as KEEP made the
+         * worker attempt a restore at a frontier no snapshot can cover. */
+        const bool keep = pos > 0 && ds4_session_reusable_pos(s) == pos;
         char terr[160] = "";
         int wstatus = -1;
         const bool sent = ds4_tp_send_rewind_mode(

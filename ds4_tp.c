@@ -42,8 +42,16 @@
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
 /* Base 7; upstream 9 adds the multimodal sync frame, and this fork adds the
- * prefill cancel frame and the verify flags word on top of it. */
-#define DS4_TP_PROTOCOL_VERSION 10u
+ * prefill cancel frame and the verify flags word on top of it.
+ *
+ * 11 adds the GLM-5.3 rollback protocol: a mode word on REWIND (reusing its
+ * `reserved` field, so the frame size is unchanged), an acknowledged REWIND,
+ * and the ROLLBACK_CAPTURE frame.  The version bump is the only thing that can
+ * refuse a mixed pair here: the frame layouts did not change, and `split_flags`
+ * bit 11 only says whether the feature is enabled, not which ACK semantics the
+ * peer speaks.  Three revisions shipped with different semantics under version
+ * 10 and all would have passed bring-up, then disagreed at the first rewind. */
+#define DS4_TP_PROTOCOL_VERSION 11u
 
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
@@ -2300,6 +2308,11 @@ int ds4_tp_send_rewind_mode(ds4_tp *tp, uint64_t session_id, int pos,
 
 int ds4_tp_rewind_ack_status(bool want_keep, int requested_pos,
                              int reusable_pos) {
+    /* KEEP at or below zero is not a representable request -- there is nothing
+     * to keep -- so refuse it rather than letting it read as a match against a
+     * zero reusable position.  Fail closed: the leader sees the mismatch and
+     * invalidates both ranks. */
+    if (want_keep && requested_pos <= 0) return 1;
     /* Position equality, not "still reusable > 0": the rewind clamps to this
      * rank's own checkpoint length, so a worker holding less than the leader
      * lands lower and must not report that as a match. */
