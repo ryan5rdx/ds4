@@ -610,6 +610,13 @@ void ds4_session_glm53_rollback_drop(ds4_session *s);
  * common prefix and is unusable; the snapshot must stay pinned at the external
  * prompt frontier.  Always pair with a matching `false`. */
 void ds4_session_rollback_hold(ds4_session *s, bool hold);
+/* TEST ONLY.  Force the next canonical rewrite down the REBUILD_NEEDED branch.
+ * That branch is otherwise unreachable: the canonical renderer replays the
+ * model's raw tool-call bytes verbatim, so the canonical form always equals the
+ * live checkpoint and the rewrite short-circuits.  Callers must ALSO suppress
+ * raw_tool_text when rendering, or the equality guards above the rewrite exit
+ * first and this never runs. */
+void ds4_session_force_canon_rebuild(ds4_session *s, bool force);
 /* The one position a GLM-5.3 rewind can restore rather than re-prefill, or -1
  * if there is none.  A caller choosing a rewind target should prefer this over
  * a deeper one whenever it still lies inside the common prefix: on GLM-5.3 any

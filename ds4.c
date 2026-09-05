@@ -57464,6 +57464,9 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
+    /* Test-only: force canonicalization down the rebuild branch.  Outside the
+     * GPU guard because both its setter and its one reader are backend-neutral. */
+    bool force_canon_rebuild;
 #ifndef DS4_NO_GPU
     /* GLM-5.3 rollback snapshot.  The KDA layers hold a running recurrence and
      * the DSA indexer keeps a rolling pool, so neither can be truncated the way
@@ -58743,6 +58746,7 @@ void ds4_session_glm53_rollback_drop(ds4_session *s) {
 void ds4_session_rollback_hold(ds4_session *s, bool hold) {
     if (s) s->glm53_rollback_held = hold;
 }
+
 
 
 /* Capture the state at the current checkpoint frontier.
@@ -71949,27 +71953,24 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         }
     }
 
-    /* Test hook: force the REBUILD_NEEDED branch for the next N rewrites.
+    /* Test hook: force the REBUILD_NEEDED branch.
      *
      * Which branch a canonicalization takes is decided by whether the model's
-     * sampled tool-call bytes happen to match the canonical rendering, so it is
-     * not reachable from a client at all.  The rebuild branch is the one that
-     * invalidates and re-syncs from zero -- the path the rollback snapshot has
-     * to survive -- and it has therefore never been exercised.  Off unless
-     * DS4_SERVER_TEST_FORCE_CANON_REBUILD is set to a positive count. */
-    {
-        static int force_rebuild = -1;
-        if (force_rebuild < 0) {
-            const char *v = getenv("DS4_SERVER_TEST_FORCE_CANON_REBUILD");
-            force_rebuild = v ? atoi(v) : 0;
-        }
-        if (force_rebuild > 0) {
-            force_rebuild--;
-            snprintf(err, errlen,
-                     "TEST HOOK forcing canonical rebuild: common=%d live=%d "
-                     "canonical=%d", common, s->checkpoint.len, prompt->len);
-            return DS4_SESSION_REWRITE_REBUILD_NEEDED;
-        }
+     * sampled tool-call bytes match the canonical rendering -- and they always
+     * do, because the canonical renderer replays raw_tool_text verbatim when it
+     * has it.  So the rebuild branch, the one that invalidates and re-syncs
+     * from zero and therefore the one the rollback snapshot has to survive, is
+     * not reachable from a client at all.
+     *
+     * A session flag rather than an env read: the caller also has to suppress
+     * raw_tool_text so the canonical form genuinely differs, and both halves
+     * must be driven by the same decision.  Set by
+     * ds4_session_force_canon_rebuild(); off by default. */
+    if (s->force_canon_rebuild) {
+        snprintf(err, errlen,
+                 "TEST HOOK forcing canonical rebuild: common=%d live=%d "
+                 "canonical=%d", common, s->checkpoint.len, prompt->len);
+        return DS4_SESSION_REWRITE_REBUILD_NEEDED;
     }
     if (common == s->checkpoint.len) {
         return ds4_session_sync(s, prompt, err, errlen) == 0 ?
@@ -80551,6 +80552,10 @@ int ds4_session_reusable_pos(ds4_session *s) {
 const ds4_tokens *ds4_session_reusable_tokens(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return NULL;
     return &s->checkpoint;
+}
+
+void ds4_session_force_canon_rebuild(ds4_session *s, bool force) {
+    if (s) s->force_canon_rebuild = force;
 }
 
 int ds4_session_rollback_frontier(ds4_session *s) {

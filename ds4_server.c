@@ -11957,6 +11957,35 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                                          const char *reasoning, const tool_calls *calls) {
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
 
+    /* Test hook: force this canonicalization down the REBUILD_NEEDED branch.
+     *
+     * Both halves are needed and neither works alone.  append_glm_tool_calls_text()
+     * replays calls->raw_tool_text verbatim whenever it has it -- regardless of
+     * --disable-exact-dsml-tool-replay, which only gates whether we canonicalize
+     * at all -- so the canonical rendering reproduces the sampled bytes exactly,
+     * the two equality guards below fire, and we `goto done` long before the
+     * rewrite is called.  Suppressing raw_tool_text makes the canonical form
+     * genuinely differ; the session flag then pins which branch the rewrite
+     * takes instead of leaving it to token arithmetic. */
+    tool_calls forced_calls;
+    static int force_canon_rebuild = -1;
+    if (force_canon_rebuild < 0) {
+        const char *v = getenv("DS4_SERVER_TEST_FORCE_CANON_REBUILD");
+        force_canon_rebuild = v ? atoi(v) : 0;
+    }
+    bool forced = false;
+    if (force_canon_rebuild > 0) {
+        force_canon_rebuild--;
+        forced = true;
+        forced_calls = *calls;
+        forced_calls.raw_tool_text = NULL;   /* shallow view; owner unchanged */
+        calls = &forced_calls;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: TEST HOOK forcing canonical rebuild "
+                   "(raw_tool_text suppressed, %d remaining)",
+                   force_canon_rebuild);
+    }
+
     char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
 
     buf rendered = {0};
@@ -11967,13 +11996,13 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
     const int live_len = ds4_session_reusable_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &canonical);
-    if (common == live_len && canonical.len == live_len) goto done;
+    if (!forced && common == live_len && canonical.len == live_len) goto done;
 
     size_t live_text_len = 0;
     char *live_text = render_tokens_text(s->engine,
                                          ds4_session_reusable_tokens(slot->session),
                                          &live_text_len);
-    if (live_text_len == rendered.len &&
+    if (!forced && live_text_len == rendered.len &&
         (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
     {
         /* The graph already represents the bytes the next request will render.
@@ -12004,9 +12033,11 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
      * brick the TP pair).  A REBUILD-canonicalized turn therefore has no
      * rollback point; that is a known gap, not an oversight. */
     ds4_session_rollback_hold(slot->session, true);
+    if (forced) ds4_session_force_canon_rebuild(slot->session, true);
     ds4_session_rewrite_result rr =
         ds4_session_rewrite_from_common(slot->session, &canonical, common,
                                         err, sizeof(err));
+    if (forced) ds4_session_force_canon_rebuild(slot->session, false);
     pthread_mutex_unlock(&s->inference_mu);
     if (rr == DS4_SESSION_REWRITE_OK) {
         server_log(DS4_LOG_KVCACHE,
