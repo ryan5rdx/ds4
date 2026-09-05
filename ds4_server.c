@@ -9176,6 +9176,15 @@ struct server {
     kv_disk_cache kv;
     tool_memory tool_mem;
     bool disable_exact_dsml_tool_replay;
+    /* Standalone persistence for the exact-DSML tool map.  Deliberately NOT the
+     * KV disk cache: that is refused under --tensor-parallel because a restore
+     * is not mirrored to the worker, which left tool memory RAM-only on the
+     * production config.  This map is host-side text with no rank-local state,
+     * so it needs no mirroring and no such gate.  See tool_store_open(). */
+    char *tool_store_path;
+    FILE *tool_store_fp;
+    /* Bytes appended since the last compaction, not a record count. */
+    uint64_t tool_store_appends;
     bool enable_cors;
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
@@ -9782,13 +9791,23 @@ static const char *tool_memory_lookup_locked(tool_memory *m, const char *id,
     return e->block->dsml;
 }
 
+static void tool_store_append_locked(server *s, const char *id, const char *dsml);
+
 static void tool_memory_remember(server *s, const tool_calls *calls) {
     if (!s || s->disable_exact_dsml_tool_replay ||
         !calls || !calls->raw_tool_text || !calls->raw_tool_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     for (int i = 0; i < calls->len; i++) {
+        /* Persist only ids the map does not already hold: an agent replays the
+         * same call on every subsequent turn, and appending each time would
+         * grow the file by the whole conversation squared. */
+        const bool known =
+            tool_memory_find_entry_locked(&s->tool_mem, calls->v[i].id) != NULL;
         tool_memory_put_locked(&s->tool_mem, calls->v[i].id, calls->raw_tool_text,
                                TOOL_MEMORY_RAM);
+        if (!known) {
+            tool_store_append_locked(s, calls->v[i].id, calls->raw_tool_text);
+        }
     }
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -10201,6 +10220,212 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
         if (!ok) return loaded;
     }
     return loaded;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Standalone tool-memory store (TM1)
+ *
+ * Exact-DSML tool replay is what keeps a long agent conversation a cheap append:
+ * when the server can reproduce the bytes it sampled for each past tool call,
+ * the client's replayed transcript tokenizes identically and the live KV prefix
+ * matches.  When it cannot, the call is re-rendered canonically, the tokens
+ * differ, and the prefix diverges at the EARLIEST such call -- discarding
+ * everything after it.  One unknown call early in a conversation costs a full
+ * re-prefill: measured at 142864 tokens / ~336 s on a live session.
+ *
+ * That map used to live only in RAM on the production config.  Its sole disk
+ * tier was a callback from the KV disk cache, and that cache is refused under
+ * --tensor-parallel because a restore is not mirrored to the worker.  So a
+ * server restart permanently poisoned every conversation in flight.
+ *
+ * The map is host-side text keyed by call id -- no rank-local state, nothing to
+ * mirror -- so it can persist on its own with no TP gate.
+ *
+ * Format: the existing KV_TOOL_MAP record layout, so kv_tool_map_load_from_pos()
+ * reads it unchanged.  Append-only during a session, compacted at startup: the
+ * common failure is `kill -9`, so durability has to be per-write rather than at
+ * shutdown, and compaction on load bounds growth across restarts.
+ * ------------------------------------------------------------------------ */
+
+/* Compact once the appended tail is as large as the live set it describes, so
+ * the file stays under ~2x the map.  Bytes, not record count: an earlier
+ * version triggered on `appends > max_entries * 4`, i.e. 400 000 records with
+ * the default cap, which is hundreds of MB before the first compaction and not
+ * a bound worth stating.  The floor stops a small map compacting on every
+ * write. */
+#define TOOL_STORE_COMPACT_FLOOR_BYTES (1024u * 1024u)
+
+static void tool_store_write_header(FILE *fp, uint32_t count) {
+    uint8_t h[KV_TOOL_MAP_HEADER];
+    h[0] = KV_TOOL_MAP_MAGIC0;
+    h[1] = KV_TOOL_MAP_MAGIC1;
+    h[2] = KV_TOOL_MAP_MAGIC2;
+    h[3] = KV_TOOL_MAP_VERSION;
+    le_put32(h + 4, count);
+    (void)fwrite(h, 1, sizeof(h), fp);
+}
+
+static bool tool_store_write_record(FILE *fp, const char *id, const char *dsml,
+                                    size_t dsml_len) {
+    const size_t id_len = strlen(id);
+    if (id_len == 0 || id_len > UINT32_MAX || dsml_len == 0 ||
+        dsml_len > UINT32_MAX) {
+        return true;   /* skip, not an error */
+    }
+    uint8_t lens[8];
+    le_put32(lens, (uint32_t)id_len);
+    le_put32(lens + 4, (uint32_t)dsml_len);
+    return fwrite(lens, 1, sizeof(lens), fp) == sizeof(lens) &&
+           fwrite(id, 1, id_len, fp) == id_len &&
+           fwrite(dsml, 1, dsml_len, fp) == dsml_len;
+}
+
+/* Rewrite the file from the in-memory map.  Caller holds tool_mu. */
+static bool tool_store_compact_locked(server *s) {
+    if (!s || !s->tool_store_path) return false;
+    char *tmp = xmalloc(strlen(s->tool_store_path) + 5);
+    sprintf(tmp, "%s.tmp", s->tool_store_path);
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) { free(tmp); return false; }
+
+    /* Advisory only -- tool_store_load() reads to EOF, because appends
+     * cannot keep this in sync without seeking back on every write. */
+    uint32_t count = 0;
+    for (tool_memory_entry *e = s->tool_mem.head; e; e = e->next) count++;
+    tool_store_write_header(fp, count);
+    bool ok = true;
+    for (tool_memory_entry *e = s->tool_mem.head; ok && e; e = e->next) {
+        if (!e->id || !e->block || !e->block->dsml) continue;
+        ok = tool_store_write_record(fp, e->id, e->block->dsml, e->block->len);
+    }
+    ok = (fflush(fp) == 0) && ok;
+    fclose(fp);
+    if (ok && rename(tmp, s->tool_store_path) != 0) ok = false;
+    if (!ok) unlink(tmp);
+    free(tmp);
+    if (!ok) return false;
+
+    if (s->tool_store_fp) fclose(s->tool_store_fp);
+    s->tool_store_fp = fopen(s->tool_store_path, "ab");
+    s->tool_store_appends = 0;
+    return s->tool_store_fp != NULL;
+}
+
+/* Caller holds tool_mu. */
+static void tool_store_append_locked(server *s, const char *id, const char *dsml) {
+    if (!s || !s->tool_store_fp || !id || !id[0] || !dsml || !dsml[0]) return;
+    if (!tool_store_write_record(s->tool_store_fp, id, dsml, strlen(dsml)) ||
+        fflush(s->tool_store_fp) != 0)
+    {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: tool memory store write failed (%s); "
+                   "persistence disabled for this run",
+                   s->tool_store_path ? s->tool_store_path : "?");
+        fclose(s->tool_store_fp);
+        s->tool_store_fp = NULL;
+        return;
+    }
+    /* Appended records accumulate duplicates only across restarts, because
+     * remember() skips ids already in the map, and across evict-then-re-add.
+     * Compact once the tail is as big as the live set, bounding the file at
+     * roughly 2x the map -- which is itself bounded by --tool-memory-max-ids
+     * and the 512 MB byte cap. */
+    s->tool_store_appends += 8u + strlen(id) + strlen(dsml);
+    const uint64_t live = (uint64_t)s->tool_mem.bytes;
+    const uint64_t budget =
+        live > TOOL_STORE_COMPACT_FLOOR_BYTES ? live
+                                              : TOOL_STORE_COMPACT_FLOOR_BYTES;
+    if (s->tool_store_appends > budget) {
+        (void)tool_store_compact_locked(s);
+    }
+}
+
+/* Read an append-only store to EOF.
+ *
+ * NOT kv_tool_map_load_from_pos(): that honours the record count in the header,
+ * which is written at compaction and cannot be kept in sync by an append
+ * without seeking backwards on every tool call.  Ignoring it means the header
+ * count is advisory only, and a file truncated by `kill -9` mid-append loses
+ * exactly the trailing partial record instead of being misread wholesale.
+ * Returns the number of ids loaded. */
+static int tool_store_load(server *s, const char *path) {
+    if (!s || s->disable_exact_dsml_tool_replay || !path) return 0;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+    uint8_t h[KV_TOOL_MAP_HEADER];
+    if (fread(h, 1, sizeof(h), fp) != sizeof(h) ||
+        h[0] != KV_TOOL_MAP_MAGIC0 || h[1] != KV_TOOL_MAP_MAGIC1 ||
+        h[2] != KV_TOOL_MAP_MAGIC2 || h[3] != KV_TOOL_MAP_VERSION)
+    {
+        fclose(fp);
+        return 0;
+    }
+    int loaded = 0;
+    for (;;) {
+        uint8_t lens[8];
+        if (fread(lens, 1, sizeof(lens), fp) != sizeof(lens)) break;
+        const uint32_t id_len = le_get32(lens);
+        const uint32_t dsml_len = le_get32(lens + 4);
+        if (id_len == 0 || id_len > 256 ||
+            dsml_len == 0 || dsml_len > DS4_TOOL_MEMORY_MAX_BYTES) break;
+        char *id = xmalloc((size_t)id_len + 1);
+        char *dsml = xmalloc((size_t)dsml_len + 1);
+        const bool ok = fread(id, 1, id_len, fp) == id_len &&
+                        fread(dsml, 1, dsml_len, fp) == dsml_len;
+        id[id_len] = '\0';
+        dsml[dsml_len] = '\0';
+        if (ok) {
+            tool_memory_put_source(s, id, dsml, TOOL_MEMORY_DISK);
+            loaded++;
+        }
+        free(id);
+        free(dsml);
+        if (!ok) break;
+    }
+    fclose(fp);
+    return loaded;
+}
+
+/* Load `path`, then compact it.  Safe to call with a missing or truncated file:
+ * kv_tool_map_load_from_pos() stops cleanly at the first short read, so a
+ * process killed mid-append loses at most the trailing record. */
+static void tool_store_open(server *s, const char *path) {
+    if (!s || !path || !path[0]) return;
+    if (s->disable_exact_dsml_tool_replay) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --tool-memory-file ignored; exact DSML tool "
+                   "replay is disabled");
+        return;
+    }
+    s->tool_store_path = xstrdup(path);
+
+    const int loaded = tool_store_load(s, path);
+
+    pthread_mutex_lock(&s->tool_mu);
+    const bool ok = tool_store_compact_locked(s);
+    pthread_mutex_unlock(&s->tool_mu);
+
+    if (!ok) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: could not open tool memory store %s; tool "
+                   "replay will not survive a restart", path);
+        free(s->tool_store_path);
+        s->tool_store_path = NULL;
+        return;
+    }
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: tool memory store %s (%d ids loaded)", path, loaded);
+}
+
+static void tool_store_close(server *s) {
+    if (!s) return;
+    if (s->tool_store_fp) {
+        fclose(s->tool_store_fp);
+        s->tool_store_fp = NULL;
+    }
+    free(s->tool_store_path);
+    s->tool_store_path = NULL;
 }
 
 #ifdef DS4_SERVER_TEST
@@ -14519,6 +14744,7 @@ typedef struct {
     const char *chdir_path;
     const char *trace_path;
     const char *kv_disk_dir;
+    const char *tool_memory_file;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;
@@ -14619,6 +14845,7 @@ static void server_close_resources(server *s) {
         s->trace = NULL;
     }
     kv_cache_close(&s->kv);
+    tool_store_close(s);
     tool_memory_free(&s->tool_mem);
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
@@ -14816,6 +15043,8 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
+        } else if (!strcmp(arg, "--tool-memory-file")) {
+            c.tool_memory_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
@@ -15158,6 +15387,9 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: exact DSML tool replay disabled; tool history uses canonical JSON rendering");
     }
+    /* Deliberately outside the TP branch above: unlike the KV disk cache, the
+     * tool map is host-side text and a restore needs no mirroring. */
+    if (cfg.tool_memory_file) tool_store_open(&s, cfg.tool_memory_file);
     if (s.batched_mode) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: batched mode enabled resident_sessions=%d prefill_quantum=%d mixed_prefill_quantum=%d decode_coalesce_us=%ld",
@@ -19005,6 +19237,163 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_tool_store_survives_restart(void) {
+    /* The whole point of TM1: a tool call remembered by one process must still
+     * be exactly replayable by the next one.  Before this, the map lived only
+     * in RAM under TP, so a restart mid-conversation forced every past call to
+     * be re-rendered canonically -- which diverges the token prefix at the
+     * earliest such call and costs a full re-prefill (measured 142864 tokens /
+     * ~336 s on a live session). */
+    char path[] = "/tmp/ds4_tool_store_testXXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    close(fd);
+    unlink(path);
+
+    const char *dsml_a = "<DSML>call_a bytes exactly as sampled</DSML>";
+    const char *dsml_b = "<DSML>call_b different bytes</DSML>";
+
+    /* Process 1: remember two ids, then go away. */
+    {
+        server s = {0};
+        pthread_mutex_init(&s.tool_mu, NULL);
+        tool_store_open(&s, path);
+        TEST_ASSERT(s.tool_store_path != NULL);
+        pthread_mutex_lock(&s.tool_mu);
+        tool_memory_put_locked(&s.tool_mem, "call_a", dsml_a, TOOL_MEMORY_RAM);
+        tool_store_append_locked(&s, "call_a", dsml_a);
+        tool_memory_put_locked(&s.tool_mem, "call_b", dsml_b, TOOL_MEMORY_RAM);
+        tool_store_append_locked(&s, "call_b", dsml_b);
+        pthread_mutex_unlock(&s.tool_mu);
+        tool_store_close(&s);
+        tool_memory_free(&s.tool_mem);
+        pthread_mutex_destroy(&s.tool_mu);
+    }
+
+    /* Process 2: a cold server must resolve both to the EXACT bytes. */
+    {
+        server s = {0};
+        pthread_mutex_init(&s.tool_mu, NULL);
+        pthread_mutex_lock(&s.tool_mu);
+        TEST_ASSERT(tool_memory_find_entry_locked(&s.tool_mem, "call_a") == NULL);
+        pthread_mutex_unlock(&s.tool_mu);
+
+        tool_store_open(&s, path);
+        pthread_mutex_lock(&s.tool_mu);
+        tool_memory_source src = TOOL_MEMORY_RAM;
+        tool_memory_block *blk = NULL;
+        const char *got_a =
+            tool_memory_lookup_locked(&s.tool_mem, "call_a", &src, &blk);
+        const char *got_b =
+            tool_memory_lookup_locked(&s.tool_mem, "call_b", &src, &blk);
+        TEST_ASSERT(got_a != NULL && !strcmp(got_a, dsml_a));
+        TEST_ASSERT(got_b != NULL && !strcmp(got_b, dsml_b));
+        pthread_mutex_unlock(&s.tool_mu);
+        tool_store_close(&s);
+        tool_memory_free(&s.tool_mem);
+        pthread_mutex_destroy(&s.tool_mu);
+    }
+
+    /* A truncated file -- the `kill -9 mid-append` case -- must lose at most
+     * the trailing record, not the whole store. */
+    {
+        FILE *fp = fopen(path, "ab");
+        TEST_ASSERT(fp != NULL);
+        uint8_t partial[6] = {1, 2, 3, 4, 5, 6};   /* short of an 8-byte length pair */
+        fwrite(partial, 1, sizeof(partial), fp);
+        fclose(fp);
+
+        server s = {0};
+        pthread_mutex_init(&s.tool_mu, NULL);
+        tool_store_open(&s, path);
+        pthread_mutex_lock(&s.tool_mu);
+        tool_memory_source src = TOOL_MEMORY_RAM;
+        tool_memory_block *blk = NULL;
+        const char *got_a =
+            tool_memory_lookup_locked(&s.tool_mem, "call_a", &src, &blk);
+        TEST_ASSERT(got_a != NULL && !strcmp(got_a, dsml_a));
+        pthread_mutex_unlock(&s.tool_mu);
+        tool_store_close(&s);
+        tool_memory_free(&s.tool_mem);
+        pthread_mutex_destroy(&s.tool_mu);
+    }
+
+    /* And it must be inert when exact replay is off, rather than writing a
+     * store nothing will ever read. */
+    {
+        server s = {0};
+        s.disable_exact_dsml_tool_replay = true;
+        pthread_mutex_init(&s.tool_mu, NULL);
+        tool_store_open(&s, path);
+        TEST_ASSERT(s.tool_store_path == NULL);
+        TEST_ASSERT(s.tool_store_fp == NULL);
+        tool_store_close(&s);
+        pthread_mutex_destroy(&s.tool_mu);
+    }
+
+    unlink(path);
+}
+
+static void test_tool_store_file_is_bounded(void) {
+    /* The store is append-only, so "does it grow forever?" is a real question.
+     * Churn far more distinct ids than the map will hold and assert the FILE
+     * stays proportional to the live set rather than to everything ever
+     * written.  An earlier version triggered compaction on `appends >
+     * max_entries * 4` -- 400 000 records at the default cap, i.e. hundreds of
+     * MB before the first compaction. */
+    char path[] = "/tmp/ds4_tool_bound_testXXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    close(fd);
+    unlink(path);
+
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    /* Leave max_entries at its DEFAULT (100 000).  That is the whole point:
+     * the old trigger was `appends > max_entries * 4`, so shrinking the entry
+     * cap would make it tight too and the test would pass either way.  Cap the
+     * live set by BYTES instead, which the old rule ignored entirely. */
+    s.tool_mem.max_bytes = 64u * 1024u;
+    tool_store_open(&s, path);
+    TEST_ASSERT(s.tool_store_path != NULL);
+
+    char dsml[512];
+    memset(dsml, 'x', sizeof(dsml) - 1);
+    dsml[sizeof(dsml) - 1] = '\0';
+
+    pthread_mutex_lock(&s.tool_mu);
+    for (int i = 0; i < 20000; i++) {
+        char id[32];
+        snprintf(id, sizeof(id), "call_%06d", i);
+        tool_memory_put_locked(&s.tool_mem, id, dsml, TOOL_MEMORY_RAM);
+        tool_store_append_locked(&s, id, dsml);
+    }
+    const uint64_t live_bytes = (uint64_t)s.tool_mem.bytes;
+    pthread_mutex_unlock(&s.tool_mu);
+
+    FILE *fp = fopen(path, "rb");
+    TEST_ASSERT(fp != NULL);
+    fseek(fp, 0, SEEK_END);
+    const long file_bytes = ftell(fp);
+    fclose(fp);
+
+    /* 20 000 records x ~520 B is ~10 MB if nothing ever compacts, and the old
+     * record-count rule would not have fired once (20 000 << 400 000).  The
+     * live set is capped at 64 KB, so the file must be a small multiple of that
+     * plus the 1 MB floor -- NOT a function of how many were ever written. */
+    const long ceiling =
+        (long)(2u * TOOL_STORE_COMPACT_FLOOR_BYTES + 2u * live_bytes);
+    TEST_ASSERT(file_bytes > 0);
+    TEST_ASSERT(file_bytes < ceiling);
+    /* And the map itself honoured its byte cap. */
+    TEST_ASSERT((uint64_t)s.tool_mem.bytes <= 64u * 1024u);
+
+    tool_store_close(&s);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+    unlink(path);
+}
+
 static void test_tp_rewind_ack_status(void) {
     /* 0 means "I reached the state you asked for".  The ack reader rejects
      * every non-zero status, so the applied mode must NOT be encoded here --
@@ -20779,6 +21168,8 @@ static void ds4_server_unit_tests_run(void) {
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
+    test_tool_store_survives_restart();
+    test_tool_store_file_is_bounded();
     test_tp_rewind_ack_status();
     test_cancel_rollback_target();
     test_cache_miss_reason_names_an_invalid_checkpoint();
