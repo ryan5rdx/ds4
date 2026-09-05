@@ -226,6 +226,7 @@ static id<MTLComputePipelineState> g_glm53_expand_pool_selection_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_rope_tail_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_score_one_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_score_one_direct_pipeline;
+static id<MTLComputePipelineState> g_glm_indexer_score_one_vpt_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_scores_batch_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_scores_tiled_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_scores_tiled_f32_pipeline;
@@ -6862,6 +6863,7 @@ typedef struct {
     uint32_t head_dim;
     uint32_t cache_f16;
     float    scale;
+    uint32_t rows_per_tg;
 } ds4_gpu_glm_indexer_score_one_args;
 
 typedef struct {
@@ -9210,6 +9212,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_indexer_score_one");
         g_glm_indexer_score_one_direct_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_indexer_score_one_direct");
+        g_glm_indexer_score_one_vpt_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_indexer_score_one_vpt");
         g_glm_indexer_scores_batch_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_indexer_scores_batch");
         g_glm_indexer_scores_tiled_pipeline =
@@ -11654,6 +11658,7 @@ void ds4_gpu_cleanup(void) {
         g_glm_indexer_rope_tail_pipeline = nil;
         g_glm_indexer_score_one_pipeline = nil;
         g_glm_indexer_score_one_direct_pipeline = nil;
+        g_glm_indexer_score_one_vpt_pipeline = nil;
         g_glm_indexer_scores_batch_pipeline = nil;
         g_glm_indexer_scores_tiled_pipeline = nil;
         g_glm_indexer_scores_tiled_f32_pipeline = nil;
@@ -36121,6 +36126,55 @@ int ds4_gpu_glm_indexer_rope_tail_tensor(
                                                "GLM indexer RoPE");
 }
 
+/* IDX-VPT: pooled rows per threadgroup for the decode indexer score.
+ *
+ * R HAS TO BE LARGE.  A model-free benchmark over 11 production-sized F16 key
+ * buffers (M1 Max) measured, per scan:
+ *
+ *      pooled rows            direct      vpt4      best tested
+ *      32 768  (~131k ctx)   0.5705 ms  0.5737 ms  vpt16: 0.5485 ms
+ *      77 500  (~310k ctx)   1.3345 ms  1.3558 ms  vpt32: 1.2587 ms
+ *
+ * So vpt4 is at or just below break-even and only R >= 16 pays.  That also
+ * corrects the reasoning this kernel was built on: the one-row kernel re-reads
+ * all 16 KB of q per row against 256 B of key, and I took that to mean q
+ * dominates the traffic.  It dominates the LOAD COUNT, but 16 KB of q is
+ * L1-resident, so the re-reads are cache hits and cost little.  What R actually
+ * buys is amortising the per-row fixed cost -- threadgroup launch, the register
+ * preload, the barriers -- which is why the curve keeps improving well past the
+ * point where q reuse has saturated.
+ *
+ * The floor is proportional, not a fixed row count.  An earlier version fell
+ * back below 512 rows, which was tuned for R=4: at 2048 ctx there are exactly
+ * 512 pooled rows, and R=16 there would leave 32 threadgroups -- far below the
+ * core count on either M2 Ultra bin.  Targeting >= 256 threadgroups scales the
+ * cap with the work instead.
+ *
+ * DS4_METAL_GLM_INDEXER_VPT overrides R for sweeps; 0 or 1 restores the
+ * original kernel exactly.  Capped at 64 so a sweep can go past the largest
+ * value measured so far without a rebuild. */
+#define IDX_VPT_MIN_THREADGROUPS 256u
+
+/* The CONFIGURED R, before the occupancy floor. */
+static uint32_t glm_indexer_score_vpt_configured(void) {
+    static int cached = -2;
+    if (cached == -2) {
+        const char *env = getenv("DS4_METAL_GLM_INDEXER_VPT");
+        cached = env && env[0] ? atoi(env) : 1;
+        if (cached < 0) cached = 0;
+        if (cached > 64) cached = 64;
+    }
+    return (uint32_t)cached;
+}
+
+static uint32_t glm_indexer_score_rows_per_tg(uint32_t n_rows) {
+    const uint32_t want = glm_indexer_score_vpt_configured();
+    if (want <= 1u) return 1u;
+    const uint32_t by_occupancy = n_rows / IDX_VPT_MIN_THREADGROUPS;
+    if (by_occupancy <= 1u) return 1u;
+    return by_occupancy < want ? by_occupancy : want;
+}
+
 int ds4_gpu_glm_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -36158,6 +36212,7 @@ int ds4_gpu_glm_indexer_score_one_tensor(
         }
 
         ds4_gpu_glm_indexer_score_one_args args = {
+            .rows_per_tg = 1u,
             .n_rows = n_rows,
             .n_head = n_head,
             .head_dim = head_dim,
@@ -36171,19 +36226,53 @@ int ds4_gpu_glm_indexer_score_one_tensor(
                                      "kernel_glm_indexer_score_one_direct");
             if (!direct_pipeline) return 0;
 
+            const uint32_t rows_per_tg = glm_indexer_score_rows_per_tg(n_rows);
+            id<MTLComputePipelineState> use_pipeline = direct_pipeline;
+            NSUInteger tg_count = (NSUInteger)n_rows;
+            NSUInteger tg_mem = (128u + 4u) * sizeof(float);
+            if (rows_per_tg > 1u) {
+                id<MTLComputePipelineState> vpt_pipeline =
+                    ds4_gpu_hot_pipeline(g_glm_indexer_score_one_vpt_pipeline,
+                                         "kernel_glm_indexer_score_one_vpt");
+                if (vpt_pipeline) {
+                    /* Announce the CONFIGURED R, not just the effective one.
+                     *
+                     * The first call of a run is at the smallest context, where
+                     * the occupancy floor caps R well below what was asked for
+                     * -- VPT=16 first prints at R=4.  A one-shot announce of the
+                     * effective value therefore made `grep "vpt16"` VOID a
+                     * correctly-running arm, which is exactly what the rig hit.
+                     * Print both, and re-announce whenever the effective R
+                     * changes so the whole ladder is visible. */
+                    static uint32_t announced_eff;
+                    if (announced_eff != rows_per_tg) {
+                        announced_eff = rows_per_tg;
+                        fprintf(stderr,
+                                "ds4: glm indexer score: vpt%u (configured vpt%u, "
+                                "%u rows -> %u threadgroups)\n",
+                                rows_per_tg, glm_indexer_score_vpt_configured(),
+                                n_rows, (n_rows + rows_per_tg - 1u) / rows_per_tg);
+                    }
+                    args.rows_per_tg = rows_per_tg;
+                    use_pipeline = vpt_pipeline;
+                    tg_count = (NSUInteger)((n_rows + rows_per_tg - 1u) / rows_per_tg);
+                    tg_mem = (128u + 32u) * sizeof(float);
+                }
+            }
+
             int owned = 0;
             id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
             if (!cb) return 0;
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-            DS4_SET_PIPE(enc, direct_pipeline);
+            DS4_SET_PIPE(enc, use_pipeline);
             [enc setBytes:&args length:sizeof(args) atIndex:0];
             [enc setBuffer:qbuf offset:ds4_gpu_tensor_offset(q) atIndex:1];
             [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
             [enc setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
             [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-            [enc setThreadgroupMemoryLength:(128u + 4u) * sizeof(float) atIndex:0];
-            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1, 1)
+            [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(tg_count, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
 

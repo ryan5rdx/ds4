@@ -263,6 +263,7 @@ struct ds4_metal_args_glm_indexer_score_one {
     uint32_t head_dim;
     uint32_t cache_f16;
     float    scale;
+    uint32_t rows_per_tg;   /* IDX-VPT; 1 reproduces the one-row kernel */
 };
 
 struct ds4_metal_args_glm_indexer_scores_batch {
@@ -2003,6 +2004,99 @@ kernel void kernel_glm_indexer_score_one_direct(
 
     if (tid == 0) {
         scores[row] = acc;
+    }
+}
+
+/* IDX-VPT: one threadgroup scores `rows_per_tg` pooled rows instead of one.
+ *
+ * The one-row kernel above is dominated by two things that have nothing to do
+ * with the key data it reads.  Per row it re-reads ALL of q -- 32 heads x 128
+ * floats = 16 KB, against 256 B of key, so at ctx 310k q accounts for ~1.24 GB
+ * of LOADS per layer per token versus ~20 MB of keys.  That is load count, not
+ * DRAM traffic: 16 KB of q is L1-resident, so the re-reads are cache hits,
+ * which is why hoisting it alone buys little.  It also runs 17 threadgroup
+ * barriers per row -- one after the key load plus two per head-group --
+ * funnelling every partial through thread 0.
+ *
+ * Both are fixed here without touching the arithmetic:
+ *
+ *   q in registers.  Simdgroup `sg` already owns exactly the heads
+ *   {sg, sg+4, ..., sg+28} because the original maps head = head0 + sg.  Each
+ *   lane therefore needs 8 float4s (128 B), loaded once per threadgroup and
+ *   reused for every row -- q traffic falls by rows_per_tg.
+ *
+ *   Two barriers per row instead of seventeen.  The one-row kernel runs one
+ *   barrier after the key load plus two per head-group over eight groups; here
+ *   each head gets its own psum slot, so a single barrier covers all 32 writes
+ *   and no third is needed to protect reuse (see the loop body).
+ *
+ * BIT-IDENTICAL to kernel_glm_indexer_score_one_direct.  The summation order is
+ * unchanged: the original accumulates psum[0..3] for head0, then head0+4, and
+ * so on, i.e. strictly ascending head order, which is exactly the order
+ * psum[0..31] is summed in below.  Each head's own value is the same
+ * simd_sum(dot(...)) over the same float4 lanes. */
+kernel void kernel_glm_indexer_score_one_vpt(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint tg [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    const uint rows_per_tg = args.rows_per_tg == 0u ? 1u : args.rows_per_tg;
+    const uint row0 = tg * rows_per_tg;
+    if (row0 >= args.n_rows) return;
+
+    threadgroup float *ktg  = shared;          /* 128 floats */
+    threadgroup float *psum = ktg + 128u;      /* 32 floats, one per head */
+
+    /* Hoisted once for the whole threadgroup: this lane's slice of q, and the
+     * per-head weights, for the 8 heads this simdgroup owns. */
+    float4 qreg[8];
+    float  wreg[8];
+    for (uint i = 0; i < 8u; i++) {
+        const uint head = i * 4u + (uint)sg;
+        device const float4 *q4 =
+            (device const float4 *)(q + (uint64_t)head * 128u * sizeof(float));
+        qreg[i] = q4[lane];
+        wreg[i] = weights[head];
+    }
+
+    for (uint r = 0; r < rows_per_tg; r++) {
+        const uint row = row0 + r;
+        if (row >= args.n_rows) break;
+
+        if (tid < 128u) {
+            ktg[tid] = glm_cache_load_f32_or_f16(indexer_key_cache,
+                                                 (uint64_t)row * 128u + tid,
+                                                 args.cache_f16);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const float4 *k4 = (threadgroup const float4 *)ktg;
+        const float4 kv = k4[lane];
+        for (uint i = 0; i < 8u; i++) {
+            const float sv = simd_sum(dot(qreg[i], kv));
+            if (lane == 0) {
+                psum[i * 4u + (uint)sg] = max(sv * args.scale, 0.0f) * wreg[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            float acc = 0.0f;
+            for (uint h = 0; h < 32u; h++) acc += psum[h];
+            scores[row] = acc;
+        }
+        /* No third barrier here.  The next iteration cannot write psum until
+         * after its own post-ktg barrier, which thread 0 only reaches once it
+         * has finished the sum above -- so psum reuse is already ordered.  ktg
+         * is likewise safe: every read of it happens before the psum barrier. */
     }
 }
 
