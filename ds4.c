@@ -71949,6 +71949,28 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         }
     }
 
+    /* Test hook: force the REBUILD_NEEDED branch for the next N rewrites.
+     *
+     * Which branch a canonicalization takes is decided by whether the model's
+     * sampled tool-call bytes happen to match the canonical rendering, so it is
+     * not reachable from a client at all.  The rebuild branch is the one that
+     * invalidates and re-syncs from zero -- the path the rollback snapshot has
+     * to survive -- and it has therefore never been exercised.  Off unless
+     * DS4_SERVER_TEST_FORCE_CANON_REBUILD is set to a positive count. */
+    {
+        static int force_rebuild = -1;
+        if (force_rebuild < 0) {
+            const char *v = getenv("DS4_SERVER_TEST_FORCE_CANON_REBUILD");
+            force_rebuild = v ? atoi(v) : 0;
+        }
+        if (force_rebuild > 0) {
+            force_rebuild--;
+            snprintf(err, errlen,
+                     "TEST HOOK forcing canonical rebuild: common=%d live=%d "
+                     "canonical=%d", common, s->checkpoint.len, prompt->len);
+            return DS4_SESSION_REWRITE_REBUILD_NEEDED;
+        }
+    }
     if (common == s->checkpoint.len) {
         return ds4_session_sync(s, prompt, err, errlen) == 0 ?
             DS4_SESSION_REWRITE_OK : DS4_SESSION_REWRITE_ERROR;
