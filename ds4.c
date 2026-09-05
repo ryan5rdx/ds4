@@ -55811,8 +55811,16 @@ glm53_attention_done:
     /* Drain -- see the twin in glm_graph_forward_indexed_tokens.  This also
      * fires on the token-major prefill path, which walks tokens through here one
      * at a time, so a per-token what=decode window during prefill is expected;
-     * the generic decode report has the same property. */
-    if (metal_graph_gpu_stage_timestamps()) {
+     * the generic decode report has the same property.
+     *
+     * NOT when the caller deferred completion.  The report waits for every
+     * tagged command buffer, and the whole point of defer_completion is that the
+     * multi-session batch loop encodes N sessions into one batch and completes
+     * it once, outside.  Reporting here would insert a full GPU wait per session
+     * inside that loop -- destroying the CPU/GPU overlap the deferral exists to
+     * create, and manufacturing exactly the gaps GAP1 is trying to measure.  The
+     * batch caller drains after its own end_commands instead. */
+    if (!defer_completion && metal_graph_gpu_stage_timestamps()) {
         ds4_gpu_stage_report("decode", pos, 1);
     }
     return ok;
@@ -74733,6 +74741,17 @@ static int ds4_sessions_eval_batch_metal(
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
+    /* The drain for every row above.  Each per-session eval ran with
+     * defer_completion, so none of them reported -- doing so would have forced a
+     * GPU wait per session inside the encode loop, which is the opposite of what
+     * the deferral is for.  Here the batch is closed, so the wait costs nothing.
+     * Deliberately outside the native_glm53 / native_shared branch: whichever
+     * path encoded, this drains the tags it left. */
+    if (metal_graph_gpu_stage_timestamps()) {
+        ds4_gpu_stage_report("decode",
+                             count > 0 ? (uint32_t)items[0].session->checkpoint.len : 0u,
+                             (uint32_t)count);
+    }
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(0);
     if (ok && e->tp.active && ds4_tp_step_failed("batch eval")) {
