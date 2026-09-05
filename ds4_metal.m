@@ -9815,11 +9815,27 @@ int ds4_gpu_pack_slot_rows_f32_tensor(
     return 1;
 }
 
+/* Set when ds4_gpu_stage_flush() opened a batch nobody asked for, so that the
+ * next real begin_commands() can adopt it rather than fail.  Only ever YES while
+ * DS4_METAL_GPU_STAGE_TIMESTAMPS is enabled; see the flush for why the
+ * self-started batch cannot simply be closed. */
+static BOOL g_stage_batch_unowned;
+
 int ds4_gpu_begin_commands(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     /* A failed concurrent FFN must never affect the next command batch. */
     ds4_gpu_parallel_ffn_reset_state(YES);
-    if (g_batch_cb) return 0;
+    if (g_batch_cb) {
+        /* Adopt an instrument-opened batch instead of reporting failure.  A
+         * caller that opens its own batch treats 0 as fatal and aborts the
+         * eval, which would turn "the stage instrument is on" into "the run
+         * fails" -- strictly worse than the silence this all started as. */
+        if (g_stage_batch_unowned) {
+            g_stage_batch_unowned = NO;
+            return 1;
+        }
+        return 0;
+    }
     /* Refresh once per command batch so same-engine A/B runs can toggle the
      * static PSO without paying for environment lookups in every layer. */
     g_use_dsv4_head_rms_norm_rope_tail_pipeline =
@@ -11312,6 +11328,7 @@ int ds4_gpu_end_commands(void) {
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
     g_batch_has_work = NO;
+    g_stage_batch_unowned = NO;
     g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
     g_stream_expert_cache_batch_seq = 0;
     return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
@@ -11345,6 +11362,18 @@ static uint64_t g_stage_drop_no_batch;
 static uint64_t g_stage_drop_no_flush;
 static uint64_t g_stage_flush_calls;
 static uint64_t g_stage_selfstart;
+static uint64_t g_stage_drop_window_full;
+
+/* Backstop on an undrained window.  Every recorded tag also retains its
+ * MTLCommandBuffer in g_stage_cbs until ds4_gpu_stage_report() runs, so a graph
+ * path that fires boundaries but never reports does not just leak tags -- it
+ * pins one command buffer per boundary per token.  That is exactly what GLM did
+ * before its two report calls existed, and at 45 boundaries x 310k tokens it is
+ * an OOM, not a slow leak.  Both GLM paths now drain per token / per chunk, so a
+ * live window is ~45 tags; this only fires if some future path forgets again.
+ * Stop recording rather than evicting: a partial window with a stated count is
+ * readable, a silently rotated one is not. */
+#define DS4_GPU_STAGE_TAG_MAX 65536
 
 int ds4_gpu_stage_flush(const char *part, const char *stage, uint32_t layer, uint32_t pos0, uint32_t n_tokens) {
     g_stage_flush_calls++;
@@ -11358,12 +11387,28 @@ int ds4_gpu_stage_flush(const char *part, const char *stage, uint32_t layer, uin
          * the shape of the timeline rather than the untouched one.  That
          * caveat already applied (each boundary commits the batch in flight);
          * this widens it to paths that were not batching before.  Counted, so
-         * the report can say how much of the window was self-started. */
+         * the report can say how much of the window was self-started.
+         *
+         * The batch is deliberately LEFT OPEN.  Closing it here would restore
+         * the caller's invariant but measure nothing: the work between this
+         * boundary and the next would then run outside a batch, so the tagged
+         * buffer would be empty and every stage would read gpu_ms=0.  You can
+         * only time work that is inside a command buffer.  Leaving it open is
+         * what makes the first self-start convert the rest of the path into a
+         * batching one -- hence one self-start and then real numbers.
+         *
+         * That open batch is not free, though: ds4_gpu_begin_commands() returns
+         * 0 when a batch already exists, so a later caller that opens its own
+         * would see a failure and abort the eval.  An instrument that makes the
+         * run FAIL is worse than one that is silent, so the flag below hands
+         * ownership to that caller instead. */
         if (ds4_gpu_begin_commands() == 0) { g_stage_drop_no_batch++; return 0; }
         g_stage_selfstart++;
+        g_stage_batch_unowned = YES;
     }
     id<MTLCommandBuffer> cb = g_batch_cb;
     if (ds4_gpu_flush_commands() == 0) { g_stage_drop_no_flush++; return 0; }
+    if (g_stage_tag_n >= DS4_GPU_STAGE_TAG_MAX) { g_stage_drop_window_full++; return 0; }
     if (g_stage_tag_n == g_stage_tag_cap) {
         const size_t cap = g_stage_tag_cap ? g_stage_tag_cap * 2 : 4096;
         ds4_gpu_stage_tag *tags = realloc(g_stage_tags, cap * sizeof(*tags));
@@ -11406,7 +11451,33 @@ void ds4_gpu_stage_report(const char *what, uint32_t pos0, uint32_t n_tokens) {
         g_stage_drop_no_batch = 0;
         g_stage_drop_no_flush = 0;
         g_stage_selfstart = 0;
+        g_stage_drop_window_full = 0;
         return;
+    }
+    if (g_stage_drop_window_full) {
+        fprintf(stderr,
+                "ds4: gpu stage times WARNING -- window hit the %d-tag cap, "
+                "%llu boundaries discarded.  Some path fires stage boundaries "
+                "without calling ds4_gpu_stage_report(); the numbers below cover "
+                "only the first %zu.\n",
+                DS4_GPU_STAGE_TAG_MAX,
+                (unsigned long long)g_stage_drop_window_full,
+                g_stage_tag_n);
+    }
+    /* Wait before measuring.  A tag is only recorded for a command buffer the
+     * flush already committed, so this is always legal, and it is free for a
+     * buffer that has finished.  It is not optional: GPUStartTime/GPUEndTime are
+     * only valid once the buffer completes, so without this the report scores
+     * still-running work as "incomplete" and drops it from every stage total.
+     *
+     * The generic call sites got away without it by accident -- both sit
+     * immediately after a logits ds4_gpu_tensor_read(), which synchronizes.  The
+     * GLM decode path has no such read on the common branch, so putting the wait
+     * here rather than at the call sites is what makes the new drains correct,
+     * and makes `incomplete` mean a genuine buffer error instead of "we asked
+     * too early". */
+    for (size_t i = 0; i < g_stage_tag_n; i++) {
+        [g_stage_cbs[i] waitUntilCompleted];
     }
     const bool detail = getenv("DS4_METAL_GPU_STAGE_TIMESTAMPS_DETAIL") != NULL;
     enum { MAX_KEYS = 128 };
@@ -11459,6 +11530,9 @@ void ds4_gpu_stage_report(const char *what, uint32_t pos0, uint32_t n_tokens) {
     g_stage_drop_no_batch = 0;
     g_stage_drop_no_flush = 0;
     g_stage_selfstart = 0;
+    g_stage_drop_window_full = 0;
+    /* Releases the retained command buffers, not just the array slots -- this is
+     * the half of the drain that actually bounds memory. */
     [g_stage_cbs removeAllObjects];
 }
 

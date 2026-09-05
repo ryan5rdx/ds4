@@ -52316,6 +52316,12 @@ glm53_batch_attention_done:
                 pos0,
                 n_tokens);
     }
+    /* Drain -- see the twin in glm_graph_forward_indexed_tokens.  This is the
+     * layer-major GLM prefill; it fires eight stage boundaries per layer and,
+     * like the other two GLM eval paths, never reported them. */
+    if (metal_graph_gpu_stage_timestamps()) {
+        ds4_gpu_stage_report("prefill", pos0, n_tokens);
+    }
     return ok;
 }
 
@@ -54082,6 +54088,16 @@ glm53_indexed_attention_done:
     ds4_gpu_tensor_free(cur_view);
     glm_vision_overlay_free(&vision_overlay);
     ds4_gpu_set_glm_streaming_prefill_full_layer(false);
+    /* Drain the stage window.  The GLM paths fire the stage boundaries but had
+     * no ds4_gpu_stage_report() call anywhere -- all five in the tree sit in the
+     * generic raw_swa / layer_major paths -- so tags accumulated and nothing
+     * ever printed, not even the "no data" diagnostic, which lives inside the
+     * report.  That left the instrument silent on the only graph GLM 5.3 runs,
+     * and (now that the flush self-starts a batch) g_stage_tags would otherwise
+     * grow for the length of the run. */
+    if (metal_graph_gpu_stage_timestamps()) {
+        ds4_gpu_stage_report("prefill", pos0, n_tokens);
+    }
     return ok;
 }
 
@@ -55792,6 +55808,13 @@ glm53_attention_done:
     ds4_gpu_tensor_free(tp_qk_low);
     ds4_gpu_tensor_free(tp_q);
     (void)glm_ft_fail_il;
+    /* Drain -- see the twin in glm_graph_forward_indexed_tokens.  This also
+     * fires on the token-major prefill path, which walks tokens through here one
+     * at a time, so a per-token what=decode window during prefill is expected;
+     * the generic decode report has the same property. */
+    if (metal_graph_gpu_stage_timestamps()) {
+        ds4_gpu_stage_report("decode", pos, 1);
+    }
     return ok;
 #undef DS4_GLM_FT_FAIL
 }
