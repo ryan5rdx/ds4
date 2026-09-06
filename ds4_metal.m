@@ -19290,25 +19290,29 @@ int ds4_gpu_indexer_topk_tensor(
          * merge is pure overhead, so the caller keeps whatever it had. */
         if (top_k == 512u && n_tokens == 1u &&
             getenv("DS4_METAL_GLM_TOPK_TILED") != NULL) {
-            /* Pass 1 is T threadgroups over n_comp/T rows each; pass 2 is ONE
-             * threadgroup over T*top_k candidates.  Cost ~ c1*(n/T) + c2*T*k,
-             * minimised near T = sqrt(n/k) -- about 12 at n=77500, k=512.  The
-             * first cut used n/(2k), which gives 64 there and makes pass 2 merge
-             * 32768 keys in a single threadgroup: the very pathology pass 1
-             * exists to avoid.  It measured 1.19x where the design floor said
-             * 1.5-2.0x, and 0.57x at 32768.
+            /* Tile count.  Measured, not derived -- and the derivation lost.
              *
-             * BUT sqrt(n/k) balances the two passes without reference to the
-             * machine, and it was tuned on a 32-core M1 Max.  The production
-             * part is a 60-core M2 Ultra, where T=12 uses a fifth of the GPU
-             * while the argsort baseline's 76 first-pass threadgroups (see
-             * :19433) need a full wave of 60 plus a straggler wave of 16 -- 63%
-             * utilisation.  T=60 would fill exactly one wave.  Whether that
-             * beats the extra merge cost is a measurement, not a derivation:
-             * sweep DS4_METAL_GLM_TOPK_TILES on the target part before trusting
-             * this default anywhere. */
-            uint32_t tiles = 1u;
-            while ((uint64_t)(tiles + 1u) * (tiles + 1u) * top_k <= (uint64_t)n_comp) tiles++;
+             * Pass 1 is T threadgroups over n_comp/T rows; pass 2 is ONE
+             * threadgroup over T*top_k candidates.  Balancing those analytically
+             * gives T = sqrt(n/k) ~ 12 at n=77500, and on a 32-core M1 Max that
+             * is indeed the better setting.  On the 60-core M2 Ultra that is
+             * production it is the WORST of the values tried:
+             *
+             *   rig sweep, native M2 Ultra, 77500 rows, selector only
+             *     T=64  1.57x     <- and n/(2k) capped at 64 lands exactly here
+             *     T=32  1.48x
+             *     T=128 1.26x
+             *     T=12  1.12x     <- what sqrt(n/k) picks
+             *
+             * So the first heuristic here, n/(2k) capped at 64, was right, and
+             * "fixing" it to sqrt(n/k) on the strength of a dev-box measurement
+             * made it worse on the only machine that matters.  Restored.
+             *
+             * The shape of the curve matches the occupancy story: T=64 roughly
+             * fills a 60-core part in one wave, T=128 oversubscribes the serial
+             * merge, T=12 leaves four fifths of the GPU idle.  Anywhere else,
+             * sweep DS4_METAL_GLM_TOPK_TILES before trusting this. */
+            uint32_t tiles = n_comp / (2u * top_k);
             const char *tenv = getenv("DS4_METAL_GLM_TOPK_TILES");
             if (tenv && *tenv) {
                 const unsigned long v = strtoul(tenv, NULL, 10);
