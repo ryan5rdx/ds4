@@ -441,6 +441,7 @@ static id<MTLComputePipelineState> g_add2_pipeline;
 static id<MTLComputePipelineState> g_add3_pipeline;
 static id<MTLComputePipelineState> g_moe_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_sum8_pipeline;
+static id<MTLComputePipelineState> g_moe_sum8_owned_pipeline;
 static id<MTLComputePipelineState> g_mul_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_plain_pipeline;
@@ -6531,6 +6532,9 @@ typedef struct {
     int32_t  tp_rank;
     int32_t  tp_world;
     int32_t  tp_expert_base;
+    /* MOE-TP-SHED: leave an unowned expert's tile unwritten instead of
+     * zero-filling it.  Flips together with the ownership-aware sum. */
+    int32_t  tp_shed;
 } ds4_gpu_mul_mm_id_args;
 
 static int ds4_gpu_encode_mul_mv_id(
@@ -7567,6 +7571,13 @@ typedef struct {
     uint32_t tokens;
     uint64_t src_token_stride;
     uint64_t dst_token_stride;
+    /* MOE-TP-SHED, read only by kernel_dsv4_moe_sum8_owned_f32.  Zero here means
+     * tp_world 0, which ds4_tp_owns_expert reads as "owns everything", so every
+     * other user of this struct is unaffected by their presence. */
+    uint32_t n_total_expert;
+    uint32_t n_expert_used;
+    int32_t  tp_rank;
+    int32_t  tp_world;
 } ds4_gpu_dsv4_moe_sum6_args;
 
 /* Compile the single in-repo Metal source and create the pipelines that every
@@ -8115,6 +8126,23 @@ int ds4_gpu_init(void) {
         }
 
         g_moe_sum8_pipeline = ds4_gpu_new_pipeline(fn, &error);
+        {
+            /* Optional: MOE-TP-SHED is off by default and the engine must start
+             * without this kernel, so a failure here disables the feature
+             * (ds4_gpu_moe_tp_shed checks the pipeline) rather than the engine. */
+            NSError *owned_err = nil;
+            id<MTLFunction> owned_fn =
+                [library newFunctionWithName:@"kernel_dsv4_moe_sum8_owned_f32"];
+            if (owned_fn) {
+                g_moe_sum8_owned_pipeline = ds4_gpu_new_pipeline(owned_fn, &owned_err);
+            }
+            if (!g_moe_sum8_owned_pipeline) {
+                fprintf(stderr,
+                        "ds4: MOE-TP-SHED unavailable (sum8_owned pipeline): %s\n",
+                        owned_err ? [[owned_err localizedDescription] UTF8String]
+                                  : "function not found");
+            }
+        }
         if (!g_moe_sum8_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_moe_sum8_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
@@ -11241,6 +11269,28 @@ static volatile uint32_t *g_tp_gpu_flags;   /* CPU view of the flag words */
 static uint64_t g_tp_gpu_flags_off;
 static uint64_t g_tp_seq;
 
+/* MOE-TP-SHED.  Prefill's routed MoE writes out_dim floats of zero into every
+ * TP-unowned expert row (metal/moe.metal, the grouped mul_mm_id path) purely so
+ * the sum can stay slot-indexed.  At TP2 half the routes are unowned, and this
+ * is the largest single write in the prefill MoE.
+ *
+ * The two halves are NOT independent and must never be set separately: the
+ * producer may only stop writing if the consumer stops reading.  One predicate
+ * decides both, and both call it.
+ *
+ * Off by default.  Bit-identical except for -0.0f (see the kernel comment). */
+static int ds4_gpu_moe_tp_shed(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_GLM_MOE_TP_SHED");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    /* Requires the split (nothing to shed at world 1) and the ownership-aware
+     * sum kernel; without the latter the unowned rows would be read as garbage. */
+    return cached && g_tp_split_world == 2 && g_moe_sum8_owned_pipeline != nil;
+}
+
+
 /* Fast release fence (DS4_METAL_FAST_SYNC=1, default off).  Resuming the
  * command processor from g_tp_cpu_event costs ~186us of a 508us gate; spinning
  * on a word this process writes instead removes most of it.  Row and verifier
@@ -13281,6 +13331,7 @@ void ds4_gpu_cleanup(void) {
         g_add3_pipeline = nil;
         g_moe_sum6_pipeline = nil;
         g_moe_sum8_pipeline = nil;
+        g_moe_sum8_owned_pipeline = nil;
         g_mul_pipeline = nil;
         g_bin_mul_scalar_pipeline = nil;
         g_bin_div_row_pipeline = nil;
@@ -36075,10 +36126,19 @@ static int ds4_gpu_encode_moe_sum8(
         id<MTLBuffer>        out,
         NSUInteger           out_off,
         uint32_t             out_dim,
-        uint32_t             n_tokens) {
+        uint32_t             n_tokens,
+        /* MOE-TP-SHED: non-NULL selects the ownership-aware kernel.  Passing
+         * NULL is the shipped behaviour, and every caller that has not been
+         * taught to shed passes NULL rather than relying on a default. */
+        id<MTLBuffer>        selected,
+        NSUInteger           selected_off,
+        uint32_t             n_total_expert) {
     if (!cb || !experts || !out || out_dim == 0 || n_tokens == 0) return 0;
 
-    if (!g_moe_sum8_pipeline) return 0;
+    const int shed = selected != nil && ds4_gpu_moe_tp_shed();
+    id<MTLComputePipelineState> pipeline =
+        shed ? g_moe_sum8_owned_pipeline : g_moe_sum8_pipeline;
+    if (!pipeline) return 0;
 
     const uint64_t out_row_bytes = (uint64_t)out_dim * sizeof(float);
     ds4_gpu_dsv4_moe_sum6_args args = {
@@ -36086,21 +36146,36 @@ static int ds4_gpu_encode_moe_sum8(
         .tokens = n_tokens,
         .src_token_stride = 8u * out_row_bytes,
         .dst_token_stride = out_row_bytes,
+        .n_total_expert = shed ? n_total_expert : 0u,
+        .n_expert_used = shed ? 8u : 0u,
+        .tp_rank = shed ? g_tp_split_rank : 0,
+        .tp_world = shed ? g_tp_split_world : 0,
     };
 
-    NSUInteger nth = g_moe_sum8_pipeline.maxTotalThreadsPerThreadgroup;
+    NSUInteger nth = pipeline.maxTotalThreadsPerThreadgroup;
     if (nth > 256u) nth = 256u;
     if (nth > out_dim) nth = out_dim;
     if (nth == 0) nth = 1u;
 
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    DS4_SET_PIPE(enc, g_moe_sum8_pipeline);
+    DS4_SET_PIPE(enc, pipeline);
     [enc setBytes:&args length:sizeof(args) atIndex:0];
     [enc setBuffer:experts offset:experts_off atIndex:1];
     [enc setBuffer:out     offset:out_off     atIndex:2];
+    if (shed) [enc setBuffer:selected offset:selected_off atIndex:3];
     [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)n_tokens, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
+    if (shed) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "ds4: MOE-TP-SHED active (ownership-aware sum8, unowned "
+                    "expert rows left unwritten, %u total experts)\n",
+                    (unsigned)n_total_expert);
+        }
+    }
     return 1;
 }
 
@@ -36146,6 +36221,13 @@ static int ds4_gpu_encode_moe_sum_experts(
         NSUInteger           experts_off,
         id<MTLBuffer>        out,
         NSUInteger           out_off,
+        /* MOE-TP-SHED, NULL/0 everywhere it is not wired: see
+         * ds4_gpu_encode_moe_sum8.  Explicit at every call site rather than a
+         * module-scoped request, because a stale request is exactly the defect
+         * the poll-gate fold had. */
+        id<MTLBuffer>        selected,
+        NSUInteger           selected_off,
+        uint32_t             n_total_expert,
         uint32_t             out_dim,
         uint32_t             n_expert,
         uint32_t             n_tokens) {
@@ -36172,7 +36254,10 @@ static int ds4_gpu_encode_moe_sum_experts(
                                   out,
                                   out_off,
                                   out_dim,
-                                  n_tokens)) {
+                                  n_tokens,
+                                  selected,
+                                  selected_off,
+                                  n_total_expert)) {
         return 1;
     }
 
@@ -41677,6 +41762,7 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                  down_dst_off,
                                                  outbuf,
                                                  ds4_gpu_tensor_offset(out),
+                                                 /* no shed here */ nil, 0, 0,
                                                  out_dim,
                                                  n_expert,
                                                  n_tokens);
@@ -41960,6 +42046,7 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_addr_tensor(
                                                  down_dst_off,
                                                  outbuf,
                                                  ds4_gpu_tensor_offset(out),
+                                                 /* no shed here */ nil, 0, 0,
                                                  out_dim,
                                                  n_expert,
                                                  n_tokens);
@@ -45590,6 +45677,7 @@ int ds4_gpu_routed_moe_one_tensor(
                                                        down_dst_off,
                                                        outbuf,
                                                        ds4_gpu_tensor_offset(out),
+                                                       /* no shed here */ nil, 0, 0,
                                                        out_dim,
                                                        n_expert,
                                                        n_tokens);
@@ -45867,6 +45955,11 @@ int ds4_gpu_routed_moe_batch_tensor(
         const uint32_t down_nr0 = ds4_gpu_routed_mv_nr0(down_type);
         id<MTLComputePipelineState> gate_mv_pipeline = ds4_gpu_routed_mv_pipeline(gate_type);
         id<MTLComputePipelineState> down_mv_pipeline = ds4_gpu_routed_mv_pipeline(down_type);
+        /* MOE-TP-SHED: nil unless the predicate below turns shedding on.  Held
+         * here rather than recomputed at the sum, so the producer and the
+         * consumer cannot end up disagreeing. */
+        id<MTLBuffer> shed_selected = nil;
+        NSUInteger    shed_selected_off = 0;
         id<MTLComputePipelineState> gate_mm_pipeline = nil;
         id<MTLComputePipelineState> up_mm_pipeline = nil;
         id<MTLComputePipelineState> down_mm_pipeline = nil;
@@ -46164,6 +46257,17 @@ int ds4_gpu_routed_moe_batch_tensor(
             down_mm_args.tp_rank = g_tp_split_rank;
             down_mm_args.tp_world = g_tp_split_world;
             down_mm_args.tp_expert_base = tp_expert_base_host;
+            /* MOE-TP-SHED.  ONE predicate drives both halves: if the producer
+             * stops zero-filling here, the sum below must stop reading those
+             * rows, and vice versa.  Deriving them separately is how this ends
+             * up summing uninitialised memory. */
+            const int moe_shed = ds4_gpu_moe_tp_shed();
+            gate_mm_args.tp_shed = moe_shed;
+            down_mm_args.tp_shed = moe_shed;
+            if (moe_shed) {
+                shed_selected = selectedbuf;
+                shed_selected_off = (NSUInteger)ds4_gpu_tensor_offset(selected);
+            }
 
             map_pipeline = ds4_gpu_get_pipeline(
                 use_mxfp4_mm_id_map_scatter ?
@@ -46984,6 +47088,12 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                        down_dst_off,
                                                        outbuf,
                                                        ds4_gpu_tensor_offset(out),
+                                                       /* MOE-TP-SHED: same
+                                                        * predicate as the two
+                                                        * mm_id args above. */
+                                                       shed_selected,
+                                                       shed_selected_off,
+                                                       n_total_expert,
                                                        out_dim,
                                                        n_expert,
                                                        n_tokens);

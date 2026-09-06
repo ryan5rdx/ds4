@@ -470,6 +470,13 @@ struct ds4_metal_dsv4_moe_sum6_args {
     uint32_t tokens;
     uint64_t src_token_stride;
     uint64_t dst_token_stride;
+    /* Appended for kernel_dsv4_moe_sum8_owned_f32.  Every other consumer of
+     * this struct leaves them zero, and tp_world 0 means "owns everything", so
+     * their presence changes nothing for the shipped kernels. */
+    uint32_t n_total_expert;
+    uint32_t n_expert_used;
+    int32_t  tp_rank;
+    int32_t  tp_world;
 };
 
 // Routed-MoE activation for the selected experts:
@@ -570,6 +577,52 @@ kernel void kernel_dsv4_moe_sum6_f32(
         v += s[3u * args.width + col];
         v += s[4u * args.width + col];
         v += s[5u * args.width + col];
+        d[col] = v;
+    }
+}
+
+/* MOE-TP-SHED's consumer half.  Identical to kernel_dsv4_moe_sum8_f32 except
+ * that a slot whose expert this rank does not own is SKIPPED rather than added.
+ *
+ * Why that is the same number: under the shipped scheme the producer wrote
+ * exactly +0.0f into those rows and this kernel added it.  Skipping the add is
+ * bit-identical for every value except -0.0f.  What it buys is that the
+ * producer stops writing out_dim floats per unowned routed row -- at TP2 that
+ * is half the routes, and it is the largest single write in the prefill MoE.
+ *
+ * `selected` is the router's per-token expert ids, n_expert_used per token, in
+ * the same slot order this kernel sums. */
+kernel void kernel_dsv4_moe_sum8_owned_f32(
+        constant ds4_metal_dsv4_moe_sum6_args &args,
+        device const char *src,
+        device       char *dst,
+        device const int32_t *selected,
+        uint token[[threadgroup_position_in_grid]],
+        uint tid[[thread_position_in_threadgroup]],
+        uint ntg[[threads_per_threadgroup]]) {
+    if (token >= args.tokens) return;
+
+    device const float *s =
+        (device const float *)(src + (uint64_t)token * args.src_token_stride);
+    device float *d =
+        (device float *)(dst + (uint64_t)token * args.dst_token_stride);
+
+    /* Slot ownership is per token and uniform across the width, so resolve it
+     * once per thread rather than per column. */
+    bool owned[8];
+    const uint used = args.n_expert_used < 8u ? args.n_expert_used : 8u;
+    for (uint k = 0; k < 8u; k++) {
+        owned[k] = (k < used) &&
+                   ds4_tp_owns_expert(selected[(uint64_t)token * used + k],
+                                      (int)args.n_total_expert,
+                                      args.tp_rank, args.tp_world);
+    }
+
+    for (uint col = tid; col < args.width; col += ntg) {
+        float v = 0.0f;
+        for (uint k = 0; k < 8u; k++) {
+            if (owned[k]) v += s[k * args.width + col];
+        }
         d[col] = v;
     }
 }
@@ -2697,6 +2750,11 @@ struct ds4_metal_args_mul_mm_id {
     int32_t  tp_rank;
     int32_t  tp_world;
     int32_t  tp_expert_base;
+    /* MOE-TP-SHED: when set, an unowned expert's tile is left UNWRITTEN rather
+     * than zero-filled.  Only legal when the consumer of those rows skips the
+     * same slots -- kernel_dsv4_moe_sum8_owned_f32 -- because the rows then
+     * hold whatever was already in the buffer.  The two flip together. */
+    int32_t  tp_shed;
 };
 
 template<int nr0, typename args_t>
@@ -8094,9 +8152,21 @@ kernel void kernel_mul_mm_id(
         !CULL_TAIL_SIMDGROUPS || 16*(short)(sgitg/2) < nr1;
 
     if (!ds4_tp_owns_expert(im, args.ne02, args.tp_rank, args.tp_world)) {
-        /* Unowned expert under the TP split: zero this tile's output rows so
-         * the downstream swiglu/sum stages stay unchanged. Each (token,slot)
-         * row belongs to exactly one expert, so nothing else writes them. */
+        /* Unowned expert under the TP split.
+         *
+         * MOE-TP-SHED: the zero fill below is not bookkeeping, it is real work
+         * -- out_dim floats per unowned routed row, and half the routes are
+         * unowned at TP2.  It exists only so the downstream swiglu/sum stages
+         * can stay slot-indexed and ignorant of ownership.  With tp_shed the
+         * sum is ownership-aware instead (kernel_dsv4_moe_sum8_owned_f32) and
+         * skips exactly these slots, so the rows never need writing.
+         *
+         * Skipping is bit-identical to filling: the sum added a term that was
+         * exactly +0.0f, and x + 0.0f == x for every x except -0.0f, which the
+         * fill turns into +0.0f and this leaves at -0.0f.  That one corner is
+         * the entire numeric difference, and it is disclosed rather than
+         * hidden -- the same corner R2's simdgroup argument turned on. */
+        if (args.tp_shed) return;
         for (short j = sgitg; j < nr1; j += 4) {
             const int idj = ids_i32[im*args.ne21 + r1 + j];
 
