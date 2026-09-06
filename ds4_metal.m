@@ -117,10 +117,34 @@ static void ds4_gpu_timeline_note_pso_name(id pso, NSString *name) {
 - (void)ds4_tl_dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tpt;
 @end
 
-static ds4_timeline_rec *ds4_gpu_timeline_current_rec(void) {
-    DS4TimelineBatch *b = g_timeline_batch;
-    if (!b || b->count == 0) return NULL;
-    return &b->recs[b->count - 1];
+/* Which record does a swizzled callback belong to?
+ *
+ * It used to be "the last record of the global current batch", which is wrong
+ * in a way that only shows up as corrupt data: the pipeline-set and dispatch
+ * selectors are swizzled on the ENCODER CLASS, so EVERY encoder in the
+ * process hits them -- the queue-keepalive thread's one-dispatch-per-second
+ * encoder on its own queue, the command-queue warm, the fence calibration.
+ * Each of those would have written its kernel name and dispatch count into
+ * whichever record the graph thread was filling at that moment.
+ *
+ * The record is now associated with the encoder INSTANCE, so an encoder this
+ * profiler did not create resolves to NULL and its callbacks no-op.  The
+ * association carries (batch, index) rather than a pointer, because b->recs is
+ * realloc'd as the batch grows; the index only ever stays valid. */
+@interface DS4TimelineSlot : NSObject {
+@public
+    DS4TimelineBatch *batch;   /* strong: keeps the batch alive for resolve */
+    uint32_t          index;
+}
+@end
+@implementation DS4TimelineSlot @end
+static const void *kDS4TimelineSlotKey = &kDS4TimelineSlotKey;
+
+static ds4_timeline_rec *ds4_gpu_timeline_rec_for(id encoder) {
+    if (!g_timeline_enabled || !encoder) return NULL;
+    DS4TimelineSlot *slot = objc_getAssociatedObject(encoder, kDS4TimelineSlotKey);
+    if (!slot || !slot->batch || slot->index >= slot->batch->count) return NULL;
+    return &slot->batch->recs[slot->index];
 }
 
 @implementation NSObject (DS4TimelineSwizzle)
@@ -143,7 +167,7 @@ static ds4_timeline_rec *ds4_gpu_timeline_current_rec(void) {
 }
 - (void)ds4_tl_setComputePipelineState:(id<MTLComputePipelineState>)pso {
     [self ds4_tl_setComputePipelineState:pso];
-    ds4_timeline_rec *rec = ds4_gpu_timeline_current_rec();
+    ds4_timeline_rec *rec = ds4_gpu_timeline_rec_for(self);
     if (!rec) return;
     NSString *name = nil;
     pthread_mutex_lock(&g_timeline_mutex);
@@ -160,7 +184,7 @@ static ds4_timeline_rec *ds4_gpu_timeline_current_rec(void) {
 }
 - (void)ds4_tl_dispatchThreadgroups:(MTLSize)tg threadsPerThreadgroup:(MTLSize)tpt {
     [self ds4_tl_dispatchThreadgroups:tg threadsPerThreadgroup:tpt];
-    ds4_timeline_rec *rec = ds4_gpu_timeline_current_rec();
+    ds4_timeline_rec *rec = ds4_gpu_timeline_rec_for(self);
     if (!rec) return;
     if (rec->n_dispatch == 0) {
         rec->tg[0] = (uint32_t)tg.width; rec->tg[1] = (uint32_t)tg.height; rec->tg[2] = (uint32_t)tg.depth;
@@ -170,7 +194,7 @@ static ds4_timeline_rec *ds4_gpu_timeline_current_rec(void) {
 }
 - (void)ds4_tl_dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tpt {
     [self ds4_tl_dispatchThreads:threads threadsPerThreadgroup:tpt];
-    ds4_timeline_rec *rec = ds4_gpu_timeline_current_rec();
+    ds4_timeline_rec *rec = ds4_gpu_timeline_rec_for(self);
     if (!rec) return;
     if (rec->n_dispatch == 0) {
         rec->tg[0] = (uint32_t)((threads.width + tpt.width - 1) / (tpt.width ? tpt.width : 1));
@@ -294,13 +318,21 @@ static void ds4_gpu_timeline_attach(id<MTLCommandBuffer> cb) {
     g_timeline_batch = b;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         ds4_gpu_timeline_resolve(b, done);
+        /* Drop the global, but only if it is still this batch -- a newer one
+         * may already have replaced it.  The encoders that referenced this
+         * batch hold it through their slot, and the block holds it here, so
+         * clearing the global cannot free anything still in use. */
+        if (g_timeline_batch == b) g_timeline_batch = nil;
     }];
 }
 
 static id<MTLComputeCommandEncoder> ds4_gpu_timeline_new_encoder(
         id<MTLCommandBuffer> cb, BOOL concurrent, uintptr_t caller) {
     DS4TimelineBatch *b = g_timeline_batch;
-    if (!b) return nil;
+    /* Only the batch command buffer owns the current batch.  Without this a
+     * command buffer from another path could append records to a timeline it
+     * has nothing to do with -- the same class of mistake as the global rec. */
+    if (!b || !cb || cb != g_batch_cb) return nil;
     const uint32_t per_buffer = DS4_TIMELINE_SAMPLES_PER_BUFFER / 2;
     const uint32_t sb_index = b->count / per_buffer;
     if (sb_index >= [b->samples count]) {
@@ -330,9 +362,16 @@ static id<MTLComputeCommandEncoder> ds4_gpu_timeline_new_encoder(
     att.endOfEncoderSampleIndex = slot + 1u;
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDescriptor:pd];
     if (!enc) return nil;
-    ds4_timeline_rec *rec = &b->recs[b->count++];
+    const uint32_t rec_index = b->count++;
+    ds4_timeline_rec *rec = &b->recs[rec_index];
     memset(rec, 0, sizeof(*rec));
     rec->caller = caller;
+    /* `slot` is already the counter-sample index in this scope. */
+    DS4TimelineSlot *rec_slot = [DS4TimelineSlot new];
+    rec_slot->batch = b;
+    rec_slot->index = rec_index;
+    objc_setAssociatedObject(enc, kDS4TimelineSlotKey, rec_slot,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     ds4_gpu_timeline_hook_encoder(enc);
     return enc;
 }
@@ -13457,6 +13496,12 @@ void ds4_gpu_cleanup(void) {
         g_indexer_topk_buffer = nil;
         g_kda_prologue_buffer = nil;
         g_kda_prologue_bytes = 0;
+        /* HCMIX-WIDE partials.  Leaking the buffer would be the lesser half;
+         * the byte count is the dangerous one, because ds4_gpu_ensure_scratch_buffer
+         * only grows when the request exceeds it, so a stale count against a nil
+         * buffer means the next allocation is skipped and the dispatch binds nil. */
+        g_bf16_ksplit_buffer = nil;
+        g_bf16_ksplit_bytes = 0;
         g_indexer_topk_tile_buffer = nil;
         g_indexer_topk_tile_bytes = 0;
         g_indexed_topk_buffer = nil;
@@ -50137,7 +50182,11 @@ int ds4_gpu_glm53_kda_small_mv_merged(
     if (rows_fa == 0 || rows_beta == 0 || rows_ga == 0) return 0;
 
     const uint64_t row_bytes = ((uint64_t)in_dim / 32u) * 34u;
-    NSUInteger inner_fa = 0, inner_beta = 0, inner_ga = 0;
+    /* uint64_t, not NSUInteger: glm53_gpu_weight_buffer takes uint64_t* and on
+     * LP64 those are unsigned long vs unsigned long long -- distinct types even
+     * at the same width, so passing &NSUInteger is an aliasing violation the
+     * compiler is right to warn about.  Cast at the Metal binding instead. */
+    uint64_t inner_fa = 0, inner_beta = 0, inner_ga = 0;
     id<MTLBuffer> w_fa = glm53_gpu_weight_buffer(
         model_map, model_size, off_fa, row_bytes * rows_fa, &inner_fa, "KDA f_a");
     id<MTLBuffer> w_beta = glm53_gpu_weight_buffer(
@@ -50185,9 +50234,9 @@ int ds4_gpu_glm53_kda_small_mv_merged(
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     DS4_SET_PIPE(enc, pipeline);
     [enc setBytes:&args length:sizeof(args) atIndex:0];
-    [enc setBuffer:w_fa   offset:inner_fa   atIndex:1];
-    [enc setBuffer:w_beta offset:inner_beta atIndex:2];
-    [enc setBuffer:w_ga   offset:inner_ga   atIndex:3];
+    [enc setBuffer:w_fa   offset:(NSUInteger)inner_fa   atIndex:1];
+    [enc setBuffer:w_beta offset:(NSUInteger)inner_beta atIndex:2];
+    [enc setBuffer:w_ga   offset:(NSUInteger)inner_ga   atIndex:3];
     [enc setBuffer:xbuf   offset:ds4_gpu_tensor_offset(x) atIndex:4];
     [enc setBuffer:d_fa   offset:ds4_gpu_tensor_offset(out_fa)   atIndex:5];
     [enc setBuffer:d_beta offset:ds4_gpu_tensor_offset(out_beta) atIndex:6];
