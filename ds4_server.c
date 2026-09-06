@@ -12679,6 +12679,22 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_vision_state_matches(slot->session,
                                          j->req.images, j->req.image_count);
     const bool vision_stale = multimodal && !live_vision_match;
+    /* GATES THE CACHE PATHS BELOW -- and note it is NOT live_vision_match.
+     *
+     * ds4_session_vision_state_matches() is false whenever the checkpoint is
+     * invalid, whatever the request is, so gating the TEXT reuse paths on it
+     * silently disabled live-prefix reuse and the GLM-5.3 rollback restore for
+     * every text request whose session happened to be in that state -- a path
+     * the pre-merge code did not gate at all.  That is what broke RB1b/RB1d
+     * after the upstream merge: the reuse was skipped while the session state
+     * was left in place, so the engine resumed from a frontier the request had
+     * never validated.
+     *
+     * A text request has no vision state to disagree about, so it is
+     * unconditionally ok here; a multimodal one with changed images has already
+     * been invalidated above, so this is belt and braces rather than the only
+     * guard. */
+    const bool vision_ok = !multimodal || live_vision_match;
     if (vision_stale) ds4_session_invalidate(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
     if (vision_stale) request_live_state_clear(s, slot);
@@ -12713,7 +12729,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * exact token-prefix match.  Exact token/text/disk matching remains the
      * fallback when the live state is absent or no longer describes the
      * request. */
-    int cached = live_vision_match ?
+    int cached = vision_ok ?
         responses_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
                                               &effective_prompt) : 0;
     const char *cache_source = cached > 0 ? "responses-visible" : "none";
@@ -12726,7 +12742,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             responses_live_match_ids = j->req.responses_live_call_ids.len;
         }
     }
-    if (cached == 0 && live_vision_match) {
+    if (cached == 0 && vision_ok) {
         cached = responses_live_continuation_prompt(s, slot, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &responses_live_match_ids);
@@ -12736,7 +12752,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (cached > 0) {
         responses_live_continuation = true;
         prompt_for_sync = &effective_prompt;
-    } else if (live_vision_match) {
+    } else if (vision_ok) {
         cached = anthropic_live_continuation_prompt(s, slot, &j->req, old_pos,
                                                     &effective_prompt,
                                                     &anthropic_live_match_ids);
@@ -12774,7 +12790,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         http_error(j->fd, s->enable_cors, 409,
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
-    } else if (cached == 0 && live_vision_match) {
+    } else if (cached == 0 && vision_ok) {
         const bool is_glm = ds4_engine_is_glm_dsa(s->engine);
         /* GLM-5.2's dense KV cache can always rewind: ds4_session_glm_cap_dense_cache()
          * keeps it consistent. Flash's raw SWA cache is a ring buffer instead
@@ -12861,7 +12877,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cache_source = cached > 0 ? "memory-token" : "none";
         }
     }
-    if (cached == 0 && live_vision_match) {
+    if (cached == 0 && vision_ok) {
         int thinking_cached =
             thinking_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
                                                 &effective_prompt);
@@ -12875,7 +12891,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     int disk_cached = 0;
     char *disk_cache_path = NULL;
     uint8_t disk_cache_ext_flags = 0;
-    if (cached == 0 && live_vision_match) {
+    if (cached == 0 && vision_ok) {
         int text_cached = live_text_prefix_prompt(s, slot, &j->req,
                                                   &effective_prompt);
         if (text_cached > 0) {
