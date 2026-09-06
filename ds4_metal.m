@@ -19296,7 +19296,17 @@ int ds4_gpu_indexer_topk_tensor(
              * first cut used n/(2k), which gives 64 there and makes pass 2 merge
              * 32768 keys in a single threadgroup: the very pathology pass 1
              * exists to avoid.  It measured 1.19x where the design floor said
-             * 1.5-2.0x, and 0.57x at 32768. */
+             * 1.5-2.0x, and 0.57x at 32768.
+             *
+             * BUT sqrt(n/k) balances the two passes without reference to the
+             * machine, and it was tuned on a 32-core M1 Max.  The production
+             * part is a 60-core M2 Ultra, where T=12 uses a fifth of the GPU
+             * while the argsort baseline's 76 first-pass threadgroups (see
+             * :19433) need a full wave of 60 plus a straggler wave of 16 -- 63%
+             * utilisation.  T=60 would fill exactly one wave.  Whether that
+             * beats the extra merge cost is a measurement, not a derivation:
+             * sweep DS4_METAL_GLM_TOPK_TILES on the target part before trusting
+             * this default anywhere. */
             uint32_t tiles = 1u;
             while ((uint64_t)(tiles + 1u) * (tiles + 1u) * top_k <= (uint64_t)n_comp) tiles++;
             const char *tenv = getenv("DS4_METAL_GLM_TOPK_TILES");
