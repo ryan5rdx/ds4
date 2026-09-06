@@ -19534,6 +19534,36 @@ int ds4_gpu_indexer_topk_tensor(
         }
         const bool truncate = trunc_env != 0;
 
+        /* Engagement evidence.  Every other arm in this campaign is
+         * announce-gated, and two have already been voided by silently not
+         * engaging.  The truncating path had no announce at all, so its A/B
+         * would have had to trust the env var -- exactly what the gates exist
+         * to avoid.  Once per process, and it names the level count so a
+         * harness can tell a real 7-level cascade from a degenerate one. */
+        if (truncate && work_width > block_top_k) {
+            static int logged_trunc;
+            if (!logged_trunc) {
+                logged_trunc = 1;
+                int32_t lv = 0, l2 = block_top_k, w2 = work_width;
+                while (l2 < work_width && lv < 64) {
+                    const int32_t m = (w2 + 2 * l2 - 1) / (2 * l2);
+                    lv++;
+                    if (m == 1) break;
+                    const int32_t tl = (int32_t)((int64_t)2 * l2 > (int64_t)top_k
+                                                 ? (int64_t)top_k : (int64_t)2 * l2);
+                    const int32_t ls = (m - 1) * 2 * l2;
+                    const int32_t la = w2 - ls;
+                    w2 = (m - 1) * tl + (la < tl ? la : tl);
+                    l2 = tl;
+                }
+                fprintf(stderr,
+                        "ds4: metal indexer topk merge TRUNCATING "
+                        "(%d levels, work_width %d -> top_k %u)\n",
+                        lv, work_width, top_k);
+            }
+        }
+        g_last_indexer_topk = truncate ? "argsort_trunc" : g_last_indexer_topk;
+
         int32_t len = block_top_k;
         int32_t in_ne0 = work_width;
         while (len < work_width) {
