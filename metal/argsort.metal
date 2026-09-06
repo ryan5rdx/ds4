@@ -420,6 +420,157 @@ static inline void ds4_topk_stream_core(
     ds4_topk_bitonic_desc_2048(buf, tid);
 }
 
+/* ---------------------------------------------------------------------------
+ * Hierarchical exact top-k for the DECODE shape (one row, many components).
+ *
+ * kernel_dsv4_indexer_topk_stream512 parallelises across TOKENS -- it dispatches
+ * MTLSizeMake(n_tokens,1,1) -- so at GLM decode, where n_tokens is 1, it would
+ * run a single threadgroup.  That is why its caller gates it on n_tokens >= 32,
+ * and why GLM decode has always fallen through to the padded bitonic argsort.
+ *
+ * These two kernels parallelise across ROWS instead.  Pass 1 gives each
+ * threadgroup a contiguous slice and has it stream its own top-k; pass 2 merges
+ * the slices' candidates.  Exact, because any member of the global top-k is by
+ * definition in the top-k of the slice that contains it.
+ *
+ * No index remapping is needed anywhere: ds4_topk_pack_key already folds the
+ * GLOBAL index into the key (`begin + c`), and the key's total order is exactly
+ * (score desc, index asc) -- the same order the argsort path produces.  Pass 1
+ * therefore emits raw keys and pass 2 consumes them unchanged, so the output is
+ * bit-identical to the single-threadgroup answer rather than merely equivalent.
+ * ------------------------------------------------------------------------- */
+
+/* Pass 2's input is already packed keys, not floats, so it cannot reuse
+ * ds4_topk_stream_core.  Same algorithm: ballot-compact into buf, and when buf
+ * is nearly full, sort and keep the running k-th best as the new threshold. */
+static inline void ds4_topk_stream_core_keys(
+        device const ulong *keys,
+        uint               count,
+        uint               top_k,
+        threadgroup ulong *buf,
+        ushort             tid,
+        ushort             lane,
+        ushort             sgid) {
+    constexpr uint CAP = 2048u;
+    constexpr uint TILE = 512u;
+
+    threadgroup uint  *cnt = (threadgroup uint *)(buf + CAP);
+    threadgroup ulong *thr_tg = (threadgroup ulong *)(buf + CAP + 1);
+    threadgroup uint  *sg_counts = (threadgroup uint *)(buf + CAP + 2);
+
+    if (tid == 0) { cnt[0] = 0u; thr_tg[0] = 0ul; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint base = 0; base < count; base += TILE) {
+        const ulong thr = thr_tg[0];
+        const uint i = base + tid;
+        ulong key = 0ul;
+        bool take = false;
+        if (i < count) {
+            key = keys[i];
+            take = key > thr;
+        }
+        const uint ballot = (uint)(ulong)simd_ballot(take);
+        const uint sg_count = popcount(ballot);
+        const uint sg = (uint)sgid;
+        if (lane == 0) sg_counts[sg] = sg_count;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            uint acc = cnt[0];
+            for (uint g = 0; g < 16u; g++) {
+                const uint c = sg_counts[g];
+                sg_counts[g] = acc;
+                acc += c;
+            }
+            cnt[0] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (take) {
+            const uint rank = popcount(ballot & ((1u << lane) - 1u));
+            buf[sg_counts[sg] + rank] = key;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (cnt[0] > CAP - TILE) {
+            const uint have = cnt[0];
+            for (uint j = tid; j < CAP; j += 512u) {
+                if (j >= have) buf[j] = 0ul;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            ds4_topk_bitonic_desc_2048(buf, tid);
+            if (tid == 0) {
+                thr_tg[0] = buf[top_k - 1u];
+                cnt[0] = top_k;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    const uint have = cnt[0];
+    for (uint j = tid; j < CAP; j += 512u) {
+        if (j >= have) buf[j] = 0ul;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ds4_topk_bitonic_desc_2048(buf, tid);
+}
+
+/* Pass 1: one threadgroup per slice.  args.ne01 carries the slice count. */
+[[max_total_threads_per_threadgroup(512)]]
+kernel void kernel_dsv4_indexer_topk_tile_p1(
+        constant ds4_metal_args_argsort & args,
+        device const char * src0,
+        device      ulong * cand,
+        threadgroup ulong * buf [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tid  [[thread_index_in_threadgroup]],
+        ushort  lane [[thread_index_in_simdgroup]],
+        ushort  sgid [[simdgroup_index_in_threadgroup]]) {
+    const uint n_comp = (uint)args.ne00;
+    const uint top_k  = (uint)args.top_k;
+    const uint tiles  = (uint)args.ne01;
+    const uint t      = tgpig.x;
+
+    /* Even split, remainder spread over the first slices, so no slice is empty
+     * and every component belongs to exactly one. */
+    const uint base = n_comp / tiles;
+    const uint rem  = n_comp - base * tiles;
+    const uint begin = t * base + (t < rem ? t : rem);
+    const uint count = base + (t < rem ? 1u : 0u);
+
+    /* row is always 0 here: this path exists for the one-row decode shape. */
+    ds4_topk_stream_core(src0, args.nb01, 0u, begin, count, top_k, t,
+                         buf, tid, lane, sgid);
+
+    /* Raw keys, not indices -- pass 2 needs the score to merge on.  A slice
+     * shorter than top_k leaves zero-padding in buf, which sorts to the bottom
+     * and is dropped by the merge, so short slices are safe rather than
+     * excluded. */
+    device ulong *out = cand + (ulong)t * top_k;
+    for (uint j = tid; j < top_k; j += 512u) {
+        out[j] = buf[j];
+    }
+}
+
+/* Pass 2: single threadgroup over tiles*top_k candidates. */
+[[max_total_threads_per_threadgroup(512)]]
+kernel void kernel_dsv4_indexer_topk_tile_p2(
+        constant ds4_metal_args_argsort & args,
+        device const ulong * cand,
+        device      int32_t * dst,
+        threadgroup ulong * buf [[threadgroup(0)]],
+        ushort  tid  [[thread_index_in_threadgroup]],
+        ushort  lane [[thread_index_in_simdgroup]],
+        ushort  sgid [[simdgroup_index_in_threadgroup]]) {
+    const uint top_k = (uint)args.top_k;
+    const uint total = (uint)args.ne00;   /* tiles * top_k */
+
+    ds4_topk_stream_core_keys(cand, total, top_k, buf, tid, lane, sgid);
+
+    for (uint j = tid; j < top_k; j += 512u) {
+        dst[j] = (int32_t)(0xffffffffu - (uint32_t)buf[j]);
+    }
+}
+
 [[max_total_threads_per_threadgroup(512)]]
 kernel void kernel_dsv4_indexer_topk_stream512(
         constant ds4_metal_args_argsort & args,

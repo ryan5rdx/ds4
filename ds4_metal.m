@@ -19269,6 +19269,106 @@ int ds4_gpu_indexer_topk_tensor(
             fprintf(stderr, "ds4: Metal graph indexer top-k received undersized buffers\n");
             return 0;
         }
+        /* Hierarchical exact top-k for the one-row decode shape.
+         *
+         * stream512 below parallelises across TOKENS, so at n_tokens == 1 it
+         * would run a single threadgroup; that is what its n_tokens >= 32 guard
+         * is protecting against, and it is why GLM decode has always used the
+         * argsort fallback instead.  This path parallelises across ROWS: pass 1
+         * gives each threadgroup a slice and streams its top-k, pass 2 merges
+         * the slices.  Exact -- any member of the global top-k is in the top-k
+         * of its own slice -- and bit-identical rather than merely equivalent,
+         * because ds4_topk_pack_key already folds the GLOBAL index into the key
+         * and the merge never unpacks it.
+         *
+         * Opt-in.  Local probe (probe_topk1.c, M1 Max) measured 1.5-2.0x at
+         * 77500 rows and only 1.07-1.30x at 32768, so it is not obviously right
+         * at every shape, and this campaign's rule is that a kernel ratio from
+         * another part does not transfer.  The rig decides.
+         *
+         * Threshold: below ~4 slices there is nothing to parallelise and the
+         * merge is pure overhead, so the caller keeps whatever it had. */
+        if (top_k == 512u && n_tokens == 1u &&
+            getenv("DS4_METAL_GLM_TOPK_TILED") != NULL) {
+            /* Pass 1 is T threadgroups over n_comp/T rows each; pass 2 is ONE
+             * threadgroup over T*top_k candidates.  Cost ~ c1*(n/T) + c2*T*k,
+             * minimised near T = sqrt(n/k) -- about 12 at n=77500, k=512.  The
+             * first cut used n/(2k), which gives 64 there and makes pass 2 merge
+             * 32768 keys in a single threadgroup: the very pathology pass 1
+             * exists to avoid.  It measured 1.19x where the design floor said
+             * 1.5-2.0x, and 0.57x at 32768. */
+            uint32_t tiles = 1u;
+            while ((uint64_t)(tiles + 1u) * (tiles + 1u) * top_k <= (uint64_t)n_comp) tiles++;
+            const char *tenv = getenv("DS4_METAL_GLM_TOPK_TILES");
+            if (tenv && *tenv) {
+                const unsigned long v = strtoul(tenv, NULL, 10);
+                if (v >= 2u && v <= 256u) tiles = (uint32_t)v;
+            }
+            if (tiles > 64u) tiles = 64u;
+            if (tiles >= 4u) {
+                g_last_indexer_topk = "tiled";
+                static int logged_tiled;
+                if (!logged_tiled) {
+                    logged_tiled = 1;
+                    fprintf(stderr,
+                            "ds4: metal indexer topk using tiled (%u slices of "
+                            "~%u rows)\n", tiles, n_comp / tiles);
+                }
+                id<MTLComputePipelineState> p1 =
+                    ds4_gpu_get_pipeline("kernel_dsv4_indexer_topk_tile_p1");
+                id<MTLComputePipelineState> p2 =
+                    ds4_gpu_get_pipeline("kernel_dsv4_indexer_topk_tile_p2");
+                if (!p1 || !p2) return 0;
+                const uint64_t cand_bytes = (uint64_t)tiles * top_k * sizeof(uint64_t);
+                /* One scratch buffer for the run, grown on demand: the decode
+                 * shape is fixed per context, so this allocates once. */
+                static id<MTLBuffer> cand_buf;
+                static uint64_t cand_cap;
+                if (cand_cap < cand_bytes) {
+                    cand_buf = [g_device newBufferWithLength:cand_bytes
+                                                     options:MTLResourceStorageModeShared];
+                    if (!cand_buf) return 0;
+                    cand_cap = cand_bytes;
+                }
+                ds4_gpu_kargs_argsort a1 = {
+                    .ne00 = (int32_t)n_comp,
+                    .ne01 = (int32_t)tiles,
+                    .ne02 = 1, .ne03 = 1,
+                    .nb00 = sizeof(float),
+                    .nb01 = (uint64_t)n_comp * sizeof(float),
+                    .nb02 = (uint64_t)n_comp * sizeof(float),
+                    .nb03 = (uint64_t)n_comp * sizeof(float),
+                    .ne0 = (int32_t)top_k, .ne1 = 1, .ne2 = 1, .ne3 = 1,
+                    .top_k = (int32_t)top_k,
+                };
+                ds4_gpu_kargs_argsort a2 = a1;
+                a2.ne00 = (int32_t)(tiles * top_k);
+                a2.ne01 = 1;
+
+                int owned = 0;
+                id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+                if (!cb) return 0;
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                DS4_SET_PIPE(enc, p1);
+                [enc setBytes:&a1 length:sizeof(a1) atIndex:0];
+                [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+                [enc setBuffer:cand_buf offset:0 atIndex:2];
+                [enc setThreadgroupMemoryLength:2048u * sizeof(uint64_t) + 96u atIndex:0];
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(tiles, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+                /* Same encoder: Metal orders dispatches within one compute
+                 * encoder, so pass 2 sees pass 1's writes without a barrier. */
+                DS4_SET_PIPE(enc, p2);
+                [enc setBytes:&a2 length:sizeof(a2) atIndex:0];
+                [enc setBuffer:cand_buf offset:0 atIndex:1];
+                [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+                [enc setThreadgroupMemoryLength:2048u * sizeof(uint64_t) + 96u atIndex:0];
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                return ds4_gpu_finish_command_buffer(cb, owned, "indexer topk tiled");
+            }
+        }
         /* Default (rollback env read per call): exact streaming top-512 —
          * one pass over the score row with a running 512th-best threshold,
          * in place of the padded bitonic + merge cascade.  Output list is
