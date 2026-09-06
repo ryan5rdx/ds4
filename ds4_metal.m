@@ -11128,6 +11128,19 @@ static ds4_tp_prefetch_range
  * flag for the sequence number the next gate encode will use, and the gate
  * encode skips its own flag kernel. */
 static uint64_t g_tp_flag_prepublished_seq;
+
+/* Fold request for producers that write the TP partial with a generic matvec
+ * (the attention output K-slice): the layer code registers (layer, gate)
+ * right before the producer call; the producer takes the request when its
+ * output is that slot and publishes the checked flag itself.
+ *
+ * Declared up here with the rest of the TP state because
+ * ds4_gpu_tp_reset_unstarted() has to clear it: a request that survives a
+ * rebind would be claimed by the first gate of the next session. */
+static int g_tp_fold_req_active;
+static uint32_t g_tp_fold_req_layer;
+static uint32_t g_tp_fold_req_gate;
+
 static id<MTLBuffer> g_tp_fold_ctl;
 static uint32_t g_tp_prefetch_count[DS4_TP_GATES_PER_LAYER];
 static const void *g_tp_prefetch_map;
@@ -11750,6 +11763,12 @@ static void ds4_gpu_tp_reset_unstarted(void) {
     g_tp_fence_spin_buffer = nil;
     g_tp_fence_spin_words = NULL;
     g_tp_fence_spin_profile = 0u;
+    /* Poll-gate fold state.  A marker or an armed request that survives a
+     * rebind would be claimed by the first gate of the NEXT session, for a slot
+     * it has nothing to do with. */
+    g_tp_flag_prepublished_seq = 0;
+    g_tp_fold_req_active = 0;
+    g_tp_fold_ctl = nil;
     g_tp_slab_buffer = nil;
     g_tp_gpu_flags = NULL;
     g_tp_exchange_fn = NULL;
@@ -12169,14 +12188,6 @@ static int ds4_gpu_tp_queue_preflight(void) {
     if (!available) fprintf(stderr, "ds4: TP gate queue overflow\n");
     return available;
 }
-
-/* Fold request for producers that write the TP partial with a generic matvec
- * (the attention output K-slice): the layer code registers (layer, gate)
- * right before the producer call; the producer takes the request when its
- * output is that slot and publishes the checked flag itself. */
-static int g_tp_fold_req_active;
-static uint32_t g_tp_fold_req_layer;
-static uint32_t g_tp_fold_req_gate;
 
 static bool ds4_gpu_tp_flag_fold_ok(uint32_t slot, uint64_t bytes) {
     return g_initialized && g_batch_cb && g_tp_thread_running &&
