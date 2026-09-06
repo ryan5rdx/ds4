@@ -51429,18 +51429,29 @@ int ds4_gpu_glm53_kda_prefill(
             &norm_inner, "KDA output norm");
         id<MTLComputePipelineState> prep_pipeline =
             ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_prepare");
-        /* KDA-PREPARE-PAR: DS4_METAL_GLM53_KDA_PREPARE_TPB=<n> splits prepare
-         * into blocks of n tokens, cutting the serial chain from n_rows to n
-         * and taking the grid from n_heads to n_heads x n_blocks.  A pass-1
-         * kernel snapshots each block's 3-token history first, while q/k/v are
-         * still pristine -- the reason the original must be serial is that it
-         * overwrites its own inputs.  0/unset keeps the original kernel. */
-        uint32_t prepare_tpb = 0;
+        /* KDA-PREPARE-PAR: split prepare into blocks of n tokens, cutting the
+         * serial chain from n_rows to n and taking the grid from n_heads to
+         * n_heads x n_blocks.  A pass-1 kernel snapshots each block's 3-token
+         * history first, while q/k/v are still pristine -- the reason the
+         * original must be serial is that it overwrites its own inputs.
+         *
+         * Default 64 (KDAPREP, 2026-09-06): +2.90% prefill @65536 on the TP2
+         * pair, 401.58 -> 413.23 t/s, above the +0.3-2.1% claimed band, and the
+         * first prefill win of the campaign.  TPB is not a tuning surface --
+         * 64/128/256 measured 413.23/412.93/412.59, within 0.16% of each other
+         * -- so 64 is taken for the headroom against n_blocks scaling rather
+         * than because it won.  Bit-identity is probe-proven 21/21 (all four
+         * conv taps nonzero, nonzero initial conv_state, boundary +-1, TP
+         * slice); see probe_kdaprep.c, which the in-tree test cannot replace
+         * because it leaves taps 0-2 at zero and never reads the halo.
+         *
+         * DS4_METAL_GLM53_KDA_PREPARE_TPB=0 restores the serial kernel. */
+        uint32_t prepare_tpb = 64u;
         {
             const char *tpb = getenv("DS4_METAL_GLM53_KDA_PREPARE_TPB");
             if (tpb && tpb[0]) {
                 const unsigned long n = strtoul(tpb, NULL, 10);
-                if (n >= 8ul && n <= 4096ul) prepare_tpb = (uint32_t)n;
+                prepare_tpb = (n >= 8ul && n <= 4096ul) ? (uint32_t)n : 0u;
             }
         }
         id<MTLComputePipelineState> prologue_pipeline = nil;
