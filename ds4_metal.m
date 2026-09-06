@@ -365,6 +365,11 @@ static id<MTLBuffer> g_router_weight_sum_buffer;
 static id<MTLBuffer> g_indexer_head_scores_buffer;
 static id<MTLBuffer> g_indexer_topk_parts_buffer;
 static id<MTLBuffer> g_indexer_topk_buffer;
+/* TOPK1 tiled pass-1 candidates.  File scope, not a function static: a
+ * function static outlives ds4_gpu teardown and would hand a stale Metal
+ * resource to the next init. */
+static id<MTLBuffer> g_indexer_topk_tile_buffer;
+static NSUInteger    g_indexer_topk_tile_bytes;
 static id<MTLBuffer> g_indexed_topk_buffer;
 static id<MTLBuffer> g_dspark_markov_candidates_buffer;
 static id<MTLBuffer> g_indexer_q16_buffer;
@@ -6623,6 +6628,8 @@ typedef struct {
     int32_t  ne3;
     int32_t  top_k;
     int32_t  len;
+    int32_t  out_len;   /* entries this level may emit per merged pair */
+    int32_t  out_ne0;   /* destination row stride; 0 => fall back to top_k */
 } ds4_gpu_kargs_argsort_merge;
 
 typedef struct {
@@ -11837,6 +11844,8 @@ void ds4_gpu_cleanup(void) {
         g_indexer_topk_parts_buffer = nil;
         g_indexer_topk_parts_bytes = 0;
         g_indexer_topk_buffer = nil;
+        g_indexer_topk_tile_buffer = nil;
+        g_indexer_topk_tile_bytes = 0;
         g_indexed_topk_buffer = nil;
         g_dspark_markov_candidates_buffer = nil;
         g_stream_expert_validate_status_buffer = nil;
@@ -19334,16 +19343,16 @@ int ds4_gpu_indexer_topk_tensor(
                     ds4_gpu_get_pipeline("kernel_dsv4_indexer_topk_tile_p2");
                 if (!p1 || !p2) return 0;
                 const uint64_t cand_bytes = (uint64_t)tiles * top_k * sizeof(uint64_t);
-                /* One scratch buffer for the run, grown on demand: the decode
-                 * shape is fixed per context, so this allocates once. */
-                static id<MTLBuffer> cand_buf;
-                static uint64_t cand_cap;
-                if (cand_cap < cand_bytes) {
-                    cand_buf = [g_device newBufferWithLength:cand_bytes
-                                                     options:MTLResourceStorageModeShared];
-                    if (!cand_buf) return 0;
-                    cand_cap = cand_bytes;
+                /* Grown on demand and freed with the other scratch buffers at
+                 * teardown; the decode shape is fixed per context so it
+                 * allocates once in practice. */
+                if (!ds4_gpu_ensure_scratch_buffer(&g_indexer_topk_tile_buffer,
+                                                   &g_indexer_topk_tile_bytes,
+                                                   (NSUInteger)cand_bytes,
+                                                   "indexer topk tile candidates")) {
+                    return 0;
                 }
+                id<MTLBuffer> cand_buf = g_indexer_topk_tile_buffer;
                 ds4_gpu_kargs_argsort a1 = {
                     .ne00 = (int32_t)n_comp,
                     .ne01 = (int32_t)tiles,
@@ -19502,10 +19511,48 @@ int ds4_gpu_indexer_topk_tensor(
              threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
+        /* MERGE-TRUNC (DS4_METAL_GLM_TOPK_TRUNC=1).
+         *
+         * The cascade below is already a correct multi-level tree, but it never
+         * SHEDS: .top_k was set to work_width at every non-final level, so the
+         * kernel's own clip could not bind and six of seven levels re-moved all
+         * 38,912 candidates when only 512 can survive -- on 38/19/10/5/3/2/1
+         * threadgroups, so the work concentrates exactly where the grid has
+         * collapsed.
+         *
+         * Truncating each level to top_k is exact: an element past position
+         * k-1 of a sorted run has >= k elements of that run above it, so it
+         * cannot enter the first k of any merge containing it.  The canon
+         * comparator's (score desc, index asc) order survives because run m
+         * still covers a strictly lower index range than run m+1.
+         *
+         * THE SHORT FINAL RUN.  out_ne0 is NOT nm*out_len.  With
+         * n_comp = 2049, k = 512 the pass-1 runs are [512, 512, 1]: the first
+         * merge emits 512 + 1 = 513 valid entries, and claiming 1024 would make
+         * the next level treat 511 never-written slots as live indices and
+         * gather scores through them.  len0/len1 in the kernel derive validity
+         * from ne0 (metal/argsort.metal), so ne0 has to be the true count. */
+        static int trunc_env = -1;
+        if (trunc_env < 0) {
+            trunc_env = getenv("DS4_METAL_GLM_TOPK_TRUNC") != NULL ? 1 : 0;
+        }
+        const bool truncate = trunc_env != 0;
+
         int32_t len = block_top_k;
+        int32_t in_ne0 = work_width;
         while (len < work_width) {
-            const int32_t nm = (work_width + 2 * len - 1) / (2 * len);
+            const int32_t nm = truncate ? (in_ne0 + 2 * len - 1) / (2 * len)
+                                        : (work_width + 2 * len - 1) / (2 * len);
             const bool final_merge = nm == 1;
+            /* Emit at most top_k per merged pair; the last pair may be short. */
+            const int32_t two_len = (int32_t)((int64_t)2 * len > (int64_t)top_k
+                                              ? (int64_t)top_k : (int64_t)2 * len);
+            const int32_t out_len = final_merge ? (int32_t)top_k : two_len;
+            const int32_t last_start = (nm - 1) * 2 * len;
+            const int32_t last_avail = in_ne0 - last_start;
+            const int32_t last_out = last_avail < out_len ? last_avail : out_len;
+            const int32_t out_ne0 = final_merge ? (int32_t)top_k
+                                                : (nm - 1) * out_len + last_out;
             NSUInteger merge_threads = g_argsort_merge_f32_i32_desc_pipeline.maxTotalThreadsPerThreadgroup;
             if (merge_threads == 0 || merge_threads > 512u) merge_threads = 512u;
             if (merge_threads > (NSUInteger)len) merge_threads = (NSUInteger)len;
@@ -19520,12 +19567,14 @@ int ds4_gpu_indexer_topk_tensor(
                 .nb01 = (uint64_t)n_comp * sizeof(float),
                 .nb02 = (uint64_t)n_comp * n_tokens * sizeof(float),
                 .nb03 = (uint64_t)n_comp * n_tokens * sizeof(float),
-                .ne0 = work_width,
+                .ne0 = truncate ? in_ne0 : work_width,
                 .ne1 = (int32_t)n_tokens,
                 .ne2 = 1,
                 .ne3 = 1,
                 .top_k = nm == 1 ? (int32_t)top_k : work_width,
                 .len = len,
+                .out_len = truncate ? out_len : 0,
+                .out_ne0 = truncate ? out_ne0 : 0,
             };
 
             enc = ds4_gpu_compute_encoder(cb);
@@ -19543,6 +19592,14 @@ int ds4_gpu_indexer_topk_tensor(
             const NSUInteger tmp = cur_off;
             cur_off = next_off;
             next_off = tmp;
+
+            if (truncate) {
+                /* Next level merges the runs this one just emitted. */
+                if (final_merge) break;
+                in_ne0 = out_ne0;
+                len = out_len;
+                continue;
+            }
             len <<= 1;
         }
 
