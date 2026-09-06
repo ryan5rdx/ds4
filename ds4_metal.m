@@ -3298,6 +3298,41 @@ static uint64_t ds4_gpu_env_u64(const char *name,
     return value;
 }
 
+/* Threadgroup scratch for the double-buffered nax/mpp direct-RHS dense kernels.
+ *
+ * The kernel holds TWO A tiles -- `tA0 = tensor(sa, ...)` and
+ * `tA1 = tensor(sa + NR0*NK, ...)` at metal/dense.metal -- so at NR0 64, NK 32,
+ * half, it writes 2 x 4096 = 8192 bytes.  Two of the five dispatch sites on this
+ * branch were allocating 4096 until upstream's 8fcd61d fixed them, which means
+ * tA1 was writing 4096 bytes past the allocation.  That is why prefill got
+ * SLOWER across the merge: 8 KiB per threadgroup instead of 4 halves the
+ * threadgroups resident per core wherever threadgroup memory is the occupancy
+ * limiter, and the cost is per dispatch, hence flat per chunk.
+ *
+ * This override exists so that cost can be MEASURED rather than assumed -- it is
+ * the only way to A/B a correctness fix.  Anything below 8192 is out of bounds
+ * and is a diagnostic arm, never a configuration: it warns on every call, and
+ * the numbers it produces are from a kernel writing past its scratch. */
+static NSUInteger ds4_gpu_mm_nax_tg_mem(void) {
+    static NSUInteger cached;
+    if (cached) return cached;
+    const NSUInteger correct = 2u * 64u * 32u * sizeof(uint16_t);
+    const uint64_t forced =
+        ds4_gpu_env_u64("DS4_METAL_MM_NAX_TG_MEM_UNSAFE", 0u, 0u, 65536u);
+    cached = forced ? (NSUInteger)forced : correct;
+    if (forced && forced < correct) {
+        fprintf(stderr,
+                "ds4: WARNING DS4_METAL_MM_NAX_TG_MEM_UNSAFE=%llu is below the "
+                "%llu bytes the double-buffered dense kernel writes; tA1 will "
+                "run past its threadgroup allocation.  Diagnostic arm only -- "
+                "this measures the pre-8fcd61d behaviour, it does not restore "
+                "a valid one.\n",
+                (unsigned long long)forced, (unsigned long long)correct);
+    }
+    return cached;
+}
+
+
 static uint32_t ds4_gpu_glm_full_attention_max_cache_len(void) {
     /*
      * kernel_glm_attention_full stores one score per visible token in
@@ -21493,7 +21528,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                     [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
                     [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                     [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-                    [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t) atIndex:0];
+                    [enc setThreadgroupMemoryLength:ds4_gpu_mm_nax_tg_mem() atIndex:0];
                     [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1u,
                                                           ((NSUInteger)out_dim + 63u) / 64u,
                                                           1u)
@@ -21618,7 +21653,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                 [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-                [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t) atIndex:0];
+                [enc setThreadgroupMemoryLength:ds4_gpu_mm_nax_tg_mem() atIndex:0];
                 [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)(nax_rows / nax_tile_n),
                                                       (NSUInteger)out_dim / 64u,
                                                       1)
@@ -22078,7 +22113,7 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                 [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-                [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t) atIndex:0];
+                [enc setThreadgroupMemoryLength:ds4_gpu_mm_nax_tg_mem() atIndex:0];
                 [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / nax_tile_n),
                                                       (NSUInteger)out_dim / 64u,
                                                       1)
@@ -23175,7 +23210,7 @@ int ds4_gpu_matmul_f16_tensor(
                 [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-                [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t) atIndex:0];
+                [enc setThreadgroupMemoryLength:ds4_gpu_mm_nax_tg_mem() atIndex:0];
                 [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / nax_tile_n),
                                                       (NSUInteger)out_dim / 64u,
                                                       1)
@@ -28663,7 +28698,7 @@ static int ds4_gpu_matmul_q8_0_kslice_rows_mpp(
                                     x_col_off * sizeof(float))
                atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t)
+        [enc setThreadgroupMemoryLength:ds4_gpu_mm_nax_tg_mem()
                                 atIndex:0];
         [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_rows / tile_rows),
                                               (NSUInteger)(out_dim / 64u),
