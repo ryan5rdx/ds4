@@ -71,7 +71,7 @@ endif
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
+.PHONY: check-threadgroup-memory metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp
 .PHONY: test-topk-ab
 
@@ -148,6 +148,14 @@ tests/test_mxfp4_metal: tests/test_mxfp4_metal.o ds4_metal.o ds4_image.o
 check-mxfp4-half-lut:
 	python3 metal/generate_mxfp4_half_lut.py --check
 
+# Static half of the threadgroup-memory census.  Metal does not bounds-check
+# threadgroup memory, so a kernel writing past its setThreadgroupMemoryLength:
+# allocation aliases silently -- upstream's 8fcd61d found two dispatch sites
+# doing exactly that, and the numbers taken before the fix were both wrong AND
+# fast.  The dynamic half is running the dispatching probes under
+# MTL_SHADER_VALIDATION=1; this is the half that costs nothing.
+check-threadgroup-memory:
+	@python3 tools/tgmem_census.py
 test-mxfp4-metal: check-mxfp4-half-lut tests/test_mxfp4_metal
 	./tests/test_mxfp4_metal
 
