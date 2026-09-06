@@ -19948,6 +19948,49 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
+            /* KDA-R2: narrow-k lane.  The kernel walks K in NSG*NQ blocks
+             * (NQ = 8, metal/dense.metal), against nb = in_dim/32 blocks of
+             * actual work.  When nb < NSG*NQ the surplus simdgroups have no
+             * block to take and retire immediately: at the KDA f_b/g_b shape
+             * (in_dim 128 -> nb = 4) with the TP2 default nsg = 2, that is
+             * 16 of 64 threads doing anything and simdgroup 1 entirely dead.
+             *
+             * Derive the useful nsg from the shape instead of guessing:
+             * nb/NQ = in_dim/256, floored at 1.  This only ever LOWERS nsg --
+             * in_dim 4096 gives 16, which min() keeps at the existing 2 -- so
+             * wide matvecs are bit-for-bit untouched and only the starved
+             * shapes move.  128 -> nsg 1, i.e. 25% -> 50% occupancy.
+             *
+             * 50% and not 100%: NQ is a compile-time constant, so closing the
+             * last 2x needs a kernel variant with NQ = 4.  Measure this first;
+             * if the shape-derived lane pays, the variant is worth writing.
+             * Opt-in so the A/B has a control.
+             *
+             * BIT-IDENTICAL, and provably so at exactly the shapes this fires
+             * on.  Lowering nsg normally reorders a reduction, but here the
+             * simdgroups being removed are the ones with NO block to take:
+             * their ib0 = sgitg*NQ already exceeds nb, so they retire before
+             * touching sumf and contribute a partial of exactly 0.0f.  Dropping
+             * them removes `+ 0.0f` terms from the cross-simdgroup reduction,
+             * which is exact for every finite input (and for inf; only a -0.0f
+             * partial would differ, and 0.0f is what the retiring path yields).
+             * The surviving simdgroups keep their block assignment unchanged,
+             * so every non-zero partial is computed identically.  That is why
+             * the lane must be derived from nb and never simply set to 1: at a
+             * shape where the surplus simdgroups DO have work, this argument
+             * fails and the change would not be bit-identical. */
+            {
+                static int lane_env = -1;
+                if (lane_env < 0) {
+                    const char *v = getenv("DS4_METAL_Q8_MV_NARROW_K_LANE");
+                    lane_env = v && v[0] && v[0] != '0';
+                }
+                if (lane_env) {
+                    const uint32_t useful = in_dim / 256u;
+                    const int16_t want = (int16_t)(useful < 1u ? 1u : useful);
+                    if (want < mv_dispatch.nsg) mv_dispatch.nsg = want;
+                }
+            }
             mv_args.nr0 = mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
