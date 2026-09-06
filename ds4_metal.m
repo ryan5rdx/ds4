@@ -368,6 +368,9 @@ static id<MTLBuffer> g_indexer_topk_buffer;
 /* TOPK1 tiled pass-1 candidates.  File scope, not a function static: a
  * function static outlives ds4_gpu teardown and would hand a stale Metal
  * resource to the next init. */
+/* KDA-PREPARE-PAR pass-1 snapshot; file scope so teardown clears it. */
+static id<MTLBuffer> g_kda_prologue_buffer;
+static NSUInteger    g_kda_prologue_bytes;
 static id<MTLBuffer> g_indexer_topk_tile_buffer;
 static NSUInteger    g_indexer_topk_tile_bytes;
 static id<MTLBuffer> g_indexed_topk_buffer;
@@ -11861,6 +11864,8 @@ void ds4_gpu_cleanup(void) {
         g_indexer_topk_parts_buffer = nil;
         g_indexer_topk_parts_bytes = 0;
         g_indexer_topk_buffer = nil;
+        g_kda_prologue_buffer = nil;
+        g_kda_prologue_bytes = 0;
         g_indexer_topk_tile_buffer = nil;
         g_indexer_topk_tile_bytes = 0;
         g_indexed_topk_buffer = nil;
@@ -47369,6 +47374,7 @@ typedef struct {
      * pointers stay lane-relative.  See glm53_kda_args in glm53_kda.metal. */
     uint32_t n_heads_total;
     uint32_t head_first;
+    uint32_t tokens_per_block;   /* KDA-PREPARE-PAR; 0 = original kernel */
 } glm53_gpu_kda_args;
 
 int ds4_gpu_glm53_kda_decode(
@@ -47592,6 +47598,51 @@ int ds4_gpu_glm53_kda_prefill(
             &norm_inner, "KDA output norm");
         id<MTLComputePipelineState> prep_pipeline =
             ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_prepare");
+        /* KDA-PREPARE-PAR: DS4_METAL_GLM53_KDA_PREPARE_TPB=<n> splits prepare
+         * into blocks of n tokens, cutting the serial chain from n_rows to n
+         * and taking the grid from n_heads to n_heads x n_blocks.  A pass-1
+         * kernel snapshots each block's 3-token history first, while q/k/v are
+         * still pristine -- the reason the original must be serial is that it
+         * overwrites its own inputs.  0/unset keeps the original kernel. */
+        uint32_t prepare_tpb = 0;
+        {
+            const char *tpb = getenv("DS4_METAL_GLM53_KDA_PREPARE_TPB");
+            if (tpb && tpb[0]) {
+                const unsigned long n = strtoul(tpb, NULL, 10);
+                if (n >= 8ul && n <= 4096ul) prepare_tpb = (uint32_t)n;
+            }
+        }
+        id<MTLComputePipelineState> prologue_pipeline = nil;
+        id<MTLComputePipelineState> prep_blocked_pipeline = nil;
+        uint32_t prepare_blocks = 1u;
+        if (prepare_tpb && n_tokens > prepare_tpb) {
+            prologue_pipeline =
+                ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_prologue");
+            prep_blocked_pipeline =
+                ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_prepare_blocked");
+            if (prologue_pipeline && prep_blocked_pipeline) {
+                prepare_blocks = (n_tokens + prepare_tpb - 1u) / prepare_tpb;
+                const uint64_t proj = (uint64_t)n_heads * GLM53_KDA_DIM;
+                const uint64_t pel = (uint64_t)prepare_blocks * 9ull * proj;
+                if (!ds4_gpu_ensure_scratch_buffer(&g_kda_prologue_buffer,
+                                                   &g_kda_prologue_bytes,
+                                                   (NSUInteger)(pel * sizeof(float)),
+                                                   "kda prepare prologue")) {
+                    return 0;
+                }
+                static int logged_tpb;
+                if (!logged_tpb) {
+                    logged_tpb = 1;
+                    fprintf(stderr,
+                            "ds4: metal kda prepare BLOCKED (%u tokens/block, "
+                            "%u blocks, serial chain %u -> %u)\n",
+                            prepare_tpb, prepare_blocks, n_tokens, prepare_tpb);
+                }
+            } else {
+                prologue_pipeline = nil;
+                prep_blocked_pipeline = nil;
+            }
+        }
         /* K1: four value rows per simdgroup, cutting the q/k/decay re-read.
          * Default off. Same total work, fewer loads -- see the kernel comment;
          * this is NOT an occupancy change. */
@@ -47628,13 +47679,32 @@ int ds4_gpu_glm53_kda_prefill(
             .norm_eps = norm_eps,
             .n_heads_total = n_heads_total,
             .head_first = head_first,
+            .tokens_per_block = prepare_tpb,
         };
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
 
-        DS4_SET_PIPE(enc, prep_pipeline);
+        /* Pass 1 must fully precede pass 2's writes.  Same serial encoder, so
+         * dispatch order IS the ordering guarantee. */
+        if (prologue_pipeline) {
+            DS4_SET_PIPE(enc, prologue_pipeline);
+            [enc setBytes:&args length:sizeof(args) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(q)
+                    offset:ds4_gpu_tensor_offset(q) atIndex:1];
+            [enc setBuffer:ds4_gpu_tensor_buffer(k)
+                    offset:ds4_gpu_tensor_offset(k) atIndex:2];
+            [enc setBuffer:ds4_gpu_tensor_buffer(v)
+                    offset:ds4_gpu_tensor_offset(v) atIndex:3];
+            [enc setBuffer:ds4_gpu_tensor_buffer(conv_state)
+                    offset:ds4_gpu_tensor_offset(conv_state) atIndex:4];
+            [enc setBuffer:g_kda_prologue_buffer offset:0 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(n_heads, prepare_blocks, 1)
+                threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        }
+        DS4_SET_PIPE(enc, prep_blocked_pipeline ? prep_blocked_pipeline
+                                                : prep_pipeline);
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:ds4_gpu_tensor_buffer(q)
                 offset:ds4_gpu_tensor_offset(q) atIndex:1];
@@ -47651,8 +47721,11 @@ int ds4_gpu_glm53_kda_prefill(
         [enc setBuffer:dt_bias offset:(NSUInteger)dt_inner atIndex:9];
         [enc setBuffer:ds4_gpu_tensor_buffer(conv_state)
                 offset:ds4_gpu_tensor_offset(conv_state) atIndex:10];
+        if (prep_blocked_pipeline) {
+            [enc setBuffer:g_kda_prologue_buffer offset:0 atIndex:11];
+        }
         [enc setThreadgroupMemoryLength:264u * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
+        [enc dispatchThreadgroups:MTLSizeMake(n_heads, prepare_blocks, 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 
         DS4_SET_PIPE(enc, recurrence_pipeline);

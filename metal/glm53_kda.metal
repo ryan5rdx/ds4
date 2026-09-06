@@ -19,6 +19,9 @@ struct glm53_kda_args {
      * offset to the lane by the host, so both keep using n_heads and head. */
     uint n_heads_total;  // heads in the whole layer, for state strides
     uint head_first;     // absolute index of this rank's first head
+    /* KDA-PREPARE-PAR: tokens each prepare threadgroup owns.  0 means the
+     * original whole-sequence kernel, which ignores it. */
+    uint tokens_per_block;
 };
 
 /*
@@ -179,6 +182,88 @@ kernel void kernel_glm53_kda_decode(
     }
 }
 
+/* ---------------------------------------------------------------------------
+ * KDA-PREPARE-PAR.  The kernel below this pair walks all n_rows tokens in ONE
+ * threadgroup per head -- 32 threadgroups of 128 threads, each running a 4096
+ * iteration chain, measured at 8.46 of the KDA block's 29.75 ms and
+ * parallelism-invariant (7.40 ms at H=1), so the chain is the cost, not the
+ * grid.
+ *
+ * Everything in that loop body is parallel over tokens: a width-4 causal
+ * depthwise conv, a SiLU, a gate, and an RMS-norm across the head's 128
+ * channels.  What forces the serialisation is that the loop OVERWRITES ITS OWN
+ * INPUTS -- it reads q[t] at the top and writes q[t] at the bottom -- so the
+ * 3-deep shift register exists precisely because the array is destroyed as it
+ * goes, and a parallel version cannot re-read x[t-3..t].
+ *
+ * Fix in two passes.  Pass 1 saves each block's 3-token prologue while the
+ * inputs are still pristine; pass 2 then runs blocks independently, each
+ * seeding its history from that snapshot rather than from its predecessor.
+ * Serial depth drops from n_rows to TOKENS_PER_BLOCK and the grid goes from
+ * n_heads to n_heads x n_blocks.
+ *
+ * Cost is one small buffer: n_blocks * 3 history * 3 tensors * projection
+ * floats -- ~9.4 MB at 64 blocks and projection 4096 -- against the ~200 MB a
+ * full out-of-place staging of q/k/v would need.
+ *
+ * Bit-identical.  Each token's four FMAs run in the same order against the same
+ * values; history that was read from conv_state/device memory is now read from
+ * registers seeded with the identical bytes.  The last block writes conv_state,
+ * so the carried state out is unchanged too.
+ * ------------------------------------------------------------------------- */
+
+/* Pass 1.  MUST complete before any pass-2 threadgroup writes q/k/v.
+ * grid = (n_heads, n_blocks); block 0 seeds from conv_state, the rest from the
+ * still-pristine activations. */
+kernel void kernel_glm53_kda_prefill_prologue(
+        constant glm53_kda_args &args,
+        device const float   *q,
+        device const float   *k,
+        device const float   *v,
+        device const float   *conv_state,
+        device float         *prologue,
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]]) {
+    constexpr uint D = 128u;
+    constexpr uint HISTORY = 3u;
+    const uint head  = tgpig.x;
+    const uint block = tgpig.y;
+    if (head >= args.n_heads) return;
+
+    const uint projection = args.n_heads * D;
+    const uint channel = head * D + tid;
+    const uint state_projection = args.n_heads_total * D;
+    const uint state_channel = (args.head_first + head) * D + tid;
+    const uint tok0 = block * args.tokens_per_block;
+    if (tok0 >= args.n_rows) return;
+
+    /* prologue layout: [block][tensor 0..2][history 0..2][channel] */
+    const ulong pbase = ((ulong)block * 3ul * HISTORY) * projection + channel;
+    device const float *qs = conv_state;
+    device const float *ks = qs + HISTORY * state_projection;
+    device const float *vs = ks + HISTORY * state_projection;
+
+    for (uint w = 0; w < HISTORY; w++) {
+        float qh, kh, vh;
+        /* History slot w holds x[tok0 - HISTORY + w].  Before the first token
+         * of the whole sequence that is the carried conv_state; otherwise it is
+         * the activation itself, which no pass-2 block has touched yet. */
+        const int src = (int)tok0 - (int)HISTORY + (int)w;
+        if (src < 0) {
+            const uint sw = (uint)(src + (int)HISTORY);
+            qh = qs[(ulong)sw * state_projection + state_channel];
+            kh = ks[(ulong)sw * state_projection + state_channel];
+            vh = vs[(ulong)sw * state_projection + state_channel];
+        } else {
+            const ulong idx = (ulong)src * projection + channel;
+            qh = q[idx]; kh = k[idx]; vh = v[idx];
+        }
+        prologue[pbase + (ulong)(0u * HISTORY + w) * projection] = qh;
+        prologue[pbase + (ulong)(1u * HISTORY + w) * projection] = kh;
+        prologue[pbase + (ulong)(2u * HISTORY + w) * projection] = vh;
+    }
+}
+
 kernel void kernel_glm53_kda_prefill_prepare(
         constant glm53_kda_args &args,
         device float         *q,
@@ -268,6 +353,115 @@ kernel void kernel_glm53_kda_prefill_prepare(
         k[index] = sk[tid] * rsqrt(k_total + 1.0e-6f);
         threadgroup_barrier(mem_flags::mem_threadgroup |
                            mem_flags::mem_device);
+    }
+}
+
+kernel void kernel_glm53_kda_prefill_prepare_blocked(
+        constant glm53_kda_args &args,
+        device float         *q,
+        device float         *k,
+        device float         *v,
+        device float         *raw_gate,
+        device const float   *q_conv,
+        device const float   *k_conv,
+        device const float   *v_conv,
+        device const float   *a_log,
+        device const float   *dt_bias,
+        device float         *conv_state,
+        device const float   *prologue,
+        threadgroup float    *scratch [[threadgroup(0)]],
+        uint2 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    constexpr uint D = 128u;
+    constexpr uint HISTORY = 3u;
+    const uint head  = tgpig.x;
+    const uint block = tgpig.y;
+    if (head >= args.n_heads) return;
+    threadgroup float *sq = scratch;
+    threadgroup float *sk = sq + D;
+    threadgroup float *reduce_q = sk + D;
+    threadgroup float *reduce_k = reduce_q + 4u;
+    const uint projection = args.n_heads * D;
+    const uint channel = head * D + tid;
+    const uint state_projection = args.n_heads_total * D;
+    const uint state_channel = (args.head_first + head) * D + tid;
+    const uint tok0 = block * args.tokens_per_block;
+    if (tok0 >= args.n_rows) return;
+    uint tok_end = tok0 + args.tokens_per_block;
+    if (tok_end > args.n_rows) tok_end = args.n_rows;
+    const bool last_block = (tok_end == args.n_rows);
+
+    /* History in REGISTERS, seeded from the pass-1 snapshot.  The original held
+     * it in conv_state and shifted it there; per block that would race, and the
+     * registers also remove a device round trip per token. */
+    const ulong pbase = ((ulong)block * 3ul * HISTORY) * projection + channel;
+    float qh[HISTORY], kh[HISTORY], vh[HISTORY];
+    for (uint w = 0; w < HISTORY; w++) {
+        qh[w] = prologue[pbase + (ulong)(0u * HISTORY + w) * projection];
+        kh[w] = prologue[pbase + (ulong)(1u * HISTORY + w) * projection];
+        vh[w] = prologue[pbase + (ulong)(2u * HISTORY + w) * projection];
+    }
+
+    for (uint token = tok0; token < tok_end; token++) {
+        const ulong index = (ulong)token * projection + channel;
+        float q_acc = 0.0f;
+        float k_acc = 0.0f;
+        float v_acc = 0.0f;
+        for (uint w = 0; w < HISTORY; w++) {
+            q_acc = fma(qh[w], q_conv[(ulong)channel * 4u + w], q_acc);
+            k_acc = fma(kh[w], k_conv[(ulong)channel * 4u + w], k_acc);
+            v_acc = fma(vh[w], v_conv[(ulong)channel * 4u + w], v_acc);
+        }
+        const float q_new = q[index];
+        const float k_new = k[index];
+        const float v_new = v[index];
+        q_acc = fma(q_new, q_conv[(ulong)channel * 4u + 3u], q_acc);
+        k_acc = fma(k_new, k_conv[(ulong)channel * 4u + 3u], k_acc);
+        v_acc = fma(v_new, v_conv[(ulong)channel * 4u + 3u], v_acc);
+        qh[0] = qh[1]; qh[1] = qh[2]; qh[2] = q_new;
+        kh[0] = kh[1]; kh[1] = kh[2]; kh[2] = k_new;
+        vh[0] = vh[1]; vh[1] = vh[2]; vh[2] = v_new;
+
+        sq[tid] = q_acc / (1.0f + exp(-q_acc));
+        sk[tid] = k_acc / (1.0f + exp(-k_acc));
+        v[index] = v_acc / (1.0f + exp(-v_acc));
+        const float gate = raw_gate[index] + dt_bias[channel];
+        raw_gate[index] = exp(args.lower_bound *
+            (1.0f / (1.0f + exp(-exp(a_log[head]) * gate))));
+        threadgroup_barrier(mem_flags::mem_threadgroup |
+                           mem_flags::mem_device);
+
+        float q_sumsq = simd_sum(sq[tid] * sq[tid]);
+        float k_sumsq = simd_sum(sk[tid] * sk[tid]);
+        if (lane == 0u) {
+            reduce_q[sg] = q_sumsq;
+            reduce_k[sg] = k_sumsq;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float q_total = lane < 4u ? reduce_q[lane] : 0.0f;
+        float k_total = lane < 4u ? reduce_k[lane] : 0.0f;
+        q_total = simd_sum(q_total);
+        k_total = simd_sum(k_total);
+        q[index] = sq[tid] * rsqrt(q_total + 1.0e-6f) *
+                   0x1.6a09e6p-4f;
+        k[index] = sk[tid] * rsqrt(k_total + 1.0e-6f);
+        threadgroup_barrier(mem_flags::mem_threadgroup |
+                           mem_flags::mem_device);
+    }
+
+    /* Only the block holding the final tokens carries the state forward; the
+     * others' registers are discarded, which is what makes them independent. */
+    if (last_block) {
+        device float *q_state = conv_state;
+        device float *k_state = q_state + HISTORY * state_projection;
+        device float *v_state = k_state + HISTORY * state_projection;
+        for (uint w = 0; w < HISTORY; w++) {
+            q_state[(ulong)w * state_projection + state_channel] = qh[w];
+            k_state[(ulong)w * state_projection + state_channel] = kh[w];
+            v_state[(ulong)w * state_projection + state_channel] = vh[w];
+        }
     }
 }
 
