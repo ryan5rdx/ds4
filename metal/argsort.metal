@@ -29,6 +29,14 @@ struct ds4_metal_args_argsort_merge {
     int32_t  ne3;
     int32_t  top_k;
     int32_t  len;
+    /* MERGE-TRUNC.  top_k has to stay the DESTINATION ROW STRIDE -- dst is
+     * indexed by i01*top_k below -- so a truncating level cannot express itself
+     * by shrinking top_k without corrupting every n_tokens>1 caller.  These two
+     * separate the three jobs top_k used to hold: out_len is how many entries
+     * this level may emit per merged pair, out_ne0 is the destination row
+     * stride, and top_k keeps its old meaning for callers that set neither. */
+    int32_t  out_len;
+    int32_t  out_ne0;
 };
 
 typedef void (argsort_t)(
@@ -169,10 +177,28 @@ kernel void kernel_argsort_merge_f32_i32(
 
     device const int32_t * tmp1 = tmp0 + args.len;
 
-    dst += start
-        + i01*args.top_k
-        + i02*args.top_k*args.ne01
-        + i03*args.top_k*args.ne01*args.ne02;
+    /* args.top_k used to carry THREE jobs at once, and they only coincide on the
+     * final level.  Separating two of them was not enough -- the first cut of
+     * this change used out_len for the slot as well as the cap, which silently
+     * moved every non-final baseline write from im*(2*len) to im*top_k.  All
+     * three, explicitly:
+     *
+     *   slot  where this threadgroup writes within the row.  Baseline: the full
+     *         merged width 2*len.  Truncating: out_len, since that is all it
+     *         emits.
+     *   cap   how many entries it may emit.  Baseline: top_k (= work_width at
+     *         non-final levels, so it never binds).  Truncating: out_len.
+     *   ne0d  destination row stride.  Baseline: top_k.  Truncating: out_ne0,
+     *         which must be the TRUE surviving count -- see the host loop for
+     *         why nm*out_len is wrong when the last run is short. */
+    const int trunc = args.out_len > 0;
+    const int slot  = trunc ? args.out_len : 2*args.len;
+    const int cap   = trunc ? args.out_len : args.top_k;
+    const int ne0d  = args.out_ne0 > 0 ? args.out_ne0 : args.top_k;
+    dst += im*slot
+        + i01*ne0d
+        + i02*ne0d*args.ne01
+        + i03*ne0d*args.ne01*args.ne02;
 
     device const float * src0_row = (device const float *)(src0
         + args.nb01*i01
@@ -183,12 +209,25 @@ kernel void kernel_argsort_merge_f32_i32(
         return;
     }
 
-    const int chunk = (total + ntg.x - 1) / ntg.x;
+    /* Spread only the surviving entries over the threadgroup.  Dividing `total`
+     * leaves every lane past cap/chunk retiring immediately -- at the final
+     * level of a 310k decode that is 7 live lanes out of 512.
+     *
+     * GATED ON trunc, and that gate is not cosmetic.  The first cut applied this
+     * unconditionally, which silently turned the 7-lane collapse into 512 lanes
+     * in the BASELINE too -- i.e. it shipped the census's separate MERGE-CHUNK
+     * candidate inside a supposedly opt-in change.  The consequence is worse
+     * than a stray optimisation: the MERGE-TRUNC "off" arm would no longer be
+     * the shipping baseline, and every TOPK1 A/B on such a build would have an
+     * argsort control that quietly got faster.  With trunc off the arithmetic
+     * below is byte-for-byte the original. */
+    const int span = trunc ? MIN(total, cap) : total;
+    const int chunk = (span + ntg.x - 1) / ntg.x;
 
     const int k0 = tpitg.x * chunk;
-    const int k1 = MIN(MIN(k0 + chunk, total), args.top_k);
+    const int k1 = MIN(MIN(k0 + chunk, total), cap);
 
-    if (k0 >= args.top_k) {
+    if (k0 >= cap) {
         return;
     }
 

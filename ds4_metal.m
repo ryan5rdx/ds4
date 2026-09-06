@@ -6425,6 +6425,8 @@ typedef struct {
     int32_t  ne3;
     int32_t  top_k;
     int32_t  len;
+    int32_t  out_len;   /* entries this level may emit per merged pair */
+    int32_t  out_ne0;   /* destination row stride; 0 => fall back to top_k */
 } ds4_gpu_kargs_argsort_merge;
 
 typedef struct {
@@ -19430,10 +19432,78 @@ int ds4_gpu_indexer_topk_tensor(
              threadsPerThreadgroup:MTLSizeMake((NSUInteger)nth, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
 
+        /* MERGE-TRUNC (DS4_METAL_GLM_TOPK_TRUNC=1).
+         *
+         * The cascade below is already a correct multi-level tree, but it never
+         * SHEDS: .top_k was set to work_width at every non-final level, so the
+         * kernel's own clip could not bind and six of seven levels re-moved all
+         * 38,912 candidates when only 512 can survive -- on 38/19/10/5/3/2/1
+         * threadgroups, so the work concentrates exactly where the grid has
+         * collapsed.
+         *
+         * Truncating each level to top_k is exact: an element past position
+         * k-1 of a sorted run has >= k elements of that run above it, so it
+         * cannot enter the first k of any merge containing it.  The canon
+         * comparator's (score desc, index asc) order survives because run m
+         * still covers a strictly lower index range than run m+1.
+         *
+         * THE SHORT FINAL RUN.  out_ne0 is NOT nm*out_len.  With
+         * n_comp = 2049, k = 512 the pass-1 runs are [512, 512, 1]: the first
+         * merge emits 512 + 1 = 513 valid entries, and claiming 1024 would make
+         * the next level treat 511 never-written slots as live indices and
+         * gather scores through them.  len0/len1 in the kernel derive validity
+         * from ne0 (metal/argsort.metal), so ne0 has to be the true count. */
+        /* Default ON. Set DS4_METAL_GLM_TOPK_TRUNC=0 to disable. */
+        static int trunc_env = -1;
+        if (trunc_env < 0) {
+            const char *v = getenv("DS4_METAL_GLM_TOPK_TRUNC");
+            trunc_env = !(v && v[0] == '0');
+        }
+        const bool truncate = trunc_env != 0;
+
+        /* Engagement evidence.  Every other arm in this campaign is
+         * announce-gated, and two have already been voided by silently not
+         * engaging.  The truncating path had no announce at all, so its A/B
+         * would have had to trust the env var -- exactly what the gates exist
+         * to avoid.  Once per process, and it names the level count so a
+         * harness can tell a real 7-level cascade from a degenerate one. */
+        if (truncate && work_width > block_top_k) {
+            static int logged_trunc;
+            if (!logged_trunc) {
+                logged_trunc = 1;
+                int32_t lv = 0, l2 = block_top_k, w2 = work_width;
+                while (l2 < work_width && lv < 64) {
+                    const int32_t m = (w2 + 2 * l2 - 1) / (2 * l2);
+                    lv++;
+                    if (m == 1) break;
+                    const int32_t tl = (int32_t)((int64_t)2 * l2 > (int64_t)top_k
+                                                 ? (int64_t)top_k : (int64_t)2 * l2);
+                    const int32_t ls = (m - 1) * 2 * l2;
+                    const int32_t la = w2 - ls;
+                    w2 = (m - 1) * tl + (la < tl ? la : tl);
+                    l2 = tl;
+                }
+                fprintf(stderr,
+                        "ds4: metal indexer topk merge TRUNCATING "
+                        "(%d levels, work_width %d -> top_k %u)\n",
+                        lv, work_width, top_k);
+            }
+        }
         int32_t len = block_top_k;
+        int32_t in_ne0 = work_width;
         while (len < work_width) {
-            const int32_t nm = (work_width + 2 * len - 1) / (2 * len);
+            const int32_t nm = truncate ? (in_ne0 + 2 * len - 1) / (2 * len)
+                                        : (work_width + 2 * len - 1) / (2 * len);
             const bool final_merge = nm == 1;
+            /* Emit at most top_k per merged pair; the last pair may be short. */
+            const int32_t two_len = (int32_t)((int64_t)2 * len > (int64_t)top_k
+                                              ? (int64_t)top_k : (int64_t)2 * len);
+            const int32_t out_len = final_merge ? (int32_t)top_k : two_len;
+            const int32_t last_start = (nm - 1) * 2 * len;
+            const int32_t last_avail = in_ne0 - last_start;
+            const int32_t last_out = last_avail < out_len ? last_avail : out_len;
+            const int32_t out_ne0 = final_merge ? (int32_t)top_k
+                                                : (nm - 1) * out_len + last_out;
             NSUInteger merge_threads = g_argsort_merge_f32_i32_desc_pipeline.maxTotalThreadsPerThreadgroup;
             if (merge_threads == 0 || merge_threads > 512u) merge_threads = 512u;
             if (merge_threads > (NSUInteger)len) merge_threads = (NSUInteger)len;
@@ -19448,12 +19518,14 @@ int ds4_gpu_indexer_topk_tensor(
                 .nb01 = (uint64_t)n_comp * sizeof(float),
                 .nb02 = (uint64_t)n_comp * n_tokens * sizeof(float),
                 .nb03 = (uint64_t)n_comp * n_tokens * sizeof(float),
-                .ne0 = work_width,
+                .ne0 = truncate ? in_ne0 : work_width,
                 .ne1 = (int32_t)n_tokens,
                 .ne2 = 1,
                 .ne3 = 1,
                 .top_k = nm == 1 ? (int32_t)top_k : work_width,
                 .len = len,
+                .out_len = truncate ? out_len : 0,
+                .out_ne0 = truncate ? out_ne0 : 0,
             };
 
             enc = ds4_gpu_compute_encoder(cb);
@@ -19471,6 +19543,14 @@ int ds4_gpu_indexer_topk_tensor(
             const NSUInteger tmp = cur_off;
             cur_off = next_off;
             next_off = tmp;
+
+            if (truncate) {
+                /* Next level merges the runs this one just emitted. */
+                if (final_merge) break;
+                in_ne0 = out_ne0;
+                len = out_len;
+                continue;
+            }
             len <<= 1;
         }
 
