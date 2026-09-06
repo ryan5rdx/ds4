@@ -46598,11 +46598,39 @@ int ds4_gpu_glm53_embedding_bf16(
  * 8-way to a 4-way split. B1 measured +6.0% decode and already occupies this
  * shape. The audit sized SK1 and B1 independently without noticing they
  * contend for the same knob. */
+/* HCMIX-WIDE: DS4_METAL_GLM53_BF16_MV_NSG=<n> sweeps B1's split factor.
+ *
+ * nsg is the K-split factor AND it sets the split-K grid, which is
+ * ceil(out_dim / nsg).  At the hc_mix shape (16384 -> 24) that is 3
+ * threadgroups at nsg=8, on a 60-core part.  Lowering nsg widens the grid:
+ * 4 -> 6 TGs, 2 -> 12.
+ *
+ * This sweep IS the HCMIX-WIDE experiment, in its cheap form.  The expensive
+ * form -- splitting K ACROSS threadgroups with a partials buffer and a combine,
+ * which would give (out_dim/NR0) x K_splits ~ 96 TGs -- is a new kernel, and it
+ * is only worth writing if this sweep shows the grid matters at all.
+ *
+ * The prior is against it.  SK1 tried exactly this direction and measured
+ * 1.03x, flat, with the note below concluding "3 -> 6 threadgroups is still far
+ * below any of these GPUs' core counts, so neither arm is fed".  Lowering nsg
+ * also cuts the K split itself, so the two effects fight: this sweep measures
+ * their sum, which is the number that actually matters. */
 static uint32_t glm53_gpu_bf16_mv_nsg(void) {
-    return ds4_gpu_device_name_contains("M3 Ultra") &&
-           getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == NULL &&
-           getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_BF16_NSG4") == NULL
-               ? 4u : 8u;
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_METAL_GLM53_BF16_MV_NSG");
+        unsigned long n = 0;
+        if (v && v[0]) n = strtoul(v, NULL, 10);
+        if (n == 2u || n == 4u || n == 8u || n == 16u || n == 32u) {
+            cached = (int)n;
+        } else {
+            cached = ds4_gpu_device_name_contains("M3 Ultra") &&
+                     getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == NULL &&
+                     getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_BF16_NSG4") == NULL
+                         ? 4 : 8;
+        }
+    }
+    return (uint32_t)cached;
 }
 
 int ds4_gpu_glm53_matmul_bf16(

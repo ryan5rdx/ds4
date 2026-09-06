@@ -852,9 +852,41 @@ static uint32_t directional_steering_layer_count(void) {
 #define DS4_GLM_SPLIT_ROWS_SMALL       32u
 #define DS4_GLM_SPLIT_ROWS_LARGE      128u
 
+/* D4-BLOCKS: DS4_GLM_SPLIT_ROWS_LARGE=<n> sweeps the large-regime block size.
+ *
+ * 128 is not a tuning choice.  It is the value that keeps the WIDEST regime
+ * under the kernel's hard `n_blocks > 64u` refusal (ds4_metal.m): SSD-streaming
+ * ctx_cap 8192 gives ceil(8192/128) = 64 exactly.  It is then applied unchanged
+ * to the narrow top-k regime that actually ships, where n_selected 2051 gives
+ * 17 blocks and a grid of 68 threadgroups on a 60-core part.  96 -> 88 TGs,
+ * 80 -> 104, 72 -> 116.
+ *
+ * Swept rather than changed, because a wider grid is the class that has
+ * repeatedly measured flat or negative here (T=64 tiles: isolated 1.21x,
+ * end-to-end -0.75%; SK1: 1.03x flat, ds4_metal.m:46590).  MERGE-TRUNC is not a
+ * precedent -- it removed work, it did not widen a grid.
+ *
+ * The override flows through glm_graph_split_blocks_for_limit() below, so the
+ * partial workspace and the availability gate scale with it; the clamp keeps
+ * the worst case inside the 64-block refusal so a sweep cannot silently
+ * DISABLE split-K and read as a regression. */
+static uint32_t glm_graph_split_rows_large(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = (int)DS4_GLM_SPLIT_ROWS_LARGE;
+        const char *v = getenv("DS4_GLM_SPLIT_ROWS_LARGE");
+        if (v && v[0]) {
+            const unsigned long n = strtoul(v, NULL, 10);
+            /* >= 33 keeps ceil(2051/n) <= 62, comfortably inside the gate. */
+            if (n >= 33u && n <= 512u) cached = (int)n;
+        }
+    }
+    return (uint32_t)cached;
+}
+
 static uint32_t glm_graph_indexed_decode_split_block_rows_for(uint32_t n_selected) {
     return n_selected <= DS4_GLM_SPLIT_SMALL_ROWS_MAX ?
-        DS4_GLM_SPLIT_ROWS_SMALL : DS4_GLM_SPLIT_ROWS_LARGE;
+        DS4_GLM_SPLIT_ROWS_SMALL : glm_graph_split_rows_large();
 }
 
 /* Worst-case split-K block count over every n_selected this model can produce.
