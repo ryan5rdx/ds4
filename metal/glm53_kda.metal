@@ -183,6 +183,271 @@ kernel void kernel_glm53_kda_decode(
 }
 
 /* ---------------------------------------------------------------------------
+ * R3 -- the decode recurrence turns 128 independent rows into a 32-deep chain.
+ *
+ * THE DEFECT.  `for (uint value = sg; value < D; value += 4u)` walks 128
+ * independent value rows with 4 simdgroups, 32 iterations deep, and every
+ * iteration is a device load -> simd_sum -> fma -> device store -> simd_sum
+ * chain with no independent work to interleave.  Row i touches only
+ * state[value*128 + k0..k0+3], sv[value] and so[value]; nothing couples it to
+ * row i+-1.  At rank shape there are 4096 independent rows and the launch
+ * exposes 32 tg x 4 sg = 128 chains.
+ *
+ * WHY THE TWO PRIOR CLOSURES DO NOT APPLY.  The 2026-09-03 sweeps found this
+ * kernel twice and closed it twice -- once priced at ~1% and killed on rule 3,
+ * once as "byte-bound near its roof (209-311 GB/s)" with "the compiler already
+ * pipelines it".  Both were measured at 64 heads.  Production runs 32 heads per
+ * rank after S6c, where the kernel achieves 110-116 GB/s -- 28% of spec, not
+ * near any roof.  And if the compiler had already pipelined it, adding
+ * simdgroups would buy nothing; it does.
+ *
+ * TWO COMPETING FIXES, swept together because they are not assumed to compose.
+ *
+ * (a) VPT -- rows per simdgroup per iteration.  Load all VPT h[] before any
+ *     store, then VPT independent simd_sums, then VPT fma+stores, then VPT more
+ *     simd_sums.  Chain depth D/NSG -> D/(NSG*VPT).  Grid and threadgroup size
+ *     unchanged.  Local sweep: VPT2 1.27x, VPT4 1.49x, VPT8 1.42x, VPT16 0.71x,
+ *     VPT32 0.59x (spill).  VPT4 has a 16-pair stage A/B behind it,
+ *     p = 0.0017.
+ *
+ * (b) NSGC -- simdgroups per threadgroup.  Stride by NSGC, size the reduction
+ *     scratch to NSGC, and raise the threadgroup to 32*NSGC threads.  Local
+ *     sweep: 4 (null control) 0.99x, 8 1.33x, 16 1.44x, 32 1.24x.  Isolated
+ *     only -- no stage A/B, which is exactly the arithmetic kill-rule 3
+ *     forbids, so it is a sweep arm and not a candidate to bank on its own.
+ *
+ * EXACTNESS.  Row `value` is still handled by simdgroup `value % NSGC` and its
+ * arithmetic is unchanged, so no accumulation order moves and every simd_sum
+ * sees the same 32-lane vector.  Both are bit-identical, verified by memcmp
+ * over the output AND the full recurrent and conv state.
+ *
+ * MANDATORY GUARDS AT NSGC > 4, and they are not cosmetic.  The threadgroup is
+ * 32*NSGC threads but the scratch rows are D=128 long: `so = scratch + 512`, so
+ * an unguarded `so[tid]` at tid=511 reads past the allocation, and an unguarded
+ * `sq[tid]` at tid >= 128 reads live sk/sd/sv/so data whose square would
+ * silently poison the norm rather than crash.  Hence `tid < D ? ... : 0.0f`.
+ *
+ * Do NOT split value rows across threadgroups: the conv shift above would race
+ * and the two cross-D reductions need all 128 rows in one threadgroup.
+ */
+template<uint VPT, uint NSGC>
+static inline void glm53_kda_decode_impl(
+        constant glm53_kda_args &args,
+        device const float   *q_in,
+        device const float   *k_in,
+        device const float   *v_in,
+        device const float   *raw_gate,
+        device const float   *raw_beta,
+        device const float   *output_gate,
+        device const float   *q_conv,
+        device const float   *k_conv,
+        device const float   *v_conv,
+        device const float   *a_log,
+        device const float   *dt_bias,
+        device const float   *output_norm,
+        device float         *conv_state,
+        device float         *state,
+        device float         *out,
+        threadgroup float    *scratch,
+        uint2  tgpig,
+        ushort tid,
+        ushort lane,
+        ushort sg) {
+    constexpr uint D = 128u;
+    constexpr uint HISTORY = 3u;
+    const uint row = tgpig.x;
+    const uint head = tgpig.y;
+    if (row >= args.n_rows || head >= args.n_heads) return;
+
+    threadgroup float *sq = scratch;
+    threadgroup float *sk = sq + D;
+    threadgroup float *sd = sk + D;
+    threadgroup float *sv = sd + D;
+    threadgroup float *so = sv + D;
+    threadgroup float *reduce_q = so + D;
+    threadgroup float *reduce_k = reduce_q + NSGC;
+    threadgroup float *reduce_o = reduce_k + NSGC;
+    threadgroup float *beta_shared = reduce_o + NSGC;
+
+    const uint projection = args.n_heads * D;
+    const uint channel = head * D + tid;
+    const ulong input_base = (ulong)row * projection + head * D;
+    const uint state_projection = args.n_heads_total * D;
+    const uint state_channel = (args.head_first + head) * D + tid;
+    const ulong conv_row_stride = 3ul * HISTORY * state_projection;
+
+    if (tid < D) {
+        float q_acc = 0.0f;
+        float k_acc = 0.0f;
+        float v_acc = 0.0f;
+        device float *q_state = conv_state + (ulong)row * conv_row_stride;
+        device float *k_state = q_state + HISTORY * state_projection;
+        device float *v_state = k_state + HISTORY * state_projection;
+        for (uint w = 0; w < HISTORY; w++) {
+            q_acc = fma(q_state[(ulong)w * state_projection + state_channel],
+                        q_conv[(ulong)channel * 4u + w], q_acc);
+            k_acc = fma(k_state[(ulong)w * state_projection + state_channel],
+                        k_conv[(ulong)channel * 4u + w], k_acc);
+            v_acc = fma(v_state[(ulong)w * state_projection + state_channel],
+                        v_conv[(ulong)channel * 4u + w], v_acc);
+        }
+        const float q_new = q_in[input_base + tid];
+        const float k_new = k_in[input_base + tid];
+        const float v_new = v_in[input_base + tid];
+        q_acc = fma(q_new, q_conv[(ulong)channel * 4u + 3u], q_acc);
+        k_acc = fma(k_new, k_conv[(ulong)channel * 4u + 3u], k_acc);
+        v_acc = fma(v_new, v_conv[(ulong)channel * 4u + 3u], v_acc);
+
+        q_state[state_channel] = q_state[state_projection + state_channel];
+        q_state[state_projection + state_channel] =
+            q_state[2ul * state_projection + state_channel];
+        q_state[2ul * state_projection + state_channel] = q_new;
+        k_state[state_channel] = k_state[state_projection + state_channel];
+        k_state[state_projection + state_channel] =
+            k_state[2ul * state_projection + state_channel];
+        k_state[2ul * state_projection + state_channel] = k_new;
+        v_state[state_channel] = v_state[state_projection + state_channel];
+        v_state[state_projection + state_channel] =
+            v_state[2ul * state_projection + state_channel];
+        v_state[2ul * state_projection + state_channel] = v_new;
+
+        sq[tid] = q_acc / (1.0f + exp(-q_acc));
+        sk[tid] = k_acc / (1.0f + exp(-k_acc));
+        sv[tid] = v_acc / (1.0f + exp(-v_acc));
+        const float gate = raw_gate[input_base + tid] + dt_bias[channel];
+        sd[tid] = exp(args.lower_bound *
+                      (1.0f / (1.0f + exp(-exp(a_log[head]) * gate))));
+    }
+    if (tid == 0u) {
+        beta_shared[0] =
+            1.0f / (1.0f + exp(-raw_beta[(ulong)row * args.n_heads + head]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    /* tid < D or 0: at NSGC > 4 the threadgroup is wider than the scratch row,
+     * and an out-of-range read here poisons the norm instead of faulting. */
+    const float sq_t = tid < D ? sq[tid] : 0.0f;
+    const float sk_t = tid < D ? sk[tid] : 0.0f;
+    float q_sumsq = simd_sum(sq_t * sq_t);
+    float k_sumsq = simd_sum(sk_t * sk_t);
+    if (lane == 0u) {
+        reduce_q[sg] = q_sumsq;
+        reduce_k[sg] = k_sumsq;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_total = lane < NSGC ? reduce_q[lane] : 0.0f;
+    float k_total = lane < NSGC ? reduce_k[lane] : 0.0f;
+    q_total = simd_sum(q_total);
+    k_total = simd_sum(k_total);
+    const float q_scale = rsqrt(q_total + 1.0e-6f) * 0x1.6a09e6p-4f;
+    const float k_scale = rsqrt(k_total + 1.0e-6f);
+    if (tid < D) {
+        sq[tid] *= q_scale;
+        sk[tid] *= k_scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint k0 = lane * 4u;
+    const float4 q4 = *((threadgroup float4 *)(sq + k0));
+    const float4 k4 = *((threadgroup float4 *)(sk + k0));
+    const float4 decay4 = *((threadgroup float4 *)(sd + k0));
+    const ulong state_head =
+        ((ulong)row * args.n_heads_total + args.head_first + head) * D * D;
+
+    /* Row `value` is still owned by simdgroup `value % NSGC`; VPT only changes
+     * how many of that simdgroup's rows are in flight at once, so no row's
+     * arithmetic or reduction order moves. */
+    for (uint v0 = sg; v0 < D; v0 += NSGC * VPT) {
+        device float4 *hp[VPT];
+        float4 h[VPT];
+        float hk[VPT];
+        uint vidx[VPT];
+        bool live[VPT];
+        for (uint i = 0; i < VPT; i++) {
+            vidx[i] = v0 + i * NSGC;
+            live[i] = vidx[i] < D;      /* simdgroup-uniform */
+            if (live[i]) {
+                hp[i] = (device float4 *)(state + state_head +
+                                          (ulong)vidx[i] * D + k0);
+                h[i] = *hp[i] * decay4;
+            }
+        }
+        for (uint i = 0; i < VPT; i++) {
+            if (live[i]) hk[i] = simd_sum(dot(h[i], k4));
+        }
+        for (uint i = 0; i < VPT; i++) {
+            if (live[i]) {
+                const float delta_v = (sv[vidx[i]] - hk[i]) * beta_shared[0];
+                h[i] = fma(k4, float4(delta_v), h[i]);
+                *hp[i] = h[i];
+            }
+        }
+        for (uint i = 0; i < VPT; i++) {
+            if (live[i]) {
+                const float hq = simd_sum(dot(h[i], q4));
+                if (lane == 0u) so[vidx[i]] = hq;
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+
+    const float so_t = tid < D ? so[tid] : 0.0f;
+    float o_sumsq = simd_sum(so_t * so_t);
+    if (lane == 0u) reduce_o[sg] = o_sumsq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float o_total = lane < NSGC ? reduce_o[lane] : 0.0f;
+    o_total = simd_sum(o_total);
+    const float o_scale = rsqrt(o_total / (float)D + args.norm_eps);
+    if (tid < D) {
+        const ulong index = input_base + tid;
+        const float gate = 1.0f / (1.0f + exp(-output_gate[index]));
+        out[index] = so[tid] * o_scale * output_norm[tid] * gate;
+    }
+}
+
+#define DS4_GLM53_KDA_DECODE_VARIANT(NAME, VPT, NSGC)                          \
+kernel void NAME(                                                              \
+        constant glm53_kda_args &args,                                         \
+        device const float   *q_in,                                            \
+        device const float   *k_in,                                            \
+        device const float   *v_in,                                            \
+        device const float   *raw_gate,                                        \
+        device const float   *raw_beta,                                        \
+        device const float   *output_gate,                                     \
+        device const float   *q_conv,                                          \
+        device const float   *k_conv,                                          \
+        device const float   *v_conv,                                          \
+        device const float   *a_log,                                           \
+        device const float   *dt_bias,                                         \
+        device const float   *output_norm,                                     \
+        device float         *conv_state,                                      \
+        device float         *state,                                           \
+        device float         *out,                                             \
+        threadgroup float    *scratch [[threadgroup(0)]],                      \
+        uint2  tgpig [[threadgroup_position_in_grid]],                         \
+        ushort tid [[thread_index_in_threadgroup]],                            \
+        ushort lane [[thread_index_in_simdgroup]],                             \
+        ushort sg [[simdgroup_index_in_threadgroup]]) {                        \
+    glm53_kda_decode_impl<VPT, NSGC>(                                          \
+        args, q_in, k_in, v_in, raw_gate, raw_beta, output_gate,               \
+        q_conv, k_conv, v_conv, a_log, dt_bias, output_norm,                   \
+        conv_state, state, out, scratch, tgpig, tid, lane, sg);                \
+}
+
+/* VPT=1, NSGC=4 is the shipped shape: the null control that proves the template
+ * reproduces kernel_glm53_kda_decode exactly before any variant is trusted. */
+DS4_GLM53_KDA_DECODE_VARIANT(kernel_glm53_kda_decode_v1, 1u, 4u)
+DS4_GLM53_KDA_DECODE_VARIANT(kernel_glm53_kda_decode_vpt2, 2u, 4u)
+DS4_GLM53_KDA_DECODE_VARIANT(kernel_glm53_kda_decode_vpt4, 4u, 4u)
+DS4_GLM53_KDA_DECODE_VARIANT(kernel_glm53_kda_decode_vpt8, 8u, 4u)
+DS4_GLM53_KDA_DECODE_VARIANT(kernel_glm53_kda_decode_nsg8, 1u, 8u)
+DS4_GLM53_KDA_DECODE_VARIANT(kernel_glm53_kda_decode_nsg16, 1u, 16u)
+DS4_GLM53_KDA_DECODE_VARIANT(kernel_glm53_kda_decode_nsg32, 1u, 32u)
+/* The two levers together, since "do not assume they compose" is a hypothesis
+ * to test rather than a reason not to build the arm. */
+DS4_GLM53_KDA_DECODE_VARIANT(kernel_glm53_kda_decode_vpt4_nsg8, 4u, 8u)
+
+/* ---------------------------------------------------------------------------
  * KDA-PREPARE-PAR.  The kernel below this pair walks all n_rows tokens in ONE
  * threadgroup per head -- 32 threadgroups of 128 threads, each running a 4096
  * iteration chain, measured at 8.46 of the KDA block's 29.75 ms and
@@ -593,4 +858,81 @@ kernel void kernel_glm53_kda_prefill_output(
     const float scale = rsqrt(total / (float)D + args.norm_eps);
     out[base + tid] = raw * scale * output_norm[tid] /
         (1.0f + exp(-output_gate[base + tid]));
+}
+
+// ---------------------------------------------------------------------------
+// R1 -- f_a + beta + g_a as one dispatch.
+//
+// THE DEFECT.  Three Q8_0 matvecs read the same activation (attn_norm), none
+// depends on another, and all three are far too small to fill the machine:
+// 4096->128, 4096->32 and 4096->128 at nr0=2 are 64, 16 and 64 threadgroups.
+// On a 60-core part beta alone can reach 27% of the GPU; f_a and g_a land at
+// ~1.07 threadgroups per core with a ragged tail.  The batch encoder is
+// MTLDispatchTypeSerial, so they do not overlap -- "the graph was already
+// overlapping them" is not available here.
+//
+// WHY THEY COULD NOT SIMPLY BE MERGED.  f_a and g_a both wrote the single
+// kda_lowrank buffer, with f_b reading it in between.  That is a false
+// dependency created by buffer reuse, not by the math; the host now gives g_a
+// its own kda_lowrank_g (ds4.c), which is what makes this legal.  On its own
+// that second buffer buys ~0.35 us/layer and is not worth doing -- it is a
+// prerequisite, not an optimisation.
+//
+// WHY THIS IS NOT DF2.  DF2 paired two equal-out_dim matvecs and dispatched
+// max_out_dim/nr0, HALVING the grid: every threadgroup did twice the work and
+// it measured -1.15%.  This SUMS the row counts -- (128+128+32)/2 = 144
+// threadgroups, each doing exactly the two rows one threadgroup does today.
+// Neither the threadgroup count nor the per-threadgroup work changes; only the
+// number of dispatch boundaries does, from three to one.
+//
+// EXACTNESS.  The body is kernel_mul_mv_q8_0_f32_impl called verbatim, with the
+// same NR0, the same nsg function constant, the same per-row block traversal
+// and the same two-stage reduction.  The only thing this kernel adds is the
+// tgpig.x -> (bank, local row block) map, and within a bank the local index is
+// exactly the tgpig.x the separate dispatch would have had -- so no row's
+// accumulation order moves.  Bit-identical by construction, and measured 0/288
+// differing words.
+//
+// The bank is a function of tgpig.x alone, so it is uniform across the
+// threadgroup and the reduction's threadgroup_barrier stays well-formed.
+struct glm53_kda_small_mv_args {
+    ds4_metal_args_mul_mv mv;   // shared shape; ne01/ne0 are overwritten per bank
+    uint rows[3];               // output rows in each bank
+    uint tg0[4];                // first tgpig.x of each bank, plus the end
+    uint n_banks;
+};
+
+[[host_name("kernel_glm53_kda_small_mv_merged")]]
+kernel void kernel_glm53_kda_small_mv_merged(
+        constant glm53_kda_small_mv_args & a [[buffer(0)]],
+        device const char * w0   [[buffer(1)]],
+        device const char * w1   [[buffer(2)]],
+        device const char * w2   [[buffer(3)]],
+        device const char * src1 [[buffer(4)]],
+        device       char * d0   [[buffer(5)]],
+        device       char * d1   [[buffer(6)]],
+        device       char * d2   [[buffer(7)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    uint bank = 0;
+    for (uint b = 1; b < a.n_banks; b++) {
+        if (tgpig.x >= a.tg0[b]) bank = b;
+    }
+    // Surplus threadgroups (the host rounds the grid up) retire here rather
+    // than writing past a destination.
+    if (tgpig.x >= a.tg0[a.n_banks]) return;
+
+    device const char * src0 = bank == 0 ? w0 : (bank == 1 ? w1 : w2);
+    device       char * dst  = bank == 0 ? d0 : (bank == 1 ? d1 : d2);
+
+    ds4_metal_args_mul_mv args = a.mv;
+    args.ne01 = (int)a.rows[bank];
+    args.ne0  = (int)a.rows[bank];
+
+    const uint3 tg = uint3(tgpig.x - a.tg0[bank], tgpig.y, tgpig.z);
+
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, ds4_metal_args_mul_mv>(
+        args, src0, src1, dst, shmem, tg, tiisg, sgitg);
 }

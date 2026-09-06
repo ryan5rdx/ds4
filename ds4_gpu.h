@@ -454,6 +454,33 @@ void ds4_gpu_model_residency_skip(int skip);
 int ds4_gpu_device_lost(void);
 /* Submit one trivial command buffer (first-submission costs paid at load). */
 int ds4_gpu_warm_command_queue(void);
+/* Nonzero when `name` is a compilable, linkable compute entry point.
+ * Diagnostic only.  the metal shader sources compile at RUNTIME, so a shader edit
+ * that does not build is a clean `make` and a rig failure minutes into an
+ * arm; this makes that a two-second check on the dev box.  See
+ * probes/probe_pipelines.c in the rig scratch repo. */
+int ds4_gpu_pipeline_exists(const char *name);
+/* R1: f_a, beta and g_a as one Q8_0 matvec over three weight bases and three
+ * destinations.  All three read the same activation and none depends on
+ * another; the grid is the SUM of their row blocks, so per-threadgroup work is
+ * unchanged and only the dispatch count falls 3 -> 1.  Bit-identical: the body
+ * is kernel_mul_mv_q8_0_f32_impl verbatim and only the tgpig.x -> (bank, row)
+ * map is new.  Requires out_ga to be a DIFFERENT buffer from out_fa -- the
+ * shared kda_lowrank was the false dependency that blocked this. */
+int ds4_gpu_glm53_kda_small_mv_merged(
+        ds4_gpu_tensor       *out_fa,
+        ds4_gpu_tensor       *out_beta,
+        ds4_gpu_tensor       *out_ga,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              off_fa,
+        uint64_t              off_beta,
+        uint64_t              off_ga,
+        uint32_t              in_dim,
+        uint32_t              rows_fa,
+        uint32_t              rows_beta,
+        uint32_t              rows_ga,
+        const ds4_gpu_tensor *x);
 /* Nonzero after any gate exchange failed, or after the bounded release fence
  * timed out; the eval must abort.  These two causes have different lifetimes --
  * see ds4_gpu_tp_clear_fence_timeout().  (Upstream's wording predates the fence

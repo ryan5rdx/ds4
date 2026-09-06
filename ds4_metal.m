@@ -695,6 +695,10 @@ static id<MTLBuffer> g_indexer_topk_buffer;
  * function static outlives ds4_gpu teardown and would hand a stale Metal
  * resource to the next init. */
 /* KDA-PREPARE-PAR pass-1 snapshot; file scope so teardown clears it. */
+/* HCMIX-WIDE partials: out_dim * n_rows * KSPLIT floats.  At the hc_mix shape
+ * (24 x 1 x 8) that is 768 bytes, so it is grown once and kept. */
+static id<MTLBuffer> g_bf16_ksplit_buffer;
+static NSUInteger    g_bf16_ksplit_bytes;
 static id<MTLBuffer> g_kda_prologue_buffer;
 static NSUInteger    g_kda_prologue_bytes;
 static id<MTLBuffer> g_indexer_topk_tile_buffer;
@@ -11149,6 +11153,18 @@ static id<MTLBuffer> g_tp_release_buffer;
 static volatile uint32_t *g_tp_release_words;
 static id<MTLBuffer> g_tp_fence_timeout_buffer;
 static volatile uint32_t *g_tp_fence_timeout_word;
+/* GATE-RESIDUE (DS4_TP_FENCE_SPIN_PROFILE=1).  Four counters per gate slot,
+ * written by the fence kernel itself: sum of spin iterations, executions,
+ * executions that hit on iteration 0, and the max.  See the kernel comment in
+ * metal/dsv4_misc.metal for what the split means.  Rides along with any arm --
+ * off it costs one uniform, never-taken branch at the end of a spin loop. */
+#define DS4_TP_FENCE_SPIN_WORDS 4u
+static void ds4_gpu_tp_fence_calibrate_spin(void);
+static void ds4_gpu_tp_fence_spin_report(void);
+static id<MTLBuffer> g_tp_fence_spin_buffer;
+static volatile uint32_t *g_tp_fence_spin_words;
+static uint32_t g_tp_fence_spin_profile;
+static double   g_tp_fence_spin_ns_per_iter;   /* 0 until calibrated */
 static bool g_tp_fast_sync;
 static bool g_tp_fast_batch_sync;
 static uint32_t g_tp_fence_max_iters;
@@ -11688,6 +11704,7 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                             g_tp_stat_batch_gpu_wait_ms * 1e3 / (double)g_tp_stat_batch_gates,
                             g_tp_stat_batch_exchange_ms * 1e3 / (double)g_tp_stat_batch_gates,
                             g_tp_stat_batch_release_ms * 1e3 / (double)g_tp_stat_batch_gates);
+                ds4_gpu_tp_fence_spin_report();
                 fprintf(stderr,
                         "ds4: TP gates: encode lead %.2f gates; verify %.1f us; release %.1f us; poll hit line avg %.1f max %llu over %llu\n",
                         (double)g_tp_stat_encode_lead / (double)g_tp_stat_gates,
@@ -11712,6 +11729,9 @@ static void ds4_gpu_tp_reset_unstarted(void) {
     g_tp_release_words = NULL;
     g_tp_fence_timeout_buffer = nil;
     g_tp_fence_timeout_word = NULL;
+    g_tp_fence_spin_buffer = nil;
+    g_tp_fence_spin_words = NULL;
+    g_tp_fence_spin_profile = 0u;
     g_tp_slab_buffer = nil;
     g_tp_gpu_flags = NULL;
     g_tp_exchange_fn = NULL;
@@ -11825,6 +11845,34 @@ int ds4_gpu_tp_init(uint32_t rank,
                    DS4_TP_RELEASE_SLOTS * sizeof(uint32_t));
             __atomic_store_n(g_tp_fence_timeout_word, 0u, __ATOMIC_RELEASE);
             fprintf(stderr, "ds4: TP fast release fence enabled\n");
+            /* Allocated unconditionally so the encode site can bind it without
+             * a branch; the kernel skips every store when profile is 0. */
+            const NSUInteger spin_bytes = (NSUInteger)DS4_TP_GATES_PER_LAYER *
+                DS4_TP_FENCE_SPIN_WORDS * sizeof(uint32_t);
+            g_tp_fence_spin_buffer =
+                [g_device newBufferWithLength:spin_bytes
+                                      options:MTLResourceStorageModeShared];
+            if (g_tp_fence_spin_buffer) {
+                memset([g_tp_fence_spin_buffer contents], 0, spin_bytes);
+                g_tp_fence_spin_words =
+                    (volatile uint32_t *)[g_tp_fence_spin_buffer contents];
+                g_tp_fence_spin_profile =
+                    getenv("DS4_TP_FENCE_SPIN_PROFILE") != NULL ? 1u : 0u;
+                if (g_tp_fence_spin_profile) {
+                    fprintf(stderr,
+                            "ds4: TP fence spin profile ON (GATE-RESIDUE)\n");
+                    ds4_gpu_tp_fence_calibrate_spin();
+                }
+            } else {
+                /* No buffer means the encode site cannot bind index 4, so the
+                 * fence itself must not run: fall back rather than crash. */
+                fprintf(stderr,
+                        "ds4: TP fence spin buffer failed; using shared events\n");
+                g_tp_release_words = NULL;
+                g_tp_fence_timeout_word = NULL;
+                g_tp_fast_sync = false;
+                g_tp_fast_batch_sync = false;
+            }
         } else {
             fprintf(stderr,
                     "ds4: TP fast release fence unavailable; using shared events\n");
@@ -11985,12 +12033,100 @@ static int ds4_gpu_tp_release_fence_encode(uint32_t slot, uint32_t want) {
     [enc setBytes:&want length:sizeof(want) atIndex:1];
     [enc setBytes:&g_tp_fence_max_iters length:sizeof(g_tp_fence_max_iters) atIndex:2];
     [enc setBuffer:g_tp_fence_timeout_buffer offset:0 atIndex:3];
+    /* Bank by gate slot within the layer so ATTN/ROUTER/FFN separate: only the
+     * FFN gate sits behind the routed-expert shard, so if the residue is
+     * straggler-shaped they will not agree.  The batch fence bank
+     * (DS4_TP_BATCH_FENCE_BASE and up) folds onto the same three. */
+    const uint32_t spin_bank = slot % DS4_TP_GATES_PER_LAYER;
+    [enc setBuffer:g_tp_fence_spin_buffer
+            offset:(NSUInteger)spin_bank * DS4_TP_FENCE_SPIN_WORDS * sizeof(uint32_t)
+           atIndex:4];
+    [enc setBytes:&g_tp_fence_spin_profile
+           length:sizeof(g_tp_fence_spin_profile) atIndex:5];
     [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     ds4_gpu_close_batch_encoder();
     return 1;
 }
+
+/* Time one command buffer that spins a known number of iterations, so the spin
+ * counts above convert to microseconds.  Without this the instrument reports an
+ * uncalibrated integer, and the gate budget it has to speak to is in us.
+ * Runs once, at TP init, only when the profile is on. */
+static void ds4_gpu_tp_fence_calibrate_spin(void) {
+    if (!g_tp_fence_spin_profile || g_tp_fence_spin_ns_per_iter > 0.0) return;
+    id<MTLComputePipelineState> pipeline =
+        ds4_gpu_get_pipeline("kernel_dsv4_tp_fence_calibrate");
+    if (!pipeline || !g_tp_release_buffer) return;
+    @autoreleasepool {
+        id<MTLBuffer> sink = [g_device newBufferWithLength:sizeof(uint32_t)
+                                                   options:MTLResourceStorageModeShared];
+        if (!sink) return;
+        /* Two runs at different depths, then subtract: the difference cancels
+         * the fixed submit + launch cost, which is ~0.28 ms here and would
+         * otherwise dominate a short spin and inflate ns/iteration. */
+        const uint32_t depth[2] = { 1000000u, 5000000u };
+        double t[2] = {0.0, 0.0};
+        for (int k = 0; k < 2; k++) {
+            id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+            if (!cb) return;
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:pipeline];
+            [enc setBuffer:g_tp_release_buffer offset:0 atIndex:0];
+            [enc setBytes:&depth[k] length:sizeof(depth[k]) atIndex:1];
+            [enc setBuffer:sink offset:0 atIndex:2];
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            [enc endEncoding];
+            const double t0 = ds4_gpu_now_ms();
+            [cb commit];
+            [cb waitUntilCompleted];
+            t[k] = ds4_gpu_now_ms() - t0;
+            if (cb.status != MTLCommandBufferStatusCompleted) return;
+        }
+        const double d_ms = t[1] - t[0];
+        const double d_it = (double)depth[1] - (double)depth[0];
+        if (d_ms > 0.0) {
+            g_tp_fence_spin_ns_per_iter = d_ms * 1.0e6 / d_it;
+            fprintf(stderr,
+                    "ds4: TP fence spin calibrated at %.2f ns/iteration "
+                    "(%.2f ms and %.2f ms for %u and %u iterations)\n",
+                    g_tp_fence_spin_ns_per_iter, t[0], t[1], depth[0], depth[1]);
+        }
+    }
+}
+
+/* Print the residue split.  Called from the gate-profile report so it rides
+ * along with DS4_TP_GATE_PROFILE rather than needing its own cadence. */
+static void ds4_gpu_tp_fence_spin_report(void) {
+    if (!g_tp_fence_spin_profile || !g_tp_fence_spin_words) return;
+    static const char *bank_name[DS4_TP_GATES_PER_LAYER] = { "attn", "router", "ffn" };
+    for (uint32_t b = 0; b < DS4_TP_GATES_PER_LAYER; b++) {
+        const volatile uint32_t *w =
+            g_tp_fence_spin_words + (size_t)b * DS4_TP_FENCE_SPIN_WORDS;
+        const uint32_t n = __atomic_load_n(&w[1], __ATOMIC_RELAXED);
+        if (n == 0u) continue;
+        const uint32_t sum   = __atomic_load_n(&w[0], __ATOMIC_RELAXED);
+        const uint32_t zero  = __atomic_load_n(&w[2], __ATOMIC_RELAXED);
+        const uint32_t peak  = __atomic_load_n(&w[3], __ATOMIC_RELAXED);
+        const double mean_it = (double)sum / (double)n;
+        const double us = g_tp_fence_spin_ns_per_iter > 0.0 ?
+            mean_it * g_tp_fence_spin_ns_per_iter / 1000.0 : -1.0;
+        fprintf(stderr,
+                "ds4: TP fence spin %-6s n %u, mean %.0f iters%s, "
+                "already-released %.1f%%, max %u iters\n",
+                bank_name[b], n, mean_it,
+                us >= 0.0 ? [[NSString stringWithFormat:@" = %.1f us", us] UTF8String] : "",
+                100.0 * (double)zero / (double)n, peak);
+    }
+    fprintf(stderr,
+            "ds4: read it as: already-released%% is the share of gates where the "
+            "peer had finished before this rank's command processor reached the "
+            "fence -- that part of the gate is command-processor latency, not "
+            "fabric.  The remainder x mean iters is peer wait.\n");
+}
+
 
 /* Gate encoding is single-producer with the global Metal command buffer.  A
  * capacity check before recording any GPU wait guarantees that overflow fails
@@ -12417,6 +12553,18 @@ void ds4_gpu_tp_clear_fence_timeout(void) {
  * mapped model views) are paid at load time rather than inside the first
  * prefill.  TP sharding skips the load-time model-view warm, which used to
  * leave a 600-800 ms stall at the head of the first prompt on each rank. */
+int ds4_gpu_pipeline_exists(const char *name) {
+    if (!name || !name[0]) return 0;
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* Specialised lookup FIRST.  A kernel that reads FC_mul_mv_nsg cannot be
+     * built without the constant, and asking Metal to do it anyway raises an
+     * uncaught exception rather than returning nil -- which killed this probe.
+     * Setting a constant an unspecialised kernel does not declare is harmless,
+     * so the specialised path is the safe one to try first. */
+    if (ds4_gpu_get_mul_mv_pipeline(name, 2) != nil) return 1;
+    return ds4_gpu_get_pipeline(name) != nil ? 1 : 0;
+}
+
 int ds4_gpu_warm_command_queue(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (g_batch_cb) return 1;
@@ -48710,15 +48858,41 @@ int ds4_gpu_glm53_matmul_bf16(
         const int bf16_splitk =
             bf16_splitk_env && bf16_splitk_env[0] && bf16_splitk_env[0] != '0' &&
             bf16_splitk_shape;
+        /* HCMIX-WIDE: a third grid axis over the contraction.  B1 took hc_mix
+         * from 3 to 12 threadgroups by splitting K across simdgroups; this
+         * splits it across threadgroups too, 12 -> 12*KSPLIT.  Two dispatches
+         * (partial + reduce) instead of one, so it only pays where the launch
+         * is starved, which is the same shape gate B1 uses.
+         *
+         * Off unless DS4_METAL_GLM53_BF16_MV_KSPLIT is 2..32.  It supersedes
+         * B1 when on -- they are two settings of one lever, not a stack. */
+        const uint32_t bf16_ksplit = bf16_splitk_shape ?
+            (uint32_t)ds4_gpu_env_u64("DS4_METAL_GLM53_BF16_MV_KSPLIT", 0u, 0u, 32u) : 0u;
+        const int bf16_wide = bf16_ksplit >= 2u;
         const bool bc_inp = (in_dim % 32u) != 0u;
         const bool bc_out = (out_dim % 64u) != 0u || (n_rows % 32u) != 0u;
         id<MTLComputePipelineState> pipeline = use_mv
-            ? ds4_gpu_get_pipeline(bf16_splitk ?
-                  "kernel_glm53_mul_mv_bf16_f32_splitk" :
-                  "kernel_glm53_mul_mv_bf16_f32")
+            ? ds4_gpu_get_pipeline(bf16_wide ?
+                  "kernel_glm53_matmul_bf16_mv_2d_partial" :
+                  (bf16_splitk ?
+                      "kernel_glm53_mul_mv_bf16_f32_splitk" :
+                      "kernel_glm53_mul_mv_bf16_f32"))
             : ds4_gpu_get_mul_mm_pipeline(
                 "kernel_glm53_mul_mm_bf16_f32", bc_inp, bc_out);
         if (!pipeline) return 0;
+        id<MTLComputePipelineState> reduce_pipeline = nil;
+        if (use_mv && bf16_wide) {
+            reduce_pipeline =
+                ds4_gpu_get_pipeline("kernel_glm53_matmul_bf16_mv_2d_reduce");
+            const NSUInteger want =
+                (NSUInteger)out_dim * n_rows * bf16_ksplit * sizeof(float);
+            if (!reduce_pipeline ||
+                !ds4_gpu_ensure_scratch_buffer(&g_bf16_ksplit_buffer,
+                                               &g_bf16_ksplit_bytes, want,
+                                               "bf16 split-K partials")) {
+                return 0;
+            }
+        }
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
@@ -48737,7 +48911,44 @@ int ds4_gpu_glm53_matmul_bf16(
                     offset:ds4_gpu_tensor_offset(x) atIndex:2];
             [enc setBuffer:ds4_gpu_tensor_buffer(out)
                     offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            if (bf16_splitk) {
+            if (bf16_wide) {
+                /* Two dispatches: (row-pair, token, k-slice) partials, then a
+                 * one-thread-per-output reduce.  The encoder is
+                 * MTLDispatchTypeSerial, so the reduce sees the partials
+                 * without an explicit barrier. */
+                [enc setBuffer:g_bf16_ksplit_buffer offset:0 atIndex:3];
+                [enc setBytes:&bf16_ksplit length:sizeof(bf16_ksplit) atIndex:4];
+                [enc setThreadgroupMemoryLength:(NSUInteger)(nsg * sizeof(float))
+                                        atIndex:0];
+                static int announced_wide;
+                if (!announced_wide) {
+                    announced_wide = 1;
+                    fprintf(stderr,
+                            "ds4: GLM53 BF16 matvec: 2D split-K (HCMIX-WIDE) "
+                            "in_dim %u out_dim %u -> %u threadgroups "
+                            "(B1 gives %u, row kernel %u), %u-way K per group "
+                            "x %u slices\n",
+                            (unsigned)in_dim, (unsigned)out_dim,
+                            (unsigned)((out_dim + 1u) / 2u * bf16_ksplit),
+                            (unsigned)((out_dim + 1u) / 2u),
+                            (unsigned)((out_dim + nsg - 1u) / nsg),
+                            (unsigned)nsg, (unsigned)bf16_ksplit);
+                }
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((out_dim + 1u) / 2u,
+                                                      n_rows, bf16_ksplit)
+                    threadsPerThreadgroup:MTLSizeMake(32u * nsg, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                enc = ds4_gpu_compute_encoder(cb);
+                DS4_SET_PIPE(enc, reduce_pipeline);
+                [enc setBytes:&args length:sizeof(args) atIndex:0];
+                [enc setBuffer:g_bf16_ksplit_buffer offset:0 atIndex:1];
+                [enc setBuffer:ds4_gpu_tensor_buffer(out)
+                        offset:ds4_gpu_tensor_offset(out) atIndex:2];
+                [enc setBytes:&bf16_ksplit length:sizeof(bf16_ksplit) atIndex:3];
+                const NSUInteger outs = (NSUInteger)out_dim * n_rows;
+                [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((outs + 255u) / 256u, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else if (bf16_splitk) {
                 /* NR0 = 2 rows per threadgroup; the nsg simdgroups split K. */
                 [enc setThreadgroupMemoryLength:(NSUInteger)(nsg * sizeof(float))
                                         atIndex:0];
@@ -49716,6 +49927,106 @@ typedef struct {
     uint32_t tokens_per_block;   /* KDA-PREPARE-PAR; 0 = original kernel */
 } glm53_gpu_kda_args;
 
+/* R1 -- f_a + beta + g_a in one dispatch.  See the kernel comment in
+ * metal/glm53_kda.metal for why this is legal and why it is not DF2.
+ *
+ * Layout note: the Metal side declares `ds4_metal_args_mul_mv mv;` followed by
+ * uint[3], uint[4], uint.  The mul_mv args end on an 8-byte boundary and carry
+ * 8-byte members, so both languages lay the tail out identically; the assert
+ * below is the guard against that stopping being true. */
+typedef struct {
+    ds4_gpu_q8_0_matvec_args mv;
+    uint32_t rows[3];
+    uint32_t tg0[4];
+    uint32_t n_banks;
+} ds4_gpu_kda_small_mv_args;
+_Static_assert(sizeof(ds4_gpu_kda_small_mv_args) ==
+               sizeof(ds4_gpu_q8_0_matvec_args) + 32u,
+               "kda small-mv args gained padding; the Metal struct must match");
+
+int ds4_gpu_glm53_kda_small_mv_merged(
+        ds4_gpu_tensor       *out_fa,
+        ds4_gpu_tensor       *out_beta,
+        ds4_gpu_tensor       *out_ga,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              off_fa,
+        uint64_t              off_beta,
+        uint64_t              off_ga,
+        uint32_t              in_dim,
+        uint32_t              rows_fa,
+        uint32_t              rows_beta,
+        uint32_t              rows_ga,
+        const ds4_gpu_tensor *x) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out_fa || !out_beta || !out_ga || !x || !model_map) return 0;
+    if (in_dim == 0 || (in_dim % 32u) != 0u) return 0;
+    if (rows_fa == 0 || rows_beta == 0 || rows_ga == 0) return 0;
+
+    const uint64_t row_bytes = ((uint64_t)in_dim / 32u) * 34u;
+    NSUInteger inner_fa = 0, inner_beta = 0, inner_ga = 0;
+    id<MTLBuffer> w_fa = glm53_gpu_weight_buffer(
+        model_map, model_size, off_fa, row_bytes * rows_fa, &inner_fa, "KDA f_a");
+    id<MTLBuffer> w_beta = glm53_gpu_weight_buffer(
+        model_map, model_size, off_beta, row_bytes * rows_beta, &inner_beta, "KDA beta");
+    id<MTLBuffer> w_ga = glm53_gpu_weight_buffer(
+        model_map, model_size, off_ga, row_bytes * rows_ga, &inner_ga, "KDA g_a");
+    if (!w_fa || !w_beta || !w_ga) return 0;
+
+    id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+    id<MTLBuffer> d_fa = ds4_gpu_tensor_buffer(out_fa);
+    id<MTLBuffer> d_beta = ds4_gpu_tensor_buffer(out_beta);
+    id<MTLBuffer> d_ga = ds4_gpu_tensor_buffer(out_ga);
+    if (!xbuf || !d_fa || !d_beta || !d_ga) return 0;
+    /* g_a must not share a destination with f_a: that false dependency is the
+     * whole reason the three could not be merged before, and merging them while
+     * it still holds would race f_b against g_a. */
+    if (d_fa == d_ga && ds4_gpu_tensor_offset(out_fa) == ds4_gpu_tensor_offset(out_ga)) {
+        return 0;
+    }
+
+    ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+    /* The merged kernel binds NR0 = N_R0_Q8_0 like every other fused Q8_0
+     * variant, so a widened DS4_METAL_Q8_MV_ROWS would halve the grid without
+     * widening the kernel.  Same trap ds4_gpu_mv_dispatch_pin_nr2 documents. */
+    ds4_gpu_mv_dispatch_pin_nr2(&mv_dispatch);
+    id<MTLComputePipelineState> pipeline = ds4_gpu_get_mul_mv_pipeline(
+        "kernel_glm53_kda_small_mv_merged", mv_dispatch.nsg);
+    if (!pipeline) return 0;
+
+    const uint32_t nr0 = (uint32_t)mv_dispatch.nr0;
+    ds4_gpu_kda_small_mv_args args = {
+        .mv = ds4_gpu_make_q8_0_mv_args(in_dim, rows_fa),
+        .rows = { rows_fa, rows_beta, rows_ga },
+        .n_banks = 3u,
+    };
+    args.mv.nr0 = (int32_t)nr0;
+    args.tg0[0] = 0u;
+    args.tg0[1] = args.tg0[0] + (rows_fa + nr0 - 1u) / nr0;
+    args.tg0[2] = args.tg0[1] + (rows_beta + nr0 - 1u) / nr0;
+    args.tg0[3] = args.tg0[2] + (rows_ga + nr0 - 1u) / nr0;
+
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    DS4_SET_PIPE(enc, pipeline);
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:w_fa   offset:inner_fa   atIndex:1];
+    [enc setBuffer:w_beta offset:inner_beta atIndex:2];
+    [enc setBuffer:w_ga   offset:inner_ga   atIndex:3];
+    [enc setBuffer:xbuf   offset:ds4_gpu_tensor_offset(x) atIndex:4];
+    [enc setBuffer:d_fa   offset:ds4_gpu_tensor_offset(out_fa)   atIndex:5];
+    [enc setBuffer:d_beta offset:ds4_gpu_tensor_offset(out_beta) atIndex:6];
+    [enc setBuffer:d_ga   offset:ds4_gpu_tensor_offset(out_ga)   atIndex:7];
+    [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)args.tg0[3], 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    if (!ds4_gpu_finish_command_buffer(cb, owned, "KDA merged small matvec")) return 0;
+    return 1;
+}
+
 int ds4_gpu_glm53_kda_decode(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
@@ -49799,8 +50110,64 @@ int ds4_gpu_glm53_kda_decode(
         id<MTLBuffer> output_norm = glm53_gpu_weight_buffer(
             model_map, model_size, output_norm_offset, norm_bytes,
             &norm_inner, "KDA output norm");
+        /* R3 -- the decode recurrence variant sweep.  See the kernel comment in
+         * metal/glm53_kda.metal.  Two independent levers (rows per simdgroup,
+         * simdgroups per threadgroup), both bit-identical, both opt-in:
+         *
+         *   v1     VPT=1  NSG=4   the shipped shape, re-expressed through the
+         *                         template -- the null control that has to
+         *                         reproduce kernel_glm53_kda_decode exactly
+         *                         before any other arm means anything
+         *   vpt2/4/8              rows per simdgroup; VPT4 is the candidate
+         *                         (16-pair stage A/B, p = 0.0017)
+         *   nsg8/16/32            simdgroups per threadgroup; isolated only
+         *   vpt4_nsg8             both, since "they may not compose" is a
+         *                         hypothesis and not a reason to skip the arm
+         *
+         * Unset keeps the shipped kernel byte for byte -- not the v1 template
+         * copy -- so the default path is untouched by this work. */
+        static int kda_decode_variant = -2;
+        static const char *kda_decode_variant_name = NULL;
+        static uint32_t kda_decode_nsg = 4u;
+        if (kda_decode_variant == -2) {
+            const char *v = getenv("DS4_GLM_KDA_DECODE_VARIANT");
+            kda_decode_variant = -1;
+            if (v && v[0] && strcmp(v, "0") != 0) {
+                static const struct { const char *name; const char *fn; uint32_t nsg; } tbl[] = {
+                    { "v1",        "kernel_glm53_kda_decode_v1",        4u },
+                    { "vpt2",      "kernel_glm53_kda_decode_vpt2",      4u },
+                    { "vpt4",      "kernel_glm53_kda_decode_vpt4",      4u },
+                    { "vpt8",      "kernel_glm53_kda_decode_vpt8",      4u },
+                    { "nsg8",      "kernel_glm53_kda_decode_nsg8",      8u },
+                    { "nsg16",     "kernel_glm53_kda_decode_nsg16",    16u },
+                    { "nsg32",     "kernel_glm53_kda_decode_nsg32",    32u },
+                    { "vpt4_nsg8", "kernel_glm53_kda_decode_vpt4_nsg8", 8u },
+                };
+                for (size_t i = 0; i < sizeof(tbl)/sizeof(tbl[0]); i++) {
+                    if (strcmp(v, tbl[i].name) != 0) continue;
+                    kda_decode_variant = (int)i;
+                    kda_decode_variant_name = tbl[i].fn;
+                    kda_decode_nsg = tbl[i].nsg;
+                    break;
+                }
+                if (kda_decode_variant < 0) {
+                    /* Never silently a second control: an unknown name here
+                     * would run the shipped kernel and read as a null. */
+                    fprintf(stderr,
+                            "ds4: DS4_GLM_KDA_DECODE_VARIANT=%s is not a known "
+                            "variant; refusing rather than silently running the "
+                            "shipped kernel\n", v);
+                    return 0;
+                }
+                fprintf(stderr,
+                        "ds4: KDA decode variant %s (%u simdgroups, %u threads)\n",
+                        v, kda_decode_nsg, kda_decode_nsg * 32u);
+            }
+        }
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_pipeline("kernel_glm53_kda_decode");
+            ds4_gpu_get_pipeline(kda_decode_variant_name ?
+                                 kda_decode_variant_name :
+                                 "kernel_glm53_kda_decode");
         if (!qw || !kw || !vw || !a_log || !dt_bias || !output_norm ||
             !pipeline) {
             return 0;
@@ -49844,9 +50211,16 @@ int ds4_gpu_glm53_kda_decode(
                 offset:ds4_gpu_tensor_offset(recurrent_state) atIndex:14];
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
                 offset:ds4_gpu_tensor_offset(out) atIndex:15];
-        [enc setThreadgroupMemoryLength:656u * sizeof(float) atIndex:0];
+        /* 5 scratch rows of D=128, then three per-simdgroup reduction arrays
+         * and the shared beta.  The shipped 656 is that at NSG=4 (653) rounded;
+         * a wider variant needs its own size or the reductions alias sv/so. */
+        const NSUInteger kda_tgmem =
+            (5u * 128u + 3u * kda_decode_nsg + 1u) * sizeof(float);
+        [enc setThreadgroupMemoryLength:(kda_decode_variant_name ? kda_tgmem
+                                                                 : 656u * sizeof(float))
+                                atIndex:0];
         [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(n_rows, n_heads, 1)
-            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(32u * kda_decode_nsg, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
         return ds4_gpu_finish_command_buffer(
             cb, owned, "GLM-5.3 fused KDA decode");

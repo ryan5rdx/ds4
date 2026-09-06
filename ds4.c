@@ -43658,6 +43658,12 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *kda_k;
     ds4_gpu_tensor *kda_v;
     ds4_gpu_tensor *kda_lowrank;
+    /* R1: g_a's destination.  f_a and g_a both wrote kda_lowrank with f_b
+     * reading it in between -- a false dependency created by buffer reuse,
+     * not by the math, and the only thing stopping the three small matvecs
+     * from being one dispatch.  Splitting the buffer alone is worth ~0.04%
+     * and is not the optimisation; it is the prerequisite. */
+    ds4_gpu_tensor *kda_lowrank_g;
     ds4_gpu_tensor *kda_raw_gate;
     ds4_gpu_tensor *kda_raw_beta;
     ds4_gpu_tensor *kda_output_gate;
@@ -45718,6 +45724,7 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
     ds4_gpu_tensor_free(g->kda_output_gate);
     ds4_gpu_tensor_free(g->kda_raw_beta);
     ds4_gpu_tensor_free(g->kda_raw_gate);
+    ds4_gpu_tensor_free(g->kda_lowrank_g);
     ds4_gpu_tensor_free(g->kda_lowrank);
     ds4_gpu_tensor_free(g->kda_v);
     ds4_gpu_tensor_free(g->kda_k);
@@ -46109,6 +46116,8 @@ static bool glm_graph_alloc_slice(
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->kda_k, kda_projection_bytes);
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->kda_v, kda_projection_bytes);
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->kda_lowrank,
+                                   (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float));
+        DS4_GLM_GRAPH_ALLOC_TENSOR(g->kda_lowrank_g,
                                    (uint64_t)DS4_N_KDA_HEAD_DIM * sizeof(float));
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->kda_raw_gate, kda_projection_bytes);
         DS4_GLM_GRAPH_ALLOC_TENSOR(g->kda_raw_beta,
@@ -47201,21 +47210,64 @@ static bool glm53_graph_kda_attention(
         ok = glm53_graph_matmul_at(g->kda_v, model, l->kda_v, off_v,
                                 DS4_N_EMBD, projection, g->attn_norm);
     }
-    if (ok) ok = glm53_graph_matmul(
-            g->kda_lowrank, model, l->kda_f_a,
-            DS4_N_EMBD, DS4_N_KDA_HEAD_DIM, g->attn_norm);
+    /* R1: f_a, beta and g_a read the same activation, none depends on another,
+     * and at nr0=2 they are 64, 16 and 64 threadgroups -- far too small to fill
+     * a 60-core part, and not overlapped, because the batch encoder is
+     * MTLDispatchTypeSerial.  Merging them sums the row blocks into one 144-tg
+     * dispatch without changing any threadgroup's work.  g_a writes
+     * kda_lowrank_g so f_b no longer has to run between f_a and g_a.
+     *
+     * Bit-identical (0/288); the merged kernel calls the shipped Q8_0 matvec
+     * body verbatim and only remaps tgpig.x.  Opt-in until the rig A/B: what
+     * is unsettled is not correctness but whether the two removed boundaries
+     * were already hidden by the neighbouring q/k/v and f_b/g_b dispatches --
+     * the exact class for which DF2 withdrew the per-dispatch rate. */
+    static int kda_small_mv_merge_env = -1;
+    if (kda_small_mv_merge_env < 0) {
+        const char *e = getenv("DS4_GLM_KDA_SMALL_MV_MERGE");
+        kda_small_mv_merge_env = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    const bool kda_small_mv_merge =
+        kda_small_mv_merge_env != 0 &&
+        l->kda_f_a->type == DS4_TENSOR_Q8_0 &&
+        l->kda_beta->type == DS4_TENSOR_Q8_0 &&
+        l->kda_g_a->type == DS4_TENSOR_Q8_0;
+    ds4_gpu_tensor *const kda_ga_out =
+        kda_small_mv_merge ? g->kda_lowrank_g : g->kda_lowrank;
+    if (ok && kda_small_mv_merge) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "ds4: KDA small matvecs MERGED (f_a %u + beta %u + g_a %u rows, "
+                    "3 dispatches -> 1)\n",
+                    (unsigned)DS4_N_KDA_HEAD_DIM, (unsigned)lane.heads,
+                    (unsigned)DS4_N_KDA_HEAD_DIM);
+        }
+        ok = ds4_gpu_glm53_kda_small_mv_merged(
+                g->kda_lowrank, g->kda_raw_beta, g->kda_lowrank_g,
+                model->map, model->size,
+                l->kda_f_a->abs_offset, off_beta, l->kda_g_a->abs_offset,
+                DS4_N_EMBD,
+                DS4_N_KDA_HEAD_DIM, lane.heads, DS4_N_KDA_HEAD_DIM,
+                g->attn_norm) != 0;
+    } else {
+        if (ok) ok = glm53_graph_matmul(
+                g->kda_lowrank, model, l->kda_f_a,
+                DS4_N_EMBD, DS4_N_KDA_HEAD_DIM, g->attn_norm);
+    }
     if (ok) ok = glm53_graph_matmul_at(
             g->kda_raw_gate, model, l->kda_f_b, off_fb,
             DS4_N_KDA_HEAD_DIM, projection, g->kda_lowrank);
-    if (ok) ok = glm53_graph_matmul_at(
+    if (ok && !kda_small_mv_merge) ok = glm53_graph_matmul_at(
             g->kda_raw_beta, model, l->kda_beta, off_beta,
             DS4_N_EMBD, lane.heads, g->attn_norm);
-    if (ok) ok = glm53_graph_matmul(
-            g->kda_lowrank, model, l->kda_g_a,
+    if (ok && !kda_small_mv_merge) ok = glm53_graph_matmul(
+            kda_ga_out, model, l->kda_g_a,
             DS4_N_EMBD, DS4_N_KDA_HEAD_DIM, g->attn_norm);
     if (ok) ok = glm53_graph_matmul_at(
             g->kda_output_gate, model, l->kda_g_b, off_gb,
-            DS4_N_KDA_HEAD_DIM, projection, g->kda_lowrank);
+            DS4_N_KDA_HEAD_DIM, projection, kda_ga_out);
     if (ok) ok = ds4_gpu_glm53_kda_decode(
             g->kda_out,
             g->layer_kda_conv_state[il],
@@ -55597,9 +55649,34 @@ static bool glm_graph_forward_token(
             getenv("DS4_GLM_DECODE_OUTPUT_PROFILE") != NULL ? 1 : 0;
     }
     const bool decode_output_profile = decode_output_profile_env != 0;
+    /* SKEW1 ride-along.  The profiler above answers "which part of the tail" at
+     * the cost of splitting the output head out of the merged path, so its
+     * absolute numbers are not production ones and it cannot be left on during
+     * a throughput arm.  This mode answers the smaller question -- does the
+     * post-layer tail differ between the ranks at all -- with the production
+     * layout untouched: it times the one boundary that exists either way (end
+     * of the layer stack) and the span from there to the logits read
+     * completing, and accumulates rather than printing per token.
+     *
+     * That is the discriminating measurement SKEW1 still needs.  The per-layer
+     * route is closed (the gates re-synchronise every layer), so the ~0.2 ms is
+     * introduced after the last gate; if this tail is equal on both ranks then
+     * it is the final gate release, and if it differs then it is the merged
+     * output head -- which is exactly the span the splitting profiler relocates
+     * and therefore cannot see.
+     *
+     * Set on BOTH ranks and diff the two logs.  Costs two now_sec() calls and
+     * one fprintf per 64 tokens, so it rides along with any arm. */
+    static int decode_tail_profile_env = -1;
+    if (decode_tail_profile_env < 0) {
+        decode_tail_profile_env =
+            getenv("DS4_GLM_DECODE_TAIL_PROFILE") != NULL ? 1 : 0;
+    }
+    const bool decode_tail_profile = decode_tail_profile_env != 0;
     const bool merge_indexed_output =
         logits_out != NULL && use_indexed_attention && !decode_output_profile;
     double decode_output_stage_t0 = decode_output_profile ? now_sec() : 0.0;
+    double decode_tail_t0 = 0.0;
     const bool decode_flush_profile = false;
     uint32_t decode_flush_layer0 = 0;
     double decode_flush_stage_t0 = decode_flush_profile ? now_sec() : 0.0;
@@ -56715,6 +56792,7 @@ glm53_attention_done:
                 (now - decode_output_stage_t0) * 1000.0);
         decode_output_stage_t0 = now;
     }
+    if (decode_tail_profile) decode_tail_t0 = now_sec();
     if (ok && output_hc && !defer_completion) {
         ok = ds4_gpu_tensor_read(g->glm53 ? g->hc_cur : g->cur,
                                  0,
@@ -56777,6 +56855,21 @@ glm53_attention_done:
                         pos,
                         (now - decode_output_stage_t0) * 1000.0);
             }
+        }
+    }
+    if (decode_tail_profile && decode_tail_t0 > 0.0 && logits_out) {
+        static double tail_ms;
+        static uint64_t tail_n;
+        tail_ms += (now_sec() - decode_tail_t0) * 1000.0;
+        if ((++tail_n % 64u) == 0u) {
+            fprintf(stderr,
+                    "ds4: GLM decode tail (rank %d) %.4f ms mean over %llu tokens "
+                    "-- end of the layer stack to the logits read returning, "
+                    "production layout, merged=%d.  Diff this against the other "
+                    "rank: an equal tail puts SKEW1 in the final gate release, an "
+                    "unequal one puts it in the merged output head.\n",
+                    g->tp_rank, tail_ms / (double)tail_n,
+                    (unsigned long long)tail_n, merge_indexed_output ? 1 : 0);
         }
     }
     if (ok &&

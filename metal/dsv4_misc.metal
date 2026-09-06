@@ -7774,11 +7774,35 @@ constexpr constant metal::thread_scope thread_scope_system =
 // kill; the service thread writes the release even on failure. A timeout is
 // latched in shared memory so the host rejects the graph instead of consuming
 // stale peer rows.
+// GATE-RESIDUE instrument (buffers 4/5, off unless `profile` is 1).
+//
+// The question the campaign cannot answer from the host: of a gate's measured
+// 16-29 us on the loaded rig, how much is this rank waiting for the PEER and
+// how much is it waiting for its own command processor to reach the fence?
+// A host clock cannot separate them -- it only sees the total.
+//
+// The spin count does. If the release word is already at `value` on iteration
+// 0, the peer had finished before this rank's command processor even started
+// the fence: that gate's cost is command-processor latency, not fabric. A large
+// count is the opposite. So `stats[2] / stats[1]` is the fraction of gates this
+// rank did not wait for the peer at all, and `stats[0] / stats[1]` scaled by
+// the calibrated ns/iteration is the part that IS peer wait.
+//
+// Four words per bank, banked by gate slot so ATTN/ROUTER/FFN separate (only
+// the FFN gate sits behind the routed-expert shard, so they should differ):
+//   [0] sum of iteration counts   [1] fence executions
+//   [2] executions that hit on iteration 0   [3] max iterations seen
+//
+// Relaxed atomics: correctness of the gate does not depend on these, and one
+// thread runs this kernel, but gates on different command buffers can overlap
+// in principle and a torn counter would be a confusing diagnostic.
 kernel void kernel_dsv4_tp_fence_wait(
         volatile coherent(system) device uint * release [[buffer(0)]],
         constant uint & value [[buffer(1)]],
         constant uint & max_iters [[buffer(2)]],
-        volatile coherent(system) device uint * timeout [[buffer(3)]]) {
+        volatile coherent(system) device uint * timeout [[buffer(3)]],
+        device atomic_uint * stats [[buffer(4)]],
+        constant uint & profile [[buffer(5)]]) {
     for (uint i = 0; i < max_iters; i++) {
         metal::atomic_thread_fence(metal::mem_flags::mem_device,
                                    metal::memory_order_seq_cst,
@@ -7787,10 +7811,41 @@ kernel void kernel_dsv4_tp_fence_wait(
             metal::atomic_thread_fence(metal::mem_flags::mem_device,
                                        metal::memory_order_seq_cst,
                                        metal::thread_scope_system);
+            if (profile != 0u) {
+                atomic_fetch_add_explicit(&stats[0], i, memory_order_relaxed);
+                atomic_fetch_add_explicit(&stats[1], 1u, memory_order_relaxed);
+                if (i == 0u)
+                    atomic_fetch_add_explicit(&stats[2], 1u, memory_order_relaxed);
+                atomic_fetch_max_explicit(&stats[3], i, memory_order_relaxed);
+            }
             return;
         }
     }
+    if (profile != 0u) {
+        atomic_fetch_add_explicit(&stats[0], max_iters, memory_order_relaxed);
+        atomic_fetch_add_explicit(&stats[1], 1u, memory_order_relaxed);
+        atomic_fetch_max_explicit(&stats[3], max_iters, memory_order_relaxed);
+    }
     timeout[0] = 1u;
+}
+
+// Calibration for the instrument above: spin exactly `iters` times against a
+// value that never arrives, so the host can time one command buffer and divide.
+// Without this the spin count is an uncalibrated integer and cannot be quoted
+// in microseconds, which is the unit the gate budget is in.
+kernel void kernel_dsv4_tp_fence_calibrate(
+        volatile coherent(system) device uint * release [[buffer(0)]],
+        constant uint & iters [[buffer(1)]],
+        device uint * sink [[buffer(2)]]) {
+    uint seen = 0u;
+    for (uint i = 0; i < iters; i++) {
+        metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                   metal::memory_order_seq_cst,
+                                   metal::thread_scope_system);
+        seen += release[0];
+    }
+    // Consume `seen` so the loop cannot be optimised away.
+    sink[0] = seen;
 }
 
 // Pipeline-parallel activation handoff. One SIMD group waits on a CPU-published
