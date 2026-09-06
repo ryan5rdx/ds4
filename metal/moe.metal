@@ -8091,9 +8091,27 @@ kernel void kernel_mul_mm_id_map_scatter_work(
 
 typedef decltype(kernel_mul_mm_id_map_scatter_work<6>)
     kernel_mul_mm_id_map_scatter_work_t;
+/* MOE1-full.  The token-centric builder shipped instantiated at ne20 6 only,
+ * which confined a 16x map builder to a shape GLM 5.3 does not run: the
+ * bound-pipeline coverage for the production TP2 config shows
+ * kernel_mul_mm_id_map0_ne20_8, so the live width is 8 and the fast builder was
+ * never reachable.  Instantiated at the same widths as map0 so the two are
+ * interchangeable at every shape the engine can ask for. */
+template [[host_name("kernel_mul_mm_id_map_scatter_work_ne20_4" )]]
+kernel kernel_mul_mm_id_map_scatter_work_t kernel_mul_mm_id_map_scatter_work<4>;
+template [[host_name("kernel_mul_mm_id_map_scatter_work_ne20_5" )]]
+kernel kernel_mul_mm_id_map_scatter_work_t kernel_mul_mm_id_map_scatter_work<5>;
 template [[host_name("kernel_mul_mm_id_map_scatter_work_ne20_6")]]
 kernel kernel_mul_mm_id_map_scatter_work_t
     kernel_mul_mm_id_map_scatter_work<6>;
+template [[host_name("kernel_mul_mm_id_map_scatter_work_ne20_8" )]]
+kernel kernel_mul_mm_id_map_scatter_work_t kernel_mul_mm_id_map_scatter_work<8>;
+template [[host_name("kernel_mul_mm_id_map_scatter_work_ne20_10")]]
+kernel kernel_mul_mm_id_map_scatter_work_t kernel_mul_mm_id_map_scatter_work<10>;
+template [[host_name("kernel_mul_mm_id_map_scatter_work_ne20_16")]]
+kernel kernel_mul_mm_id_map_scatter_work_t kernel_mul_mm_id_map_scatter_work<16>;
+template [[host_name("kernel_mul_mm_id_map_scatter_work_ne20_22")]]
+kernel kernel_mul_mm_id_map_scatter_work_t kernel_mul_mm_id_map_scatter_work<22>;
 
 // Batched routed-expert matmul. It reads the expert-major map produced above,
 // loads selected expert weights, and writes results back to token-major slots

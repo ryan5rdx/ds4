@@ -3659,6 +3659,36 @@ static int ds4_gpu_warm_model_views(void) {
     return 1;
 }
 
+/* MOE1-full.  The token-centric map builder: each selected route reserves one
+ * expert-local row through a threadgroup atomic, instead of map0 having every
+ * expert scan every token.  16x on the kernel in isolation.
+ *
+ * It shipped instantiated at ne20 6 and gated to MXFP4 + n_expert 6 +
+ * tp_world 1, none of which GLM 5.3 is: the bound-pipeline coverage for the
+ * production TP2 config shows kernel_mul_mm_id_map0_ne20_8, so the fast builder
+ * was unreachable on the config that matters.  Widening it is MOE1-full.
+ *
+ * Bit-identical by the kernel's own construction, not by argument: expert-local
+ * ORDER is unspecified in both builders, and hids carries the original
+ * token/slot id, so every downstream row still writes its own fixed
+ * destination.  Nothing reads the map in expert-local order.
+ *
+ * TP needs nothing here.  The map lists every route; the consumers cull by
+ * ownership themselves, and the work-list consumer already returns early for an
+ * unowned expert.  That is also why tp_world 1 was never a real precondition. */
+static const char *ds4_gpu_mul_mm_id_map_scatter_name(uint32_t ne20) {
+    switch (ne20) {
+        case 4:  return "kernel_mul_mm_id_map_scatter_work_ne20_4";
+        case 5:  return "kernel_mul_mm_id_map_scatter_work_ne20_5";
+        case 6:  return "kernel_mul_mm_id_map_scatter_work_ne20_6";
+        case 8:  return "kernel_mul_mm_id_map_scatter_work_ne20_8";
+        case 10: return "kernel_mul_mm_id_map_scatter_work_ne20_10";
+        case 16: return "kernel_mul_mm_id_map_scatter_work_ne20_16";
+        case 22: return "kernel_mul_mm_id_map_scatter_work_ne20_22";
+        default: return NULL;     /* never silently fall back to map0 */
+    }
+}
+
 static const char *ds4_gpu_mul_mm_id_map0_name(uint32_t ne20) {
     switch (ne20) {
         case 1:  return "kernel_mul_mm_id_map0_ne20_1";
@@ -35705,7 +35735,17 @@ static int ds4_gpu_encode_mul_mm_id_map(
     [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:2];
     [enc setBuffer:g_moe_id_map_buffer offset:tpe_bytes atIndex:3];
     [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:4];
-    [enc setThreadgroupMemoryLength:(NSUInteger)mm_args->ne02 * (NSUInteger)mm_args->ne20 * sizeof(uint16_t) atIndex:0];
+    /* map0 wants ne02*ne20 uint16 tallies.  The scatter builder wants a uint32
+     * atomic counter plus a uint16 tile count per expert -- ne02*6 -- which the
+     * map0 formula happens to cover at ne20 >= 3 and would NOT at ne20 1 or 2.
+     * Sizing for both explicitly rather than relying on that coincidence; this
+     * is the exact class the threadgroup-memory census exists to catch. */
+    const NSUInteger map_tg_bytes = (NSUInteger)mm_args->ne02 *
+        (NSUInteger)mm_args->ne20 * sizeof(uint16_t);
+    const NSUInteger scatter_tg_bytes = (NSUInteger)mm_args->ne02 *
+        (sizeof(uint32_t) + sizeof(uint16_t));
+    [enc setThreadgroupMemoryLength:(map_tg_bytes > scatter_tg_bytes ?
+                                     map_tg_bytes : scatter_tg_bytes) atIndex:0];
     [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
          threadsPerThreadgroup:MTLSizeMake((NSUInteger)mm_args->ne02, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -46174,6 +46214,20 @@ int ds4_gpu_routed_moe_batch_tensor(
             g_tp_split_world == 1 &&
             (use_pre_m5_mxfp4_mm_id_map_scatter_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_MAP_SCATTER) != 0u);
+        /* MOE1-full: the same builder, at any width, any quant, and under the
+         * TP split.  Kept as a separate opt-in rather than by loosening the
+         * predicate above, so the shipped MXFP4 automatic path is byte-for-byte
+         * the same decision it was and only this arm is new. */
+        static int moe_map_scatter_env = -1;
+        if (moe_map_scatter_env < 0) {
+            const char *e = getenv("DS4_GLM_MOE_MAP_SCATTER");
+            moe_map_scatter_env = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        const bool use_mm_id_map_scatter_full =
+            moe_map_scatter_env != 0 &&
+            !use_mxfp4_mm_id_map_scatter &&
+            !g_ssd_streaming_mode &&
+            ds4_gpu_mul_mm_id_map_scatter_name(n_expert) != NULL;
         /*
          * On a final occupied 32-row work tile with at most 16 rows, the
          * second SIMDgroup pair has no valid MMA output. The specialized
@@ -46269,10 +46323,23 @@ int ds4_gpu_routed_moe_batch_tensor(
                 shed_selected_off = (NSUInteger)ds4_gpu_tensor_offset(selected);
             }
 
-            map_pipeline = ds4_gpu_get_pipeline(
+            const char *map_fn =
                 use_mxfp4_mm_id_map_scatter ?
                     "kernel_mul_mm_id_map_scatter_work_ne20_6" :
-                    ds4_gpu_mul_mm_id_map0_name(n_expert));
+                    (use_mm_id_map_scatter_full ?
+                        ds4_gpu_mul_mm_id_map_scatter_name(n_expert) :
+                        ds4_gpu_mul_mm_id_map0_name(n_expert));
+            map_pipeline = ds4_gpu_get_pipeline(map_fn);
+            if (use_mm_id_map_scatter_full) {
+                static int announced_scatter;
+                if (!announced_scatter) {
+                    announced_scatter = 1;
+                    fprintf(stderr,
+                            "ds4: MOE1-full map builder %s (n_expert %u, "
+                            "tp_world %d)\n",
+                            map_fn, (unsigned)n_expert, (int)g_tp_split_world);
+                }
+            }
             gate_mm_pipeline = ds4_gpu_routed_mm_pipeline(gate_type);
             up_mm_pipeline = ds4_gpu_routed_mm_pipeline(gate_type);
             /* Engagement evidence for F3.  Reports WHICH down kernel was
