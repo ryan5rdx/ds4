@@ -210,15 +210,24 @@ kernel void kernel_argsort_merge_f32_i32(
     }
 
     /* Spread only the surviving entries over the threadgroup.  Dividing `total`
-     * instead left every lane past out_len/chunk retiring immediately -- at the
-     * final level of a 310k decode that was 7 live lanes out of 512. */
-    const int emit = MIN(total, cap);
-    const int chunk = (emit + ntg.x - 1) / ntg.x;
+     * leaves every lane past cap/chunk retiring immediately -- at the final
+     * level of a 310k decode that is 7 live lanes out of 512.
+     *
+     * GATED ON trunc, and that gate is not cosmetic.  The first cut applied this
+     * unconditionally, which silently turned the 7-lane collapse into 512 lanes
+     * in the BASELINE too -- i.e. it shipped the census's separate MERGE-CHUNK
+     * candidate inside a supposedly opt-in change.  The consequence is worse
+     * than a stray optimisation: the MERGE-TRUNC "off" arm would no longer be
+     * the shipping baseline, and every TOPK1 A/B on such a build would have an
+     * argsort control that quietly got faster.  With trunc off the arithmetic
+     * below is byte-for-byte the original. */
+    const int span = trunc ? MIN(total, cap) : total;
+    const int chunk = (span + ntg.x - 1) / ntg.x;
 
     const int k0 = tpitg.x * chunk;
-    const int k1 = MIN(MIN(k0 + chunk, total), emit);
+    const int k1 = MIN(MIN(k0 + chunk, total), cap);
 
-    if (k0 >= emit) {
+    if (k0 >= cap) {
         return;
     }
 
