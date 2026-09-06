@@ -70,7 +70,7 @@ endif
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: metal-decode-schedule-bench metal-prefill-variant-bench metal-flash-attn-decode-bench check-mxfp4-half-lut check-dispatch-count
+.PHONY: check-threadgroup-memory metal-decode-schedule-bench metal-prefill-variant-bench metal-flash-attn-decode-bench check-mxfp4-half-lut check-dispatch-count
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -185,6 +185,15 @@ check-mxfp4-half-lut:
 # it) matches the same text but is not a dispatch SITE -- it is the interposer
 # every site already goes through, so counting it would demand a DS4_DISP on the
 # interposer and double-count every dispatch.  Excluded by name.
+# Static half of the threadgroup-memory census.  Metal does not bounds-check
+# threadgroup memory, so a kernel writing past its setThreadgroupMemoryLength:
+# allocation aliases silently -- upstream's 8fcd61d found two dispatch sites
+# doing exactly that, and the numbers taken before the fix were both wrong AND
+# fast.  The dynamic half is running the dispatching probes under
+# MTL_SHADER_VALIDATION=1; this is the half that costs nothing.
+check-threadgroup-memory:
+	@python3 tools/tgmem_census.py
+
 check-dispatch-count:
 	@calls=$$(grep 'dispatchThreadgroups:\|dispatchThreads:' ds4_metal.m | grep -vc 'ds4_tl_\|@selector'); \
 	 disp=$$(grep -c 'DS4_DISP(' ds4_metal.m); \
