@@ -6008,24 +6008,7 @@ typedef struct {
     int32_t  tp_world;
     int32_t  tp_addend;
     int32_t  tp_expert_base;
-    /* MOE-TP-SHED: value written into an unowned expert's output rows.  0.0f in
-     * production; DS4_METAL_MOE_TP_FILL sets a sentinel to test whether
-     * anything downstream reads them.  Mirrors metal/moe.metal. */
-    float    tp_unowned_fill;
 } ds4_gpu_mul_mv_id_args;
-
-/* Memoized: this is read once per dispatch on the prefill MoE hot path. */
-static float ds4_gpu_moe_tp_unowned_fill(void) {
-    static int initialized;
-    static float fill;
-    if (!initialized) {
-        initialized = 1;
-        fill = 0.0f;
-        const char *v = getenv("DS4_METAL_MOE_TP_FILL");
-        if (v && v[0]) fill = (float)atof(v);
-    }
-    return fill;
-}
 
 typedef struct {
     uint32_t n_total_expert;
@@ -19953,49 +19936,6 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
-            /* KDA-R2: narrow-k lane.  The kernel walks K in NSG*NQ blocks
-             * (NQ = 8, metal/dense.metal), against nb = in_dim/32 blocks of
-             * actual work.  When nb < NSG*NQ the surplus simdgroups have no
-             * block to take and retire immediately: at the KDA f_b/g_b shape
-             * (in_dim 128 -> nb = 4) with the TP2 default nsg = 2, that is
-             * 16 of 64 threads doing anything and simdgroup 1 entirely dead.
-             *
-             * Derive the useful nsg from the shape instead of guessing:
-             * nb/NQ = in_dim/256, floored at 1.  This only ever LOWERS nsg --
-             * in_dim 4096 gives 16, which min() keeps at the existing 2 -- so
-             * wide matvecs are bit-for-bit untouched and only the starved
-             * shapes move.  128 -> nsg 1, i.e. 25% -> 50% occupancy.
-             *
-             * 50% and not 100%: NQ is a compile-time constant, so closing the
-             * last 2x needs a kernel variant with NQ = 4.  Measure this first;
-             * if the shape-derived lane pays, the variant is worth writing.
-             * Opt-in so the A/B has a control.
-             *
-             * BIT-IDENTICAL, and provably so at exactly the shapes this fires
-             * on.  Lowering nsg normally reorders a reduction, but here the
-             * simdgroups being removed are the ones with NO block to take:
-             * their ib0 = sgitg*NQ already exceeds nb, so they retire before
-             * touching sumf and contribute a partial of exactly 0.0f.  Dropping
-             * them removes `+ 0.0f` terms from the cross-simdgroup reduction,
-             * which is exact for every finite input (and for inf; only a -0.0f
-             * partial would differ, and 0.0f is what the retiring path yields).
-             * The surviving simdgroups keep their block assignment unchanged,
-             * so every non-zero partial is computed identically.  That is why
-             * the lane must be derived from nb and never simply set to 1: at a
-             * shape where the surplus simdgroups DO have work, this argument
-             * fails and the change would not be bit-identical. */
-            {
-                static int lane_env = -1;
-                if (lane_env < 0) {
-                    const char *v = getenv("DS4_METAL_Q8_MV_NARROW_K_LANE");
-                    lane_env = v && v[0] && v[0] != '0';
-                }
-                if (lane_env) {
-                    const uint32_t useful = in_dim / 256u;
-                    const int16_t want = (int16_t)(useful < 1u ? 1u : useful);
-                    if (want < mv_dispatch.nsg) mv_dispatch.nsg = want;
-                }
-            }
             mv_args.nr0 = mv_dispatch.nr0;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
@@ -26477,7 +26417,6 @@ int ds4_gpu_attention_output_q8_batch_tensor(
                                                 0) != 0;
             } else if (use_direct_low) {
                 ds4_gpu_mul_mv_id_args args = {
-                    .tp_unowned_fill = ds4_gpu_moe_tp_unowned_fill(),
                     .nei0 = (int32_t)n_groups,
                     .nei1 = (int32_t)n_tokens,
                     .nbi1 = 0,
@@ -26515,7 +26454,6 @@ int ds4_gpu_attention_output_q8_batch_tensor(
                                                              true) != 0;
             } else {
                 ds4_gpu_mul_mv_id_args args = {
-                    .tp_unowned_fill = ds4_gpu_moe_tp_unowned_fill(),
                     .nei0 = (int32_t)n_groups,
                     .nei1 = (int32_t)n_tokens,
                     .nbi1 = (uint64_t)n_groups * sizeof(int32_t),
@@ -27395,7 +27333,6 @@ int ds4_gpu_attention_output_q8_tp_tensor(
          * group count shifted to the slice.  The owned low half lands
          * compactly at low[0 .. group_cnt*rank). */
         ds4_gpu_mul_mv_id_args args = {
-                    .tp_unowned_fill = ds4_gpu_moe_tp_unowned_fill(),
             .nei0 = (int32_t)group_cnt,
             .nei1 = 1,
             .nbi1 = 0,
@@ -27517,7 +27454,6 @@ int ds4_gpu_attention_output_low_q8_tensor(
 
         if (ok) {
             ds4_gpu_mul_mv_id_args args = {
-                    .tp_unowned_fill = ds4_gpu_moe_tp_unowned_fill(),
                 .nei0 = (int32_t)n_groups,
                 .nei1 = 1,
                 .nbi1 = 0,
@@ -27632,7 +27568,6 @@ int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
              * rank's first group, but preserve nb12 so every verifier row
              * lands on the same group slice. `low` is compact by rank. */
             ds4_gpu_mul_mv_id_args args = {
-                    .tp_unowned_fill = ds4_gpu_moe_tp_unowned_fill(),
                 .nei0 = (int32_t)group_cnt,
                 .nei1 = (int32_t)n_rows,
                 .nbi1 = 0,
@@ -27749,7 +27684,6 @@ int ds4_gpu_attention_output_low_q4_K_slice_tensor(
 
         if (ok) {
             ds4_gpu_mul_mv_id_args args = {
-                    .tp_unowned_fill = ds4_gpu_moe_tp_unowned_fill(),
                 .nei0 = (int32_t)group_cnt,
                 .nei1 = 1,
                 .nbi1 = 0,
@@ -46669,40 +46603,24 @@ int ds4_gpu_glm53_embedding_bf16(
  * 8-way to a 4-way split. B1 measured +6.0% decode and already occupies this
  * shape. The audit sized SK1 and B1 independently without noticing they
  * contend for the same knob. */
-/* HCMIX-WIDE: DS4_METAL_GLM53_BF16_MV_NSG=<n> sweeps B1's split factor.
+/* HCMIX-WIDE was withdrawn.  DS4_METAL_GLM53_BF16_MV_NSG was added here to
+ * sweep B1's split-K grid, on the belief that the grid is ceil(out_dim/nsg).
+ * It is not: the split-K branch dispatches (out_dim + 1)/2 threadgroups
+ * INDEPENDENT of nsg -- the ceil(out_dim/nsg) form belongs to the non-split
+ * branch.  So at the hc_mix shape every nsg launches the same 12 threadgroups
+ * and the sweep could not have answered the question it was queued for; a null
+ * would have said nothing about across-threadgroup split-K.
  *
- * nsg is the K-split factor AND it sets the split-K grid, which is
- * ceil(out_dim / nsg).  At the hc_mix shape (16384 -> 24) that is 3
- * threadgroups at nsg=8, on a 60-core part.  Lowering nsg widens the grid:
- * 4 -> 6 TGs, 2 -> 12.
- *
- * This sweep IS the HCMIX-WIDE experiment, in its cheap form.  The expensive
- * form -- splitting K ACROSS threadgroups with a partials buffer and a combine,
- * which would give (out_dim/NR0) x K_splits ~ 96 TGs -- is a new kernel, and it
- * is only worth writing if this sweep shows the grid matters at all.
- *
- * The prior is against it.  SK1 tried exactly this direction and measured
- * 1.03x, flat, with the note below concluding "3 -> 6 threadgroups is still far
- * below any of these GPUs' core counts, so neither arm is fed".  Lowering nsg
- * also cuts the K split itself, so the two effects fight: this sweep measures
- * their sum, which is the number that actually matters. */
+ * The real experiment needs a 2-D (row-pair, k-split) partial kernel plus a
+ * reduction.  B1's own 3 -> 12 threadgroup win is positive evidence for that
+ * design, and it is queued as its own item rather than as an env knob. */
 static uint32_t glm53_gpu_bf16_mv_nsg(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *v = getenv("DS4_METAL_GLM53_BF16_MV_NSG");
-        unsigned long n = 0;
-        if (v && v[0]) n = strtoul(v, NULL, 10);
-        if (n == 2u || n == 4u || n == 8u || n == 16u || n == 32u) {
-            cached = (int)n;
-        } else {
-            cached = ds4_gpu_device_name_contains("M3 Ultra") &&
-                     getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == NULL &&
-                     getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_BF16_NSG4") == NULL
-                         ? 4 : 8;
-        }
-    }
-    return (uint32_t)cached;
+    return ds4_gpu_device_name_contains("M3 Ultra") &&
+           getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == NULL &&
+           getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_BF16_NSG4") == NULL
+               ? 4u : 8u;
 }
+
 
 int ds4_gpu_glm53_matmul_bf16(
         ds4_gpu_tensor       *out,
