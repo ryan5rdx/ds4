@@ -2723,14 +2723,56 @@ int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count) {
     return ok;
 }
 
+/* Split rank 0's blocking logits recv into peer-wait and payload.
+ *
+ * Stage 0 measured the recv at 0.39 ms/token against rank 1's 0.047 ms send, and
+ * the whole stage-1 decision turns on how much of that 0.35 ms gap is the 310 KB
+ * crossing the socket (which a transport change could recover) versus rank 0
+ * simply arriving first and waiting (which nothing can recover).
+ *
+ * The obvious probe -- an arm that sends 8 dummy bytes -- is confounded: with the
+ * upper half of the logits missing, decode picks different tokens from the second
+ * step on, therefore different experts, therefore different work, and the timing
+ * difference is no longer attributable to the transport.  Teacher-forcing would
+ * fix that but changes what is being measured and needs both arms rebuilt.
+ *
+ * This needs neither.  The header and the body are already two reads: the header
+ * cannot arrive before rank 1 starts sending, so waiting for it IS the peer-wait
+ * plus one frame latency, and the body read that follows is very nearly pure
+ * payload.  Same code path, correct output, one arm. */
 static int ds4_tp_recv_logits_half_unlocked(ds4_tp *tp, float *half, uint32_t count) {
+    static int split_profile = -1;
+    if (split_profile < 0) {
+        split_profile = getenv("DS4_TP_LOGITS_PROFILE") != NULL ? 1 : 0;
+    }
+    const double t0 = split_profile ? tp_now_sec() : 0.0;
     uint32_t type = 0, bytes = 0;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_LOGITS || bytes != count * sizeof(float)) {
         fprintf(stderr, "ds4-tp: bad logits frame (type %u bytes %u)\n", type, bytes);
         return 0;
     }
-    return tp_read_full(tp->control_fd, half, bytes);
+    const double t1 = split_profile ? tp_now_sec() : 0.0;
+    const int ok = tp_read_full(tp->control_fd, half, bytes);
+    if (split_profile && ok) {
+        static double wait_ms, body_ms;
+        static uint64_t calls;
+        const double t2 = tp_now_sec();
+        wait_ms += (t1 - t0) * 1000.0;
+        body_ms += (t2 - t1) * 1000.0;
+        calls++;
+        if ((calls % 64u) == 0u) {
+            fprintf(stderr,
+                    "ds4: tp logits split peer_wait %.3f ms + payload %.3f ms "
+                    "= %.3f ms over %llu tokens (%u bytes).  peer_wait is not "
+                    "recoverable by any transport change; payload is the stage-1 "
+                    "ceiling.\n",
+                    wait_ms / (double)calls, body_ms / (double)calls,
+                    (wait_ms + body_ms) / (double)calls,
+                    (unsigned long long)calls, bytes);
+        }
+    }
+    return ok;
 }
 
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count) {
