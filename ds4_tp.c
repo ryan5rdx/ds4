@@ -1550,12 +1550,28 @@ static int tp_rdma_post_gate_recv(ds4_tp *tp, uint64_t seq) {
 
 /* One decode gate: ensure the receive window is armed, send our partial,
  * wait for the peer's receive completion, and advance the window. */
-/* Per-gate-kind RDMA timing (DS4_TP_GATE_PROFILE): post cost and the wait
- * for the peer's partial, printed every 860 gates. */
-static double g_rdma_stat_post_us[2];
-static double g_rdma_stat_wait_us[2];
-static uint64_t g_rdma_stat_count[2];
+/* Per-gate-slot RDMA timing (DS4_TP_GATE_PROFILE): post cost and the wait for
+ * the peer's partial, printed every 430 gates per slot.
+ *
+ * Sized and bounded by DS4_TP_GATES_PER_LAYER, not 2.  Upstream has two gates
+ * per layer; this branch has three (ATTN / ROUTER / FFN), so the imported
+ * `gate < 2u` guard silently dropped every FFN gate from the profile.  That is
+ * the slot that matters most -- it is the only one sitting behind the
+ * routed-expert shard, so it is where a straggler shows up, and a profile that
+ * omits it reads as "the two gates agree" when the interesting one was never
+ * counted. */
+static double g_rdma_stat_post_us[DS4_TP_GATES_PER_LAYER];
+static double g_rdma_stat_wait_us[DS4_TP_GATES_PER_LAYER];
+static uint64_t g_rdma_stat_count[DS4_TP_GATES_PER_LAYER];
 static int g_rdma_stat_enabled = -1;
+static const char *tp_gate_slot_name(uint32_t gate) {
+    switch (gate) {
+    case DS4_TP_GATE_ATTN:   return "attn";
+    case DS4_TP_GATE_ROUTER: return "router";
+    case DS4_TP_GATE_FFN:    return "ffn";
+    default:                 return "?";
+    }
+}
 
 static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_tp_rdma *r = &tp->rdma;
@@ -1650,13 +1666,15 @@ static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint
             ok = 0;
         }
     }
-    if (g_rdma_stat_enabled && ok && gate < 2u) {
+    if (g_rdma_stat_enabled && ok && gate < DS4_TP_GATES_PER_LAYER) {
         const double st2 = tp_now_sec();
         g_rdma_stat_post_us[gate] += (st1 - st0) * 1e6;
         g_rdma_stat_wait_us[gate] += (st2 - st1) * 1e6;
         if (++g_rdma_stat_count[gate] % 430 == 0) {
-            fprintf(stderr, "ds4-tp: rdma gate %u: post %.1f us, peer wait %.1f us (n=%llu)\n",
-                    gate, g_rdma_stat_post_us[gate] / (double)g_rdma_stat_count[gate],
+            fprintf(stderr,
+                    "ds4-tp: rdma gate %u (%s): post %.1f us, peer wait %.1f us (n=%llu)\n",
+                    gate, tp_gate_slot_name(gate),
+                    g_rdma_stat_post_us[gate] / (double)g_rdma_stat_count[gate],
                     g_rdma_stat_wait_us[gate] / (double)g_rdma_stat_count[gate],
                     (unsigned long long)g_rdma_stat_count[gate]);
         }

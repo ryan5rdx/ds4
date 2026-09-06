@@ -460,6 +460,22 @@ int ds4_gpu_warm_command_queue(void);
  * arm; this makes that a two-second check on the dev box.  See
  * probes/probe_pipelines.c in the rig scratch repo. */
 int ds4_gpu_pipeline_exists(const char *name);
+/* Diagnostic: run kernel_dsv4_tp_flag_set_checked against caller-supplied
+ * tensors so the poll-gate producer/consumer contract can be checked without a
+ * two-node rig.  That contract -- the flag word and the checksum key must be the
+ * SAME value the gate service thread computes -- is otherwise only exercisable
+ * with DS4_TP_ENABLE_POLL_GATES on and a peer attached, and getting it wrong
+ * costs a 20-million-try spin and a failed transport rather than an error.
+ * See probes/probe_pollgate.c.  Not used by inference. */
+int ds4_gpu_tp_flag_set_checked_probe(
+        ds4_gpu_tensor       *flags,
+        uint32_t              flag_index,
+        ds4_gpu_tensor       *check,
+        uint32_t              check_index,
+        const ds4_gpu_tensor *payload,
+        uint64_t              payload_offset,
+        uint32_t              words,
+        uint32_t              value);
 /* R1: f_a, beta and g_a as one Q8_0 matvec over three weight bases and three
  * destinations.  All three read the same activation and none depends on
  * another; the grid is the SUM of their row blocks, so per-threadgroup work is

@@ -11028,6 +11028,20 @@ static inline uint32_t ds4_gpu_tp_fence_value(uint64_t seq) {
     return (uint32_t)(seq % UINT32_MAX) + 1u;
 }
 
+/* The value written into an arrival flag word -- and, on the poll-gate path,
+ * the key the payload checksum is XORed with.
+ *
+ * ONE definition, because three producers write it (the gate encoder, the
+ * add2 fold, the matvec fold) and two consumers read it (the arrival spin and
+ * the checksum verify).  Upstream used a raw (uint32_t)seq throughout; this
+ * branch reserves zero via fence_value(), so importing upstream's poll path
+ * verbatim left both folds publishing seq where the spin wanted seq+1, and the
+ * checksum keyed on a different number again.  Neither shows up until poll
+ * gates are enabled, which is exactly why it has to be a function. */
+static inline uint32_t ds4_gpu_tp_flag_value(uint64_t seq) {
+    return ds4_gpu_tp_fence_value(seq);
+}
+
 /* Return the contiguous routed-expert range backed by this process. Rank 1
  * owns the high range and receives any odd-count remainder. */
 static void ds4_gpu_tp_expert_range(uint32_t n_total_expert,
@@ -11486,7 +11500,11 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
             const uint32_t words = (uint32_t)(g_tp_vec_bytes / 4u);
             const volatile uint32_t *payload =
                 (const volatile uint32_t *)(g_tp_slab_cpu + g_tp_out_off + (uint64_t)slot * g_tp_vec_bytes);
-            const uint32_t mix = (uint32_t)req.seq * 0x9E3779B9u;
+            /* Same key the producer used: kernel_dsv4_tp_flag_set_checked
+             * stores check = sum ^ (value * 0x9E3779B9) with `value` the flag
+             * word, and this branch's flag word is fence_value(seq), not the
+             * raw seq upstream wrote. */
+            const uint32_t mix = ds4_gpu_tp_flag_value(req.seq) * 0x9E3779B9u;
             uint64_t tries = 0;
             for (;;) {
                 const uint32_t want = __atomic_load_n(&g_tp_check_words[slot], __ATOMIC_ACQUIRE) ^ mix;
@@ -11802,7 +11820,20 @@ int ds4_gpu_tp_init(uint32_t rank,
     g_tp_poll_prev_valid = 0;
     g_tp_gate_prefetch = getenv("DS4_TP_DISABLE_GATE_PREFETCH") == NULL;
     memset(g_tp_prefetch_count, 0, sizeof(g_tp_prefetch_count));
-    if (g_tp_flag_gates && getenv("DS4_TP_ENABLE_POLL_GATES") != NULL) {
+    /* Poll gates and the release fence are ALTERNATIVE ways to resume the
+     * command processor, not layers of one stack: the fence has the GPU spin on
+     * a word this process writes, the poll gate ends the command buffer and has
+     * the next one open with a probe.  Running both would publish a coherent
+     * flag with no checksum into a service thread that is waiting for one, and
+     * take the poll release for a gate the fence is also waiting on.  Refuse
+     * loudly -- the whole point of the A/B is to compare them. */
+    if (g_tp_flag_gates && getenv("DS4_TP_ENABLE_POLL_GATES") != NULL &&
+        getenv("DS4_METAL_FAST_SYNC") != NULL) {
+        fprintf(stderr,
+                "ds4: DS4_TP_ENABLE_POLL_GATES and DS4_METAL_FAST_SYNC are "
+                "alternative release mechanisms; unset FAST_SYNC to run the "
+                "poll-gate arm.  Poll gates stay OFF.\n");
+    } else if (g_tp_flag_gates && getenv("DS4_TP_ENABLE_POLL_GATES") != NULL) {
         const NSUInteger region_bytes =
             (NSUInteger)DS4_TP_POLL_LINES * DS4_TP_POLL_LINE_BYTES * DS4_TP_POLL_RING;
         const NSUInteger status_bytes =
@@ -12208,7 +12239,7 @@ static int ds4_gpu_tp_flag_fold_take(const ds4_gpu_tensor *out, uint64_t out_byt
     }
     g_tp_fold_req_active = 0;
     *slot_out = slot;
-    *value_out = (uint32_t)(g_tp_seq + 1u);
+    *value_out = ds4_gpu_tp_flag_value(g_tp_seq + 1u);
     return 1;
 }
 
@@ -12238,7 +12269,7 @@ int ds4_gpu_add_tensor_tp_flag(
     id<MTLBuffer> abuf = ds4_gpu_tensor_buffer(a);
     id<MTLBuffer> bbuf = ds4_gpu_tensor_buffer(b);
     if (!abuf || !bbuf) return ds4_gpu_add_tensor(out, a, b, n);
-    const uint32_t value = (uint32_t)(g_tp_seq + 1u);
+    const uint32_t value = ds4_gpu_tp_flag_value(g_tp_seq + 1u);
     const uint32_t ntg = n / 256u;
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
     [enc setComputePipelineState:pipeline];
@@ -12271,6 +12302,10 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         return 0;
     }
     if (!ds4_gpu_tp_queue_preflight()) return 0;
+    /* Any fold request the layer code registered but no producer took is stale
+     * the moment this gate starts encoding: leaving it armed would let the NEXT
+     * producer, for a different slot, believe it owns this gate's flag. */
+    g_tp_fold_req_active = 0;
     const uint64_t seq = ++g_tp_seq;
     const uint32_t gate_slot = layer * DS4_TP_GATES_PER_LAYER + gate;
     const bool fast_release =
@@ -12285,7 +12320,16 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
      * unchanged. */
     const bool event_arrival = !g_tp_flag_gates ||
                                (g_tp_session_batch_mode && !g_tp_fast_sync);
-    const uint32_t value = ds4_gpu_tp_fence_value(seq);
+    const uint32_t value = ds4_gpu_tp_flag_value(seq);
+    /* The service thread verifies a payload checksum for every gate it marks
+     * `poll`, so the arrival flag on that path MUST come from the checked
+     * kernel (or from a fold that publishes the same checksum).  Publishing a
+     * bare flag under poll gates is not a slow path -- it is a 20-million-try
+     * spin and then a failed transport. */
+    const bool checked =
+        !event_arrival && g_tp_poll_gates && !g_ssd_streaming_mode &&
+        g_tp_check_words != NULL && g_tp_check_buffer != nil &&
+        gate_slot < DS4_TP_POLL_MAX_SLOTS && g_tp_vec_bytes != 0;
     if (!event_arrival) {
         /* Publish arrival through the slab word; the buffer hazard against
          * the partial-output kernels orders the store after the payload. */
@@ -12293,23 +12337,66 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb || owned) return 0;
-        /* The relaxed store is only safe because the event block that follows
-         * flushes it; under the fence nothing does, so use the scoped variant. */
+        /* A producer may already have published this gate's flag AND its
+         * checksum (see ds4_gpu_add_tensor_tp_flag and the matvec fold); the
+         * flag kernel would then be redundant work on the critical path.
+         * Consume the marker unconditionally so a stale one cannot satisfy a
+         * later gate. */
+        const uint64_t prepublished_seq = g_tp_flag_prepublished_seq;
+        g_tp_flag_prepublished_seq = 0;
+        const bool prepublished = checked && prepublished_seq == seq;
+        if (prepublished) {
+            ds4_gpu_close_batch_encoder();
+        } else {
+        /* Three-way, and the three are not interchangeable:
+         *   checked  -- poll gates; publishes the payload checksum the service
+         *               thread verifies before it reads the partial
+         *   coherent -- the release fence; the relaxed store is only safe when
+         *               an event block flushes it, and under the fence nothing
+         *               does, so the store has to be system-scoped
+         *   plain    -- neither
+         * checked and coherent cannot both apply: poll gates and FAST_SYNC are
+         * alternative release mechanisms and ds4_gpu_tp_init refuses the
+         * combination.  Assert rather than silently pick one. */
+        if (checked && fast_release) {
+            fprintf(stderr,
+                    "ds4: TP poll gates and the release fence are alternative "
+                    "mechanisms and cannot both be active (layer %u gate %u)\n",
+                    layer, gate);
+            return 0;
+        }
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_pipeline(fast_release ?
-                                 "kernel_dsv4_tp_flag_set_coherent" :
-                                 "kernel_dsv4_tp_flag_set");
+            ds4_gpu_get_pipeline(checked ?
+                                 "kernel_dsv4_tp_flag_set_checked" :
+                                 (fast_release ?
+                                  "kernel_dsv4_tp_flag_set_coherent" :
+                                  "kernel_dsv4_tp_flag_set"));
         if (!pipeline) return 0;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         DS4_SET_PIPE(enc, pipeline);
         [enc setBuffer:g_tp_slab_buffer
                 offset:(NSUInteger)(g_tp_slab_buffer_off + g_tp_gpu_flags_off + (uint64_t)slot * 4u)
                atIndex:0];
-        [enc setBytes:&value length:sizeof(value) atIndex:1];
-        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        if (checked) {
+            const uint32_t words = (uint32_t)(g_tp_vec_bytes / 4u);
+            [enc setBuffer:g_tp_check_buffer offset:(NSUInteger)slot * 4u atIndex:1];
+            [enc setBytes:&value length:sizeof(value) atIndex:2];
+            [enc setBuffer:g_tp_slab_buffer
+                    offset:(NSUInteger)(g_tp_slab_buffer_off + g_tp_out_off +
+                                        (uint64_t)slot * g_tp_vec_bytes)
+                   atIndex:3];
+            [enc setBytes:&words length:sizeof(words) atIndex:4];
+            [enc setThreadgroupMemoryLength:8 * sizeof(uint32_t) atIndex:0];
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            [enc setBytes:&value length:sizeof(value) atIndex:1];
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        }
         ds4_gpu_end_compute_encoder(cb, enc);
         ds4_gpu_close_batch_encoder();
+        }
     } else {
         ds4_gpu_close_batch_encoder();
         [g_batch_cb encodeSignalEvent:g_tp_gpu_event value:seq];
@@ -12336,6 +12423,9 @@ int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
         id<MTLComputePipelineState> poll_pipeline =
             ds4_gpu_get_pipeline("kernel_dsv4_tp_poll_release");
         if (!poll_pipeline) return 0;
+        /* The poll ring is its own channel: the service thread writes the raw
+         * (uint32_t)req.seq into it, so this must be the raw seq and NOT
+         * flag_value().  Shadowing `value` here is deliberate. */
         const uint32_t value = (uint32_t)seq;
         const uint32_t nlines = DS4_TP_POLL_LINES;
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
@@ -12563,6 +12653,43 @@ int ds4_gpu_pipeline_exists(const char *name) {
      * so the specialised path is the safe one to try first. */
     if (ds4_gpu_get_mul_mv_pipeline(name, 2) != nil) return 1;
     return ds4_gpu_get_pipeline(name) != nil ? 1 : 0;
+}
+
+int ds4_gpu_tp_flag_set_checked_probe(
+        ds4_gpu_tensor       *flags,
+        uint32_t              flag_index,
+        ds4_gpu_tensor       *check,
+        uint32_t              check_index,
+        const ds4_gpu_tensor *payload,
+        uint64_t              payload_offset,
+        uint32_t              words,
+        uint32_t              value) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!flags || !check || !payload || words == 0) return 0;
+    id<MTLComputePipelineState> pipeline =
+        ds4_gpu_get_pipeline("kernel_dsv4_tp_flag_set_checked");
+    id<MTLBuffer> fb = ds4_gpu_tensor_buffer(flags);
+    id<MTLBuffer> cb_ = ds4_gpu_tensor_buffer(check);
+    id<MTLBuffer> pb = ds4_gpu_tensor_buffer(payload);
+    if (!pipeline || !fb || !cb_ || !pb) return 0;
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    DS4_SET_PIPE(enc, pipeline);
+    [enc setBuffer:fb offset:(NSUInteger)(ds4_gpu_tensor_offset(flags) +
+                                          (uint64_t)flag_index * 4u) atIndex:0];
+    [enc setBuffer:cb_ offset:(NSUInteger)(ds4_gpu_tensor_offset(check) +
+                                           (uint64_t)check_index * 4u) atIndex:1];
+    [enc setBytes:&value length:sizeof(value) atIndex:2];
+    [enc setBuffer:pb offset:(NSUInteger)(ds4_gpu_tensor_offset(payload) +
+                                          payload_offset) atIndex:3];
+    [enc setBytes:&words length:sizeof(words) atIndex:4];
+    [enc setThreadgroupMemoryLength:8 * sizeof(uint32_t) atIndex:0];
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, "TP checked flag probe");
 }
 
 int ds4_gpu_warm_command_queue(void) {
