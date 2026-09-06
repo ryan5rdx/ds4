@@ -21402,14 +21402,11 @@ int ds4_gpu_indexer_topk_tensor(
          * the next level treat 511 never-written slots as live indices and
          * gather scores through them.  len0/len1 in the kernel derive validity
          * from ne0 (metal/argsort.metal), so ne0 has to be the true count. */
-        /* Opt-in here; v4 flips the default. Parse "0" as OFF on BOTH branches:
-         * with `!= NULL` a control arm setting =0 would have silently ENABLED
-         * truncation on v3 while disabling it on v4, so the same harness would
-         * mean opposite things depending on the build. */
+        /* Default ON. Set DS4_METAL_GLM_TOPK_TRUNC=0 to disable. */
         static int trunc_env = -1;
         if (trunc_env < 0) {
             const char *v = getenv("DS4_METAL_GLM_TOPK_TRUNC");
-            trunc_env = v && v[0] && v[0] != '0';
+            trunc_env = !(v && v[0] == '0');
         }
         const bool truncate = trunc_env != 0;
 
