@@ -1949,6 +1949,22 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                     fprintf(stderr, "ds4-tp: big gate post_send(%u): %s\n", n, strerror(errno));
                     return 0;
                 }
+                {
+                    /* Confirm the batched send loop upstream added actually
+                     * engaged.  It replaced "post every chunk up front" with
+                     * "post in sub-batches bounded by the send depth, signal
+                     * the last of each", and the difference is invisible from
+                     * throughput alone -- the old shape would simply have been
+                     * slower, not wrong.  One line, once. */
+                    static int announced_batch;
+                    if (!announced_batch) {
+                        announced_batch = 1;
+                        fprintf(stderr,
+                                "ds4-tp: bulk gate send BATCHED (%u chunks this "
+                                "round, up to %u per post, send depth %u)\n",
+                                chunks, n, send_depth);
+                    }
+                }
                 sent += n;
                 signaled++;
             }
@@ -2061,6 +2077,15 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
                    theirs.version, DS4_TP_PROTOCOL_VERSION);
         return 0;
     }
+    /* Say it out loud on SUCCESS, not only on mismatch.  A version bump is a
+     * silent property otherwise -- the only evidence both ranks agreed is that
+     * nothing failed -- and version 12 exists precisely because 10 and 11 name
+     * two incompatible wire protocols that would both have completed bring-up
+     * against each other's frame numbering.  A post-merge smoke test has to be
+     * able to READ the version, not infer it. */
+    fprintf(stderr, "ds4-tp: hello ok, protocol version %u, %u gate slots/layer\n",
+            (unsigned)DS4_TP_PROTOCOL_VERSION,
+            (unsigned)DS4_TP_GATES_PER_LAYER);
     if (theirs.role == mine.role) {
         tp_set_err(err, errlen, "tp hello: both sides claim role %u", mine.role);
         return 0;
