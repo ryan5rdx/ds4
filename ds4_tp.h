@@ -166,6 +166,10 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
  * the GPU gate service thread. */
 int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                                uint64_t seq);
+/* Verify-block RDMA window (speculative decoding): call on both ranks right
+ * before/after a verify block with one batch gate per layer. */
+int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers);
+int ds4_tp_batch_block_end(ds4_tp *tp);
 
 /* Prefill batch gate: arbitrary-size symmetric payload exchange over bulk
  * RDMA, with interleaved 2MB TCP rounds as fallback (see ds4_tp.c). */
@@ -189,6 +193,10 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
                                 uint32_t image_count);
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token, uint32_t flags);
+/* Upstream's speculative-cycle command, kept alongside our flags-carrying
+ * verify: they are different commands, not two versions of one. */
+int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
+                        uint64_t seq, int token, int limit);
 /* How a mirrored rewind must leave the checkpoint.  The leader decides and
  * sends it rather than each rank deciding locally: on GLM-5.3 the decision
  * depends on whether a rollback snapshot covers `pos`, and a rank that stopped
@@ -268,13 +276,24 @@ typedef enum {
     DS4_TP_FRAME_MIXED_BATCH = 16,
     DS4_TP_FRAME_COMMAND_ACK = 17,
     DS4_TP_FRAME_SYNC_MULTIMODAL = 18,
+    /* NOTE ON NUMBERING.  Upstream took 19/20/21 for RDMA_WARM / RDMA_POSTED /
+     * GLM_MTP while this branch had taken 19/20 for CANCEL / ROLLBACK_CAPTURE.
+     * Same wire numbers, different meanings -- a mixed pair would have executed
+     * a rollback capture on receipt of an RDMA warm-up.  Upstream's numbering is
+     * canonical because it will be the one everyone else ships; ours moves to
+     * 22/23.  The protocol version is bumped past BOTH sides (see ds4_tp.c) so
+     * neither an upstream-10 nor an ours-11 peer can complete bring-up and
+     * silently disagree about what frame 19 means. */
+    DS4_TP_FRAME_RDMA_WARM = 19,
+    DS4_TP_FRAME_RDMA_POSTED = 20,
+    DS4_TP_FRAME_GLM_MTP = 21,
     /* Leader -> worker, valid only while the worker is executing a mirrored
      * SYNC.  The prefill cancel predicate is host-side and leader-only, so
      * without this the worker keeps prefilling chunks whose gates the leader
      * has already stopped sending and eats a bounded fence timeout per chunk.
      * On receipt the worker stops at its next chunk boundary, leaving its
      * checkpoint at the pre-sync length the leader also holds. */
-    DS4_TP_FRAME_CANCEL = 19,
+    DS4_TP_FRAME_CANCEL = 22,
     /* Leader -> worker, acknowledged.  Take a GLM-5.3 rollback snapshot at
      * `value`, which must be the worker's current frontier.
      *
@@ -284,7 +303,7 @@ typedef enum {
      * about to ask it to restore, because the leader rewinds to its pre-sync
      * length.  Capturing only on this command keeps the two snapshots at the
      * same frontier at all times. */
-    DS4_TP_FRAME_ROLLBACK_CAPTURE = 20,
+    DS4_TP_FRAME_ROLLBACK_CAPTURE = 23,
 } ds4_tp_frame_type;
 
 typedef struct {
@@ -292,7 +311,8 @@ typedef struct {
     uint64_t session_id;
     uint64_t seq;
     int value;
-    uint32_t flags;
+    uint32_t flags;   /* ours: verify/rewind flags */
+    int limit;        /* upstream: GLM MTP shared token limit */
     int *tokens;
     uint32_t n_tokens;
     ds4_tp_batch_item *items;
@@ -322,7 +342,21 @@ int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count);
  * on the commit frame.  commit_n keeps exactly that many verifier rows
  * (draft_n is the full-accept fast path, a shorter nonzero prefix restores a
  * captured compressor frontier).  commit_n == 0 rolls the verifier back and
- * optionally replays replay_n tokens through gated single-token decode. */
+ * optionally replays replay_n tokens through gated single-token decode.
+ *
+ * MERGE NOTE.  The merge base carried (full_accept, replay_n) with full_accept
+ * a boolean.  Both sides then independently taught it prefix commits: upstream
+ * as an enum (ROLLBACK_REPLAY / COMMIT_FULL / COMMIT_PREFIX) plus a token_count
+ * whose meaning depends on the mode, this branch by widening full_accept into a
+ * row count.  They are isomorphic --- (FULL,0) is commit_n == draft_n,
+ * (PREFIX,k) is commit_n == k, (ROLLBACK_REPLAY,n) is commit_n == 0,
+ * replay_n == n --- so this is an encoding choice, not a feature difference.
+ * The count wins because it is one field instead of two-with-a-discriminant,
+ * and because it sends the accepted length explicitly rather than making the
+ * receiver re-derive draft_n to interpret COMMIT_FULL.  Upstream's call sites
+ * are translated at the point of use; the enum itself is not carried, so a
+ * stale DS4_TP_VERIFY_* reference is a compile error rather than a silent
+ * reinterpretation of the second argument. */
 int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
                        const int *drafts, uint32_t n, uint32_t flags);
 int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t commit_n, int32_t replay_n);

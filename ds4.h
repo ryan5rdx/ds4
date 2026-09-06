@@ -190,6 +190,9 @@ typedef struct {
 typedef struct {
     float *data;
     uint32_t token_count;
+    uint32_t layout;
+    uint32_t grid_width;
+    uint32_t grid_height;
     uint32_t width;
     uint32_t height;
     uint32_t content_width;
@@ -475,6 +478,14 @@ int ds4_session_sync_multimodal(ds4_session *s,
                                 size_t image_count,
                                 char *err,
                                 size_t errlen);
+/* Return true only when every image that conditioned the live checkpoint has
+ * the same token span and embedding fingerprint in the supplied prompt. */
+bool ds4_session_vision_state_matches(const ds4_session *s,
+                                      const ds4_vision_span *images,
+                                      size_t image_count);
+/* True while a session contains, or is actively syncing, image-conditioned
+ * state. Such state must not be written to the text-keyed disk KV cache. */
+bool ds4_session_has_vision_state(const ds4_session *s);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
@@ -584,7 +595,12 @@ enum {
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
                               uint32_t flags, int *replay_n_out,
                               char *err, size_t errlen);
+int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
+                                 char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
+/* Keep the token prefix, restoring recurrent state where possible. Otherwise
+ * the checkpoint becomes invalid: sync the retained prefix before eval.
+ * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 /* checkpoint.len, but 0 when the checkpoint has been invalidated.  Use this,
