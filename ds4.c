@@ -54605,7 +54605,34 @@ static bool glm_graph_forward_token(
         }
     }
 
-    const bool decode_output_profile = false;
+    /* SKEW1: where the rank asymmetry has to be.
+     *
+     * Rank 0 blocks 0.24-0.27 ms/token waiting for rank 1's logits header, and
+     * the per-layer stage diff cannot explain it: every layer's attn_output
+     * window contains a TP gate (ds4_gpu_tp_gate_encode at ds4.c:55437) and each
+     * layer has an FFN gate after it, so the gates re-synchronise the ranks and
+     * a few-microsecond per-layer difference cannot accumulate.  The filtered
+     * whole-window diff is ~0, which says the same thing.
+     *
+     * So the skew is introduced AFTER the last gate, in the post-layer tail: the
+     * output head, its read, and the final sync.  This profiler already covers
+     * exactly that span and was hardcoded off.  Env-gating it is the direct
+     * test, and it costs one getenv per eval rather than the 810 batch commits
+     * per token an unfiltered stage sweep would spend to still miss the tail.
+     *
+     * NOT behaviour-neutral, and that is presumably why it shipped hardcoded
+     * off: `merge_indexed_output` below is gated on !decode_output_profile, so
+     * enabling this splits the output head out of the merged indexed path in
+     * order to time it separately.  The absolute ms are therefore NOT production
+     * numbers.  It is still the right instrument for SKEW1, because SKEW1 is a
+     * DIFFERENCE between two ranks running the identical alternate path -- but
+     * do not quote its totals as a decode cost, and do not leave it on. */
+    static int decode_output_profile_env = -1;
+    if (decode_output_profile_env < 0) {
+        decode_output_profile_env =
+            getenv("DS4_GLM_DECODE_OUTPUT_PROFILE") != NULL ? 1 : 0;
+    }
+    const bool decode_output_profile = decode_output_profile_env != 0;
     const bool merge_indexed_output =
         logits_out != NULL && use_indexed_attention && !decode_output_profile;
     double decode_output_stage_t0 = decode_output_profile ? now_sec() : 0.0;
