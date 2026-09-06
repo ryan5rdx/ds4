@@ -184,6 +184,130 @@ kernel void kernel_glm53_mul_mv_bf16_f32_splitk(
     }
 }
 
+/* HCMIX-WIDE -- split the contraction across THREADGROUPS, not just simdgroups.
+ *
+ * WHAT THE PREVIOUS ATTEMPT GOT WRONG.  A queued sweep proposed turning nsg up
+ * on the kernel above, on the belief that its grid is ceil(out_dim/nsg).  It is
+ * not: the split-K branch dispatches (out_dim + 1)/2 threadgroups INDEPENDENT of
+ * nsg -- ceil(out_dim/nsg) is the NON-split branch's formula.  Every nsg
+ * launches the same 12 threadgroups at the hc_mix shape, so nsg changes only
+ * threads-per-group and the within-threadgroup K partition, and a null would
+ * have said nothing about the question.  That sweep was withdrawn.
+ *
+ * THE ACTUAL DEFECT.  hc_mix is 16384 -> 24.  The row kernel gives one
+ * simdgroup a whole row: 3 threadgroups.  B1 splits K across simdgroups: 12.
+ * On a 60-core part 12 threadgroups is still a fifth of the machine, and the
+ * contraction is 16384 long -- there is far more K to split than there are
+ * rows to spread.  B1's own 3 -> 12 win is the positive evidence for going
+ * further in the same direction.
+ *
+ * THE FIX.  A third grid axis: threadgroup (r, token, ks) sums only the K
+ * slice belonging to ks and writes a partial; a second, trivial kernel sums the
+ * KSPLIT partials.  At hc_mix with KSPLIT 8 that is 96 threadgroups against 12.
+ *
+ * The K partition is INTERLEAVED, not blocked: lane l of simdgroup sg in slice
+ * ks starts at ks*32*nsg + 32*sg + l and strides by 32*nsg*KSPLIT.  Blocking
+ * would have been simpler to describe but would give the last slice a ragged
+ * tail and break the coalescing the eight independent loads depend on.  The
+ * union over (ks, sg, lane) covers [0, in_dim) exactly once.
+ *
+ * Keep the EIGHT independent loads per iteration.  The first cut of B1 used one
+ * and measured 0.77x -- slower than the kernel it replaced -- because at this
+ * shape memory-level parallelism is worth more than threadgroup count.  Adding
+ * a grid axis does not change that; it multiplies it.
+ *
+ * NOT bit-identical -- to the row kernel or to B1.  The contraction is summed
+ * in a different order again, so this arm needs a quality gate exactly as B1
+ * did.  The reduce kernel sums slices in index order so the result is at least
+ * deterministic run to run.
+ */
+kernel void kernel_glm53_matmul_bf16_mv_2d_partial(
+        constant glm53_bf16_matmul_args &args,
+        device const ushort             *weights,
+        device const float              *x,
+        device float                    *partials,
+        constant uint                   &ksplit,
+        threadgroup float               *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg   [[simdgroup_index_in_threadgroup]],
+        ushort nsg  [[simdgroups_per_threadgroup]]) {
+    constexpr uint NR0 = 2u;
+    const uint row0  = tgpig.x * NR0;
+    const uint token = tgpig.y;
+    const uint ks    = tgpig.z;
+    if (row0 >= args.out_dim || token >= args.n_rows || ks >= ksplit) return;
+    device const float *xr = x + (ulong)token * args.in_dim;
+
+    for (uint r = 0; r < NR0; r++) {
+        const uint out_row = row0 + r;
+        float sum = 0.0f;
+        if (out_row < args.out_dim) {
+            device const ushort *w = weights + (ulong)out_row * args.in_dim;
+            const uint stride = 32u * (uint)nsg * ksplit;
+            uint k = ks * 32u * (uint)nsg + lane + 32u * (uint)sg;
+            for (; k + 7u * stride < args.in_dim; k += 8u * stride) {
+                const ushort w0 = w[k];
+                const ushort w1 = w[k + stride];
+                const ushort w2 = w[k + 2u * stride];
+                const ushort w3 = w[k + 3u * stride];
+                const ushort w4 = w[k + 4u * stride];
+                const ushort w5 = w[k + 5u * stride];
+                const ushort w6 = w[k + 6u * stride];
+                const ushort w7 = w[k + 7u * stride];
+                const float x0 = xr[k];
+                const float x1 = xr[k + stride];
+                const float x2 = xr[k + 2u * stride];
+                const float x3 = xr[k + 3u * stride];
+                const float x4 = xr[k + 4u * stride];
+                const float x5 = xr[k + 5u * stride];
+                const float x6 = xr[k + 6u * stride];
+                const float x7 = xr[k + 7u * stride];
+                sum = fma(glm53_bf16_to_f32(w0), x0, sum);
+                sum = fma(glm53_bf16_to_f32(w1), x1, sum);
+                sum = fma(glm53_bf16_to_f32(w2), x2, sum);
+                sum = fma(glm53_bf16_to_f32(w3), x3, sum);
+                sum = fma(glm53_bf16_to_f32(w4), x4, sum);
+                sum = fma(glm53_bf16_to_f32(w5), x5, sum);
+                sum = fma(glm53_bf16_to_f32(w6), x6, sum);
+                sum = fma(glm53_bf16_to_f32(w7), x7, sum);
+            }
+            for (; k < args.in_dim; k += stride) {
+                sum = fma(glm53_bf16_to_f32(w[k]), xr[k], sum);
+            }
+        }
+        sum = simd_sum(sum);
+        if (lane == 0u) shmem[sg] = sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0u) {
+            float tot = lane < nsg ? shmem[lane] : 0.0f;
+            tot = simd_sum(tot);
+            if (lane == 0u && out_row < args.out_dim) {
+                /* KSPLIT partials for one output land contiguously, so the
+                 * reduce below reads a single cache line per output. */
+                partials[(((ulong)token * args.out_dim) + out_row) * ksplit + ks] = tot;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void kernel_glm53_matmul_bf16_mv_2d_reduce(
+        constant glm53_bf16_matmul_args &args,
+        device const float              *partials,
+        device float                    *out,
+        constant uint                   &ksplit,
+        uint gid [[thread_position_in_grid]]) {
+    const uint total = args.out_dim * args.n_rows;
+    if (gid >= total) return;
+    device const float *p = partials + (ulong)gid * ksplit;
+    /* Index order, so the result is deterministic across runs even though it
+     * differs from both the row kernel and B1. */
+    float sum = 0.0f;
+    for (uint i = 0; i < ksplit; i++) sum += p[i];
+    out[gid] = sum;
+}
+
 kernel void kernel_glm53_mul_mv_bf16_f32_qkv(
         constant glm53_bf16_matmul_args &args,
         device const ushort             *weights_q,
