@@ -6005,7 +6005,24 @@ typedef struct {
     int32_t  tp_world;
     int32_t  tp_addend;
     int32_t  tp_expert_base;
+    /* MOE-TP-SHED: value written into an unowned expert's output rows.  0.0f in
+     * production; DS4_METAL_MOE_TP_FILL sets a sentinel to test whether
+     * anything downstream reads them.  Mirrors metal/moe.metal. */
+    float    tp_unowned_fill;
 } ds4_gpu_mul_mv_id_args;
+
+/* Memoized: this is read once per dispatch on the prefill MoE hot path. */
+static float ds4_gpu_moe_tp_unowned_fill(void) {
+    static int initialized;
+    static float fill;
+    if (!initialized) {
+        initialized = 1;
+        fill = 0.0f;
+        const char *v = getenv("DS4_METAL_MOE_TP_FILL");
+        if (v && v[0]) fill = (float)atof(v);
+    }
+    return fill;
+}
 
 typedef struct {
     uint32_t n_total_expert;
@@ -26412,6 +26429,7 @@ int ds4_gpu_attention_output_q8_batch_tensor(
                                                 0) != 0;
             } else if (use_direct_low) {
                 ds4_gpu_mul_mv_id_args args = {
+                    .tp_unowned_fill = ds4_gpu_moe_tp_unowned_fill(),
                     .nei0 = (int32_t)n_groups,
                     .nei1 = (int32_t)n_tokens,
                     .nbi1 = 0,
@@ -26449,6 +26467,7 @@ int ds4_gpu_attention_output_q8_batch_tensor(
                                                              true) != 0;
             } else {
                 ds4_gpu_mul_mv_id_args args = {
+                    .tp_unowned_fill = ds4_gpu_moe_tp_unowned_fill(),
                     .nei0 = (int32_t)n_groups,
                     .nei1 = (int32_t)n_tokens,
                     .nbi1 = (uint64_t)n_groups * sizeof(int32_t),
@@ -27328,6 +27347,7 @@ int ds4_gpu_attention_output_q8_tp_tensor(
          * group count shifted to the slice.  The owned low half lands
          * compactly at low[0 .. group_cnt*rank). */
         ds4_gpu_mul_mv_id_args args = {
+                    .tp_unowned_fill = ds4_gpu_moe_tp_unowned_fill(),
             .nei0 = (int32_t)group_cnt,
             .nei1 = 1,
             .nbi1 = 0,
@@ -27449,6 +27469,7 @@ int ds4_gpu_attention_output_low_q8_tensor(
 
         if (ok) {
             ds4_gpu_mul_mv_id_args args = {
+                    .tp_unowned_fill = ds4_gpu_moe_tp_unowned_fill(),
                 .nei0 = (int32_t)n_groups,
                 .nei1 = 1,
                 .nbi1 = 0,
@@ -27563,6 +27584,7 @@ int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
              * rank's first group, but preserve nb12 so every verifier row
              * lands on the same group slice. `low` is compact by rank. */
             ds4_gpu_mul_mv_id_args args = {
+                    .tp_unowned_fill = ds4_gpu_moe_tp_unowned_fill(),
                 .nei0 = (int32_t)group_cnt,
                 .nei1 = (int32_t)n_rows,
                 .nbi1 = 0,
@@ -27679,6 +27701,7 @@ int ds4_gpu_attention_output_low_q4_K_slice_tensor(
 
         if (ok) {
             ds4_gpu_mul_mv_id_args args = {
+                    .tp_unowned_fill = ds4_gpu_moe_tp_unowned_fill(),
                 .nei0 = (int32_t)group_cnt,
                 .nei1 = 1,
                 .nbi1 = 0,

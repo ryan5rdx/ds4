@@ -2630,6 +2630,10 @@ struct ds4_metal_args_mul_mv_id {
     /* First expert id present at the bound blob base (TP mappings bind only
      * the owned range; kernels rebase before pointer math). */
     int32_t  tp_expert_base;
+    /* MOE-TP-SHED consumer trace.  Normally 0.0f -- the value written into an
+     * unowned expert's output rows below.  Set to a sentinel to test whether
+     * anything downstream actually READS those rows; see the fill site. */
+    float    tp_unowned_fill;
 };
 
 struct ds4_metal_moe_expert_group_args {
@@ -3307,12 +3311,25 @@ kernel void kernel_mul_mv_id(
 
     if (!ds4_tp_owns_expert(i02, args.ne02, args.tp_rank, args.tp_world)) {
         /* Unowned expert under the TP split: zero this threadgroup's output
-         * rows so the downstream expert-sum stages stay unchanged. */
+         * rows so the downstream expert-sum stages stay unchanged.
+         *
+         * MOE-TP-SHED asks whether that comment is true.  If nothing reads
+         * these rows the whole fill is dead work and can be deleted outright;
+         * if something does, shedding it needs the sum stages taught about
+         * ownership, which is a far larger change.  Decode already skips
+         * outright (see the decode paths in this file), so the two phases
+         * disagree and only one of them can be right.
+         *
+         * DS4_METAL_MOE_TP_FILL=<float> writes a sentinel instead of zero.  One
+         * A/B decides it: byte-identical output means nothing reads these rows.
+         * Use a large FINITE value, not NaN -- a NaN could be swallowed by a
+         * later clamp and read as a false negative. */
         const short NSG = FC_mul_mv_nsg;
         const int row0 = (tgpig.x * NSG + sgitg) * args.nr0;
         device float *dst_f32 = (device float *)dst_cur;
+        const float fill = args.tp_unowned_fill;
         for (int r = 0; r < args.nr0 && row0 + r < args.ne0; r++) {
-            if (tiisg == 0) dst_f32[row0 + r] = 0.0f;
+            if (tiisg == 0) dst_f32[row0 + r] = fill;
         }
         return;
     }
