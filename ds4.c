@@ -13265,13 +13265,19 @@ static uint32_t ds4_effective_prefill_chunk(bool cuda_tensor_parallel,
  * prefill workspace (see ds4_prefill_cap_for_prompt).  Rounds down to a power of
  * two so the only reachable sizes are ones the graph paths already run and the
  * 2048-token KV boundary alignment still divides evenly. */
-static uint32_t ds4_prefill_watchdog_chunk(uint32_t prompt_len) {
-    const uint32_t base = DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u;
+static uint32_t glm53_prefill_chunk_tokens(void);
+
+static uint32_t ds4_prefill_watchdog_chunk_capped(uint32_t prompt_len, uint32_t base) {
     if (prompt_len == 0) return base;
     const uint64_t budget = DS4_PREFILL_CHUNK_WORK_BUDGET / prompt_len;
     uint32_t chunk = DS4_PREFILL_CHUNK_MIN;
     while (chunk < base && (uint64_t)chunk * 2u <= budget) chunk *= 2u;
     return chunk;
+}
+
+static uint32_t ds4_prefill_watchdog_chunk(uint32_t prompt_len) {
+    return ds4_prefill_watchdog_chunk_capped(
+        prompt_len, DS4_MODEL_VARIANT == DS4_VARIANT_PRO ? 8192u : 4096u);
 }
 
 #define DS4_GLM_METAL_INDEXED_PREFILL_SCORE_SCRATCH_MB 256u
@@ -13771,9 +13777,21 @@ static uint32_t glm53_prefill_score_scratch_mb(void) {
  * exact token array -- so both ranks derive the same schedule, which the
  * per-layer gates require.  Never derive it from anything rank-local. */
 static uint32_t glm53_prefill_chunk_for_prompt(uint32_t prompt_len) {
+    /* The ladder's own cap used to be a hard 4096 for every non-PRO variant,
+     * which made DS4_GLM53_PREFILL_CHUNK=8192 a no-op: it raised the ceiling,
+     * the ladder still returned at most 4096, and `ladder < ceiling` handed
+     * back the ladder.  The knob looked configurable and was not.
+     *
+     * The cap and the SAFETY are different things.  The safety is the work
+     * budget -- chunk x prompt_len <= DS4_PREFILL_CHUNK_WORK_BUDGET -- which is
+     * what keeps a chunk from tripping the Metal command-buffer timeout, and it
+     * still applies at every rung.  The base is only an upper bound on how far
+     * the ladder may climb, so letting it follow the configured ceiling unlocks
+     * the knob without weakening the guard: at 8192 the budget still refuses
+     * any prompt longer than 81920 tokens and drops back to 4096 there. */
     const uint32_t ceiling = glm53_prefill_chunk_tokens();
     if (prompt_len == 0) return ceiling;
-    const uint32_t ladder = ds4_prefill_watchdog_chunk(prompt_len);
+    const uint32_t ladder = ds4_prefill_watchdog_chunk_capped(prompt_len, ceiling);
     return (ladder != 0 && ladder < ceiling) ? ladder : ceiling;
 }
 
