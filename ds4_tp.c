@@ -168,18 +168,33 @@ typedef struct {
  * frames ending in one whose `eof` nibble is 3.  Queue depths are counted in
  * FRAMES, so every max_send_wr / max_recv_wr in this file is a frame budget and
  * must be divided by this before it means "messages". */
-/* Frame budget requested from create_qp.  1024 frames = 256 outstanding 16 KiB
- * messages, which is where the bulk gate's 4 MiB window comes from.  The ring
- * holds 4095 (4096 descriptors, one slot held free), so there is real headroom,
- * and taking it is the cheapest lever on the per-window rendezvous count:
- * barriers = bytes / (window x 16 KiB), so 4095 frames quarters them.
+/* Frame budget requested from create_qp, in 4 KB frames.
  *
- * Default unchanged at 1024 -- every measurement on this branch was taken
- * there, and this is a live transport parameter, not a tuning dial. */
+ * Default 4095 (P2'-WIDE, 2026-09-07): +1.3% prefill @65536 on the TP2 pair,
+ * 393.30 -> 398.01 t/s, 2 counterbalanced reps, bytes identical across arms and
+ * no transport errors.  4095 is the ring maximum -- 4096 descriptors with one
+ * slot held free -- and gives 1023 outstanding 16 KiB messages against the old
+ * 1024 frames / 256 messages, so windows per 64 MiB exchange fall 16 -> 5 and
+ * the per-window rendezvous count falls with them (22272 -> 6960 for the run).
+ * Barrier time drops 29% (129.8 -> 92.1 ms/chunk) and the WR-build and post
+ * columns drop with it, which is why throughput moves more than the barrier
+ * line alone predicts.
+ *
+ * FIVE WINDOWS IS THE FLOOR, not a tuning choice.  A window carries at most
+ * 4095 x 4096 = 15.996 MiB, and a 64 MiB exchange divided by that is 4.001 --
+ * so it always rounds to 5, and the one reserved descriptor is exactly what
+ * puts it over 4.  Larger messages do not help: the window cap is a frame
+ * budget, so it is 15.996 MiB whatever the message size.
+ *
+ * An earlier run of this same arm reported +21.4%.  That was measured across a
+ * desynced pair (see the send flow control above) and was an artifact; the
+ * harness's fail-closed flag was right and the honest figure is +1.3%.
+ *
+ * DS4_TP_RDMA_RECV_FRAMES=1024 restores the old 4 MiB window. */
 static uint32_t tp_rdma_want_frames(void) {
     static uint32_t cached;
     if (!cached) {
-        cached = 1024u;
+        cached = 4095u;
         const char *e = getenv("DS4_TP_RDMA_RECV_FRAMES");
         if (e && e[0]) {
             const int v = atoi(e);
@@ -1096,7 +1111,7 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     qia.cap.max_recv_sge = 1;
     qia.cap.max_inline_data = 0;
     r->qp = r->api.create_qp(r->pd, &qia);
-    if (!r->qp && want_frames != 1024u) {
+    if (!r->qp && want_frames > 1024u) {
         /* A refused larger ask must NOT silently become the 256/64 floor --
          * that is a 4x SMALLER window than the default, so a wide arm that
          * failed to get its frames would read as "wider windows made it
@@ -1268,7 +1283,7 @@ static int tp_rdma_recreate_qp(ds4_tp *tp, char *err, size_t errlen) {
     qia.cap.max_recv_sge = 1;
     qia.cap.max_inline_data = 0;
     r->qp = r->api.create_qp(r->pd, &qia);
-    if (!r->qp && want_frames != 1024u) {
+    if (!r->qp && want_frames > 1024u) {
         /* A refused larger ask must NOT silently become the 256/64 floor --
          * that is a 4x SMALLER window than the default, so a wide arm that
          * failed to get its frames would read as "wider windows made it
