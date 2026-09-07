@@ -34314,6 +34314,9 @@ static bool metal_graph_eval_token_raw_swa(
                 logits != NULL);
     }
     if (metal_graph_gpu_stage_timestamps()) ds4_gpu_stage_report("decode", pos, 1);
+    /* Once, cheaply: the DSA-LORA specialisation is prefill-only and this is
+     * the evidence, not the announce. */
+    { static int c; if (!c++) ds4_gpu_dsa_lora_census("first decode token"); }
     if (ok) graph_power_note_decode_token(g, t_read - t0);
     if (!ok) {
         if (ds4_gpu_synchronize() == 0) {

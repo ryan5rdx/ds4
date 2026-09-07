@@ -1433,6 +1433,28 @@ static char g_trace_tag[64];
  * lets one run yield both anatomies instead of neither. */
 static char g_trace_phase[8];
 
+/* DSA-LORA phase census: how many times the specialised pipeline was chosen,
+ * split by which graph was running.  See the call site for why an announce is
+ * not enough. */
+static uint64_t g_dsa_lora_disp_pf, g_dsa_lora_disp_dec, g_dsa_lora_disp_unknown;
+
+static void ds4_gpu_dsa_lora_count_dispatch(void) {
+    if (g_trace_phase[0] == 'p') g_dsa_lora_disp_pf++;
+    else if (g_trace_phase[0] == 'd') g_dsa_lora_disp_dec++;
+    else g_dsa_lora_disp_unknown++;
+}
+
+void ds4_gpu_dsa_lora_census(const char *when) {
+    if (!(g_dsa_lora_disp_pf | g_dsa_lora_disp_dec | g_dsa_lora_disp_unknown)) return;
+    fprintf(stderr,
+            "ds4: DSA-LORA census [%s] prefill=%llu decode=%llu unknown=%llu%s\n",
+            when ? when : "run",
+            (unsigned long long)g_dsa_lora_disp_pf,
+            (unsigned long long)g_dsa_lora_disp_dec,
+            (unsigned long long)g_dsa_lora_disp_unknown,
+            g_dsa_lora_disp_dec ? "  <-- LEAKED INTO DECODE" : "");
+}
+
 void ds4_gpu_trace_phase(const char *phase) {
     if (!ds4_gpu_stage_tag_wanted()) return;
     snprintf(g_trace_phase, sizeof(g_trace_phase), "%s", phase ? phase : "");
@@ -7749,6 +7771,20 @@ int ds4_gpu_init(void) {
         if (g_metal4_tensor_api_enabled) {
             macros[@"DS4_METAL_HAS_TENSOR"] = @"1";
             fprintf(stderr, "ds4: Metal 4 tensor API enabled for Tensor kernels\n");
+        }
+        /* DSA-LORA negative control.  The shaders compile AT RUNTIME from
+         * metal/*.metal, so a -D on the C compiler never reaches them -- only
+         * this dictionary does, which is why the documented control did not
+         * exist until now.  The assert build restores the per-row bounds test
+         * inside the guaranteed prefix so a poisoned selected id is caught and
+         * REPORTED instead of becoming an unchecked out-of-bounds read.
+         * Diagnostic only: it costs the exact branch the specialisation exists
+         * to remove. */
+        if (ds4_gpu_env_bool("DS4_METAL_GLM53_DSA_LORA_ASSERT") == 1) {
+            macros[@"DS4_GLM53_DSA_LORA_ASSERT"] = @"1";
+            fprintf(stderr,
+                    "ds4: DSA-LORA prefix bounds checks COMPILED IN "
+                    "(negative control; slower than the shipping path)\n");
         }
 
         const int drift_hc_stable        = ds4_gpu_env_bool("DS4_METAL_HC_STABLE")          != 0; // default ON
@@ -40438,7 +40474,20 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
          *   valid_prefix <= n_selected     the tail may be empty, never negative
          *
          * selected_rows_valid is NOT one of them and must not be conflated:
-         * it claims EVERY row is valid, stronger than "the first prefix are". */
+         * it claims EVERY row is valid, stronger than "the first prefix are".
+         *
+         * THE GATE IS GENERALISED ON PURPOSE, and that is a decision rather
+         * than an oversight.  It accepts any stage-aligned prefix with
+         * valid_prefix <= n_selected, not literally 2048/2051.  Pinning the
+         * production shape would be tighter, but it would also make the kernel
+         * silently wrong the day index_topk or pool_size moves -- the caller
+         * would still pass a prefix and the gate would still say yes to 2048.
+         * The generalised contract is what the kernel actually needs:
+         * `[0, valid_prefix)` in range, `[valid_prefix, n_selected)` checked.
+         * probe_dsalora tests it AS a general contract -- n_selected 2048 and
+         * 2051, tail lengths 0/1/2/3, both head_base values -- rather than only
+         * at the production point, so the generalisation is covered rather than
+         * merely permitted. */
         const bool glm53_shape_ok =
             cache_f16 && kv_lora_dim == 512u && qk_rope == 0u &&
             full_head_groups && (glm53_head_base % 8u) == 0u &&
@@ -40471,6 +40520,13 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
 
         id<MTLComputePipelineState> pipeline = nil;
         if (use_glm53_padded) {
+            /* PHASE CENSUS.  The specialisation is a sparse-noncausal-PREFILL
+             * kernel; single-token decode uses the indexed-decode split-K path.
+             * Static inspection agrees, but "the announce fired" only proves it
+             * ran somewhere -- it cannot prove it never ran in decode, and the
+             * harness was claiming exactly that.  Count dispatches per phase
+             * and report at teardown so the claim is evidence. */
+            ds4_gpu_dsa_lora_count_dispatch();
             pipeline = ds4_gpu_hot_pipeline(
                 g_glm_attention_indexed_batch_lora_group8_vec_glm53_padded_pipeline,
                 "kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_padded");

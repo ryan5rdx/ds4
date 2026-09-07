@@ -698,9 +698,11 @@ void ds4_gpu_trace_tag_layer(uint32_t layer, const char *stage);
 /* "pf" or "dec": stamped into every timeline record so one run yields both
  * anatomies, and so a prefill-dominated run cannot be read as decode. */
 void ds4_gpu_trace_phase(const char *phase);
+/* Dispatch counts for the DSA-LORA specialisation, split by graph phase.
+ * That kernel is prefill-only; a nonzero decode count is a leak. */
+void ds4_gpu_dsa_lora_census(const char *when);
 /* "pf" or "dec": stamped into every timeline record so one run yields both
  * anatomies, and so a prefill-dominated run cannot be read as decode. */
-void ds4_gpu_trace_phase(const char *phase);
 
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,

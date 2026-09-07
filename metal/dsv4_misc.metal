@@ -4352,6 +4352,14 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl(
     float M = -FLT_MAX / 2.0f;
     float S = 0.0f;
     float4 o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+#ifdef DS4_GLM53_DSA_LORA_ASSERT
+    /* Carried per-thread and applied AFTER the final store.  Flagging from the
+     * gather loop does not work: that is a different thread from the one that
+     * writes this lane, so the normal output overwrites the marker and the
+     * control silently passes.  Every thread walks every row in the score loop,
+     * so detecting there and flagging at the end keeps it in one thread. */
+    bool bad_prefix = false;
+#endif
 
     const uint prefix = min(args.valid_prefix, args.n_selected);
 
@@ -4430,6 +4438,13 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl(
         for (uint rr = 0u; rr < rows; rr++) {
             const uint row = token_selected[base + rr];
             const bool valid_row = row < args.cache_cap;
+#ifdef DS4_GLM53_DSA_LORA_ASSERT
+            /* Out of range INSIDE the guaranteed prefix is a producer bug that
+             * the shipping path would turn into an unchecked OOB read.  A
+             * silent zero here is indistinguishable from a legitimately masked
+             * tail slot, so it has to be loud or the control cannot fail. */
+            if (!valid_row && (base + rr) < prefix) bad_prefix = true;
+#endif
             threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
             float partial = 0.0f;
             if (valid_head && valid_row) {
@@ -4466,6 +4481,9 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl(
         out4[lane + 32u] = o1 * inv_s;
         out4[lane + 64u] = o2 * inv_s;
         out4[lane + 96u] = o3 * inv_s;
+#ifdef DS4_GLM53_DSA_LORA_ASSERT
+        if (bad_prefix) out4[lane + 0u] = float4(NAN);
+#endif
     }
 }
 
