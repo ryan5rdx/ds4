@@ -1937,6 +1937,16 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
     uint8_t *stage_recv = tp->slab + tp->batch_in_off;
     const uint64_t stage_bytes = (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
     uint32_t depth = r->recv_depth ? r->recv_depth : 64u;
+    /* The 256 was a magic number with no stated reason, and it is 1/4 of what
+     * create_qp asks for (max_recv_wr = 1024).  recv_depth is what the
+     * provider actually GRANTED, and the WR arrays are already allocated at
+     * that size, so the cap was throwing away window size -- and therefore
+     * multiplying the barrier count -- for nothing anyone wrote down.
+     *
+     * Kept as the default because it is what every measurement on this branch
+     * was taken at, and unpicking a magic number is not the same as knowing it
+     * was wrong.  DS4_TP_RDMA_WINDOW_DEPTH now lifts it, up to the grant. */
+    const uint32_t depth_granted = depth;
     if (depth > 256u) depth = 256u;
     /* DS4_TP_RDMA_WINDOW_DEPTH exists to test the barrier hypothesis in the
      * only direction that is safe.  Barrier count is bytes/(depth x 16 KiB),
@@ -1952,8 +1962,27 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             const char *e = getenv("DS4_TP_RDMA_WINDOW_DEPTH");
             win_override = (e && e[0]) ? atoi(e) : -1;
         }
-        if (win_override > 0 && (uint32_t)win_override < depth)
-            depth = (uint32_t)win_override;
+        if (win_override > 0) {
+            /* Both directions now.  Down multiplies barriers (the causal test
+             * that can only make things worse, so it is always safe).  Up
+             * divides them, and is clamped to the depth the QP actually
+             * granted -- posting more receive WRs than the queue holds would
+             * overrun it, and on a UC QP that is a silent drop, not an error. */
+            uint32_t want = (uint32_t)win_override;
+            if (want > depth_granted) {
+                static int warned;
+                if (!warned) {
+                    warned = 1;
+                    fprintf(stderr,
+                            "ds4-tp: window depth %u exceeds the granted receive "
+                            "depth %u; clamping.  Posting past the queue on a UC "
+                            "QP drops silently rather than erroring.\n",
+                            want, depth_granted);
+                }
+                want = depth_granted;
+            }
+            depth = want;
+        }
     }
     if (!direct) {
         const uint32_t stage_slots = (uint32_t)(stage_bytes / DS4_TP_RDMA_MAX_MSG);
@@ -1971,8 +2000,8 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         if (!announced_depth) {
             announced_depth = 1;
             fprintf(stderr,
-                    "ds4-tp: bulk window depth %u -> %u (%.2f MiB/window, %s)\n",
-                    depth_base, depth,
+                    "ds4-tp: bulk window depth %u -> %u (granted %u, %.2f MiB/window, %s)\n",
+                    depth_base, depth, depth_granted,
                     (double)depth * DS4_TP_RDMA_MAX_MSG / 1048576.0,
                     depth == depth_base ? "no override" : "override or clamp applied");
         }
