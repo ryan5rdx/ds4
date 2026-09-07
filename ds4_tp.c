@@ -207,10 +207,28 @@ typedef struct {
  * desynced pair (see the send flow control above) and was an artifact; the
  * harness's fail-closed flag was right and the honest figure is +1.3%.
  *
- * DS4_TP_RDMA_RECV_FRAMES=1024 restores the old 4 MiB window. */
+ * DECLINED, 2026-09-07.  The default stays 1024 and the +1.3% is not taken.
+ *
+ * The arm is sound and the earlier suspicion against it was wrong: FRAMESDEC
+ * showed 1024 and 4095 decode-equivalent from 2k to 131k, and the ~23% collapse
+ * that got 4095 reverted was the TG16 threadgroup-rounding bug, not ring depth.
+ * So this is not a rejection on evidence.
+ *
+ * It is a rejection on price.  Shipping 4095 reopens transport state: the CQ is
+ * sized from this budget, the send flow control is calibrated against it, and
+ * the rollback/resume suite has only ever certified 1024 -- P2'-GATE passed on a
+ * build running the reverted default, so it certified the wrong thing.  Claiming
+ * 1.3% of prefill costs a re-certification of the interrupt/resume/rollback path
+ * and puts the deepest possible ring into production, and that trade was
+ * declined deliberately.
+ *
+ * Set DS4_TP_RDMA_RECV_FRAMES=4095 to measure it again.  If it is ever taken,
+ * `EXTRA_ENV="DS4_TP_RDMA_RECV_FRAMES=4095" bash harness-rb1.sh A` is the run
+ * that has to pass first, and a 310k decode rung closes FRAMESDEC's one gap. */
 static uint32_t tp_rdma_want_frames(void) {
     static uint32_t cached;
     if (!cached) {
+        /* Explicit, not inherited: this value is a decision, not a leftover. */
         cached = 1024u;
         const char *e = getenv("DS4_TP_RDMA_RECV_FRAMES");
         if (e && e[0]) {
