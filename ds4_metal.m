@@ -1444,19 +1444,53 @@ static void ds4_gpu_dsa_lora_count_dispatch(void) {
     else g_dsa_lora_disp_unknown++;
 }
 
+/* Prints ALWAYS, including all-zero, once per process, AT PROCESS EXIT.
+ *
+ * All-zero is the CONTROL's correct answer: the specialisation was never
+ * chosen, so there is nothing to count.  Returning early there made "the
+ * control behaved" and "the engine has no census" the same observation, and a
+ * gate that cannot distinguish those two is not a gate.  It cost the first
+ * DSALORA run its verdict.
+ *
+ * NOT HUNG OFF A DECODE ENTRY POINT, for two reasons.  The census was attached
+ * to metal_graph_eval_token_raw_swa, the DeepSeek/SWA decode path, which GLM
+ * 5.3 never reaches -- the third time this week a probe went on a function the
+ * run was not in.  And attaching it to the right one is still wrong: the
+ * harness sweeps a ladder in ONE process from ctx 2048, where the DSA
+ * specialisation is inert because sparse attention only begins past
+ * dense_limit = 2051.  A census taken at the first decode token would have read
+ * prefill=0 and failed the treatment for never dispatching, at the one rung
+ * where not dispatching is correct.
+ *
+ * At exit the counts cover every rung and all ~900 decode tokens, so decode=0
+ * is a much stronger claim than it would have been after the first one. */
 void ds4_gpu_dsa_lora_census(const char *when) {
-    if (!(g_dsa_lora_disp_pf | g_dsa_lora_disp_dec | g_dsa_lora_disp_unknown)) return;
+    static int done;
+    if (done++) return;
     fprintf(stderr,
-            "ds4: DSA-LORA census [%s] prefill=%llu decode=%llu unknown=%llu%s\n",
+            "ds4: DSA-LORA census [%s] prefill=%llu decode=%llu unknown=%llu%s%s\n",
             when ? when : "run",
             (unsigned long long)g_dsa_lora_disp_pf,
             (unsigned long long)g_dsa_lora_disp_dec,
             (unsigned long long)g_dsa_lora_disp_unknown,
-            g_dsa_lora_disp_dec ? "  <-- LEAKED INTO DECODE" : "");
+            g_dsa_lora_disp_dec ? "  <-- LEAKED INTO DECODE" : "",
+            g_dsa_lora_disp_unknown ? "  <-- UNPHASED, census is not evidence" : "");
+}
+
+static void ds4_gpu_dsa_lora_census_atexit(void) {
+    ds4_gpu_dsa_lora_census("process exit");
 }
 
 void ds4_gpu_trace_phase(const char *phase) {
-    if (!ds4_gpu_stage_tag_wanted()) return;
+    /* NOT gated on the tracing flags.  Two consumers read this: the timeline
+     * records, which are instrumentation and stay gated at their own site, and
+     * the DSA-LORA census, which is a CORRECTNESS gate and has to work on a
+     * production run with nothing switched on.
+     *
+     * It was gated, and that is why the first DSALORA run could not be scored:
+     * the harness sets neither DS4_METAL_TRACE_LABELS nor the timeline, so the
+     * phase stayed empty and every dispatch would have been counted `unknown` --
+     * indistinguishable from a specialisation leaking into decode. */
     snprintf(g_trace_phase, sizeof(g_trace_phase), "%s", phase ? phase : "");
 }
 
@@ -7724,6 +7758,10 @@ int ds4_gpu_init(void) {
         ds4_gpu_timeline_probe(g_device);
         ds4_gpu_print_device_summary();
         ds4_gpu_detect_metal4_features();
+        /* Backstop so the census line exists on every run, whatever path the
+         * model took and however few decode tokens it generated.  The once-guard
+         * inside makes this a no-op when a decode site already printed it. */
+        atexit(ds4_gpu_dsa_lora_census_atexit);
 
         g_queue = [g_device newCommandQueueWithMaxCommandBufferCount:256];
         if (!g_queue) {
@@ -7773,7 +7811,7 @@ int ds4_gpu_init(void) {
             fprintf(stderr, "ds4: Metal 4 tensor API enabled for Tensor kernels\n");
         }
         /* DSA-LORA negative control.  The shaders compile AT RUNTIME from
-         * metal/*.metal, so a -D on the C compiler never reaches them -- only
+         * the metal/ sources, so a -D on the C compiler never reaches them; only
          * this dictionary does, which is why the documented control did not
          * exist until now.  The assert build restores the per-row bounds test
          * inside the guaranteed prefix so a poisoned selected id is caught and
