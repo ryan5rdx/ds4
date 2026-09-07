@@ -2060,8 +2060,10 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             announced_depth = 1;
             fprintf(stderr,
                     "ds4-tp: bulk window depth %u -> %u messages "
-                    "(%u frames granted / %u per msg = %u max, %.2f MiB/window, %s)\n",
-                    depth_base, depth, recv_frames, frames_per_msg, depth_granted,
+                    "(frames asked %u granted %u / %u per msg = %u max, "
+                    "%.2f MiB/window, %s)\n",
+                    depth_base, depth, tp_rdma_want_frames(), recv_frames,
+                    frames_per_msg, depth_granted,
                     (double)depth * DS4_TP_RDMA_MAX_MSG / 1048576.0,
                     depth == depth_base ? "no override" : "override or clamp applied");
         }
