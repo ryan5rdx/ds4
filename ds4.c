@@ -13308,6 +13308,17 @@ static uint32_t ds4_prefill_watchdog_chunk(uint32_t prompt_len) {
  * knob is kept because the coupling is real (at 131k the indexer pool is 32768
  * columns, so 256 MB is exactly 2048 score rows) and a future chunk change would
  * need to re-check it. */
+/* IDX-HALF selector.  Separate from the clamp so the "inactive here" message
+ * can fire without the clamp taking effect. */
+static int glm53_idx_half_scan_requested(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_GLM_IDX_HALF_SCAN");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 static uint32_t glm53_prefill_chunk_tokens(void) {
     static uint32_t cached;
     if (cached) return cached;
@@ -56387,8 +56398,60 @@ static bool glm_graph_forward_token(
                     DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "indexer_weights");
                     const float indexer_scale =
                         1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
-                    const uint32_t score_rows = g->glm53 ?
+                    uint32_t score_rows = g->glm53 ?
                         visible / DS4_GLM53_INDEX_POOL_SIZE : visible;
+                    /* IDX-HALF: a PRICING ARM for IDX-SPLIT.  Decode only, and
+                     * one place, because the scorer and its top-k must agree
+                     * about how many rows exist.
+                     *
+                     * The DSA indexer is the one part of DSA both ranks compute
+                     * in full: the score sums over all 32 indexer heads to one
+                     * value per (token, KV position), and the top-k selection
+                     * has to be IDENTICAL on both ranks because they hold
+                     * different attention heads over the same positions.
+                     * Splitting by KV position is exact -- top-k of two local
+                     * top-k lists is the global one -- but it needs a fourth
+                     * gate slot to exchange them.  Before paying for that,
+                     * measure what halving the scan is worth.
+                     *
+                     * Both ranks clamp identically, so the selection still
+                     * matches and the pair cannot desync.  Only half the
+                     * context is considered, so the OUTPUT IS WRONG: this is a
+                     * diagnostic in the same class as
+                     * DS4_METAL_MM_NAX_TG_MEM_UNSAFE and must never be banked.
+                     *
+                     * It refuses rather than halves when there is not room for
+                     * the full top-k in the halved rows.  Halving top-k too
+                     * would shrink the SELECTION, which changes the attention
+                     * work downstream and would price two things at once --
+                     * and IDX-SPLIT does not shrink the selection at all.  At
+                     * the low context rungs the arm therefore equals the
+                     * control, which is honest; the 5.35 ms it exists to price
+                     * lives at 310k, where the headroom is 75x. */
+                    if (glm53_idx_half_scan_requested() && g->glm53) {
+                        const uint32_t want_pools =
+                            indexer_top_k / DS4_GLM53_INDEX_POOL_SIZE;
+                        const uint32_t half = score_rows / 2u;
+                        static int announced;
+                        if (half >= want_pools && half > 0u) {
+                            score_rows = half;
+                            if (!announced) {
+                                announced = 1;
+                                fprintf(stderr,
+                                        "ds4: *** DS4_GLM_IDX_HALF_SCAN active: the decode "
+                                        "indexer scans HALF the pooled rows (%u of %u). "
+                                        "OUTPUT IS WRONG. This prices IDX-SPLIT and is not "
+                                        "a configuration. ***\n", half, half * 2u);
+                            }
+                        } else if (!announced) {
+                            announced = 1;
+                            fprintf(stderr,
+                                    "ds4: DS4_GLM_IDX_HALF_SCAN inactive at this context: "
+                                    "%u pooled rows halve to %u, below the %u top-k pools. "
+                                    "This arm equals the control here.\n",
+                                    score_rows, half, want_pools);
+                        }
+                    }
                     ok = ds4_gpu_glm_indexer_score_one_tensor(
                             g->indexer_scores,
                             g->indexer_q,

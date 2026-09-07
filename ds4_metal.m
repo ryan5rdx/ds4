@@ -21111,45 +21111,6 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
                                                  scale);
 }
 
-/* IDX-HALF: a PRICING ARM for IDX-SPLIT, and never a configuration.
- *
- * The DSA indexer is the one piece of DSA that both ranks compute in full: the
- * score is a sum over all 64 indexer heads, one value per (token, KV position),
- * and the top-512 selection has to be identical on both ranks because they hold
- * different attention heads over the SAME positions.  So the whole scan is
- * duplicated.
- *
- * Splitting it by KV position is exact -- top-512 of two local top-512s is the
- * true global top-512 -- but it needs a fourth gate slot per DSA layer to
- * exchange the two lists, which is a protocol change.  Before spending that,
- * price it: clamp the scan to half the positions on BOTH ranks and measure.
- *
- * Both ranks clamp identically, so the selection still matches and the pair
- * stays in sync -- this cannot desync anything.  What it does do is consider
- * only half the context, so the OUTPUT IS WRONG.  It is the same class as
- * DS4_METAL_MM_NAX_TG_MEM_UNSAFE: a number-producing diagnostic that must never
- * be banked, and it warns on every process.
- *
- * The clamp is applied with one rule at all three entry points -- both scores
- * variants and the top-k -- so scores and top-k never disagree about how many
- * rows exist, which would read uninitialised scratch. */
-static uint32_t ds4_gpu_idx_half_scan_rows(uint32_t rows) {
-    static int on = -1;
-    if (on < 0) {
-        const char *e = getenv("DS4_GLM_IDX_HALF_SCAN");
-        on = (e && e[0] && e[0] != '0') ? 1 : 0;
-        if (on) {
-            fprintf(stderr,
-                    "ds4: *** DS4_GLM_IDX_HALF_SCAN: the indexer scans HALF the "
-                    "KV positions. OUTPUT IS WRONG. This prices IDX-SPLIT and is "
-                    "not a configuration -- never bank a number taken with it "
-                    "except as the ceiling it measures. ***\n");
-        }
-    }
-    if (!on || rows < 2u) return rows;
-    return rows / 2u;
-}
-
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
@@ -21157,7 +21118,6 @@ int ds4_gpu_indexer_topk_tensor(
         uint32_t                n_tokens,
         uint32_t                top_k) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
-    n_comp = ds4_gpu_idx_half_scan_rows(n_comp);
     if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0 || top_k > n_comp) return 0;
 
     @autoreleasepool {
@@ -39094,7 +39054,7 @@ int ds4_gpu_glm_indexer_scores_batch_tensor(
         uint32_t              head_dim,
         float                 scale,
         bool                  cache_f16) {
-    n_rows = ds4_gpu_idx_half_scan_rows(n_rows);
+
     return ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
             scores, q, weights, indexer_key_cache, n_rows, n_tokens, pos0, 1u,
             n_head, head_dim, scale, cache_f16);
@@ -39113,7 +39073,7 @@ int ds4_gpu_glm53_indexer_scores_batch_tensor(
         uint32_t              head_dim,
         float                 scale,
         bool                  cache_f16) {
-    n_rows = ds4_gpu_idx_half_scan_rows(n_rows);
+
     if (pool_size != 4u) return 0;
     return ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
             scores, q, weights, indexer_key_cache, n_rows, n_tokens, pos0,
