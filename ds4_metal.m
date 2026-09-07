@@ -40658,8 +40658,20 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
         static int glm53_sel = -1;              /* 0 = base, 1 = padded */
         if (glm53_sel < 0) {
             const char *e = getenv("DS4_METAL_GLM53_DSA_LORA");
-            /* Explicit, not presence-only: "=base" must restore the control. */
-            glm53_sel = (e && strcmp(e, "padded") == 0) ? 1 : 0;
+            /* Banked 2026-09-07 (DSALORA + DSALORA2): +4.8-7.1% prefill at
+             * every rung 4096+, 101 cases byte-identical, and the phase census
+             * reads prefill=33 decode=0 unknown=0 on BOTH ranks with the base
+             * arm at all zeros -- so the specialisation is prefill-only as
+             * claimed rather than merely announced.
+             *
+             * DEFAULT PADDED.  Explicit, not presence-only, so "=base" restores
+             * the control -- which a control arm must write, since on v4 an
+             * omitted knob is ON.
+             *
+             * The 2048 rung reads +0.2% and that is correct: sparse attention
+             * begins past dense_limit = index_topk + pool_size - 1 = 2051, so
+             * the kernel is inert below it. */
+            glm53_sel = (e && strcmp(e, "base") == 0) ? 0 : 1;
         }
         const bool use_glm53_padded = (glm53_sel == 1) && glm53_shape_ok;
         {
