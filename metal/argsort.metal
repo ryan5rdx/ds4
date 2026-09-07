@@ -633,3 +633,121 @@ kernel void kernel_dsv4_indexer_topk_stream512(
     }
 }
 
+
+/* ---------------------------------------------------------------------------
+ * IDX-SPLIT-DEC (queue 2c), the two NON-TP pieces.
+ *
+ * Each rank scores a disjoint half of the pooled KV rows and reduces its half
+ * to a local top-512 with the SHIPPING route (argsort + MERGE-TRUNC).  These
+ * two kernels are what turns those two local answers back into the one answer
+ * a replicated scan would have produced.
+ *
+ * WHY A PACK STEP EXISTS AT ALL.  The design assumed the reduction already
+ * emits packed (score, global index) keys, as ds4_topk_pack_key does on the
+ * tiled path.  The SHIPPING path does not: kernel_argsort_f32_i32 carries
+ * int32 INDICES and its merge re-gathers scores through src0.  So the export
+ * has to gather the score once and fold in the rank's global base -- which is
+ * cheap (512 threads) and is also the only place the local->global mapping
+ * lives.
+ *
+ * TIES CANNOT HAPPEN, so the merge has no tie policy.  ds4_topk_pack_key puts
+ * an order-preserving float in the high 32 bits and 0xffffffff - idx in the
+ * low, so the order is (score desc, index asc) and it is STRICT on a unique
+ * index.  Rank 1's local indices are a monotone shift of its globals, so the
+ * within-rank order survives the shift, and a cross-rank tie resolves to the
+ * lower global index -- which is what a single replicated scan would do.
+ * ------------------------------------------------------------------------- */
+
+struct ds4_metal_args_idxsplit_pack {
+    uint32_t top_k;            /* entries in sel / keys                      */
+    uint32_t count;            /* valid rows in THIS rank's half             */
+    uint32_t index_base;       /* this rank's first global pooled-row index  */
+};
+
+/* 512 local indices -> 512 packed keys carrying GLOBAL indices. */
+kernel void kernel_glm53_idxsplit_pack(
+        constant ds4_metal_args_idxsplit_pack & args,
+        device const float   * scores,     /* COMPACT, rank-local            */
+        device const int32_t * sel,        /* local indices, sorted desc     */
+        device       ulong   * keys,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.top_k) return;
+    const int32_t idx = sel[gid];
+    /* A run shorter than top_k leaves slots the reduction never wrote.  Zero
+     * sorts to the bottom of a descending merge and is dropped, which is the
+     * same convention pass 1 uses for a short slice. */
+    if (idx < 0 || (uint)idx >= args.count) { keys[gid] = 0ul; return; }
+    keys[gid] = ds4_topk_pack_key(scores[idx], (uint32_t)idx + args.index_base);
+}
+
+struct ds4_metal_args_idxsplit_merge {
+    uint32_t top_k;            /* 512 per run, and 512 out                   */
+    uint32_t pool_size;
+    uint32_t index_topk;
+    uint32_t output_width;
+    uint32_t pos0;
+};
+
+/* Two sorted 512-runs -> global top-512 -> 4:1 pool expansion, in ONE kernel.
+ *
+ * The expansion is fused rather than left to kernel_glm53_expand_pool_selection
+ * because the merged pools are already in threadgroup memory: writing them out
+ * as 512 pool ids only to have the next dispatch read them back and multiply by
+ * four is a dispatch and a memory round trip per DSA layer, 11 per token.
+ *
+ * A bitonic MERGE, not a sort.  Loading run b reversed makes the concatenation
+ * bitonic, which one direction-uniform pass of log2(1024) = 10 stages sorts
+ * descending.  Sorting 1024 from scratch would be 10*11/2 = 55.
+ */
+[[max_total_threads_per_threadgroup(512)]]
+kernel void kernel_glm53_idxsplit_merge_expand(
+        constant ds4_metal_args_idxsplit_merge & args,
+        device const ulong    * keys_a,
+        device const ulong    * keys_b,
+        device       uint32_t * raw_selected,
+        threadgroup  ulong    * buf [[threadgroup(0)]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    const uint k = args.top_k;
+    const uint n = 2u * k;
+
+    for (uint i = tid; i < k; i += 512u) {
+        buf[i]         = keys_a[i];
+        buf[n - 1u - i] = keys_b[i];   /* b reversed -> the pair is bitonic */
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = k; j > 0u; j >>= 1) {
+        for (uint i = tid; i < n; i += 512u) {
+            const uint ixj = i ^ j;
+            if (ixj > i && buf[i] < buf[ixj]) {
+                const ulong t = buf[i]; buf[i] = buf[ixj]; buf[ixj] = t;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    /* buf[0, k) is the global top-k, descending.  Expand exactly as
+     * kernel_glm53_expand_pool_selection does; decode is one token, so
+     * visible = pos0 + 1. */
+    for (uint slot = tid; slot < args.output_width; slot += 512u) {
+        uint value = 0xffffffffu;
+        if (slot < args.index_topk) {
+            const uint pool_slot = slot / args.pool_size;
+            if (pool_slot < k) {
+                const ulong key = buf[pool_slot];
+                /* key 0 is a padded slot from a short run, not pool
+                 * 0xffffffff -- unpacking it would index off the end. */
+                if (key != 0ul) {
+                    const uint pool = 0xffffffffu - (uint32_t)(key & 0xffffffffu);
+                    value = pool * args.pool_size + slot % args.pool_size;
+                }
+            }
+        } else {
+            const uint tail_slot = slot - args.index_topk;
+            const uint visible = args.pos0 + 1u;
+            const uint tail_count = visible % args.pool_size;
+            if (tail_slot < tail_count) value = visible - tail_count + tail_slot;
+        }
+        raw_selected[slot] = value;
+    }
+}

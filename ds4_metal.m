@@ -37903,6 +37903,129 @@ int ds4_gpu_glm53_expand_pool_selection_tensor(
     return 1;
 }
 
+/* ---------------------------------------------------------------------------
+ * IDX-SPLIT-DEC (queue 2c), non-TP half.  See IDX-SPLIT-DEC-DESIGN.md.
+ *
+ * Neither of these knows anything about the transport: pack turns one rank's
+ * local reduction into exportable keys, merge_expand turns two of those into
+ * the answer a replicated scan would have produced.  Where the keys travel is
+ * the gated half of the work and is not here.
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    uint32_t top_k;
+    uint32_t count;
+    uint32_t index_base;
+} ds4_gpu_idxsplit_pack_args;
+
+int ds4_gpu_glm53_idxsplit_pack_tensor(
+        ds4_gpu_tensor       *keys,
+        const ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *selected,
+        uint32_t              top_k,
+        uint32_t              count,
+        uint32_t              index_base) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!keys || !scores || !selected || top_k == 0u || count == 0u) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> kb = ds4_gpu_tensor_buffer(keys);
+        id<MTLBuffer> sb = ds4_gpu_tensor_buffer(scores);
+        id<MTLBuffer> ib = ds4_gpu_tensor_buffer(selected);
+        if (!kb || !sb || !ib ||
+            ds4_gpu_tensor_bytes(keys) < (uint64_t)top_k * sizeof(uint64_t) ||
+            ds4_gpu_tensor_bytes(scores) < (uint64_t)count * sizeof(float) ||
+            ds4_gpu_tensor_bytes(selected) < (uint64_t)top_k * sizeof(int32_t)) {
+            fprintf(stderr, "ds4: IDX-SPLIT pack received undersized buffers\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_idxsplit_pack");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        ds4_gpu_idxsplit_pack_args args = {
+            .top_k = top_k, .count = count, .index_base = index_base };
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        DS4_SET_PIPE(enc, pipeline);
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:sb offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+        [enc setBuffer:ib offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+        [enc setBuffer:kb offset:ds4_gpu_tensor_offset(keys) atIndex:3];
+        const NSUInteger nth = MIN((NSUInteger)256, pipeline.maxTotalThreadsPerThreadgroup);
+        [DS4_DISP(enc) dispatchThreads:MTLSizeMake(top_k, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "IDX-SPLIT pack")) return 0;
+    }
+    return 1;
+}
+
+typedef struct {
+    uint32_t top_k;
+    uint32_t pool_size;
+    uint32_t index_topk;
+    uint32_t output_width;
+    uint32_t pos0;
+} ds4_gpu_idxsplit_merge_args;
+
+int ds4_gpu_glm53_idxsplit_merge_expand_tensor(
+        ds4_gpu_tensor       *raw_selected,
+        const ds4_gpu_tensor *keys_a,
+        const ds4_gpu_tensor *keys_b,
+        uint32_t              top_k,
+        uint32_t              pos0,
+        uint32_t              index_topk,
+        uint32_t              pool_size,
+        uint32_t              output_width) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!raw_selected || !keys_a || !keys_b || top_k == 0u || pool_size == 0u ||
+        index_topk == 0u || output_width < index_topk + pool_size - 1u ||
+        top_k > index_topk / pool_size) {
+        return 0;
+    }
+    /* The merge is bitonic and indexes i ^ j over 2*top_k, so a non-power-of-two
+     * run would compare across the end of the buffer.  512 is the production
+     * value; refuse anything else rather than sort a bitonic sequence wrong. */
+    if ((top_k & (top_k - 1u)) != 0u) {
+        fprintf(stderr, "ds4: IDX-SPLIT merge needs a power-of-two run (got %u)\n", top_k);
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLBuffer> rb = ds4_gpu_tensor_buffer(raw_selected);
+        id<MTLBuffer> ab = ds4_gpu_tensor_buffer(keys_a);
+        id<MTLBuffer> bb = ds4_gpu_tensor_buffer(keys_b);
+        const uint64_t kbytes = (uint64_t)top_k * sizeof(uint64_t);
+        if (!rb || !ab || !bb ||
+            ds4_gpu_tensor_bytes(raw_selected) < (uint64_t)output_width * sizeof(uint32_t) ||
+            ds4_gpu_tensor_bytes(keys_a) < kbytes ||
+            ds4_gpu_tensor_bytes(keys_b) < kbytes) {
+            fprintf(stderr, "ds4: IDX-SPLIT merge received undersized buffers\n");
+            return 0;
+        }
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_glm53_idxsplit_merge_expand");
+        if (!pipeline) return 0;
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        ds4_gpu_idxsplit_merge_args args = {
+            .top_k = top_k, .pool_size = pool_size, .index_topk = index_topk,
+            .output_width = output_width, .pos0 = pos0 };
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        DS4_SET_PIPE(enc, pipeline);
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:ab offset:ds4_gpu_tensor_offset(keys_a) atIndex:1];
+        [enc setBuffer:bb offset:ds4_gpu_tensor_offset(keys_b) atIndex:2];
+        [enc setBuffer:rb offset:ds4_gpu_tensor_offset(raw_selected) atIndex:3];
+        [enc setThreadgroupMemoryLength:DS4_TG16(2u * top_k * sizeof(uint64_t)) atIndex:0];
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+           threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "IDX-SPLIT merge+expand")) return 0;
+    }
+    return 1;
+}
+
 int ds4_gpu_glm_build_kv_cache_tensor(
         ds4_gpu_tensor       *key_cache,
         ds4_gpu_tensor       *value_cache,
