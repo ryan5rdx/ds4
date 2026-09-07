@@ -47519,14 +47519,20 @@ static bool glm53_graph_kda_attention(
      * kda_lowrank_g so f_b no longer has to run between f_a and g_a.
      *
      * Bit-identical (0/288); the merged kernel calls the shipped Q8_0 matvec
-     * body verbatim and only remaps tgpig.x.  Opt-in until the rig A/B: what
-     * is unsettled is not correctness but whether the two removed boundaries
-     * were already hidden by the neighbouring q/k/v and f_b/g_b dispatches --
-     * the exact class for which DF2 withdrew the per-dispatch rate. */
+     * body verbatim and only remaps tgpig.x.
+     *
+     * Default ON (A1, 2026-09-06): +1.05% decode @310k on the TP2 pair,
+     * 29.47 -> 29.78 t/s, mid-band of the +0.54-1.54% claim.  The open question
+     * was never correctness -- it was whether the two removed dispatch
+     * boundaries were already hidden by the neighbouring q/k/v and f_b/g_b
+     * work, the class for which DF2 withdrew the per-dispatch rate.  They were
+     * not; the boundaries were real.
+     *
+     * DS4_GLM_KDA_SMALL_MV_MERGE=0 restores the three separate matvecs. */
     static int kda_small_mv_merge_env = -1;
     if (kda_small_mv_merge_env < 0) {
         const char *e = getenv("DS4_GLM_KDA_SMALL_MV_MERGE");
-        kda_small_mv_merge_env = (e && e[0] && e[0] != '0') ? 1 : 0;
+        kda_small_mv_merge_env = (e && e[0]) ? (e[0] != '0') : 1;
     }
     const bool kda_small_mv_merge =
         kda_small_mv_merge_env != 0 &&

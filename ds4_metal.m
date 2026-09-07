@@ -51234,9 +51234,24 @@ int ds4_gpu_glm53_kda_decode(
         static const char *kda_decode_variant_name = NULL;
         static uint32_t kda_decode_nsg = 4u;
         if (kda_decode_variant == -2) {
+            /* R3NSG16 is the DEFAULT (A1, 2026-09-06): +1.32% decode @310k on
+             * the TP2 pair, 29.47 -> 29.86 t/s, the best of eight shapes and
+             * probe-proven bit-identical on both TP slices at the production
+             * 32-of-64-head shape.
+             *
+             * The shape that won is not the one the claim priced.  The
+             * value-per-thread family the original table costed (+0.43-0.59%
+             * for vpt4) measured flat-to-NEGATIVE -- v1 -0.10%, vpt4 -0.48%,
+             * vpt8 -0.85% -- while the simdgroup-count family rises with nsg:
+             * nsg8 +0.85%, nsg16 +1.32%.  Widening the threadgroup helps; giving
+             * each thread more values does not.  nsg32 is built and untested.
+             *
+             * DS4_GLM_KDA_DECODE_VARIANT=0 restores the shipped kernel; any
+             * table name below selects that shape instead. */
             const char *v = getenv("DS4_GLM_KDA_DECODE_VARIANT");
+            if (!v || !v[0]) v = "nsg16";
             kda_decode_variant = -1;
-            if (v && v[0] && strcmp(v, "0") != 0) {
+            if (strcmp(v, "0") != 0) {
                 static const struct { const char *name; const char *fn; uint32_t nsg; } tbl[] = {
                     { "v1",        "kernel_glm53_kda_decode_v1",        4u },
                     { "vpt2",      "kernel_glm53_kda_decode_vpt2",      4u },
