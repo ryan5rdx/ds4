@@ -1421,6 +1421,21 @@ static int ds4_gpu_stage_tag_wanted(void) {
 }
 
 static char g_trace_tag[64];
+/* Which forward pass is running.  Q1 ran `harness-timeline.sh Q1 decode`, which
+ * prefills 310,000 tokens and then generates 64 -- and the timeline accumulates
+ * from process start, so its "decode anatomy" was 310k tokens of prefill with
+ * 64 decode tokens buried in it.  The tell was the launch shape: the dominant
+ * kernel reported grid 4x2048, and 2048 is exactly the watchdog chunk at ctx
+ * 310000, where a decode dispatch would be 4x1.
+ *
+ * Stamping the phase into every record makes that impossible to miss again, and
+ * lets one run yield both anatomies instead of neither. */
+static char g_trace_phase[8];
+
+void ds4_gpu_trace_phase(const char *phase) {
+    if (!ds4_gpu_stage_tag_wanted()) return;
+    snprintf(g_trace_phase, sizeof(g_trace_phase), "%s", phase ? phase : "");
+}
 
 void ds4_gpu_trace_tag(const char *tag) {
     if (!ds4_gpu_stage_tag_wanted()) return;
@@ -1440,7 +1455,8 @@ void ds4_gpu_trace_tag_layer(uint32_t layer, const char *stage) {
 static void ds4_gpu_trace_tag_copy(char *dst, size_t cap) {
     if (!dst || !cap) return;
     if (!g_trace_tag[0]) { dst[0] = 0; return; }
-    snprintf(dst, cap, "%s", g_trace_tag);
+    if (g_trace_phase[0]) snprintf(dst, cap, "%s/%s", g_trace_phase, g_trace_tag);
+    else                  snprintf(dst, cap, "%s", g_trace_tag);
 }
 
 static void ds4_gpu_trace_label_encoder(id<MTLComputeCommandEncoder> enc) {

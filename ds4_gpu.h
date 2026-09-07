@@ -695,6 +695,12 @@ int ds4_gpu_tp_batch_split_safe(uint32_t gate_slots);
 
 void ds4_gpu_trace_tag(const char *tag);
 void ds4_gpu_trace_tag_layer(uint32_t layer, const char *stage);
+/* "pf" or "dec": stamped into every timeline record so one run yields both
+ * anatomies, and so a prefill-dominated run cannot be read as decode. */
+void ds4_gpu_trace_phase(const char *phase);
+/* "pf" or "dec": stamped into every timeline record so one run yields both
+ * anatomies, and so a prefill-dominated run cannot be read as decode. */
+void ds4_gpu_trace_phase(const char *phase);
 
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,

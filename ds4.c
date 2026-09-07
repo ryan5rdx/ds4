@@ -53445,6 +53445,7 @@ static bool glm_graph_forward_indexed_tokens(
         uint32_t           display_absolute_base,
         uint32_t           work_done_base,
         uint32_t           work_total) {
+    ds4_gpu_trace_phase("pf");
     if (!g || !model || !weights || !tokens ||
         g->compact_cache_cap == 0 ||
         g->indexed_prefill_cap == 0 ||
@@ -55658,6 +55659,7 @@ static bool glm_graph_forward_token(
         float             *output_hc,
         float             *logits_out,
         bool               defer_completion) {
+    ds4_gpu_trace_phase("dec");
 #define DS4_GLM_FT_FAIL(why) do { \
         if (getenv("DS4_GLM_TP_DEBUG")) \
             fprintf(stderr, "ds4: glm forward_token fail pos=%u: %s\n", pos, why); \
