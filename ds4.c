@@ -53787,6 +53787,7 @@ static bool glm_graph_forward_indexed_tokens(
         }
 
         if (ok && g->glm53) {
+            ds4_gpu_trace_tag_layer(il, "hc_pre");
             ok = glm53_graph_hc_pre_rows(g,
                                          model,
                                          l->hc_attn_fn,
@@ -53812,6 +53813,7 @@ static bool glm_graph_forward_indexed_tokens(
         }
         DS4_GLM_PROFILE_INDEXED_STAGE("glm_indexed_attn", "attn_norm");
         if (ok && glm53_kda) {
+            ds4_gpu_trace_tag_layer(il, glm53_kda ? "kda_attention" : "dsa_attention");
             ok = glm53_graph_kda_attention_rows(g,
                                                 model,
                                                 l,
@@ -54740,6 +54742,7 @@ glm53_indexed_attention_done:
                                                 DS4_N_EMBD,
                                                 DS4_N_HC) != 0;
             if (ok) {
+                ds4_gpu_trace_tag_layer(il, "ffn_hc_pre");
                 ok = glm53_graph_hc_pre_rows(g,
                                              model,
                                              l->hc_ffn_fn,
@@ -54772,6 +54775,7 @@ glm53_indexed_attention_done:
                                       il,
                                       pos0);
         if (ok && use_batch_ffn) {
+            ds4_gpu_trace_tag_layer(il, "dense_ffn");
             ok = glm_graph_encode_ffn_batch(g,
                                             model,
                                             weights,
@@ -54806,6 +54810,7 @@ glm53_indexed_attention_done:
                 use_batch_ffn_norm &&
                 il >= DS4_N_LEADING_DENSE &&
                 glm_graph_indexed_prefill_batch_routed_moe()) {
+                ds4_gpu_trace_tag_layer(il, "routed_moe");
                 ok = glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
                         g,
                         model,
