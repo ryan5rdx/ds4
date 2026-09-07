@@ -52062,9 +52062,38 @@ static bool glm_graph_forward_indexed_tokens(
                                 DS4_ROPE_YARN_BETA_SLOW);
                     } else {
                         /* GLM 5.3 pads the incomplete pool with invalid IDs. */
-                        rc = (g->glm53 ?
-                                ds4_gpu_glm_attention_indexed_batch_lora_tensor :
-                                ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor)(
+                        /* GLM 5.3: state the producer contract instead of leaving it to be
+                         * rediscovered.  kernel_glm53_expand_pool_selection writes four
+                         * contiguous raw rows per selected pool into [0, index_topk), so
+                         * those slots are in range by construction and only the ragged
+                         * current pool can hold sentinels.  Every other model keeps the
+                         * generic entry, which claims nothing. */
+                        if (g->glm53) {
+                            rc = ds4_gpu_glm_attention_indexed_batch_lora_prefix_tensor(
+                                attn_lora_view,
+                                q_view,
+                                qk_low_view,
+                                g->layer_kv_lora_cache[il],
+                                g->layer_k_rope_cache[il],
+                                selected_view,
+                                slice,
+                                last_indexer_selected_count,
+                                g->compact_cache_cap,
+                                glm_graph_compact_cache_is_f16(),
+                                DS4_N_HEAD,
+                                DS4_N_KV_LORA,
+                                (uint32_t)g->q_nope,
+                                DS4_N_ROT,
+                                0,
+                                rope_base,
+                                rope_scale,
+                                0.0f,
+                                1.0f,
+                                DS4_ROPE_YARN_BETA_FAST,
+                                DS4_ROPE_YARN_BETA_SLOW,
+                                    indexer_top_k);
+                        } else {
+                            rc = ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
                                 attn_lora_view,
                                 q_view,
                                 qk_low_view,
@@ -52086,6 +52115,7 @@ static bool glm_graph_forward_indexed_tokens(
                                 1.0f,
                                 DS4_ROPE_YARN_BETA_FAST,
                                 DS4_ROPE_YARN_BETA_SLOW);
+                        }
                     }
                     ok = rc != 0;
                     if (!ok) fprintf(stderr, "ds4: GLM sliced indexed prefill attention-lora failed at layer %u token %u\n", il, t0);

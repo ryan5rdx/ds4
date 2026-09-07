@@ -613,6 +613,7 @@ static id<MTLComputePipelineState> g_glm_attention_indexed_batch_group8_pipeline
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_valid_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline;
+static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_glm53_padded_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline;
 static id<MTLComputePipelineState> g_glm_attention_indexed_batch_lora_group8_vec_causal_fullheads_pipeline;
 static id<MTLComputePipelineState> g_glm_q4_k_pair_swiglu_f32_pipeline;
@@ -6781,6 +6782,7 @@ typedef struct {
     float    beta_fast;
     float    beta_slow;
     uint32_t head_base;
+    uint32_t valid_prefix;   /* see the Metal struct; 0 = check every row */
 } ds4_gpu_glm_attention_indexed_batch_args;
 
 typedef struct {
@@ -9066,6 +9068,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec");
         g_glm_attention_indexed_batch_lora_group8_vec_valid_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec_valid");
+        g_glm_attention_indexed_batch_lora_group8_vec_glm53_padded_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_padded");
         g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads");
         g_glm_attention_indexed_batch_lora_group8_vec_causal_pipeline =
@@ -37891,7 +37895,11 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
         float                 attn_factor,
         float                 beta_fast,
         float                 beta_slow,
-        bool                  selected_rows_valid) {
+        bool                  selected_rows_valid,
+        /* GLM53 sparse-prefill only: how many leading selected slots the
+         * producer guarantees are in range.  0 disables the specialisation, and
+         * every non-GLM53 caller passes 0. */
+        uint32_t              valid_prefix) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     const uint32_t qk_dim = qk_nope + qk_rope;
     if (!lora_out || !q || !qk_low || !kv_lora_cache || !k_rope_cache || !selected ||
@@ -37941,8 +37949,71 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
             cache_f16 && kv_lora_dim == 512u &&
             (qk_rope == 0u || qk_rope == 64u);
         const bool full_head_groups = (n_head % 8u) == 0u;
+
+        uint32_t glm53_head_base = 0u, glm53_head_count = n_head;
+        ds4_gpu_tp_attn_head_range(n_head, 8u, &glm53_head_base, &glm53_head_count);
+        (void)glm53_head_count;
+        /* DSA-LORA: the GLM 5.3 sparse-prefill specialisation.  Every condition
+         * is an invariant the kernel relies on, not a preference:
+         *
+         *   cache_f16, kv_lora_dim == 512  the staging layout is half4 x 128
+         *   qk_rope == 0                   the kernel has no RoPE path at all
+         *   full 8-head groups             no partial-group masking
+         *   head_base % 8 == 0             TP2 gives 0 or 32, both aligned
+         *   valid_prefix > 0, % 16 == 0    stage-aligned, so prefix/tail is a
+         *                                  per-stage branch not a per-row test
+         *   valid_prefix <= n_selected     the tail may be empty, never negative
+         *
+         * selected_rows_valid is NOT one of them and must not be conflated:
+         * it claims EVERY row is valid, stronger than "the first prefix are". */
+        const bool glm53_shape_ok =
+            cache_f16 && kv_lora_dim == 512u && qk_rope == 0u &&
+            full_head_groups && (glm53_head_base % 8u) == 0u &&
+            valid_prefix > 0u && (valid_prefix % 16u) == 0u &&
+            valid_prefix <= n_selected;
+        static int glm53_sel = -1;              /* 0 = base, 1 = padded */
+        if (glm53_sel < 0) {
+            const char *e = getenv("DS4_METAL_GLM53_DSA_LORA");
+            /* Banked 2026-09-07 (DSALORA + DSALORA2): +4.8-7.1% prefill at
+             * every rung 4096+, 101 cases byte-identical, and the phase census
+             * reads prefill=33 decode=0 unknown=0 on BOTH ranks with the base
+             * arm at all zeros -- so the specialisation is prefill-only as
+             * claimed rather than merely announced.
+             *
+             * DEFAULT PADDED.  Explicit, not presence-only, so "=base" restores
+             * the control -- which a control arm must write, since on v4 an
+             * omitted knob is ON.
+             *
+             * The 2048 rung reads +0.2% and that is correct: sparse attention
+             * begins past dense_limit = index_topk + pool_size - 1 = 2051, so
+             * the kernel is inert below it. */
+            glm53_sel = (e && strcmp(e, "base") == 0) ? 0 : 1;
+        }
+        const bool use_glm53_padded = (glm53_sel == 1) && glm53_shape_ok;
+        {
+            static int announced;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: DSA-LORA path %s (selector=%s shape_ok=%d | "
+                        "f16=%u lora=%u rope=%u nhead=%u head_base=%u "
+                        "groups8=%d prefix=%u n_selected=%u rows_valid=%d)\n",
+                        use_glm53_padded ? "GLM53-PADDED" : "BASE",
+                        glm53_sel ? "padded" : "base", glm53_shape_ok ? 1 : 0,
+                        (unsigned)cache_f16, (unsigned)kv_lora_dim,
+                        (unsigned)qk_rope, (unsigned)n_head,
+                        (unsigned)glm53_head_base, full_head_groups ? 1 : 0,
+                        (unsigned)valid_prefix, (unsigned)n_selected,
+                        selected_rows_valid ? 1 : 0);
+            }
+        }
+
         id<MTLComputePipelineState> pipeline = nil;
-        if (use_vec_lora && selected_rows_valid && full_head_groups) {
+        if (use_glm53_padded) {
+            pipeline = ds4_gpu_hot_pipeline(
+                g_glm_attention_indexed_batch_lora_group8_vec_glm53_padded_pipeline,
+                "kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_padded");
+        } else if (use_vec_lora && selected_rows_valid && full_head_groups) {
             pipeline = ds4_gpu_hot_pipeline(
                     g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline,
                     "kernel_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads");
@@ -37985,9 +38056,12 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
             .beta_fast = beta_fast,
             .beta_slow = beta_slow,
             .head_base = 0,
+            .valid_prefix = valid_prefix,
         };
         uint32_t head_count = n_head;
         ds4_gpu_tp_attn_head_range(n_head, 8u, &args.head_base, &head_count);
+
+
         const NSUInteger scratch_bytes = use_vec_lora ?
             (16u * ((NSUInteger)kv_lora_dim / 4u) * sizeof(uint16_t) * 4u +
              16u * ((NSUInteger)qk_rope / 4u) * sizeof(float) * 4u) :
@@ -38020,6 +38094,37 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
     }
 
     return 1;
+}
+
+int ds4_gpu_glm_attention_indexed_batch_lora_prefix_tensor(
+        ds4_gpu_tensor       *lora_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_tokens,
+        uint32_t              n_selected,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        uint32_t              valid_prefix) {
+    return ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
+        lora_out, q, qk_low, kv_lora_cache, k_rope_cache, selected,
+        n_tokens, n_selected, cache_cap, cache_f16, n_head, kv_lora_dim,
+        qk_nope, qk_rope, n_ctx_orig, freq_base, freq_scale, ext_factor,
+        attn_factor, beta_fast, beta_slow,
+        /* selected_rows_valid */ false, valid_prefix);
 }
 
 int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
@@ -38194,7 +38299,8 @@ int ds4_gpu_glm_attention_indexed_batch_lora_tensor(
                                                                  attn_factor,
                                                                  beta_fast,
                                                                  beta_slow,
-                                                                 false);
+                                                                 false,
+                                                                 /*valid_prefix=*/0u);
 }
 
 int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
@@ -38240,7 +38346,8 @@ int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
                                                                  attn_factor,
                                                                  beta_fast,
                                                                  beta_slow,
-                                                                 true);
+                                                                 true,
+                                                                 /*valid_prefix=*/0u);
 }
 
 int ds4_gpu_glm_router_select_tensor(
