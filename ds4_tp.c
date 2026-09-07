@@ -170,7 +170,24 @@ typedef struct {
  * must be divided by this before it means "messages". */
 /* Frame budget requested from create_qp, in 4 KB frames.
  *
- * Default 4095 (P2'-WIDE, 2026-09-07): +1.3% prefill @65536 on the TP2 pair,
+ * UN-BANKED 2026-09-07, same day.  Default is back to 1024.
+ *
+ * It was banked on a PREFILL-ONLY measurement -- harness-windep runs gen 0, so
+ * the +1.3% below came from a run with zero decode tokens -- and the first
+ * decode ladder to carry it (NORMFUSE, v3 8921373 with shipping-base) read a
+ * flat ~27 t/s against ~35 on the previous baseline, about -23% at every
+ * context.  The fuse arm was OFF in that run, so NORM-FUSE is exonerated and
+ * this is the live suspect: it is the only new thing in the shared baseline
+ * that touches the transport, and the CQ is sized from it.
+ *
+ * Not yet proven -- the decisive A/B is 4095 vs 1024 on a decode ladder, one
+ * env var, queued -- but a production default that may be costing 23% of decode
+ * does not get to sit in the tree while we find out.
+ *
+ * The prefill result stands as a prefill result.  What was wrong was banking a
+ * change to SHARED TRANSPORT STATE on one workload's measurement.
+ *
+ * Was: default 4095 (P2'-WIDE, 2026-09-07): +1.3% prefill @65536 on the TP2 pair,
  * 393.30 -> 398.01 t/s, 2 counterbalanced reps, bytes identical across arms and
  * no transport errors.  4095 is the ring maximum -- 4096 descriptors with one
  * slot held free -- and gives 1023 outstanding 16 KiB messages against the old
@@ -194,7 +211,7 @@ typedef struct {
 static uint32_t tp_rdma_want_frames(void) {
     static uint32_t cached;
     if (!cached) {
-        cached = 4095u;
+        cached = 1024u;
         const char *e = getenv("DS4_TP_RDMA_RECV_FRAMES");
         if (e && e[0]) {
             const int v = atoi(e);
