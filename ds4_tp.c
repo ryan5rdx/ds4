@@ -2148,14 +2148,58 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         /* Sends in sub-batches bounded by the send depth; the last of each
          * sub-batch is signaled. */
         uint32_t sent = 0, send_done = 0, recv_done = 0, signaled = 0;
+        /* How many MESSAGES the send queue can hold, from the frame budget.
+         *
+         * This provider completes EVERY send work request, whether or not
+         * IBV_SEND_SIGNALED is set -- the same thin-shim behaviour that makes
+         * it ignore wr->opcode and imm_data.  The old gate compared a count of
+         * POSTS against a count of COMPLETIONS:
+         *
+         *     while (... send_done < signaled ...)
+         *         if (sent < chunks && (signaled - send_done) < 4u)
+         *
+         * so send_done raced past signaled (WINDEP2 logged 1023 against 16),
+         * the unsigned subtraction wrapped to ~4e9, and the gate stopped
+         * gating.  At the shipping 256-message window that was 4 posts and the
+         * race rarely opened; at 1023 messages it is 16 posts and the loop
+         * fires everything at the queue at once.
+         *
+         * Both counters are in messages now, and sent >= send_done always, so
+         * the subtraction cannot wrap. */
+        /* Start from the frame budget, then LEARN the real capacity.
+         *
+         * The arithmetic says 4095 frames / 4 per message = 1023 messages, and
+         * 1023 x 4 = 4092 of 4095 -- three frames of slack.  WINDEP2 shows the
+         * true limit is lower: the worker took 1009 messages and then refused,
+         * so something else occupies ~60 frames (a provider-reserved
+         * descriptor, or accounting slack this side cannot see).  Guessing a
+         * margin would be a magic number replacing a magic number, so instead
+         * the first EAGAIN teaches us the capacity and every later window
+         * respects it.  Static: one QP per process, and the answer does not
+         * change within a run. */
+        static uint32_t g_send_msgs_cap;
+        const uint32_t send_msgs_from_frames =
+            send_depth / frames_per_msg ? send_depth / frames_per_msg : 1u;
+        if (!g_send_msgs_cap || g_send_msgs_cap > send_msgs_from_frames)
+            g_send_msgs_cap = send_msgs_from_frames;
+        /* Read live below, not snapshotted: an EAGAIN mid-window lowers the cap
+         * and the remainder of THIS window should already respect it. */
+#define SEND_MSGS_MAX (g_send_msgs_cap)
         const double deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0 + 2.0;
         uint32_t peer_poll = 0;
-        while (recv_done < chunks || send_done < signaled || sent < chunks) {
-            if (sent < chunks && (signaled - send_done) < 4u) {
+        while (recv_done < chunks || send_done < sent) {
+            const uint32_t in_flight = sent - send_done;
+            if (sent < chunks && in_flight < SEND_MSGS_MAX) {
                 const double ws0 = acct ? tp_now_sec() : 0.0;
                 uint32_t n = chunks - sent;
-                if (n > 64u) n = 64u;
-                if (n > send_depth / 4u && send_depth / 4u > 0u) n = send_depth / 4u;
+                if (n > 64u) n = 64u;   /* chain length the driver accepts */
+                /* Never offer more than the queue can still hold.  The old
+                 * bound was `send_depth / 4u`, which is the frames-per-message
+                 * divisor written as a bare 4 -- correct only while a message
+                 * is 16 KiB, and it bounded the BATCH rather than the
+                 * OUTSTANDING total, so it never prevented an overflow. */
+                const uint32_t room = SEND_MSGS_MAX - in_flight;
+                if (n > room) n = room;
                 if (n == 0u) n = 1u;
                 for (uint32_t i = 0; i < n; i++) {
                     struct ibv_send_wr *w = &r->win_swr[i];
@@ -2164,7 +2208,15 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                     w->sg_list = &r->win_sge[depth + sent + i];
                     w->num_sge = 1;
                     w->opcode = IBV_WR_SEND;
-                    w->send_flags = i + 1u == n ? IBV_SEND_SIGNALED : 0;
+                    /* SIGNAL EVERY REQUEST.  The flow control below compares
+                     * completions against sends, so it needs one completion per
+                     * send.  This provider already produces that -- it ignores
+                     * send_flags exactly as it ignores wr->opcode -- but relying
+                     * on that is a hang waiting to happen: if the flag were ever
+                     * honoured, `send_done < sent` would never clear and the
+                     * loop would spin to its deadline.  Asking for what the code
+                     * depends on costs nothing here and cannot be wrong. */
+                    w->send_flags = IBV_SEND_SIGNALED;
                     w->next = i + 1u < n ? &r->win_swr[i + 1u] : NULL;
                 }
                 if (acct) t_setup += (tp_now_sec() - ws0) * 1e6;
@@ -2172,7 +2224,44 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 int psrc = 0;
                 BULK_T(t_spost, psrc = ibv_post_send(r->qp, r->win_swr, &bad_send));
                 if (psrc != 0) {
-                    fprintf(stderr, "ds4-tp: big gate post_send(%u): %s\n", n, strerror(errno));
+                    /* A failed post_send is PARTIAL, not atomic: *bad_wr names
+                     * the first request the queue would not take, and
+                     * everything before it was accepted.  Discarding the whole
+                     * batch loses those, and the peer then waits forever for
+                     * chunks that were already on the wire -- which is exactly
+                     * how WINDEP2 desynced (worker EAGAIN on post_send(63) with
+                     * 49 accepted; coordinator stalled at 1009/1023 recvs, and
+                     * 1023 - 1009 = 14 = 63 - 49).
+                     *
+                     * EAGAIN means "queue full, try again", so credit what was
+                     * taken and let the loop drain completions and retry.  Only
+                     * a genuine error is fatal. */
+                    uint32_t accepted = 0;
+                    if (bad_send >= r->win_swr && bad_send < r->win_swr + n)
+                        accepted = (uint32_t)(bad_send - r->win_swr);
+                    if (errno == EAGAIN || errno == ENOMEM) {
+                        sent += accepted;
+                        if (accepted) signaled++;
+                        /* The queue told us its real size.  Back the cap off
+                         * below what was in flight when it refused, so the next
+                         * window paces itself instead of rediscovering this. */
+                        const uint32_t observed = sent - send_done;
+                        const uint32_t learned = observed > 8u ? observed - 8u : 1u;
+                        if (learned < g_send_msgs_cap) {
+                            fprintf(stderr,
+                                    "ds4-tp: big gate send queue refused at %u "
+                                    "messages in flight (frame budget implied "
+                                    "%u); capping at %u for the rest of the run\n",
+                                    observed, send_msgs_from_frames, learned);
+                            g_send_msgs_cap = learned;
+                        }
+                        goto poll_completions;
+                    }
+                    fprintf(stderr,
+                            "ds4-tp: big gate post_send(%u): %s (%u of %u accepted, "
+                            "%u/%u sent, %u in flight of %u)\n",
+                            n, strerror(errno), accepted, n, sent, chunks,
+                            in_flight, SEND_MSGS_MAX);
                     return 0;
                 }
                 {
@@ -2187,13 +2276,15 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                         announced_batch = 1;
                         fprintf(stderr,
                                 "ds4-tp: bulk gate send BATCHED (%u chunks this "
-                                "round, up to %u per post, send depth %u)\n",
-                                chunks, n, send_depth);
+                                "round, up to %u per post, send queue %u frames "
+                                "= %u messages)\n",
+                                chunks, n, send_depth, SEND_MSGS_MAX);
                     }
                 }
                 sent += n;
                 signaled++;
             }
+        poll_completions:;
             struct ibv_wc wc[64];
             int nwc = 0;
             BULK_T(t_cwait, nwc = ibv_poll_cq(r->cq, 64, wc));
@@ -2236,8 +2327,10 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 return 0;
             }
             if (nwc == 0 && tp_now_sec() > deadline) {
-                fprintf(stderr, "ds4-tp: timeout in big gate window (%u/%u recvs, %u/%u sends, %u sent)\n",
-                        recv_done, chunks, send_done, signaled, sent);
+                fprintf(stderr,
+                        "ds4-tp: timeout in big gate window (%u/%u recvs, %u/%u send "
+                        "completions, %u posts, queue cap %u messages)\n",
+                        recv_done, chunks, send_done, sent, signaled, SEND_MSGS_MAX);
                 return 0;
             }
         }
@@ -2246,6 +2339,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             BULK_T(t_copyout,
                    memcpy((uint8_t *)in + off, stage_recv, (size_t)win_bytes));
         }
+#undef SEND_MSGS_MAX
         off += win_bytes;
         if (acct) {
             /* Committed only HERE, after the window completed.  A window that
