@@ -861,7 +861,13 @@ static uint32_t directional_steering_layer_count(void) {
  * wide; large ones get big blocks so the block COUNT stays bounded. */
 #define DS4_GLM_SPLIT_SMALL_ROWS_MAX 1024u
 #define DS4_GLM_SPLIT_ROWS_SMALL       32u
-#define DS4_GLM_SPLIT_ROWS_LARGE      128u
+/* D4-BLOCKS, default-on in v4: 80 rows/block, +0.89% decode @310k, quality gate
+ * clean (NLL +0.000%, 100/100 cases tied).  Safe as a default only because
+ * glm_graph_indexed_decode_split_block_rows_for() raises it wherever the block
+ * count would trip the kernel's 64-block refusal -- at 80 that is anything above
+ * n_selected 5120, including the SSD-streaming 8192 cap.
+ * DS4_GLM_SPLIT_ROWS_LARGE=128 restores the old constant. */
+#define DS4_GLM_SPLIT_ROWS_LARGE       80u
 /* The decode split-K kernel refuses outright above this many blocks
  * (ds4_metal.m, the `n_blocks > 64u` clause) and the failure mode is a SILENTLY
  * disabled optimisation, not an error. */
