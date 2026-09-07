@@ -1416,6 +1416,28 @@ int ds4_gpu_glm53_indexer_pool_update_tensor(
         float                 eps,
         bool                  cache_f16);
 
+/* IDX-SPLIT-DEC (queue 2c), non-TP half.  pack turns one rank's local top-k
+ * (int32 LOCAL indices from the shipping argsort/MERGE-TRUNC route) into packed
+ * (score desc, GLOBAL index asc) keys; merge_expand turns two such runs into
+ * the replicated answer, with the 4:1 pool expansion fused in. */
+int ds4_gpu_glm53_idxsplit_pack_tensor(
+        ds4_gpu_tensor       *keys,
+        const ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *selected,
+        uint32_t              top_k,
+        uint32_t              count,
+        uint32_t              index_base);
+
+int ds4_gpu_glm53_idxsplit_merge_expand_tensor(
+        ds4_gpu_tensor       *raw_selected,
+        const ds4_gpu_tensor *keys_a,
+        const ds4_gpu_tensor *keys_b,
+        uint32_t              top_k,
+        uint32_t              pos0,
+        uint32_t              index_topk,
+        uint32_t              pool_size,
+        uint32_t              output_width);
+
 int ds4_gpu_glm53_expand_pool_selection_tensor(
         ds4_gpu_tensor       *raw_selected,
         const ds4_gpu_tensor *pool_selected,
@@ -1513,6 +1535,18 @@ int ds4_gpu_glm_indexer_rope_tail_tensor(
         float           attn_factor,
         float           beta_fast,
         float           beta_slow);
+
+int ds4_gpu_glm_indexer_score_one_base_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        uint32_t              n_rows,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale,
+        bool                  cache_f16,
+        uint32_t              row_base);
 
 int ds4_gpu_glm_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,

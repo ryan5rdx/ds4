@@ -27,9 +27,8 @@
 typedef struct ds4_tp ds4_tp;
 
 enum {
-    DS4_TP_GATE_ATTN = 0,
-    DS4_TP_GATE_FFN = 1,
-    DS4_TP_GATES_PER_LAYER = 2,
+    /* DS4_TP_GATE_* and DS4_TP_GATES_PER_LAYER live in ds4.h so the
+     * transport and Metal fence encoders share one slot layout. */
     /* Max rows in a verify-block batch gate (speculative blocks are <=5). */
     DS4_TP_BATCH_MAX_ROWS = 8,
 };

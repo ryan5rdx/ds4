@@ -247,7 +247,17 @@ int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
 int ds4_engine_layer_count(ds4_engine *e);
 /* Decode gate schedule for the TP transport; see ds4_tp_identity. */
-enum { DS4_TP_GATE_MASK_WORDS = 3 };
+enum { DS4_TP_GATE_MASK_WORDS = 4 };
+/* Slots are ordered by actual graph execution. The router slot remains
+ * reserved for wire compatibility even though the retired router split is not
+ * part of this branch. */
+enum {
+    DS4_TP_GATE_INDEXER = 0,
+    DS4_TP_GATE_ATTN = 1,
+    DS4_TP_GATE_ROUTER = 2,
+    DS4_TP_GATE_FFN = 3,
+    DS4_TP_GATES_PER_LAYER = 4,
+};
 void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *start,
                                  uint32_t *step,

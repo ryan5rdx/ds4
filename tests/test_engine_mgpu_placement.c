@@ -91,6 +91,14 @@ uint64_t ds4_test_glm_memory_guard_default_budget(uint64_t host_bytes,
 int ds4_test_glm_memory_guard_disabled(void);
 int ds4_test_glm53_kda_phase_splits(int mode, int phase);
 int ds4_test_glm53_kda_split_mode_of(const char *env);
+int ds4_test_glm53_idx_split_decide(int gate_due, uint32_t score_rows,
+                                    uint32_t selected_pools, uint32_t min_ctx);
+void ds4_test_glm53_layer_tp_indexer_gate(uint32_t il,
+                                          uint32_t n_layer,
+                                          uint32_t n_nextn,
+                                          uint32_t n_leading_dense,
+                                          int idx_split,
+                                          int *fires_indexer);
 void ds4_test_glm53_layer_tp_gates(uint32_t il,
                                    uint32_t n_layer,
                                    uint32_t n_nextn,
@@ -843,6 +851,61 @@ static void test_prefill_watchdog_bound(void) {
             CHECK(attn == 1 && ffn == 0,
                   "leading dense layer gates its KDA attention when split, "
                   "and still never gates its dense FFN");
+        }
+
+        /* IDX-SPLIT-DEC's gate.  DSA layers only -- il % 4 == 3 and not the
+         * nextn layer -- and nothing at all when the split is off.  Both halves
+         * matter: a gate fired where the mask omits it shifts every later
+         * ordinal on that layer, which is how S6a died. */
+        {
+            int idx = -1;
+            uint32_t dsa_seen = 0;
+            for (uint32_t il = 0; il < N_LAYER; il++) {
+                ds4_test_glm53_layer_tp_indexer_gate(il, N_LAYER, N_NEXTN,
+                                                     N_DENSE, 0, &idx);
+                CHECK(idx == 0, "no indexer gate anywhere with the split off");
+                ds4_test_glm53_layer_tp_indexer_gate(il, N_LAYER, N_NEXTN,
+                                                     N_DENSE, 1, &idx);
+                const int want = (il + N_NEXTN < N_LAYER && il % 4u == 3u);
+                CHECK(idx == want,
+                      "indexer gate fires on DSA layers and only those");
+                dsa_seen += (uint32_t)idx;
+            }
+            CHECK(dsa_seen == 11,
+                  "GLM 5.3 has exactly 11 DSA layers to exchange on");
+        }
+
+        /* IDX-SPLIT's split-or-replicate decision, at the boundaries.  The
+         * layer owes an INDEXER gate whenever it is due; this only picks
+         * between a real exchange and a dummy, so "0" here still means a gate
+         * is sent.  POOL_SIZE 4, 512 selected pools -> exactness needs
+         * score_rows >= 1024, i.e. visible >= 4096. */
+        {
+            const uint32_t POOL = 4u, POOLS = 512u;
+            const uint32_t MIN = 65536u;   /* the shipped default */
+            struct { uint32_t visible; int want; const char *why; } cases[] = {
+                { 1u,      0, "visible 1: nowhere near the exactness bound" },
+                { 2051u,   0, "visible 2051: the dense limit, still no split" },
+                { 2052u,   0, "visible 2052: sparse but under the exactness bound" },
+                { 4095u,   0, "visible 4095: one short of exactness" },
+                { 4096u,   0, "visible 4096: exact, but under the profit bound" },
+                { MIN - POOL, 0, "one pool under the profitability bound" },
+                { MIN,     1, "at the profitability bound: split" },
+                { 310000u, 1, "production: split" },
+            };
+            for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+                const uint32_t rows = cases[i].visible / POOL;
+                CHECK(ds4_test_glm53_idx_split_decide(1, rows, POOLS, MIN)
+                          == cases[i].want, cases[i].why);
+                /* Not due -> never split, whatever the context. */
+                CHECK(ds4_test_glm53_idx_split_decide(0, rows, POOLS, MIN) == 0,
+                      "a layer that owes no gate never splits");
+            }
+            /* Both ranks derive it from score_rows alone, so a sequence that
+             * crosses the bound flips both at the same token or neither. */
+            CHECK(ds4_test_glm53_idx_split_decide(1, (MIN - POOL)/POOL, POOLS, MIN) == 0 &&
+                  ds4_test_glm53_idx_split_decide(1, MIN/POOL, POOLS, MIN) == 1,
+                  "the crossing is a step function of score_rows, identical on both ranks");
         }
 
         /* Layer 3 is the first DSA layer and the first routed FFN. */

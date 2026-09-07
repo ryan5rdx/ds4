@@ -1187,8 +1187,12 @@ static const char *tp_wc_status_str(int status) {
  * (identity mapping); GLM's schedule from the hello skips dense layers
  * and the ATTN slots. */
 static uint32_t tp_gate_slot(const ds4_tp *tp, uint64_t seq) {
-    if (tp->gate_slot_mask[0] || tp->gate_slot_mask[1] ||
-        tp->gate_slot_mask[2]) {
+    /* Loop rather than naming three words: with four gates a GLM 5.3 mask
+     * reaches slot 183, and a hardcoded three-word test is one gate away from
+     * silently treating a masked schedule as an unmasked one. */
+    uint64_t any = 0;
+    for (uint32_t w = 0; w < DS4_TP_GATE_MASK_WORDS; w++) any |= tp->gate_slot_mask[w];
+    if (any) {
         uint32_t ordinal = (uint32_t)((seq - 1) % tp->gates_per_token);
         for (uint32_t word = 0; word < DS4_TP_GATE_MASK_WORDS; word++) {
             uint64_t bits = tp->gate_slot_mask[word];

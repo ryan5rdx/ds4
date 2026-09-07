@@ -840,15 +840,25 @@ static void glm53_layer_tp_gates(uint32_t il,
                                  uint32_t n_nextn,
                                  uint32_t n_leading_dense,
                                  bool kda_split,
+                                 bool dense_ffn_split,
+                                 bool idx_split,
+                                 bool *fires_indexer,
                                  bool *fires_attn,
                                  bool *fires_ffn) {
     const bool normal = il + n_nextn < n_layer;
     const bool kda = normal && il % 4u != 3u;
+    /* IDX-SPLIT-DEC exchanges 512 packed top-k keys on DSA layers only -- KDA
+     * layers have no indexer to split.  It fires BEFORE the attention gate on
+     * the same layer, which is why INDEXER is slot 0 and not slot 3. */
+    if (fires_indexer) *fires_indexer = normal && !kda && idx_split;
     /* DSA layers always exchange their attention output; KDA layers compute the
      * whole recurrence locally and exchange nothing unless the heads are split. */
     if (fires_attn) *fires_attn = normal && (!kda || kda_split);
-    /* Only the routed sparse FFNs exchange a partial. */
-    if (fires_ffn) *fires_ffn = normal && il >= n_leading_dense;
+    /* Sparse FFNs always exchange; S4 adds the three leading dense FFNs. */
+    if (fires_ffn) {
+        *fires_ffn = normal &&
+            (il >= n_leading_dense || dense_ffn_split);
+    }
 }
 
 static int g_ds4_lock_fd = -1;
@@ -13081,6 +13091,7 @@ static uint32_t ds4_prefill_watchdog_chunk(uint32_t prompt_len) {
 
 #define DS4_GLM_METAL_INDEXED_PREFILL_SCORE_SCRATCH_MB 256u
 #define DS4_GLM53_PREFILL_CHUNK_TOKENS 4096u
+#define DS4_GLM53_INDEX_POOL_SIZE 4u
 
 /* GLM 5.3 prefill chunking, in the two levels the DeepSeek path already uses.
  *
@@ -13107,6 +13118,143 @@ static uint32_t ds4_prefill_watchdog_chunk(uint32_t prompt_len) {
  * knob is kept because the coupling is real (at 131k the indexer pool is 32768
  * columns, so 256 MB is exactly 2048 score rows) and a future chunk change would
  * need to re-check it. */
+/* IDX-SPLIT-DEC (queue 2c).  Each rank scores a disjoint half of the pooled KV
+ * rows, reduces its half with the shipping route, exchanges 512 packed
+ * (score desc, global index asc) keys over a fourth gate, and merges.  Exact:
+ * any member of the global top-k is in the top-k of the half containing it, and
+ * the packed key is a strict total order on a unique index, so the top 512 of
+ * the union is unique.  probe_idxsplit proves it bit-identical on the dev box.
+ *
+ * STATIC FOR THE WHOLE RUN, deliberately.  gate_slot_mask is exchanged once in
+ * tp_hello_exchange and is not rebuilt per token, so a context-dependent
+ * crossover is not merely risky -- it is unimplementable without renegotiation.
+ * The eventual production policy is per-sequence negotiation persisted across
+ * interrupt/resume; the first arm is one knob for the whole process.
+ *
+ * Decode only.  Prefill exchanges 4 KiB per TOKEN rather than per token-step,
+ * which is a different transport problem (2d). */
+/* Profitability, which is NOT the exactness bound, and is now a REAL gate on
+ * the split rather than advice.
+ *
+ * The INDEXER slot is reserved for the whole run and the layer fires it either
+ * way -- a dummy when it does not split -- so the ~0.12 ms/token of 11 gates is
+ * SUNK and is not part of this decision.  What is left is the merge, measured
+ * at 0.243 ms/token, against a half-scan saving of S(C)/2 that scales with
+ * context.  Splitting wins when S(C)/2 > 0.243, i.e. above ~54,000 tokens:
+ *
+ *     16384  -0.169 ms      65536  +0.052 ms      131072  +0.347 ms
+ *     32768  -0.096 ms      98304  +0.199 ms      310000  +2.182 ms
+ *
+ * Default 65536: the first round number past break-even.  An earlier draft used
+ * 131072, which was wrong once the gate became unconditional -- it would have
+ * taken the replicated path all the way to 131k and given up as much as 0.35
+ * ms/token (~1.2%) in the 54k-131k band for nothing.
+ *
+ * SAFE HERE WHERE IT WAS NOT SAFE IN THE MASK.  It chooses between splitting
+ * and scanning replicated; it does not change WHICH gates fire, so it cannot
+ * desync a pair.  Both ranks evaluate it from score_rows, which they agree on
+ * by construction. */
+static uint32_t glm53_idx_split_min_ctx(void) {
+    static uint32_t cached;
+    static int done;
+    if (!done) {
+        done = 1;
+        cached = 65536u;
+        const char *e = getenv("DS4_GLM_IDX_SPLIT_MIN_CTX");
+        if (e && e[0]) {
+            const unsigned long v = strtoul(e, NULL, 10);
+            if (v >= 4096ul && v <= (1ul << 22)) cached = (uint32_t)v;
+        }
+    }
+    return cached;
+}
+
+/* The decision the gate schedule made, so the graph cannot re-derive it and get
+ * a different answer.  The hello compares gate_slot_mask between RANKS, which
+ * catches a two-rank disagreement; nothing catches the schedule and the graph
+ * disagreeing on ONE rank, and that is the S6a shape.  One variable, written
+ * where the mask is built, read where the gate fires. */
+static int g_glm53_idx_split_negotiated = -1;
+
+static int glm53_idx_split_dec_active(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        /* Banked and default ON: +7.93% decode at 310k, byte-identical across
+         * three runs.  Below the 65k split threshold the gate remains reserved
+         * and fires empty, so short-context users may set =0 to avoid that
+         * fixed cost.  This changes the negotiated TP gate schedule; both ranks
+         * must agree, and the hello rejects a mismatch. */
+        const char *e = getenv("DS4_GLM_IDX_SPLIT_DEC");
+        cached = !(e && e[0] == '0');
+    }
+    return cached;
+}
+
+/* Announce unconditionally once, printing every input the decision used, so a
+ * run that silently did not split is distinguishable from one that did.  Two
+ * arms in this campaign were voided by an announce that only fired on the happy
+ * path. */
+static void glm53_idx_split_announce(uint32_t rows, uint32_t begin,
+                                     uint32_t count, uint32_t want_pools,
+                                     int active) {
+    static int announced;
+    if (announced) return;
+    announced = 1;
+    fprintf(stderr,
+            "ds4: IDX-SPLIT-DEC %s (pooled rows %u -> [%u, %u) = %u, "
+            "top_k pools %u, crossover %u)%s\n",
+            active ? "ACTIVE" : "GATE-ONLY",
+            rows, begin, begin + count, count, want_pools, 2u * want_pools,
+            active ? "" :
+            "  <-- below crossover: both ranks scan everything and the gate "
+            "fires empty to keep the ordinal");
+    /* The old form of this could not fire once min_ctx gated activation: it
+     * warned about being "active below break-even", which is now impossible by
+     * construction.  What is worth saying is the opposite -- the gate is being
+     * reserved and fired on every DSA layer while the split itself is off, so
+     * the run pays ~0.12 ms/token of skew for nothing. */
+    if (!active && rows * DS4_GLM53_INDEX_POOL_SIZE < glm53_idx_split_min_ctx()) {
+        fprintf(stderr,
+                "ds4: IDX-SPLIT-DEC is enabled but this context (~%u visible) "
+                "is below the ~%u break-even, so the reserved gate fires empty "
+                "-- about 0.12 ms/token of skew for no saving.  Set "
+                "DS4_GLM_IDX_SPLIT_DEC=0 for short-context work.\n",
+                rows * DS4_GLM53_INDEX_POOL_SIZE, glm53_idx_split_min_ctx());
+    }
+}
+
+/* Split, or scan replicated?  ONE copy, called by the graph and pinned by the
+ * CPU test, because two copies of a gate-adjacent condition is how S6a and S6c
+ * both happened.  It does NOT decide whether the gate fires -- the layer owes
+ * the gate either way and a dummy is sent when this says no.
+ *
+ *   score_rows >= 2 * selected_pools   EXACTNESS.  Each half must hold the full
+ *                                      top-k or the union is not the global one.
+ *   visible >= min_ctx                 PROFITABILITY.  Below break-even the
+ *                                      half-scan saving does not cover the
+ *                                      merge, so replicated + a dummy is cheaper.
+ *
+ * Both are functions of score_rows alone, which both ranks already agree on. */
+static int glm53_idx_split_decide(int gate_due, uint32_t score_rows,
+                                  uint32_t selected_pools, uint32_t min_ctx) {
+    if (!gate_due || selected_pools == 0u) return 0;
+    if (score_rows < 2u * selected_pools) return 0;
+    return (uint64_t)score_rows * DS4_GLM53_INDEX_POOL_SIZE >= (uint64_t)min_ctx;
+}
+
+/* The rank's half of `rows`, by the quotient/remainder form pass 1 already uses
+ * for tiles, so an odd count has no empty and no double-counted row.  Both
+ * ranks compute it from the same `rows`, which is why it takes no rank-local
+ * state beyond the rank index. */
+static void glm53_idx_split_range(uint32_t rows, uint32_t rank, uint32_t world,
+                                  uint32_t *begin, uint32_t *count) {
+    const uint32_t base = world ? rows / world : rows;
+    const uint32_t rem = world ? rows - base * world : 0u;
+    const uint32_t b = rank * base + (rank < rem ? rank : rem);
+    if (begin) *begin = b;
+    if (count) *count = base + (rank < rem ? 1u : 0u);
+}
+
 static uint32_t glm53_prefill_chunk_tokens(void) {
     static uint32_t cached;
     if (cached) return cached;
@@ -13213,6 +13361,13 @@ static int glm53_tp_dense_ffn_split_requested(void) {
     /* Default ON. Set DS4_GLM_TP_DENSE_FFN_SPLIT=0 to disable. */
     const char *env = getenv("DS4_GLM_TP_DENSE_FFN_SPLIT");
     return !(env && env[0] == '0');
+}
+
+/* Keep the gate schedule and graph on the same shape predicate.  GLM 5.3's
+ * dense FFN happens to be aligned, but relying on that would shift every later
+ * gate ordinal for an unaligned shape. */
+static bool glm53_tp_dense_ffn_split_shape_ok(void) {
+    return DS4_N_FF_DENSE >= 2u && (DS4_N_FF_DENSE % 64u) == 0u;
 }
 
 /* HC1 -- fuse the hc_pre tail: split+weighted-sum and the RMS norm are one
@@ -38188,9 +38343,6 @@ static uint32_t glm53_graph_resume_prefill_min_tokens(void) {
 #define DS4_GLM_METAL_LONG_CONTEXT_THRESHOLD 65536u
 #define DS4_GLM_METAL_LONG_CONTEXT_FULL_ATTN_CONTEXT 4096u
 #define DS4_GLM_METAL_INDEXED_PREFILL_CHUNK_TOKENS 4096u
-#define DS4_GLM53_INDEX_POOL_SIZE 4u
-
-
 static uint32_t glm_graph_full_attention_cap(uint32_t ctx_size,
                                              bool     ssd_streaming);
 static uint32_t glm_graph_indexed_prefill_chunk_tokens(
@@ -53379,6 +53531,28 @@ static bool glm_graph_forward_token(
         }
         glm_ft_fail_il = il;
         const uint32_t slice_layer_done = il - g->layer_start + 1u;
+        /* IDX-SPLIT's gate is OWED BY THE LAYER, not by the branch that happens
+         * to want it.  The schedule reserves an INDEXER slot on every DSA layer
+         * whenever the flag is on, but the selection code below has several
+         * exits -- dense attention while visible <= dense_limit, a layer that
+         * is not a full-indexer layer, the indexer ablation -- and each of them
+         * used to leave the slot unconsumed.  The next ATTN gate then lands on
+         * the INDEXER ordinal and the pair dies with "gate order broke".  That
+         * was latent while the flag was opt-in and only ever set at 310k, where
+         * decode never sees a short context; making it default-on exposed it to
+         * ordinary short-context TP decode.
+         *
+         * So it is decided once, here, and a catch-all below fires a dummy for
+         * any path that did not fire a real one.  Exactly one per due layer. */
+        bool idx_gate_due_layer = false;
+        glm53_layer_tp_gates(il, DS4_N_LAYER, DS4_N_NEXTN_PREDICT,
+                             DS4_N_LEADING_DENSE, false, false,
+                             g_glm53_idx_split_negotiated == 1,
+                             &idx_gate_due_layer, NULL, NULL);
+        const int idx_gate_due =
+            idx_gate_due_layer && g->tp_world == 2u && g->tp_out && g->tp_in &&
+            !g->ssd_streaming;
+        int idx_gate_fired = 0;
         if (g->ssd_streaming) {
             if (!static_decode_map) {
                 ok = glm_graph_stream_map_decode_layer(g, model, weights, il);
@@ -53768,20 +53942,96 @@ static bool glm_graph_forward_token(
                         1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
                     const uint32_t score_rows = g->glm53 ?
                         visible / DS4_GLM53_INDEX_POOL_SIZE : visible;
-                    ok = ds4_gpu_glm_indexer_score_one_tensor(
+                    /* IDX-SPLIT-DEC.  Refuses rather than halving when a half
+                     * cannot hold the full top-k: the exchange is exact only
+                     * because each half's local top-k contains every global
+                     * winner that lives in it, and a half shorter than top_k
+                     * cannot make that claim.  Below the threshold both ranks
+                     * scan everything, exactly as before. */
+                    const uint32_t idx_selected_pools =
+                        indexer_top_k / DS4_GLM53_INDEX_POOL_SIZE;
+                    /* Ask the SHARED policy which gates this layer fires rather
+                     * than re-deriving the layer set here.  A graph that fires a
+                     * gate the mask omits -- or skips one it reserves -- shifts
+                     * every later ordinal and kills the pair, which is how S6a
+                     * and S6c each died once. */
+                    const int idx_gate_here = idx_gate_due && g->glm53;
+                    /* GLOBAL condition, evaluated identically on both ranks from
+                     * score_rows alone.  `count >= selected_pools` per rank was
+                     * WRONG and one-sided: at score_rows = 1023 the remainder
+                     * gives rank 0 512 rows and rank 1 511, so rank 0 would fire
+                     * the exchange and rank 1 would not.  Both halves are big
+                     * enough exactly when score_rows >= 2 * selected_pools, and
+                     * that is a statement about a number both ranks already
+                     * agree on. */
+                    const int idx_split_here =
+                        glm53_idx_split_decide(idx_gate_here, score_rows,
+                                               idx_selected_pools,
+                                               glm53_idx_split_min_ctx());
+                    uint32_t idx_begin = 0u, idx_count = score_rows;
+                    if (idx_split_here) {
+                        glm53_idx_split_range(score_rows, g->tp_rank,
+                                              g->tp_world, &idx_begin,
+                                              &idx_count);
+                    }
+                    if (idx_gate_here) {
+                        glm53_idx_split_announce(score_rows, idx_begin,
+                                                 idx_count, idx_selected_pools,
+                                                 idx_split_here);
+                    }
+                    ok = ds4_gpu_glm_indexer_score_one_base_tensor(
                             g->indexer_scores,
                             g->indexer_q,
                             g->indexer_weights,
                             g->layer_indexer_key_cache[il],
-                            score_rows,
+                            idx_count,
                             DS4_N_INDEXER_HEAD,
                             DS4_N_INDEXER_HEAD_DIM,
                             indexer_scale,
-                            glm_graph_compact_cache_is_f16()) != 0;
+                            glm_graph_compact_cache_is_f16(),
+                            idx_begin) != 0;
                     DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "indexer_scores");
-                    if (ok && g->glm53) {
-                        const uint32_t selected_pools =
-                            indexer_top_k / DS4_GLM53_INDEX_POOL_SIZE;
+                    if (ok && g->glm53 && idx_split_here) {
+                        const uint32_t slot =
+                            il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_INDEXER;
+                        /* Local reduction over my half with the SHIPPING route
+                         * (argsort + MERGE-TRUNC), then pack straight into the
+                         * gate's out slot -- the pack has to gather the score
+                         * anyway, so it is also where the local->global
+                         * relabelling belongs. */
+                        ok = ds4_gpu_indexer_topk_tensor(
+                                g->indexer_pool_selected,
+                                g->indexer_scores,
+                                idx_count,
+                                1,
+                                idx_selected_pools) != 0;
+                        if (ok) ok = ds4_gpu_glm53_idxsplit_pack_tensor(
+                                g->tp_out[slot],
+                                g->indexer_scores,
+                                g->indexer_pool_selected,
+                                idx_selected_pools,
+                                idx_count,
+                                idx_begin) != 0;
+                        if (ok) ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_INDEXER) != 0;
+                        if (ok) idx_gate_fired = 1;
+                        /* Rank 0's half first on BOTH ranks.  The merge is a
+                         * bitonic merge of the same multiset either way, but
+                         * ordering it by rank rather than by "mine/theirs" is
+                         * the idiom the ATTN gate already uses and makes rank
+                         * symmetry structural instead of incidental. */
+                        if (ok) {
+                            const ds4_gpu_tensor *ka = g->tp_rank == 0 ?
+                                g->tp_out[slot] : g->tp_in[slot];
+                            const ds4_gpu_tensor *kb = g->tp_rank == 0 ?
+                                g->tp_in[slot] : g->tp_out[slot];
+                            ok = ds4_gpu_glm53_idxsplit_merge_expand_tensor(
+                                    g->indexer_selected, ka, kb,
+                                    idx_selected_pools, pos, indexer_top_k,
+                                    DS4_GLM53_INDEX_POOL_SIZE,
+                                    glm53_graph_indexer_selected_limit()) != 0;
+                        }
+                    } else if (ok && g->glm53) {
+                        const uint32_t selected_pools = idx_selected_pools;
                         ok = ds4_gpu_indexer_topk_tensor(
                                 g->indexer_pool_selected,
                                 g->indexer_scores,
@@ -53797,6 +54047,22 @@ static bool glm_graph_forward_token(
                                 indexer_top_k,
                                 DS4_GLM53_INDEX_POOL_SIZE,
                                 glm53_graph_indexer_selected_limit()) != 0;
+                        /* CONSUME THE RESERVED SLOT.  The mask is negotiated
+                         * once at TP creation and reserves an INDEXER gate on
+                         * every DSA layer whenever the flag is on, but the split
+                         * itself only makes sense above the crossover.  Below it
+                         * both ranks scan everything and still have to fire the
+                         * gate, or the ordinal walk slips and every later gate
+                         * on this layer lands on the wrong slot.
+                         *
+                         * The payload is whatever the out slot holds and nobody
+                         * reads it; the exchange exists for its ordinal.  Both
+                         * ranks reach this together because the condition above
+                         * is global. */
+                        if (ok && idx_gate_here) {
+                            ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_INDEXER) != 0;
+                            if (ok) idx_gate_fired = 1;
+                        }
                     } else if (ok) {
                         ok = ds4_gpu_indexer_topk_tensor(g->indexer_selected,
                                                          g->indexer_scores,
@@ -54000,6 +54266,14 @@ static bool glm_graph_forward_token(
                                                            DS4_N_KEY_MLA,
                                                            DS4_N_VALUE_MLA,
                                                            true) != 0;
+        }
+        /* Every DSA-layer path that did not fire a real INDEXER gate fires an
+         * empty one here, before ATTN, so the ordinal is consumed exactly once
+         * whichever way the selection went.  Position relative to the attention
+         * compute is irrelevant -- only the order among GATES matters. */
+        if (ok && idx_gate_due && !idx_gate_fired) {
+            ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_INDEXER) != 0;
+            if (ok) idx_gate_fired = 1;
         }
         DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "attention");
         if (ok) metal_graph_debug_dump_tensor("glm_decode_heads",
@@ -64557,11 +64831,34 @@ void ds4_test_glm53_layer_tp_gates(uint32_t il,
                                    int *fires_ffn) {
     bool attn = false, ffn = false;
     glm53_layer_tp_gates(il, n_layer, n_nextn, n_leading_dense,
-                         kda_split != 0, &attn, &ffn);
+                         kda_split != 0, false, false,
+                         NULL, &attn, &ffn);
     if (fires_attn) *fires_attn = attn ? 1 : 0;
     if (fires_ffn) *fires_ffn = ffn ? 1 : 0;
 }
 
+/* IDX-SPLIT-DEC's gate, as its own shim.  The rule worth pinning is that it
+ * fires on DSA layers ONLY (il % 4 == 3, and not the nextn layer) and only when
+ * the split is on -- and that it takes the LOWEST slot, because the exchange
+ * happens before the attention output and tp_gate_slot() walks ascending.  Get
+ * the layer set wrong and every later gate on that layer shifts: S6a. */
+void ds4_test_glm53_layer_tp_indexer_gate(uint32_t il,
+                                          uint32_t n_layer,
+                                          uint32_t n_nextn,
+                                          uint32_t n_leading_dense,
+                                          int idx_split,
+                                          int *fires_indexer) {
+    bool indexer = false;
+    glm53_layer_tp_gates(il, n_layer, n_nextn, n_leading_dense,
+                         false, false, idx_split != 0,
+                         &indexer, NULL, NULL);
+    if (fires_indexer) *fires_indexer = indexer ? 1 : 0;
+}
+
+int ds4_test_glm53_idx_split_decide(int gate_due, uint32_t score_rows,
+                                    uint32_t selected_pools, uint32_t min_ctx) {
+    return glm53_idx_split_decide(gate_due, score_rows, selected_pools, min_ctx);
+}
 /* mode: 0 off, 1 decode, 2 both.  phase: 0 decode, 1 prefill. */
 int ds4_test_glm53_kda_phase_splits(int mode, int phase) {
     return glm53_kda_phase_splits((glm53_kda_split_mode)mode,
@@ -65961,17 +66258,44 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
                 glm53_kda_phase_splits(glm53_tp_kda_split_mode(),
                                        GLM53_KDA_PHASE_DECODE) &&
                 glm53_tp_kda_split_shape_ok();
+            const bool dense_ffn_split =
+                glm53_tp_dense_ffn_split_requested() != 0 &&
+                glm53_tp_dense_ffn_split_shape_ok();
+            /* THE THRESHOLD CANNOT LIVE HERE, and it was tried.  The mask is
+             * built before the hello, and the WORKER sets ctx_size = 0 there
+             * and adopts the leader's afterwards (ds4_tp.c: "adopt the
+             * leader's").  So a ctx-dependent mask would have the leader
+             * reserving INDEXER slots and the worker not, the hello's mask
+             * comparison would refuse the pairing, and the feature would be
+             * unusable rather than merely mis-sized.
+             *
+             * So the mask depends on the env alone -- which both ranks set
+             * identically, and a one-sided setting is exactly what the mask
+             * comparison already catches.  Profitability is the operator's
+             * call, advised at runtime by glm53_idx_split_announce(). */
+            const bool idx_split = glm53_idx_split_dec_active();
+            g_glm53_idx_split_negotiated = idx_split ? 1 : 0;
             /* From layer 0, not DS4_N_LEADING_DENSE: the leading layers are
              * dense only in their FFN and their KDA attention gates too.  See
              * glm53_layer_tp_gates(), which owns both rules. */
             for (uint32_t il = 0; il < normal_layers; il++) {
+                bool fires_indexer = false;
                 bool fires_attn = false, fires_ffn = false;
                 glm53_layer_tp_gates(il, DS4_N_LAYER, DS4_N_NEXTN_PREDICT,
                                      DS4_N_LEADING_DENSE, kda_split,
-                                     &fires_attn, &fires_ffn);
-                const uint32_t gates[2] = { DS4_TP_GATE_ATTN, DS4_TP_GATE_FFN };
-                const bool fires[2] = { fires_attn, fires_ffn };
-                for (uint32_t k = 0; k < 2; k++) {
+                                     dense_ffn_split, idx_split,
+                                     &fires_indexer, &fires_attn, &fires_ffn);
+                /* Listed in firing order, and the slot indices are ascending by
+                 * construction (INDEXER 0 < ATTN 1 < FFN 3) so the
+                 * ordinal walk in tp_gate_slot() matches the graph.  Those two
+                 * facts have to stay true together: the indexer exchange really
+                 * does happen before the attention output on a DSA layer, which
+                 * is the only reason INDEXER may take the lowest slot. */
+                const uint32_t gates[3] = { DS4_TP_GATE_INDEXER,
+                                            DS4_TP_GATE_ATTN,
+                                            DS4_TP_GATE_FFN };
+                const bool fires[3] = { fires_indexer, fires_attn, fires_ffn };
+                for (uint32_t k = 0; k < 3; k++) {
                     if (!fires[k]) continue;
                     const uint32_t slot =
                         il * DS4_TP_GATES_PER_LAYER + gates[k];
