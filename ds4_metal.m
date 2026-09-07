@@ -49960,10 +49960,19 @@ int ds4_gpu_glm53_matmul_bf16(
          * (partial + reduce) instead of one, so it only pays where the launch
          * is starved, which is the same shape gate B1 uses.
          *
-         * Off unless DS4_METAL_GLM53_BF16_MV_KSPLIT is 2..32.  It supersedes
-         * B1 when on -- they are two settings of one lever, not a stack. */
+         * Banked at KSPLIT=4 (A2, 2026-09-07): +0.7% decode @310k over a B1
+         * control, quality gate PASS.  It SUPERSEDES B1 when on -- these are two
+         * settings of one lever, not a stack -- so DS4_METAL_GLM53_BF16_MV_KSPLIT=0
+         * is what restores B1, and is what a control arm must write.  An omitted
+         * knob here is ON.
+         *
+         * 4 and not more: the sweep peaks at 4-8 (30.32 / 30.31 t/s, tied) and
+         * reverses by 32 (-0.6%).  Past the peak each threadgroup gets too
+         * little of the contraction to amortise the second (reduce) dispatch.
+         * 4 is the smaller reduction-order perturbation of the two tied values
+         * and is the one the quality gate covers. */
         const uint32_t bf16_ksplit = bf16_splitk_shape ?
-            (uint32_t)ds4_gpu_env_u64("DS4_METAL_GLM53_BF16_MV_KSPLIT", 0u, 0u, 32u) : 0u;
+            (uint32_t)ds4_gpu_env_u64("DS4_METAL_GLM53_BF16_MV_KSPLIT", 4u, 0u, 32u) : 0u;
         const int bf16_wide = bf16_ksplit >= 2u;
         const bool bc_inp = (in_dim % 32u) != 0u;
         const bool bc_out = (out_dim % 64u) != 0u || (n_rows % 32u) != 0u;
