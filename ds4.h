@@ -283,10 +283,19 @@ enum { DS4_TP_GATE_MASK_WORDS = 4 };
  * hello's gate_slot_mask comparison refuses that pairing rather than
  * corrupting it. */
 enum {
-    DS4_TP_GATE_ATTN = 0,
-    DS4_TP_GATE_ROUTER = 1,
-    DS4_TP_GATE_FFN = 2,
-    DS4_TP_GATES_PER_LAYER = 3,
+    /* IDX-SPLIT-DEC's exchange fires BEFORE the attention output on a DSA
+     * layer, and tp_gate_slot() walks the mask in ASCENDING slot order.  So
+     * INDEXER takes 0 and everything shifts; appending it as 3 would have put
+     * it after FFN in the walk and shifted every later gate onto the wrong
+     * slot, which is the S6a failure exactly.
+     *
+     * 46 layers x 4 = 184 slots against DS4_TP_GATE_MASK_WORDS * 64 = 256, and
+     * ds4_engine_tp_gate_schedule() refuses loudly if that ever stops holding. */
+    DS4_TP_GATE_INDEXER = 0,
+    DS4_TP_GATE_ATTN = 1,
+    DS4_TP_GATE_ROUTER = 2,
+    DS4_TP_GATE_FFN = 3,
+    DS4_TP_GATES_PER_LAYER = 4,
 };
 void ds4_engine_tp_gate_schedule(ds4_engine *e,
                                  uint32_t *start,

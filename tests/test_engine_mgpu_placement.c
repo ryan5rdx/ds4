@@ -92,6 +92,12 @@ int ds4_test_glm_memory_guard_disabled(void);
 uint32_t ds4_test_glm53_tp_split_flags(void);
 int ds4_test_glm53_kda_phase_splits(int mode, int phase);
 int ds4_test_glm53_kda_split_mode_of(const char *env);
+void ds4_test_glm53_layer_tp_indexer_gate(uint32_t il,
+                                          uint32_t n_layer,
+                                          uint32_t n_nextn,
+                                          uint32_t n_leading_dense,
+                                          int idx_split,
+                                          int *fires_indexer);
 void ds4_test_glm53_layer_tp_gates(uint32_t il,
                                    uint32_t n_layer,
                                    uint32_t n_nextn,
@@ -854,6 +860,28 @@ static void test_prefill_watchdog_bound(void) {
             CHECK(attn == 1 && ffn == 0,
                   "leading dense layer gates its KDA attention when split, "
                   "and still never gates its dense FFN");
+        }
+
+        /* IDX-SPLIT-DEC's gate.  DSA layers only -- il % 4 == 3 and not the
+         * nextn layer -- and nothing at all when the split is off.  Both halves
+         * matter: a gate fired where the mask omits it shifts every later
+         * ordinal on that layer, which is how S6a died. */
+        {
+            int idx = -1;
+            uint32_t dsa_seen = 0;
+            for (uint32_t il = 0; il < N_LAYER; il++) {
+                ds4_test_glm53_layer_tp_indexer_gate(il, N_LAYER, N_NEXTN,
+                                                     N_DENSE, 0, &idx);
+                CHECK(idx == 0, "no indexer gate anywhere with the split off");
+                ds4_test_glm53_layer_tp_indexer_gate(il, N_LAYER, N_NEXTN,
+                                                     N_DENSE, 1, &idx);
+                const int want = (il + N_NEXTN < N_LAYER && il % 4u == 3u);
+                CHECK(idx == want,
+                      "indexer gate fires on DSA layers and only those");
+                dsa_seen += (uint32_t)idx;
+            }
+            CHECK(dsa_seen == 11,
+                  "GLM 5.3 has exactly 11 DSA layers to exchange on");
         }
 
         /* Layer 3 is the first DSA layer and the first routed FFN. */

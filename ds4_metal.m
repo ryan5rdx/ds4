@@ -7528,6 +7528,7 @@ typedef struct {
     uint32_t cache_f16;
     float    scale;
     uint32_t rows_per_tg;
+    uint32_t row_base;   /* IDX-SPLIT-DEC; 0 reproduces the full scan */
 } ds4_gpu_glm_indexer_score_one_args;
 
 typedef struct {
@@ -38986,6 +38987,9 @@ static uint32_t glm_indexer_score_rows_per_tg(uint32_t n_rows) {
     return by_occupancy < want ? by_occupancy : want;
 }
 
+/* IDX-SPLIT-DEC scores pooled rows [row_base, row_base + n_rows) into
+ * scores[0, n_rows).  Every pre-existing caller goes through the wrapper below
+ * with row_base = 0, which is the full scan unchanged. */
 int ds4_gpu_glm_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -38996,6 +39000,22 @@ int ds4_gpu_glm_indexer_score_one_tensor(
         uint32_t              head_dim,
         float                 scale,
         bool                  cache_f16) {
+    return ds4_gpu_glm_indexer_score_one_base_tensor(
+            scores, q, weights, indexer_key_cache, n_rows, n_head, head_dim,
+            scale, cache_f16, 0u);
+}
+
+int ds4_gpu_glm_indexer_score_one_base_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        uint32_t              n_rows,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale,
+        bool                  cache_f16,
+        uint32_t              row_base) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!scores || !q || !weights || !indexer_key_cache ||
         n_rows == 0 || n_head == 0 || head_dim == 0 ||
@@ -39024,6 +39044,7 @@ int ds4_gpu_glm_indexer_score_one_tensor(
 
         ds4_gpu_glm_indexer_score_one_args args = {
             .rows_per_tg = 1u,
+            .row_base = row_base,
             .n_rows = n_rows,
             .n_head = n_head,
             .head_dim = head_dim,

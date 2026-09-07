@@ -1660,6 +1660,18 @@ int ds4_gpu_glm_indexer_rope_tail_tensor(
         float           beta_fast,
         float           beta_slow);
 
+int ds4_gpu_glm_indexer_score_one_base_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        uint32_t              n_rows,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale,
+        bool                  cache_f16,
+        uint32_t              row_base);
+
 int ds4_gpu_glm_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,

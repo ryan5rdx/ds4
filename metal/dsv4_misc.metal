@@ -272,6 +272,17 @@ struct ds4_metal_args_glm_indexer_score_one {
     uint32_t cache_f16;
     float    scale;
     uint32_t rows_per_tg;   /* IDX-VPT; 1 reproduces the one-row kernel */
+    /* IDX-SPLIT-DEC: score pooled rows [row_base, row_base + n_rows) of the
+     * cache into scores[0, n_rows) -- a COMPACT rank-local output.  The READ
+     * side shifts and the WRITE side does not; that asymmetry is the point,
+     * and it is why the packer downstream needs a score_offset and a
+     * global_index_base separately rather than one `begin`.  row_base = 0
+     * reproduces the full scan exactly, so every existing caller is unchanged.
+     *
+     * Only the three kernels on THIS struct take it.  The batch scorers index
+     * the cache the same way but carry args_glm_indexer_scores_batch and are
+     * prefill; 2c is decode-only and they are deliberately untouched. */
+    uint32_t row_base;
 };
 
 struct ds4_metal_args_glm_indexer_scores_batch {
@@ -1950,7 +1961,7 @@ kernel void kernel_glm_indexer_score_one(
             (device const float *)(q + (uint64_t)h * args.head_dim * sizeof(float));
         for (uint d = tid; d < args.head_dim; d += nth) {
             const float k = glm_cache_load_f32_or_f16(indexer_key_cache,
-                                                      (uint64_t)row * args.head_dim + d,
+                                                      (uint64_t)(args.row_base + row) * args.head_dim + d,
                                                       args.cache_f16);
             partial += qh[d] * k;
         }
@@ -1989,7 +2000,7 @@ kernel void kernel_glm_indexer_score_one_direct(
 
     if (tid < 128u) {
         ktg[tid] = glm_cache_load_f32_or_f16(indexer_key_cache,
-                                             (uint64_t)row * 128u + tid,
+                                             (uint64_t)(args.row_base + row) * 128u + tid,
                                              args.cache_f16);
     }
 
@@ -2088,7 +2099,7 @@ kernel void kernel_glm_indexer_score_one_vpt(
 
         if (tid < 128u) {
             ktg[tid] = glm_cache_load_f32_or_f16(indexer_key_cache,
-                                                 (uint64_t)row * 128u + tid,
+                                                 (uint64_t)(args.row_base + row) * 128u + tid,
                                                  args.cache_f16);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
