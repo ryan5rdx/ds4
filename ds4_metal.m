@@ -11309,12 +11309,19 @@ static uint64_t g_tp_seq;
  * decides both, and both call it.
  *
  * Off by default.  Bit-identical except for -0.0f (see the kernel comment). */
-static int ds4_gpu_moe_tp_shed(void) {
+/* Was the knob asked for at all?  Separate from whether it is legal, so an
+ * unsupported shape can say so instead of silently doing nothing. */
+static int ds4_gpu_moe_tp_shed_requested(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *e = getenv("DS4_GLM_MOE_TP_SHED");
         cached = (e && e[0] && e[0] != '0') ? 1 : 0;
     }
+    return cached;
+}
+
+static int ds4_gpu_moe_tp_shed(void) {
+    const int cached = ds4_gpu_moe_tp_shed_requested();
     /* Requires the split (nothing to shed at world 1) and the ownership-aware
      * sum kernel; without the latter the unowned rows would be read as garbage. */
     return cached && g_tp_split_world == 2 && g_moe_sum8_owned_pipeline != nil;
@@ -46332,7 +46339,44 @@ int ds4_gpu_routed_moe_batch_tensor(
              * stops zero-filling here, the sum below must stop reading those
              * rows, and vice versa.  Deriving them separately is how this ends
              * up summing uninitialised memory. */
-            const int moe_shed = ds4_gpu_moe_tp_shed();
+            /* n_expert == 8 is NOT incidental.  The producer half stops
+             * writing unowned rows for any grouped shape, but the only
+             * ownership-aware consumer is kernel_dsv4_moe_sum8_owned_f32 --
+             * a top-6 route still goes through the ordinary sum6, which would
+             * read rows nobody wrote.  ds4_gpu_moe_tp_shed() cannot check this
+             * because it has no n_expert; the check belongs here, at the one
+             * place both halves are decided together. */
+            const int moe_shed = (n_expert == 8) && ds4_gpu_moe_tp_shed();
+            if (n_expert != 8 && ds4_gpu_moe_tp_shed_requested()) {
+                static int warned;
+                if (!warned) {
+                    warned = 1;
+                    fprintf(stderr,
+                            "ds4: MOE-TP-SHED requested but n_expert is %u, not 8 -- "
+                            "only sum8 has an ownership-aware variant, so shedding "
+                            "here would sum unwritten rows.  Staying OFF.\n",
+                            (unsigned)n_expert);
+                }
+            }
+            /* Engagement confirmation, once, on BOTH ranks.  SHED's producer
+             * half is a `return` inside a kernel that always builds and its
+             * consumer half is a pipeline swap -- neither fails loudly if the
+             * arm never turns on, so "SHED measured no change" and "SHED never
+             * ran" are the same log.  The campaign has already spent rig cycles
+             * on that ambiguity.  Print the decision, the width that allowed
+             * it, and the rank that owns the shard. */
+            {
+                static int announced_shed;
+                if (!announced_shed) {
+                    announced_shed = 1;
+                    fprintf(stderr,
+                            "ds4: MOE-TP-SHED %s (n_expert %u, rank %d of %d)\n",
+                            moe_shed ? "ENGAGED -- producers skip unowned rows, "
+                                       "sum8_owned consumes"
+                                     : "off -- producers write all rows",
+                            (unsigned)n_expert, (int)g_tp_split_rank, (int)g_tp_split_world);
+                }
+            }
             gate_mm_args.tp_shed = moe_shed;
             down_mm_args.tp_shed = moe_shed;
             if (moe_shed) {

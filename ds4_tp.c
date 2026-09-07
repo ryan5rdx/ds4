@@ -1573,6 +1573,61 @@ static const char *tp_gate_slot_name(uint32_t gate) {
     }
 }
 
+/* ---- bulk-gate window accounting (DS4_TP_BIG_GATE_DEBUG=2) ----------------
+ *
+ * The merge brought in a windowed bulk path whose every window opens with
+ * tp_rdma_window_barrier(): a blocking 1-byte write + 1-byte read on the TCP
+ * data socket.  A full round trip, serialized, before any RDMA in that window
+ * can start.  The pre-merge path had no such barrier -- `git show 4ec9f2d` has
+ * zero occurrences of the function.
+ *
+ * That makes it the leading suspect for the -4.7% prefill shift, and the
+ * arithmetic is not far-fetched: a window is at most depth x 16 KiB = 4 MiB,
+ * so a 32 MiB exchange costs 8 barriers, and this campaign has already
+ * MEASURED a TCP round trip on this pair at 0.236-0.267 ms (LOGITS-TCP).  A
+ * few hundred of those is the whole regression.
+ *
+ * But "not far-fetched" is what the NAX attribution was, and that one was
+ * wrong -- it named a code path the M2 Ultra cannot even reach.  So this
+ * counts rather than argues.  Barrier, post, poll and staging-copy are timed
+ * separately, because the fix differs for each: a barrier cost wants
+ * ping-pong windows, a copy cost wants direct registration, a poll cost is
+ * just the peer being slow and is nobody's bug. */
+static uint64_t g_bulk_win_count;
+static uint64_t g_bulk_bytes;
+static double   g_bulk_barrier_us;
+static double   g_bulk_post_us;
+static double   g_bulk_poll_us;
+static double   g_bulk_copy_us;
+static int      g_bulk_dbg = -1;   /* 0 off, 1 debug, 2 window accounting */
+
+static int tp_bulk_dbg_level(void) {
+    if (g_bulk_dbg < 0) {
+        const char *e = getenv("DS4_TP_BIG_GATE_DEBUG");
+        g_bulk_dbg = (!e || !e[0]) ? 0 : (e[0] == '2' ? 2 : 1);
+    }
+    return g_bulk_dbg;
+}
+
+/* Windows per exchange is the number that decides whether the barrier can
+ * matter at all, so it is reported alongside the times rather than left to be
+ * divided out by the reader. */
+void ds4_tp_bulk_window_report(const char *when) {
+    if (!g_bulk_win_count) return;
+    const double n = (double)g_bulk_win_count;
+    fprintf(stderr,
+            "ds4-tp: bulk windows [%s] n=%llu  %.2f MiB total  "
+            "barrier %.3f ms (%.1f%%, %.0f us/win)  post %.3f ms  "
+            "poll %.3f ms  stage-copy %.3f ms\n",
+            when ? when : "run", (unsigned long long)g_bulk_win_count,
+            (double)g_bulk_bytes / 1048576.0,
+            g_bulk_barrier_us / 1000.0,
+            100.0 * g_bulk_barrier_us /
+                (g_bulk_barrier_us + g_bulk_post_us + g_bulk_poll_us + g_bulk_copy_us + 1e-9),
+            g_bulk_barrier_us / n,
+            g_bulk_post_us / 1000.0, g_bulk_poll_us / 1000.0, g_bulk_copy_us / 1000.0);
+}
+
 static int tp_rdma_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
     ds4_tp_rdma *r = &tp->rdma;
     const uint32_t slot = layer * DS4_TP_GATES_PER_LAYER + gate;
@@ -1860,6 +1915,25 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
     const uint64_t stage_bytes = (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
     uint32_t depth = r->recv_depth ? r->recv_depth : 64u;
     if (depth > 256u) depth = 256u;
+    /* DS4_TP_RDMA_WINDOW_DEPTH exists to test the barrier hypothesis in the
+     * only direction that is safe.  Barrier count is bytes/(depth x 16 KiB),
+     * so LOWERING depth multiplies barriers: if the barrier owns the
+     * regression, halving depth must roughly double the penalty, and that is a
+     * causal test no amount of correlation gives.  Raising it past what the QP
+     * was created with would overrun the receive queue, so it is clamped -- the
+     * knob can make things worse on purpose, never silently worse by accident. */
+    {
+        static int win_override = -2;
+        if (win_override == -2) {
+            const char *e = getenv("DS4_TP_RDMA_WINDOW_DEPTH");
+            win_override = (e && e[0]) ? atoi(e) : -1;
+            if (win_override > 0)
+                fprintf(stderr, "ds4-tp: bulk window depth forced to %d (cap %u)\n",
+                        win_override, depth);
+        }
+        if (win_override > 0 && (uint32_t)win_override < depth)
+            depth = (uint32_t)win_override;
+    }
     if (!direct) {
         const uint32_t stage_slots = (uint32_t)(stage_bytes / DS4_TP_RDMA_MAX_MSG);
         if (depth > stage_slots) depth = stage_slots;
@@ -1874,9 +1948,11 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         if (!r->win_sge || !r->win_rwr || !r->win_swr) return 0;
     }
     const uint32_t send_depth = r->send_depth ? r->send_depth : 256u;
+    const int dbg2 = tp_bulk_dbg_level() >= 2;
     uint64_t off = 0;
     uint8_t tag = 1;
     while (off < bytes) {
+        const double w0 = dbg2 ? tp_now_sec() : 0.0;
         const uint64_t remaining = bytes - off;
         uint32_t chunks = (uint32_t)((remaining + DS4_TP_RDMA_MAX_MSG - 1u) / DS4_TP_RDMA_MAX_MSG);
         if (chunks > depth) chunks = depth;
@@ -1886,7 +1962,9 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             const uint32_t len = (uint32_t)(left > DS4_TP_RDMA_MAX_MSG ? DS4_TP_RDMA_MAX_MSG : left);
             const uint64_t coff = win_bytes;
             if (!direct) {
+                const double c0 = dbg2 ? tp_now_sec() : 0.0;
                 memcpy(stage_send + coff, (const uint8_t *)out + off + coff, len);
+                if (dbg2) g_bulk_copy_us += (tp_now_sec() - c0) * 1e6;
             }
             r->win_sge[i] = (struct ibv_sge) {
                 .addr = direct ? in_lo + off + coff : (uintptr_t)(stage_recv + coff),
@@ -1908,6 +1986,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         /* Post in chains of 64 (the chain length the driver is known to
          * accept); the work requests are already linked, so cut the links at
          * chain ends. */
+        const double p0 = dbg2 ? tp_now_sec() : 0.0;
         for (uint32_t c0 = 0; c0 < chunks; c0 += 64u) {
             const uint32_t c1 = c0 + 64u < chunks ? c0 + 64u : chunks;
             r->win_rwr[c1 - 1u].next = NULL;
@@ -1918,9 +1997,16 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             }
         }
         atomic_thread_fence(memory_order_release);
+        const double b0 = dbg2 ? tp_now_sec() : 0.0;
+        if (dbg2) g_bulk_post_us += (b0 - p0) * 1e6;
         if (!tp_rdma_window_barrier(tp, tag)) {
             fprintf(stderr, "ds4-tp: big gate window barrier failed\n");
             return 0;
+        }
+        if (dbg2) {
+            g_bulk_barrier_us += (tp_now_sec() - b0) * 1e6;
+            g_bulk_win_count++;
+            g_bulk_bytes += win_bytes;
         }
         tag++;
         /* Sends in sub-batches bounded by the send depth; the last of each
@@ -2016,15 +2102,31 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         }
         atomic_thread_fence(memory_order_acquire);
         if (!direct) {
+            const double c1 = dbg2 ? tp_now_sec() : 0.0;
             memcpy((uint8_t *)in + off, stage_recv, win_bytes);
+            if (dbg2) g_bulk_copy_us += (tp_now_sec() - c1) * 1e6;
         }
         off += win_bytes;
+        if (dbg2) {
+            /* Poll is the residual: whole window minus the parts named above.
+             * Naming it that way rather than timing it directly means the four
+             * numbers always sum to the wall clock, so a missing cost shows up
+             * as an implausible poll share instead of vanishing. */
+            const double whole = (tp_now_sec() - w0) * 1e6;
+            const double named = g_bulk_barrier_us + g_bulk_post_us + g_bulk_copy_us;
+            static double prev_named;
+            const double poll = whole - (named - prev_named);
+            prev_named = named;
+            if (poll > 0.0) g_bulk_poll_us += poll;
+            if ((g_bulk_win_count % 512u) == 0u) ds4_tp_bulk_window_report("running");
+        }
     }
     return 1;
 }
 
 static void tp_rdma_close(ds4_tp *tp) {
     ds4_tp_rdma *r = &tp->rdma;
+    ds4_tp_bulk_window_report("final");
     free(r->win_sge); free(r->win_rwr); free(r->win_swr);
     r->win_sge = NULL; r->win_rwr = NULL; r->win_swr = NULL;
     if (r->qp) r->api.destroy_qp(r->qp);
@@ -2619,7 +2721,7 @@ int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
             static double hs_acc, tx_acc, last_end;
             const double t_end = tp_now_sec();
             hs_acc += t_hs - t_start; tx_acc += t_end - t_hs;
-            if (getenv("DS4_TP_BIG_GATE_DEBUG")[0] == '2')
+            if (tp_bulk_dbg_level() >= 2)
                 fprintf(stderr, "ds4-tp: big gate #%u layer %u: %llu bytes, since last release %.2f ms, handshake %.2f, transfer %.2f\n",
                         n + 1, layer, (unsigned long long)bytes,
                         last_end > 0.0 ? (t_start - last_end) * 1e3 : 0.0,

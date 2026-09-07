@@ -197,7 +197,14 @@ check-mxfp4-half-lut:
 # -- so a gate arm would fail on a missing score_official three steps in.  One
 # target so the rebuild recipe cannot be partially remembered: a gate arm needs
 # `ds4` and score_official, not just ds4-bench.
-rig: ds4 ds4-server ds4-bench gguf-tools/quality-testing/score_official
+# check-threadgroup-memory is a PREREQUISITE, not advice.  A kernel bound below
+# what it indexes does not crash and does not warn -- it reads whatever else is
+# in threadgroup memory, so the failure mode is a wrong number that looks like a
+# result.  This campaign has already shipped one 16-alignment bug that only the
+# Metal debug layer caught, and the static census is the only check that runs
+# without a device.  It costs under a second; a rig host that skips it is a rig
+# host that can measure garbage all night.
+rig: check-threadgroup-memory ds4 ds4-server ds4-bench gguf-tools/quality-testing/score_official
 	@echo "ds4: rig host ready (ds4, ds4-server, ds4-bench, score_official)"
 
 check-threadgroup-memory:

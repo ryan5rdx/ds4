@@ -315,8 +315,13 @@ def main():
         return 1
     print("No kernel is bound below what it can be shown to index.")
     print("Not a proof: computed offsets (NR0*NK, NSG*D) are invisible to a")
-    print("static pass -- run the dispatching probes under MTL_SHADER_VALIDATION=1")
-    print("for those.")
+    print("static pass, and there is NO working dynamic check to fall back on.")
+    print("MTL_SHADER_VALIDATION=1 does not catch threadgroup overruns -- that")
+    print("was tested, not assumed: 16 bytes bound to a kernel indexing 32 is")
+    print("reported as nothing at all (probes/probe_pollgate.c carries the")
+    print("negative control behind DS4_PROBE_TGMEM_OVERRUN).  MTL_DEBUG_LAYER=1")
+    print("checks the API contract (16-byte alignment, binding rules) and does")
+    print("earn its place, but it does not check indexing either.")
     return 0
 
 

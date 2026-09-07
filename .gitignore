@@ -71,3 +71,6 @@ tests/bench_*
 !tests/*.sh
 !tests/*.py
 !tests/*.md
+
+# stamp used by the scratch repo probe runner to detect stale objects
+.probe-objects.stamp
