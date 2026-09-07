@@ -46504,6 +46504,37 @@ int ds4_gpu_routed_moe_batch_tensor(
              getenv("DS4_METAL_DS4F_MXFP4_DOWN_LUT_TP") != NULL) &&
             (use_pre_m5_mxfp4_mm_id_down_half_lut_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_DOWN_HALF_LUT) != 0u);
+        /* WHY SHED DID OR DID NOT ENGAGE -- outside the branch, so a skipped
+         * branch still says something.
+         *
+         * SHEDGATE2 burned a rig cycle on this: the announce lived inside
+         * `if (use_mm_id)`, that branch was not taken, and the gate saw NO
+         * announce at all in either arm.  With nothing to read, the run
+         * concluded the predicate rejects GLM for `n_expert != 8` -- but
+         * n_expert here is DS4_N_EXPERT_USED, which is 8 on GLM at all three
+         * call sites, so that was never it.  An absent signal got interpreted,
+         * which is worse than a wrong one.
+         *
+         * Every precondition is named now, with its value. */
+        if (ds4_gpu_moe_tp_shed_requested()) {
+            static int announced_why;
+            if (!announced_why) {
+                announced_why = 1;
+                const char *map0 = ds4_gpu_mul_mm_id_map0_name(n_expert);
+                fprintf(stderr,
+                        "ds4: MOE-TP-SHED requested -- use_mm_id=%d "
+                        "(q4_batch_expert_table=%d iq2_batch_selected_addr=%d "
+                        "n_tokens=%u>=32 is %d map0_ne20_%u=%s) n_expert=%u "
+                        "n_total_expert=%u tp_world=%d sum8_owned_pipeline=%s\n",
+                        use_mm_id ? 1 : 0,
+                        use_q4_batch_expert_table ? 1 : 0,
+                        use_iq2_batch_selected_addr ? 1 : 0,
+                        n_tokens, n_tokens >= 32u ? 1 : 0,
+                        n_expert, map0 ? map0 : "MISSING",
+                        n_expert, n_total_expert, (int)g_tp_split_world,
+                        g_moe_sum8_owned_pipeline != nil ? "loaded" : "NIL");
+            }
+        }
         if (use_mm_id) {
             gate_map_args =
                 ds4_gpu_make_mul_mm_id_map_args(expert_in_dim, n_total_expert, 1, n_expert, n_tokens);
