@@ -67,12 +67,23 @@ static BOOL g_batch_has_work;
  * are an upper bound; the anatomy is what this exists for. Off by default. */
 #define DS4_TIMELINE_NAME_MAX 80
 #define DS4_TIMELINE_SAMPLES_PER_BUFFER 4096
+#define DS4_TIMELINE_TAG_MAX 40
 typedef struct {
     uintptr_t caller;
     uint32_t n_dispatch;
     uint32_t tg[3];
     uint32_t tpt[3];
     char kernel[DS4_TIMELINE_NAME_MAX];
+    /* Which model stage this encoder belongs to, e.g. "L17/kda_attention".
+     *
+     * Without it the rollup aggregates by kernel name alone, and the kernels
+     * that matter most here are GENERIC: the same mul_mm services routed-MoE
+     * experts, the dense FFN and the output projection, across every layer.
+     * Summing them into one row answers no question anyone is asking -- "which
+     * kernel owns routed_moe" cannot be recovered from a total that also
+     * contains dense_ffn.  Captured when the encoder is created, from the tag
+     * the graph set, so it is durable rather than reconstructed. */
+    char tag[DS4_TIMELINE_TAG_MAX];
 } ds4_timeline_rec;
 
 @interface DS4TimelineBatch : NSObject {
@@ -89,6 +100,8 @@ typedef struct {
 @end
 
 static BOOL g_timeline_enabled;
+static void ds4_gpu_trace_tag_copy(char *dst, size_t cap);
+static void ds4_gpu_trace_label_encoder(id<MTLComputeCommandEncoder> enc);
 static FILE *g_timeline_file;
 static pthread_mutex_t g_timeline_mutex = PTHREAD_MUTEX_INITIALIZER;
 static DS4TimelineBatch *g_timeline_batch;
@@ -256,7 +269,8 @@ static void ds4_gpu_timeline_probe(id<MTLDevice> device) {
     fprintf(g_timeline_file, "# ds4 encoder timeline; slide=0x%llx pid=%d\n",
             (unsigned long long)_dyld_get_image_vmaddr_slide(0), (int)getpid());
     fprintf(g_timeline_file, "# B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns>\n");
-    fprintf(g_timeline_file, "# E <seq> <idx> <start_ns> <end_ns> <dur_us> <gap_us> <caller_unslid> <n_dispatch> <tg> <tpt> <kernel>\n");
+    fprintf(g_timeline_file, "# E <seq> <idx> <start_ns> <end_ns> <dur_us> <gap_us> <caller_unslid> <n_dispatch> <tg> <tpt> <stage> <kernel>\n");
+    fprintf(g_timeline_file, "# fields are 1-based: $6=dur_us $7=gap_us $10=tg $11=tpt $12=stage $13=kernel\n");
     fflush(g_timeline_file);
     fprintf(stderr, "ds4: encoder timeline -> %s\n", path);
 }
@@ -294,11 +308,12 @@ static void ds4_gpu_timeline_resolve(DS4TimelineBatch *b, id<MTLCommandBuffer> c
         const ds4_timeline_rec *r = &b->recs[i];
         const double dur_us = (end >= start) ? (double)(end - start) / 1000.0 : -1.0;
         const double gap_us = (prev_end && start >= prev_end) ? (double)(start - prev_end) / 1000.0 : 0.0;
-        fprintf(g_timeline_file, "E %llu %u %llu %llu %.2f %.2f 0x%llx %u %ux%ux%u %ux%ux%u %s\n",
+        fprintf(g_timeline_file, "E %llu %u %llu %llu %.2f %.2f 0x%llx %u %ux%ux%u %ux%ux%u %s %s\n",
                 (unsigned long long)b->seq, i,
                 (unsigned long long)start, (unsigned long long)end, dur_us, gap_us,
                 (unsigned long long)(r->caller - (uintptr_t)_dyld_get_image_vmaddr_slide(0)),
                 r->n_dispatch, r->tg[0], r->tg[1], r->tg[2], r->tpt[0], r->tpt[1], r->tpt[2],
+                r->tag[0] ? r->tag : "untagged",
                 r->kernel[0] ? r->kernel : "?");
         if (end) prev_end = end;
     }
@@ -366,6 +381,7 @@ static id<MTLComputeCommandEncoder> ds4_gpu_timeline_new_encoder(
     ds4_timeline_rec *rec = &b->recs[rec_index];
     memset(rec, 0, sizeof(*rec));
     rec->caller = caller;
+    ds4_gpu_trace_tag_copy(rec->tag, sizeof(rec->tag));
     /* `slot` is already the counter-sample index in this scope. */
     DS4TimelineSlot *rec_slot = [DS4TimelineSlot new];
     rec_slot->batch = b;
@@ -373,6 +389,11 @@ static id<MTLComputeCommandEncoder> ds4_gpu_timeline_new_encoder(
     objc_setAssociatedObject(enc, kDS4TimelineSlotKey, rec_slot,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     ds4_gpu_timeline_hook_encoder(enc);
+    /* Label the encoder too, when DS4_METAL_TRACE_LABELS asks for it.  The
+     * labeller existed and had no caller, so the Metal System Trace
+     * integration its comment describes has never actually applied a label --
+     * the intervals table showed unnamed encoders.  Same tag as the record. */
+    ds4_gpu_trace_label_encoder(enc);
     return enc;
 }
 /* Blit encoder with timeline sampling (blit passes are otherwise invisible
@@ -1373,17 +1394,35 @@ static int ds4_gpu_trace_labels(void) {
     return value;
 }
 
+/* The tag feeds TWO consumers now: Metal System Trace encoder labels, and the
+ * encoder timeline's per-record stage field.  Gating it on TRACE_LABELS alone
+ * meant a timeline run recorded every encoder as untagged -- which is how the
+ * Q2 rollup ended up aggregating generic GEMMs across unrelated stages. */
+static int ds4_gpu_stage_tag_wanted(void) {
+    return ds4_gpu_trace_labels() || g_timeline_enabled;
+}
+
 static char g_trace_tag[64];
 
 void ds4_gpu_trace_tag(const char *tag) {
-    if (!ds4_gpu_trace_labels()) return;
+    if (!ds4_gpu_stage_tag_wanted()) return;
     if (!tag) { g_trace_tag[0] = 0; return; }
     snprintf(g_trace_tag, sizeof(g_trace_tag), "%s", tag);
 }
 
 void ds4_gpu_trace_tag_layer(uint32_t layer, const char *stage) {
-    if (!ds4_gpu_trace_labels()) return;
+    if (!ds4_gpu_stage_tag_wanted()) return;
     snprintf(g_trace_tag, sizeof(g_trace_tag), "L%u/%s", layer, stage ? stage : "");
+}
+
+/* Snapshot the tag into a record.  Copied at encoder creation rather than
+ * read at resolve time: the graph moves on to the next stage long before the
+ * batch resolves, so a pointer would name whatever stage happened to be
+ * current when the file was written. */
+static void ds4_gpu_trace_tag_copy(char *dst, size_t cap) {
+    if (!dst || !cap) return;
+    if (!g_trace_tag[0]) { dst[0] = 0; return; }
+    snprintf(dst, cap, "%s", g_trace_tag);
 }
 
 static void ds4_gpu_trace_label_encoder(id<MTLComputeCommandEncoder> enc) {
@@ -50602,6 +50641,12 @@ int ds4_gpu_glm53_kda_decode(
                     { "nsg16",     "kernel_glm53_kda_decode_nsg16",    16u },
                     { "nsg32",     "kernel_glm53_kda_decode_nsg32",    32u },
                     { "vpt4_nsg8", "kernel_glm53_kda_decode_vpt4_nsg8", 8u },
+                    /* WP3 diagnostic: v1's shape with the device scope dropped
+                     * from both threadgroup barriers.  Selectable so
+                     * probe_kdadecode can pair it against v1 in one library;
+                     * nothing selects it by default and it is not a variant
+                     * anyone should ship without the probe's identity result. */
+                    { "v1_tgbar",  "kernel_glm53_kda_decode_v1_tgbar",  4u },
                 };
                 for (size_t i = 0; i < sizeof(tbl)/sizeof(tbl[0]); i++) {
                     if (strcmp(v, tbl[i].name) != 0) continue;

@@ -49986,6 +49986,7 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
         glm_graph_indexed_prefill_batch_router_select();
     if (ok && use_batch_router_select) {
         failed_stage = "router selection";
+        ds4_gpu_trace_tag_layer(il, "router");
         ok = ds4_gpu_glm_router_select_batch_tensor(g->batch_router_selected,
                                                     g->batch_router_weights,
                                                     g->batch_router_probs,
@@ -50000,6 +50001,7 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
     }
     for (uint32_t t = 0; ok && !use_batch_router_select && t < n_tokens; t++) {
         failed_stage = "router selection";
+        ds4_gpu_trace_tag_layer(il, "router");
         ds4_gpu_tensor *logits_view =
             glm_graph_tensor_row_view_strided(g->batch_router_logits,
                                               t,
@@ -50072,10 +50074,12 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
     const bool tp_batch_split_ffn2 = g->tp_world == 2;
     if (ok && tp_batch_split_ffn2) {
         failed_stage = "TP bounce";
+        ds4_gpu_trace_tag_layer(il, "tp_bounce");
         ok = glm_graph_tp_batch_bounce_ready(g, n_tokens);
     }
     if (ok) {
         failed_stage = "routed experts";
+        ds4_gpu_trace_tag_layer(il, "routed_moe");
         const bool use_grouped_moe =
             glm_graph_indexed_prefill_grouped_moe_default(g);
         ok = glm_graph_routed_moe_batch_dispatch(
@@ -50121,6 +50125,7 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
     bool shared_expert_done = false;
     if (ok) {
         failed_stage = "shared expert";
+        ds4_gpu_trace_tag_layer(il, "dense_ffn");
     }
     if (ok && use_batch_residual &&
         glm_graph_indexed_prefill_batch_shared_expert() &&
@@ -52522,6 +52527,7 @@ static bool glm_graph_forward_tokens(
         }
 
         failed_stage = "attention mHC pre";
+        ds4_gpu_trace_tag_layer(il, "hc_pre");
         if (ok && g->glm53) {
             ok = glm53_graph_hc_pre_rows(g,
                                          model,
@@ -52572,6 +52578,7 @@ static bool glm_graph_forward_tokens(
         }
         DS4_GLM_PROFILE_PREFILL_STAGE("glm_attn", "attn_norm");
         failed_stage = glm53_kda ? "KDA attention" : "DSA attention";
+        ds4_gpu_trace_tag_layer(il, glm53_kda ? "kda_attention" : "dsa_attention");
         if (ok && glm53_kda) {
             ok = glm53_graph_kda_attention_rows(g,
                                                 model,
@@ -52925,6 +52932,7 @@ static bool glm_graph_forward_tokens(
         }
         DS4_GLM_PROFILE_PREFILL_STAGE("glm_attn", "attention");
         if (ok) failed_stage = "DSA output projection";
+        if (ok) ds4_gpu_trace_tag_layer(il, "dsa_attention_output");
         if (ok) ok = glm_graph_matmul_q8_0_tensor(g->batch_attn_out,
                                                   model,
                                                   l->attn_output->abs_offset,

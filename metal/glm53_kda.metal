@@ -230,7 +230,22 @@ kernel void kernel_glm53_kda_decode(
  * Do NOT split value rows across threadgroups: the conv shift above would race
  * and the two cross-D reductions need all 128 rows in one threadgroup.
  */
-template<uint VPT, uint NSGC>
+/* DEVSCOPE selects the barrier scope, and it is a diagnostic, not a tuning
+ * knob.  Both barriers below are written `mem_threadgroup | mem_device`, but
+ * nothing in this kernel consumes another thread's DEVICE write: every `*hptr`
+ * store lands in a slice indexed by (value, k0), disjoint per thread, and the
+ * only cross-thread reads after either barrier are of threadgroup scratch
+ * (`sq`/`sk`/`so`).  Ordering for later dispatches comes from kernel
+ * completion, not from a barrier inside the kernel.  The third barrier in this
+ * same function is already `mem_threadgroup` alone, which is the author having
+ * reached the same conclusion once.
+ *
+ * DEVSCOPE=false drops the device scope so the cost can be MEASURED rather
+ * than argued about.  It is a template parameter and not a source edit so both
+ * variants live in ONE library and can be compared byte-for-byte in one
+ * process, alternating, without a second compile.  Nothing selects
+ * DEVSCOPE=false by default. */
+template<uint VPT, uint NSGC, bool DEVSCOPE = true>
 static inline void glm53_kda_decode_impl(
         constant glm53_kda_args &args,
         device const float   *q_in,
@@ -322,7 +337,8 @@ static inline void glm53_kda_decode_impl(
         beta_shared[0] =
             1.0f / (1.0f + exp(-raw_beta[(ulong)row * args.n_heads + head]));
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    threadgroup_barrier(DEVSCOPE ? (mem_flags::mem_threadgroup | mem_flags::mem_device)
+                                 : mem_flags::mem_threadgroup);
 
     /* tid < D or 0: at NSGC > 4 the threadgroup is wider than the scratch row,
      * and an out-of-range read here poisons the norm instead of faulting. */
@@ -389,7 +405,8 @@ static inline void glm53_kda_decode_impl(
             }
         }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+    threadgroup_barrier(DEVSCOPE ? (mem_flags::mem_threadgroup | mem_flags::mem_device)
+                                 : mem_flags::mem_threadgroup);
 
     const float so_t = tid < D ? so[tid] : 0.0f;
     float o_sumsq = simd_sum(so_t * so_t);
@@ -405,7 +422,7 @@ static inline void glm53_kda_decode_impl(
     }
 }
 
-#define DS4_GLM53_KDA_DECODE_VARIANT(NAME, VPT, NSGC)                          \
+#define DS4_GLM53_KDA_DECODE_VARIANT_SCOPED(NAME, VPT, NSGC, DEVSCOPE)         \
 kernel void NAME(                                                              \
         constant glm53_kda_args &args,                                         \
         device const float   *q_in,                                            \
@@ -428,11 +445,13 @@ kernel void NAME(                                                              \
         ushort tid [[thread_index_in_threadgroup]],                            \
         ushort lane [[thread_index_in_simdgroup]],                             \
         ushort sg [[simdgroup_index_in_threadgroup]]) {                        \
-    glm53_kda_decode_impl<VPT, NSGC>(                                          \
+    glm53_kda_decode_impl<VPT, NSGC, DEVSCOPE>(                                \
         args, q_in, k_in, v_in, raw_gate, raw_beta, output_gate,               \
         q_conv, k_conv, v_conv, a_log, dt_bias, output_norm,                   \
         conv_state, state, out, scratch, tgpig, tid, lane, sg);                \
 }
+#define DS4_GLM53_KDA_DECODE_VARIANT(NAME, VPT, NSGC)                          \
+    DS4_GLM53_KDA_DECODE_VARIANT_SCOPED(NAME, VPT, NSGC, true)
 
 /* VPT=1, NSGC=4 is the shipped shape: the null control that proves the template
  * reproduces kernel_glm53_kda_decode exactly before any variant is trusted. */
@@ -446,6 +465,10 @@ DS4_GLM53_KDA_DECODE_VARIANT(kernel_glm53_kda_decode_nsg32, 1u, 32u)
 /* The two levers together, since "do not assume they compose" is a hypothesis
  * to test rather than a reason not to build the arm. */
 DS4_GLM53_KDA_DECODE_VARIANT(kernel_glm53_kda_decode_vpt4_nsg8, 4u, 8u)
+/* Barrier-scope probe arm, shipped shape only.  Paired with _v1 above, which is
+ * the same code with the device scope kept, so the pair isolates exactly one
+ * change.  Never selected by the graph; probe_kdadecode drives it. */
+DS4_GLM53_KDA_DECODE_VARIANT_SCOPED(kernel_glm53_kda_decode_v1_tgbar, 1u, 4u, false)
 
 /* ---------------------------------------------------------------------------
  * KDA-PREPARE-PAR.  The kernel below this pair walks all n_rows tokens in ONE
