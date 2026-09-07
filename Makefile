@@ -209,6 +209,15 @@ rig: check-threadgroup-memory ds4 ds4-server ds4-bench gguf-tools/quality-testin
 
 check-threadgroup-memory:
 	@python3 tools/tgmem_census.py
+	@bare=$$(grep -oE 'setThreadgroupMemoryLength:[^D]' ds4_metal.m | wc -l | tr -d ' '); \
+	 if [ "$$bare" != "0" ]; then \
+	   echo "ds4: $$bare setThreadgroupMemoryLength site(s) not wrapped in DS4_TG16."; \
+	   echo "     Metal requires a multiple of 16 and only the debug layer enforces it,"; \
+	   echo "     so an unaligned length ships silently and aborts any MTL_DEBUG_LAYER run."; \
+	   grep -n 'setThreadgroupMemoryLength:[^D]' ds4_metal.m | head -5; \
+	   exit 1; \
+	 fi; \
+	 echo "ds4: all setThreadgroupMemoryLength sites are 16-rounded"
 
 check-dispatch-count:
 	@calls=$$(grep 'dispatchThreadgroups:\|dispatchThreads:' ds4_metal.m | grep -vc 'ds4_tl_\|@selector'); \

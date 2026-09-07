@@ -50737,6 +50737,7 @@ static bool glm_graph_encode_ffn_batch(
                                       il,
                                       pos0);
     }
+    ds4_gpu_trace_tag_layer(il, "router");
     if (ok) ok = glm_graph_profile_router_selection_batch(g,
                                                           l,
                                                           il,
@@ -50909,6 +50910,7 @@ static bool glm_graph_encode_ffn_batch(
     }
 #endif
     if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) { /* ablate: keep the gate */ } else
+    ds4_gpu_trace_tag_layer(il, "routed_moe");
     if (ok) ok = glm_graph_routed_moe_batch_dispatch(
             g,
             model,
@@ -50936,6 +50938,7 @@ static bool glm_graph_encode_ffn_batch(
              * routed partial, so the one all-reduce below carries both.  Each
              * row is added by exactly one rank, which is what makes the sum
              * correct rather than doubled. */
+            ds4_gpu_trace_tag_layer(il, "shared_expert");
             ok = glm_graph_encode_shared_rows_into(g, model, l, shared_row0,
                                                    shared_rows,
                                                    g->batch_attn_out);
@@ -54842,7 +54845,14 @@ glm53_indexed_attention_done:
                                       il,
                                       pos0);
         if (ok && use_batch_ffn) {
-            ds4_gpu_trace_tag_layer(il, "dense_ffn");
+            /* NOT "dense_ffn": use_batch_ffn is true at prefill and
+             * glm_graph_encode_ffn_batch encodes the WHOLE FFN -- router,
+             * routed experts, shared expert and the dense layers.  Q2's first
+             * pass reported a 57 s "dense_ffn" stage that was three quarters
+             * grouped Q4_K routed-expert GEMMs, because of this label.  The
+             * inner tags below split it; this one only catches whatever they
+             * do not. */
+            ds4_gpu_trace_tag_layer(il, "ffn_other");
             ok = glm_graph_encode_ffn_batch(g,
                                             model,
                                             weights,
@@ -54877,6 +54887,8 @@ glm53_indexed_attention_done:
                 use_batch_ffn_norm &&
                 il >= DS4_N_LEADING_DENSE &&
                 glm_graph_indexed_prefill_batch_routed_moe()) {
+                /* Reachable only when use_batch_ffn is false, which prefill
+                 * never is -- kept so the non-batched path is not untagged. */
                 ds4_gpu_trace_tag_layer(il, "routed_moe");
                 ok = glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
                         g,
