@@ -46712,6 +46712,50 @@ static bool glm53_graph_hc_pre_rows(
                                          hc_mix,
                                          flat,
                                          rows);
+    /* NORM-FUSE: fold the trailing RMS norm into the split+weighted-sum.
+     *
+     * `ds4_gpu_hc_split_weighted_sum_norm_tensor` already exists and the
+     * DeepSeek path ships it at five call sites; GLM issues the pair.  HC1
+     * fused split+weighted-sum into one kernel and stopped there, so this is
+     * the last dispatch of the four.  Both variants derive their row count the
+     * same way (out_tensor_bytes / out_row_bytes), so the swap is shape-safe
+     * for prefill as well as decode.
+     *
+     * glm53_graph_hc_pre_rows runs 90x per decode token -- twice per layer
+     * across 45 layers -- so one dispatch removed here is 90 removed from the
+     * token.  Opt-in until the rig prices it; probes/probe_normfuse.c measures
+     * the chain locally and checks the two paths agree bit for bit.
+     *
+     * The reference sinkhorn path is left alone: it is a correctness fallback
+     * and its extra dispatch is the point. */
+    static int fuse_env = -1;
+    if (fuse_env < 0) {
+        const char *e = getenv("DS4_GLM_HC_NORM_FUSE");
+        fuse_env = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    if (ok && fuse_env && !metal_graph_use_reference_hc_decode()) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "ds4: HC norm FUSED into split+weighted-sum "
+                            "(one dispatch per hc_pre, 90 per decode token)\n");
+        }
+        return ds4_gpu_hc_split_weighted_sum_norm_tensor(collapsed,
+                                                         normalized,
+                                                         split,
+                                                         mix,
+                                                         residual_hc,
+                                                         model->map,
+                                                         model->size,
+                                                         scale->abs_offset,
+                                                         base->abs_offset,
+                                                         norm->abs_offset,
+                                                         DS4_N_EMBD,
+                                                         DS4_N_HC,
+                                                         DS4_N_HC_SINKHORN_ITER,
+                                                         DS4_HC_EPS,
+                                                         DS4_RMS_EPS) != 0;
+    }
     if (ok) ok = metal_graph_decode_hc_pre(collapsed,
                                            split,
                                            mix,
