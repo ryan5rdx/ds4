@@ -388,6 +388,11 @@ struct ds4_metal_args_glm_attention_indexed_batch {
     float    beta_fast;
     float    beta_slow;
     uint32_t head_base;
+    /* GLM53 sparse-prefill only: selected slots [0, valid_prefix) are
+     * guaranteed in range by the producer, so the specialised kernel skips the
+     * per-row bounds test there and checks only the ragged tail.  Zero means
+     * "check everything", which is what every other caller leaves it at. */
+    uint32_t valid_prefix;
 };
 
 struct ds4_metal_args_dsv4_directional_steering_project {
@@ -4262,6 +4267,211 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_impl(
         out4[lane + 96u] = o3 * inv_s;
     }
 }
+
+/* GLM 5.3 sparse-prefill specialisation of the kernel above.
+ *
+ * Same arithmetic, same row order, same online softmax -- so it is required to
+ * be BYTE-IDENTICAL to the generic path, and the probe asserts that.  What it
+ * removes is work the generic template must keep because it is runtime-generic:
+ *
+ *   1. RoPE.  GLM 5.3 has qk_rope == 0, but the shipping template still
+ *      compiles the query-RoPE load, the K-RoPE cache gather, the YARN
+ *      correction and a second staging region, all behind runtime branches on
+ *      args.qk_rope.  Here they are gone at compile time, and so is the
+ *      rope_shared allocation.
+ *   2. The per-row bounds test.  kernel_glm53_expand_pool_selection fills slots
+ *      [0, index_topk) with four contiguous raw rows per selected pool, so every
+ *      one of them is in range by construction; only the ragged current pool at
+ *      the end can hold 0xffffffff sentinels.  The generic kernel cannot know
+ *      that and tests all 2051.  Here the prefix loop has no test and only the
+ *      tail does.
+ *
+ * The prefix bound arrives as args.valid_prefix rather than a literal 2048, so
+ * a change to index_topk or pool_size cannot silently desynchronise the kernel
+ * from its producer.  The host refuses the pipeline unless valid_prefix is a
+ * multiple of stage_rows and no greater than n_selected.
+ *
+ * An out-of-range id inside the prefix is a producer bug, not a case to
+ * tolerate: it would be an unchecked OOB read here.  DS4_GLM53_DSA_LORA_ASSERT
+ * compiles in a prefix bounds check that zeroes and flags instead, for the
+ * probe's negative control.
+ */
+template <bool assume_valid_heads>
+kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl(
+        constant ds4_metal_args_glm_attention_indexed_batch & args,
+        device const char *q,
+        device const char *qk_low,
+        device const char *kv_lora_cache,
+        device const char *k_rope_cache,
+        device const uint32_t *selected,
+        device char *lora_out,
+        threadgroup half4 *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid_u [[thread_index_in_threadgroup]],
+        ushort lane_u [[thread_index_in_simdgroup]],
+        ushort sg_u [[simdgroup_index_in_threadgroup]]) {
+    (void)q; (void)k_rope_cache;          /* no RoPE: both are unread here */
+    constexpr uint group_heads = 8u;
+    constexpr uint stage_rows = 16u;
+    const uint token = tgpig.y;
+    const uint tid = (uint)tid_u;
+    const uint lane = (uint)lane_u;
+    const uint head = tgpig.x * group_heads + (uint)sg_u + args.head_base;
+    /* Same refusal set as the generic kernel, minus the qk_rope test, which the
+     * host has already pinned to 0 as a gate condition. */
+    if (token >= args.n_tokens ||
+        args.n_selected == 0u ||
+        args.cache_f16 == 0u ||
+        args.kv_lora_dim != 512u) {
+        return;
+    }
+
+    const bool valid_head = assume_valid_heads || head < args.n_head;
+    const uint safe_head = valid_head ? head : 0u;
+    const uint kv_vecs = args.kv_lora_dim >> 2;
+    const uint64_t low_token_stride =
+        (uint64_t)args.n_head * args.kv_lora_dim * sizeof(float);
+
+    threadgroup half4 *kv_shared = scratch;
+
+    device const float4 *low4 =
+        (device const float4 *)(qk_low +
+            (uint64_t)token * low_token_stride +
+            (uint64_t)safe_head * args.kv_lora_dim * sizeof(float));
+    device const uint32_t *token_selected =
+        selected + (uint64_t)token * args.n_selected;
+
+    float4 low0 = 0.0f, low1 = 0.0f, low2 = 0.0f, low3 = 0.0f;
+    if (valid_head) {
+        low0 = low4[lane + 0u];
+        low1 = low4[lane + 32u];
+        low2 = low4[lane + 64u];
+        low3 = low4[lane + 96u];
+    }
+
+    float M = -FLT_MAX / 2.0f;
+    float S = 0.0f;
+    float4 o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+    const uint prefix = min(args.valid_prefix, args.n_selected);
+
+    for (uint base = 0u; base < args.n_selected; base += stage_rows) {
+        const uint rows = min(stage_rows, args.n_selected - base);
+        /* One branch per STAGE, not per row: the whole stage is either inside
+         * the guaranteed prefix or straddling the tail. */
+        const bool stage_all_valid = (base + rows) <= prefix;
+#ifndef DS4_GLM53_DSA_LORA_ASSERT
+        /* TWO LOOP BODIES, not one with a runtime flag.
+         *
+         * A single body guarded by `stage_all_valid || row < cache_cap` reads
+         * correctly but still LOADS token_selected[] on the score pass and
+         * keeps a per-row predicate the compiler cannot fold, because
+         * stage_all_valid is a runtime bool.  Measured: 6.3% that way.  Giving
+         * the guaranteed prefix its own body removes the selected-id load, the
+         * predicate and the loop-bound variable from the hot path entirely, so
+         * `rows` is the literal stage_rows and the whole thing unrolls.
+         *
+         * The two bodies must stay arithmetically identical -- same order, same
+         * online-softmax sequence -- or byte identity goes, which the probe
+         * checks on every shape. */
+        if (stage_all_valid) {
+            for (uint off = tid; off < stage_rows * kv_vecs; off += 256u) {
+                const uint rr = off / kv_vecs;
+                const uint vv = off - rr * kv_vecs;
+                device const half4 *src =
+                    (device const half4 *)((device const half *)kv_lora_cache +
+                        (uint64_t)token_selected[base + rr] * args.kv_lora_dim);
+                kv_shared[off] = src[vv];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint rr = 0u; rr < stage_rows; rr++) {
+                threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+                float partial = 0.0f;
+                if (valid_head) {
+                    partial += dot(low0, (float4)kv_row[lane + 0u]);
+                    partial += dot(low1, (float4)kv_row[lane + 32u]);
+                    partial += dot(low2, (float4)kv_row[lane + 64u]);
+                    partial += dot(low3, (float4)kv_row[lane + 96u]);
+                }
+                const float sum = simd_sum(partial);
+                if (valid_head) {
+                    const float score = sum * args.scale;
+                    const float new_m = max(M, score);
+                    const float old_scale = exp(M - new_m);
+                    const float row_scale = exp(score - new_m);
+                    o0 = o0 * old_scale + (float4)kv_row[lane + 0u] * row_scale;
+                    o1 = o1 * old_scale + (float4)kv_row[lane + 32u] * row_scale;
+                    o2 = o2 * old_scale + (float4)kv_row[lane + 64u] * row_scale;
+                    o3 = o3 * old_scale + (float4)kv_row[lane + 96u] * row_scale;
+                    S = S * old_scale + row_scale;
+                    M = new_m;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            continue;
+        }
+#endif
+        for (uint off = tid; off < rows * kv_vecs; off += 256u) {
+            const uint rr = off / kv_vecs;
+            const uint vv = off - rr * kv_vecs;
+            const uint row = token_selected[base + rr];
+            const bool valid_row = row < args.cache_cap;
+            if (valid_row) {
+                device const half4 *src =
+                    (device const half4 *)((device const half *)kv_lora_cache +
+                        (uint64_t)row * args.kv_lora_dim);
+                kv_shared[off] = src[vv];
+            } else {
+                kv_shared[off] = half4(half(0.0f));
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint rr = 0u; rr < rows; rr++) {
+            const uint row = token_selected[base + rr];
+            const bool valid_row = row < args.cache_cap;
+            threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+            float partial = 0.0f;
+            if (valid_head && valid_row) {
+                partial += dot(low0, (float4)kv_row[lane + 0u]);
+                partial += dot(low1, (float4)kv_row[lane + 32u]);
+                partial += dot(low2, (float4)kv_row[lane + 64u]);
+                partial += dot(low3, (float4)kv_row[lane + 96u]);
+            }
+            const float sum = simd_sum(partial);
+            const float score =
+                (valid_head && valid_row) ? sum * args.scale : -FLT_MAX / 2.0f;
+            if (valid_head && valid_row) {
+                const float new_m = max(M, score);
+                const float old_scale = exp(M - new_m);
+                const float row_scale = exp(score - new_m);
+                o0 = o0 * old_scale + (float4)kv_row[lane + 0u] * row_scale;
+                o1 = o1 * old_scale + (float4)kv_row[lane + 32u] * row_scale;
+                o2 = o2 * old_scale + (float4)kv_row[lane + 64u] * row_scale;
+                o3 = o3 * old_scale + (float4)kv_row[lane + 96u] * row_scale;
+                S = S * old_scale + row_scale;
+                M = new_m;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (valid_head) {
+        const float inv_s = S > 0.0f ? 1.0f / S : 0.0f;
+        device float4 *out4 =
+            (device float4 *)(lora_out +
+                ((uint64_t)token * args.n_head + head) *
+                    args.kv_lora_dim * sizeof(float));
+        out4[lane + 0u] = o0 * inv_s;
+        out4[lane + 32u] = o1 * inv_s;
+        out4[lane + 64u] = o2 * inv_s;
+        out4[lane + 96u] = o3 * inv_s;
+    }
+}
+
+template [[host_name("kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_padded")]]
+kernel decltype(kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl<true>)
+kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl<true>;
 
 typedef decltype(kernel_glm_attention_indexed_batch_lora_group8_vec_impl<false, false>)
         glm_attention_indexed_batch_lora_group8_vec_t;

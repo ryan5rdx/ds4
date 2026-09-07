@@ -1961,6 +1961,39 @@ int ds4_gpu_glm_attention_indexed_batch_lora_tensor(
         float                 beta_fast,
         float                 beta_slow);
 
+/* GLM 5.3 sparse prefill only.  Identical to the plain _lora_tensor except that
+ * the caller states how many LEADING selected slots the producer guarantees are
+ * in range -- kernel_glm53_expand_pool_selection fills [0, index_topk) with four
+ * contiguous raw rows per pool, so only the ragged current pool can hold
+ * sentinels.  Passing 0 is exactly the plain entry point.
+ *
+ * Deliberately a separate symbol: the generic API keeps its meaning, and a
+ * caller that does not know its producer's contract cannot accidentally claim
+ * one. */
+int ds4_gpu_glm_attention_indexed_batch_lora_prefix_tensor(
+        ds4_gpu_tensor       *lora_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_tokens,
+        uint32_t              n_selected,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        uint32_t              valid_prefix);
+
 int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
         ds4_gpu_tensor       *lora_out,
         const ds4_gpu_tensor *q,
