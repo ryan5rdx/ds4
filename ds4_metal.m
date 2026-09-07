@@ -12063,8 +12063,19 @@ int ds4_gpu_tp_init(uint32_t rank,
                 g_tp_fence_spin_profile =
                     getenv("DS4_TP_FENCE_SPIN_PROFILE") != NULL ? 1u : 0u;
                 if (g_tp_fence_spin_profile) {
+                    /* The counters accumulate here, but the REPORT hangs off
+                     * the gate profiler's 860-gate cadence -- so with only this
+                     * env set the run calibrates, counts, and prints nothing.
+                     * That cost a silent rig run on 2026-09-06.  Say so at the
+                     * point the mistake is made rather than leaving the
+                     * operator to notice an absence. */
+                    const int reporter_on = getenv("DS4_TP_GATE_PROFILE") != NULL;
                     fprintf(stderr,
-                            "ds4: TP fence spin profile ON (GATE-RESIDUE)\n");
+                            "ds4: TP fence spin profile ON (GATE-RESIDUE)%s\n",
+                            reporter_on ? "" :
+                            " -- but DS4_TP_GATE_PROFILE is NOT set, so the "
+                            "counters will accumulate and NEVER be reported. "
+                            "Set both on both ranks.");
                     ds4_gpu_tp_fence_calibrate_spin();
                 }
             } else {
