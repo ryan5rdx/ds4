@@ -861,6 +861,10 @@ static uint32_t directional_steering_layer_count(void) {
 #define DS4_GLM_SPLIT_SMALL_ROWS_MAX 1024u
 #define DS4_GLM_SPLIT_ROWS_SMALL       32u
 #define DS4_GLM_SPLIT_ROWS_LARGE      128u
+/* The decode split-K kernel refuses outright above this many blocks
+ * (ds4_metal.m, the `n_blocks > 64u` clause) and the failure mode is a SILENTLY
+ * disabled optimisation, not an error. */
+#define DS4_GLM_SPLIT_MAX_BLOCKS       64u
 
 /* D4-BLOCKS: DS4_GLM_SPLIT_ROWS_LARGE=<n> sweeps the large-regime block size.
  *
@@ -895,8 +899,25 @@ static uint32_t glm_graph_split_rows_large(void) {
 }
 
 static uint32_t glm_graph_indexed_decode_split_block_rows_for(uint32_t n_selected) {
-    return n_selected <= DS4_GLM_SPLIT_SMALL_ROWS_MAX ?
-        DS4_GLM_SPLIT_ROWS_SMALL : glm_graph_split_rows_large();
+    if (n_selected <= DS4_GLM_SPLIT_SMALL_ROWS_MAX) return DS4_GLM_SPLIT_ROWS_SMALL;
+    const uint32_t rows = glm_graph_split_rows_large();
+    /* D4-BLOCKS banked 80, and 80 is NOT safe as a bare constant.  128 could be
+     * one because it kept the widest regime under the 64-block refusal at every
+     * n_selected; 80 holds only to n_selected 5120, and the SSD-streaming cap of
+     * 8192 would need 103 blocks -- at which point split-K simply switches off
+     * and the arm reads as a regression it did not cause.  That footgun was
+     * flagged when D4-BLOCKS was queued and is closed here rather than shipped
+     * into.
+     *
+     * Raise the block size where, and only where, the count would otherwise
+     * trip the refusal.  At the shipping n_selected 2051 this leaves 80
+     * untouched (26 blocks); at 8192 it yields 128, the old constant.  Every
+     * consumer -- the runtime dispatch, the workspace sizing in
+     * glm_graph_split_blocks_for_limit(), and the availability gate -- goes
+     * through this one function, so they cannot disagree. */
+    const uint32_t need = (n_selected + DS4_GLM_SPLIT_MAX_BLOCKS - 1u) /
+                          DS4_GLM_SPLIT_MAX_BLOCKS;
+    return rows < need ? need : rows;
 }
 
 /* Worst-case split-K block count over every n_selected this model can produce.

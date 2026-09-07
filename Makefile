@@ -70,7 +70,7 @@ endif
 .PHONY: all help clean test test-rocm test-glm53-kda-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
-.PHONY: check-threadgroup-memory metal-decode-schedule-bench metal-prefill-variant-bench metal-flash-attn-decode-bench check-mxfp4-half-lut check-dispatch-count
+.PHONY: rig check-threadgroup-memory metal-decode-schedule-bench metal-prefill-variant-bench metal-flash-attn-decode-bench check-mxfp4-half-lut check-dispatch-count
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp
 
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -191,6 +191,15 @@ check-mxfp4-half-lut:
 # doing exactly that, and the numbers taken before the fix were both wrong AND
 # fast.  The dynamic half is running the dispatching probes under
 # MTL_SHADER_VALIDATION=1; this is the half that costs nothing.
+# Everything a rig HOST needs after a clean.  `git clean -fdqx` is now required
+# after a branch switch (stale gitignored .o files were linked into new-mtime
+# binaries) and -x also removes the built test binaries, which f60a5fb untracked
+# -- so a gate arm would fail on a missing score_official three steps in.  One
+# target so the rebuild recipe cannot be partially remembered: a gate arm needs
+# `ds4` and score_official, not just ds4-bench.
+rig: ds4 ds4-server ds4-bench gguf-tools/quality-testing/score_official
+	@echo "ds4: rig host ready (ds4, ds4-server, ds4-bench, score_official)"
+
 check-threadgroup-memory:
 	@python3 tools/tgmem_census.py
 
