@@ -56431,25 +56431,37 @@ static bool glm_graph_forward_token(
                     if (glm53_idx_half_scan_requested() && g->glm53) {
                         const uint32_t want_pools =
                             indexer_top_k / DS4_GLM53_INDEX_POOL_SIZE;
-                        const uint32_t half = score_rows / 2u;
+                        /* CEILING half.  At an odd row count the floor would
+                         * drop below want_pools one rung earlier than it needs
+                         * to, and the boundary rung is exactly where the ladder
+                         * starts (4096 tokens -> 1024 pooled rows -> 512, which
+                         * is want_pools). */
+                        const uint32_t scan_rows = (score_rows + 1u) / 2u;
                         static int announced;
-                        if (half >= want_pools && half > 0u) {
-                            score_rows = half;
+                        if (scan_rows >= want_pools && scan_rows > 0u) {
+                            /* TWO messages, because two consumers must receive
+                             * the same number and the harness proves each one
+                             * did.  A single "active" line cannot distinguish
+                             * "the scorer was halved" from "both were". */
                             if (!announced) {
                                 announced = 1;
                                 fprintf(stderr,
-                                        "ds4: *** DS4_GLM_IDX_HALF_SCAN active: the decode "
-                                        "indexer scans HALF the pooled rows (%u of %u). "
-                                        "OUTPUT IS WRONG. This prices IDX-SPLIT and is not "
-                                        "a configuration. ***\n", half, half * 2u);
+                                        "ds4: *** DS4_GLM_IDX_HALF_SCAN active: OUTPUT IS "
+                                        "WRONG, this prices IDX-SPLIT and is not a "
+                                        "configuration ***\n"
+                                        "ds4: IDX-HALF score_one rows %u -> %u\n"
+                                        "ds4: IDX-HALF top_k rows    %u -> %u (top_k pools %u)\n",
+                                        score_rows, scan_rows,
+                                        score_rows, scan_rows, want_pools);
                             }
+                            score_rows = scan_rows;
                         } else if (!announced) {
                             announced = 1;
                             fprintf(stderr,
-                                    "ds4: DS4_GLM_IDX_HALF_SCAN inactive at this context: "
-                                    "%u pooled rows halve to %u, below the %u top-k pools. "
-                                    "This arm equals the control here.\n",
-                                    score_rows, half, want_pools);
+                                    "ds4: IDX-HALF inactive at this context: %u pooled rows "
+                                    "halve to %u, below the %u top-k pools. This arm equals "
+                                    "the control here -- start the ladder at 4096.\n",
+                                    score_rows, scan_rows, want_pools);
                         }
                     }
                     ok = ds4_gpu_glm_indexer_score_one_tensor(
