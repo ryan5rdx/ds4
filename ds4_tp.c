@@ -164,6 +164,32 @@ typedef struct {
  * decode keeps a receive window posted by sequence number: recv for seq s
  * lands in the slab in-slot (s-1) % slots and its completion is the arrival
  * signal. */
+/* The Thunderbolt NHI frames everything at 4 KB: a message is a run of <=4 KB
+ * frames ending in one whose `eof` nibble is 3.  Queue depths are counted in
+ * FRAMES, so every max_send_wr / max_recv_wr in this file is a frame budget and
+ * must be divided by this before it means "messages". */
+/* Frame budget requested from create_qp.  1024 frames = 256 outstanding 16 KiB
+ * messages, which is where the bulk gate's 4 MiB window comes from.  The ring
+ * holds 4095 (4096 descriptors, one slot held free), so there is real headroom,
+ * and taking it is the cheapest lever on the per-window rendezvous count:
+ * barriers = bytes / (window x 16 KiB), so 4095 frames quarters them.
+ *
+ * Default unchanged at 1024 -- every measurement on this branch was taken
+ * there, and this is a live transport parameter, not a tuning dial. */
+static uint32_t tp_rdma_want_frames(void) {
+    static uint32_t cached;
+    if (!cached) {
+        cached = 1024u;
+        const char *e = getenv("DS4_TP_RDMA_RECV_FRAMES");
+        if (e && e[0]) {
+            const int v = atoi(e);
+            if (v > 0) cached = (uint32_t)v > 4095u ? 4095u : (uint32_t)v;
+        }
+    }
+    return cached;
+}
+
+#define DS4_TP_RDMA_FRAME_BYTES 4096u
 #define DS4_TP_RDMA_MAX_MSG 16384
 #define DS4_TP_RDMA_RECV_WINDOW 16
 #define DS4_TP_RDMA_BULK_SLOTS 64
@@ -1006,12 +1032,23 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
     qia.qp_type = IBV_QPT_UC;
-    qia.cap.max_send_wr = 1024;
-    qia.cap.max_recv_wr = 1024;
+    const uint32_t want_frames = tp_rdma_want_frames();
+    qia.cap.max_send_wr = want_frames;
+    qia.cap.max_recv_wr = want_frames;
     qia.cap.max_send_sge = 1;
     qia.cap.max_recv_sge = 1;
     qia.cap.max_inline_data = 0;
     r->qp = r->api.create_qp(r->pd, &qia);
+    if (!r->qp && want_frames != 1024u) {
+        /* A refused larger ask must NOT silently become the 256/64 floor --
+         * that is a 4x SMALLER window than the default, so a wide arm that
+         * failed to get its frames would read as "wider windows made it
+         * worse" when the wide window never existed. */
+        fprintf(stderr, "ds4-tp: create_qp refused %u frames; retrying at 1024\n",
+                want_frames);
+        qia.cap.max_send_wr = qia.cap.max_recv_wr = 1024u;
+        r->qp = r->api.create_qp(r->pd, &qia);
+    }
     if (!r->qp) {
         qia.cap.max_send_wr = 256;
         qia.cap.max_recv_wr = 64;
@@ -1167,12 +1204,23 @@ static int tp_rdma_recreate_qp(ds4_tp *tp, char *err, size_t errlen) {
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
     qia.qp_type = IBV_QPT_UC;
-    qia.cap.max_send_wr = 1024;
-    qia.cap.max_recv_wr = 1024;
+    const uint32_t want_frames = tp_rdma_want_frames();
+    qia.cap.max_send_wr = want_frames;
+    qia.cap.max_recv_wr = want_frames;
     qia.cap.max_send_sge = 1;
     qia.cap.max_recv_sge = 1;
     qia.cap.max_inline_data = 0;
     r->qp = r->api.create_qp(r->pd, &qia);
+    if (!r->qp && want_frames != 1024u) {
+        /* A refused larger ask must NOT silently become the 256/64 floor --
+         * that is a 4x SMALLER window than the default, so a wide arm that
+         * failed to get its frames would read as "wider windows made it
+         * worse" when the wide window never existed. */
+        fprintf(stderr, "ds4-tp: create_qp refused %u frames; retrying at 1024\n",
+                want_frames);
+        qia.cap.max_send_wr = qia.cap.max_recv_wr = 1024u;
+        r->qp = r->api.create_qp(r->pd, &qia);
+    }
     if (!r->qp) {
         qia.cap.max_send_wr = 256;
         qia.cap.max_recv_wr = 64;
@@ -1936,18 +1984,27 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
     uint8_t *stage_send = tp->slab + tp->batch_out_off;
     uint8_t *stage_recv = tp->slab + tp->batch_in_off;
     const uint64_t stage_bytes = (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
-    uint32_t depth = r->recv_depth ? r->recv_depth : 64u;
-    /* The 256 was a magic number with no stated reason, and it is 1/4 of what
-     * create_qp asks for (max_recv_wr = 1024).  recv_depth is what the
-     * provider actually GRANTED, and the WR arrays are already allocated at
-     * that size, so the cap was throwing away window size -- and therefore
-     * multiplying the barrier count -- for nothing anyone wrote down.
+    /* WINDOW DEPTH IS IN MESSAGES.  THE QUEUE IS IN FRAMES.  Getting this
+     * wrong wedges both ranks.
      *
-     * Kept as the default because it is what every measurement on this branch
-     * was taken at, and unpicking a magic number is not the same as knowing it
-     * was wrong.  DS4_TP_RDMA_WINDOW_DEPTH now lifts it, up to the grant. */
-    const uint32_t depth_granted = depth;
-    if (depth > 256u) depth = 256u;
+     * TN3205: "Queues are sized in units of 4 KB frames... two 4 KB sends and
+     * a single 8 KB send would both take up 2 queue spaces."  A 16 KiB message
+     * is therefore FOUR receive slots, not one, and the granted max_recv_wr of
+     * 1024 buys 256 outstanding messages.
+     *
+     * That is where the bare `if (depth > 256u) depth = 256u;` came from -- it
+     * was exactly this conversion, written as a constant with nothing saying
+     * so, which reads as an arbitrary cap with headroom above it.  It is not.
+     * Over-posting the ring does not error: per APPLE-RDMA.md 3.1 completions
+     * simply never arrive and both ends spin forever.
+     *
+     * Derived from the grant now, so it cannot drift from the QP or from
+     * DS4_TP_RDMA_MAX_MSG. */
+    const uint32_t frames_per_msg =
+        (DS4_TP_RDMA_MAX_MSG + DS4_TP_RDMA_FRAME_BYTES - 1u) / DS4_TP_RDMA_FRAME_BYTES;
+    const uint32_t recv_frames = r->recv_depth ? r->recv_depth : 64u;
+    const uint32_t depth_granted = recv_frames / frames_per_msg;
+    uint32_t depth = depth_granted ? depth_granted : 1u;
     /* DS4_TP_RDMA_WINDOW_DEPTH exists to test the barrier hypothesis in the
      * only direction that is safe.  Barrier count is bytes/(depth x 16 KiB),
      * so LOWERING depth multiplies barriers: if the barrier owns the
@@ -1974,10 +2031,12 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 if (!warned) {
                     warned = 1;
                     fprintf(stderr,
-                            "ds4-tp: window depth %u exceeds the granted receive "
-                            "depth %u; clamping.  Posting past the queue on a UC "
-                            "QP drops silently rather than erroring.\n",
-                            want, depth_granted);
+                            "ds4-tp: window depth %u messages exceeds what the "
+                            "granted queue holds (%u frames / %u per message = "
+                            "%u messages); clamping.  Over-posting this ring does "
+                            "not error -- completions stop arriving and both "
+                            "ranks spin.  Raise DS4_TP_RDMA_RECV_FRAMES instead.\n",
+                            want, recv_frames, frames_per_msg, depth_granted);
                 }
                 want = depth_granted;
             }
@@ -2000,8 +2059,9 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         if (!announced_depth) {
             announced_depth = 1;
             fprintf(stderr,
-                    "ds4-tp: bulk window depth %u -> %u (granted %u, %.2f MiB/window, %s)\n",
-                    depth_base, depth, depth_granted,
+                    "ds4-tp: bulk window depth %u -> %u messages "
+                    "(%u frames granted / %u per msg = %u max, %.2f MiB/window, %s)\n",
+                    depth_base, depth, recv_frames, frames_per_msg, depth_granted,
                     (double)depth * DS4_TP_RDMA_MAX_MSG / 1048576.0,
                     depth == depth_base ? "no override" : "override or clamp applied");
         }
