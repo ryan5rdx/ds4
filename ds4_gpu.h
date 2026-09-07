@@ -475,7 +475,12 @@ int ds4_gpu_tp_flag_set_checked_probe(
         const ds4_gpu_tensor *payload,
         uint64_t              payload_offset,
         uint32_t              words,
-        uint32_t              value);
+        uint32_t              value,
+        /* Threadgroup bytes to bind.  0 = the correct 8 words the kernel
+         * indexes.  A smaller value is a DELIBERATE overrun, used only as the
+         * negative control for MTL_SHADER_VALIDATION -- a validation pass that
+         * has never been shown to fail is not evidence of anything. */
+        uint32_t              tg_bytes_override);
 /* R1: f_a, beta and g_a as one Q8_0 matvec over three weight bases and three
  * destinations.  All three read the same activation and none depends on
  * another; the grid is the SUM of their row blocks, so per-threadgroup work is

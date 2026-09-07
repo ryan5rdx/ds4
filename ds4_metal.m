@@ -12839,7 +12839,8 @@ int ds4_gpu_tp_flag_set_checked_probe(
         const ds4_gpu_tensor *payload,
         uint64_t              payload_offset,
         uint32_t              words,
-        uint32_t              value) {
+        uint32_t              value,
+        uint32_t              tg_bytes_override) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!flags || !check || !payload || words == 0) return 0;
     id<MTLComputePipelineState> pipeline =
@@ -12861,7 +12862,12 @@ int ds4_gpu_tp_flag_set_checked_probe(
     [enc setBuffer:pb offset:(NSUInteger)(ds4_gpu_tensor_offset(payload) +
                                           payload_offset) atIndex:3];
     [enc setBytes:&words length:sizeof(words) atIndex:4];
-    [enc setThreadgroupMemoryLength:8 * sizeof(uint32_t) atIndex:0];
+    /* The kernel reduces through shmem[sgitg] for 8 simdgroups at 256 threads,
+     * so 8 words is exactly what it indexes.  An override below that is the
+     * negative control for the shader validator. */
+    [enc setThreadgroupMemoryLength:(tg_bytes_override ? (NSUInteger)tg_bytes_override
+                                                       : 8 * sizeof(uint32_t))
+                            atIndex:0];
     [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -50624,8 +50630,16 @@ int ds4_gpu_glm53_kda_decode(
         /* 5 scratch rows of D=128, then three per-simdgroup reduction arrays
          * and the shared beta.  The shipped 656 is that at NSG=4 (653) rounded;
          * a wider variant needs its own size or the reductions alias sv/so. */
-        const NSUInteger kda_tgmem =
+        /* Metal requires setThreadgroupMemoryLength to be a multiple of 16
+         * bytes -- the debug layer asserts on it, the release runtime does not.
+         * That is why the shipped constant is 656 floats and not the 653 the
+         * NSG=4 kernel actually indexes: 653*4 = 2612 is not 16-aligned.
+         * Reproducing the exact requirement instead of the rounded one was
+         * wrong at every NSGC (2612 / 2660 / 2756 / 2948, none aligned), and it
+         * was silent until MTL_DEBUG_LAYER=1 asserted on it. */
+        const NSUInteger kda_tgmem_exact =
             (5u * 128u + 3u * kda_decode_nsg + 1u) * sizeof(float);
+        const NSUInteger kda_tgmem = (kda_tgmem_exact + 15u) & ~(NSUInteger)15u;
         [enc setThreadgroupMemoryLength:(kda_decode_variant_name ? kda_tgmem
                                                                  : 656u * sizeof(float))
                                 atIndex:0];
