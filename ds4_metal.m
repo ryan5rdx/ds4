@@ -430,6 +430,11 @@ static id<MTLBlitCommandEncoder> ds4_gpu_blit_encoder(id<MTLCommandBuffer> cb, c
     memset(rec, 0, sizeof(*rec));
     rec->caller = (uintptr_t)__builtin_return_address(0);
     rec->n_dispatch = n_ops;
+    /* Blits carry the stage tag too.  Without it every copy lands in
+     * "untagged", and the copies are not incidental -- the KV stores and the TP
+     * staging are blits, so a stage that is mostly copy would read as if it did
+     * nothing. */
+    ds4_gpu_trace_tag_copy(rec->tag, sizeof(rec->tag));
     snprintf(rec->kernel, sizeof(rec->kernel), "blit:%s", label ? label : "?");
     return enc;
 }

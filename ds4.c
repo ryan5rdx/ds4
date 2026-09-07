@@ -53830,8 +53830,13 @@ static bool glm_graph_forward_indexed_tokens(
                                                      DS4_RMS_EPS) != 0;
         }
         DS4_GLM_PROFILE_INDEXED_STAGE("glm_indexed_attn", "attn_norm");
+        /* OUTSIDE the glm53_kda branch.  Inside it the ternary can only ever
+         * yield "kda_attention", so every DSA layer's attention was charged to
+         * whichever tag preceded it -- hc_pre -- and the rollup would have
+         * reported DSA attention as zero while overstating hc_pre by the same
+         * amount.  The regular graph tags before the branch for this reason. */
+        ds4_gpu_trace_tag_layer(il, glm53_kda ? "kda_attention" : "dsa_attention");
         if (ok && glm53_kda) {
-            ds4_gpu_trace_tag_layer(il, glm53_kda ? "kda_attention" : "dsa_attention");
             ok = glm53_graph_kda_attention_rows(g,
                                                 model,
                                                 l,

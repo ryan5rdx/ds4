@@ -183,7 +183,18 @@ static uint32_t tp_rdma_want_frames(void) {
         const char *e = getenv("DS4_TP_RDMA_RECV_FRAMES");
         if (e && e[0]) {
             const int v = atoi(e);
-            if (v > 0) cached = (uint32_t)v > 4095u ? 4095u : (uint32_t)v;
+            /* Floor at one whole message: below 16 KiB / 4 KiB = 4 frames the
+             * window rounds to zero messages and the bulk path posts nothing,
+             * which presents as a hang rather than a refusal. */
+            if (v > 0) {
+                uint32_t want = (uint32_t)v > 4095u ? 4095u : (uint32_t)v;
+                if (want < 4u) {
+                    fprintf(stderr, "ds4-tp: DS4_TP_RDMA_RECV_FRAMES=%d is below "
+                                    "one 16 KiB message; using 4\n", v);
+                    want = 4u;
+                }
+                cached = want;
+            }
         }
     }
     return cached;
@@ -937,6 +948,52 @@ static int tp_rdma_probe(ds4_tp_verbs_api *api) {
     return num > 0;
 }
 
+/* Completion-queue entries for a given frame budget.
+ *
+ * The CQ was a flat 512 and that is now far too small.  Two changes stacked:
+ * the frame budget went 1024 -> 4095 frames (256 -> 1023 messages per window),
+ * and the bulk send loop now signals EVERY work request rather than one per
+ * 64-message batch, because its flow control compares completions against
+ * sends.  Signalling is right -- depending on a provider to complete
+ * unsignalled sends is a hang the day that behaviour changes -- but it took the
+ * send side from ~16 completions per window to 1023.
+ *
+ * Worst case in flight is a full receive window plus a full send window plus
+ * the decode path's own traffic, so size from both directions with slack.
+ * Overrunning a CQ is not a clean error on any provider: it is lost completions
+ * and a spin to the deadline. */
+static uint32_t tp_rdma_cq_entries(uint32_t frames, uint32_t max_cqe) {
+    const uint32_t fpm =
+        (DS4_TP_RDMA_MAX_MSG + DS4_TP_RDMA_FRAME_BYTES - 1u) / DS4_TP_RDMA_FRAME_BYTES;
+    const uint32_t msgs = frames / fpm ? frames / fpm : 1u;
+    uint64_t want = (uint64_t)msgs * 2u + 256u;
+    if (want < 512u) want = 512u;            /* never below the old floor */
+    if (max_cqe && want > max_cqe) want = max_cqe;
+    return (uint32_t)want;
+}
+
+/* Shared by bring-up and the retry path so the two cannot drift apart. */
+static struct ibv_cq *tp_rdma_make_cq(ds4_tp_rdma *r) {
+    struct ibv_device_attr cqa;
+    memset(&cqa, 0, sizeof(cqa));
+    uint32_t max_cqe = 0;
+    if (r->api.query_device && r->api.query_device(r->ctx, &cqa) == 0)
+        max_cqe = (uint32_t)cqa.max_cqe;
+    const uint32_t cqe = tp_rdma_cq_entries(tp_rdma_want_frames(), max_cqe);
+    struct ibv_cq *cq = r->api.create_cq(r->ctx, (int)cqe, NULL, NULL, 0);
+    if (!cq && cqe > 512u) {
+        fprintf(stderr, "ds4-tp: create_cq(%u) refused; retrying at 512\n", cqe);
+        cq = r->api.create_cq(r->ctx, 512, NULL, NULL, 0);
+    }
+    static int announced;
+    if (cq && !announced) {
+        announced = 1;
+        fprintf(stderr, "ds4-tp: completion queue %u entries (frame budget %u, "
+                        "device max_cqe %u)\n", cqe, tp_rdma_want_frames(), max_cqe);
+    }
+    return cq;
+}
+
 static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     ds4_tp_rdma *r = &tp->rdma;
     int num = 0;
@@ -1023,7 +1080,7 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
                     da.max_qp_wr, da.max_sge, da.max_cqe, (unsigned long long)da.max_mr_size);
         }
     }
-    r->cq = r->api.create_cq(r->ctx, 512, NULL, NULL, 0);
+    r->cq = tp_rdma_make_cq(r);
     if (!r->cq) {
         tp_set_err(err, errlen, "tp rdma: create_cq failed");
         return 0;
@@ -1195,7 +1252,7 @@ static int tp_rdma_recreate_qp(ds4_tp *tp, char *err, size_t errlen) {
     ds4_tp_rdma *r = &tp->rdma;
     if (r->qp) { r->api.destroy_qp(r->qp); r->qp = NULL; }
     if (r->cq) { r->api.destroy_cq(r->cq); r->cq = NULL; }
-    r->cq = r->api.create_cq(r->ctx, 512, NULL, NULL, 0);
+    r->cq = tp_rdma_make_cq(r);
     if (!r->cq) {
         tp_set_err(err, errlen, "tp rdma: create_cq (retry) failed");
         return 0;
@@ -2239,7 +2296,12 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                     uint32_t accepted = 0;
                     if (bad_send >= r->win_swr && bad_send < r->win_swr + n)
                         accepted = (uint32_t)(bad_send - r->win_swr);
-                    if (errno == EAGAIN || errno == ENOMEM) {
+                    /* The RETURN CODE is the error: verbs returns errno by
+                     * value and is not required to set the global.  Reading
+                     * errno can pick up whatever the last unrelated syscall
+                     * left, and a misclassified EAGAIN is a discarded partial
+                     * post -- the desync this path exists to prevent. */
+                    if (psrc == EAGAIN || psrc == ENOMEM) {
                         sent += accepted;
                         if (accepted) signaled++;
                         /* The queue told us its real size.  Back the cap off
@@ -2260,7 +2322,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                     fprintf(stderr,
                             "ds4-tp: big gate post_send(%u): %s (%u of %u accepted, "
                             "%u/%u sent, %u in flight of %u)\n",
-                            n, strerror(errno), accepted, n, sent, chunks,
+                            n, strerror(psrc), accepted, n, sent, chunks,
                             in_flight, SEND_MSGS_MAX);
                     return 0;
                 }
