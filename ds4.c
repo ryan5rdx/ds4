@@ -42538,8 +42538,30 @@ static bool glm_graph_small_prefill_stage_sync(
            n_tokens <= DS4_GLM_METAL_SMALL_PREFILL_STAGE_SYNC_TOKENS;
 }
 
+/* D4-BLOCKS: 80 rows per block measured +0.89% at 310k. Keep the old 128
+ * available as an override and grow the block wherever 80 would exceed the
+ * kernel's hard 64-block limit (notably the 8192-row streaming dense cap). */
+#define DS4_GLM_SPLIT_MAX_BLOCKS 64u
+static uint32_t glm_graph_split_rows_large(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = 80;
+        const char *v = getenv("DS4_GLM_SPLIT_ROWS_LARGE");
+        if (v && v[0]) {
+            const unsigned long n = strtoul(v, NULL, 10);
+            if (n >= 33u && n <= 512u) cached = (int)n;
+        }
+    }
+    return (uint32_t)cached;
+}
+
 static uint32_t glm_graph_indexed_decode_split_block_rows_for(uint32_t n_selected) {
-    return n_selected <= 1024u ? 32u : 128u;
+    if (n_selected <= 1024u) return 32u;
+    const uint32_t rows = glm_graph_split_rows_large();
+    const uint32_t need =
+        (n_selected + DS4_GLM_SPLIT_MAX_BLOCKS - 1u) /
+        DS4_GLM_SPLIT_MAX_BLOCKS;
+    return rows < need ? need : rows;
 }
 
 /* Size the split-K workspace from the actual piecewise block policy.  Pairing

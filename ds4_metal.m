@@ -46697,10 +46697,21 @@ int ds4_gpu_glm53_embedding_bf16(
 }
 
 static uint32_t glm53_gpu_bf16_mv_nsg(void) {
-    return ds4_gpu_device_name_contains("M3 Ultra") &&
-           getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == NULL &&
-           getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_BF16_NSG4") == NULL
-               ? 4u : 8u;
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_METAL_GLM53_BF16_MV_NSG");
+        unsigned long n = 0;
+        if (v && v[0]) n = strtoul(v, NULL, 10);
+        if (n == 2u || n == 4u || n == 8u || n == 16u || n == 32u) {
+            cached = (int)n;
+        } else {
+            cached = ds4_gpu_device_name_contains("M3 Ultra") &&
+                     getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_DECODE") == NULL &&
+                     getenv("DS4_METAL_DISABLE_M3_ULTRA_GLM53_BF16_NSG4") == NULL
+                         ? 4 : 8;
+        }
+    }
+    return (uint32_t)cached;
 }
 
 int ds4_gpu_glm53_matmul_bf16(
