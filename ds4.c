@@ -42786,6 +42786,43 @@ static uint32_t glm_graph_indexed_decode_split_block_rows_for(uint32_t n_selecte
     return rows < need ? need : rows;
 }
 
+/* Experimental MTP verifier path: route each row of the two-token GLM 5.3
+ * verifier through the split-K decode attention kernel. The two rows have
+ * distinct Q/QK values and selected lists, so doubling the head count is not an
+ * equivalent benchmark. Keep replicated heads and reuse the partial scratch
+ * sequentially; a TP head split needs separate gate accounting. */
+static bool glm53_mtp1a_d4_active(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_GLM_MTP1A_D4");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+static uint32_t g_glm53_mtp1a_d4_calls;
+
+static void glm53_mtp1a_note_d4_call(void) {
+    g_glm53_mtp1a_d4_calls++;
+    static int announced;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr,
+                "ds4: GLM MTP1A ACTIVE -- two-row verify DSA attention through "
+                "the split-K decode kernel, one call per row, 64 replicated "
+                "heads, selected_rows_valid=false\n");
+    }
+}
+
+static void glm53_mtp1a_report_cycle(uint32_t expect_layers) {
+    if (!glm53_mtp1a_d4_active()) return;
+    const uint32_t want = expect_layers * 2u;
+    fprintf(stderr, "ds4: glm mtp1a d4census: calls=%u expect=%u%s\n",
+            g_glm53_mtp1a_d4_calls, want,
+            g_glm53_mtp1a_d4_calls == want ? "" : "  MISMATCH");
+    g_glm53_mtp1a_d4_calls = 0;
+}
+
 /* Size the split-K workspace from the actual piecewise block policy.  Pairing
  * the smallest block size with the largest selection count describes a shape
  * that can never dispatch and used to over-size GLM 5.3 from 32 to 65 blocks,
@@ -52184,9 +52221,19 @@ static bool glm_graph_forward_indexed_tokens(
                                       (uint64_t)n_tokens * DS4_N_HEAD * DS4_N_KV_LORA,
                                       il,
                                       pos0);
-        if (ok && use_batch_attn_kernel) ok = glm_graph_indexed_prefill_attention_boundary();
+        /* The two-row MTP verifier can reuse the scalar row views below to call
+         * the split-K decode kernel once for each row. Keep this incompatible
+         * with the TP head split: this probe computes all heads locally and
+         * does not add the attention exchange that a half-head path requires. */
+        const bool mtp1a_rows =
+            glm53_mtp1a_d4_active() && g->glm53 && n_tokens == 2u &&
+            !tp_attn_head_split &&
+            glm_graph_indexed_decode_split_group8_available(
+                    last_indexer_selected_count, g->ctx_cap, DS4_N_HEAD);
+        if (ok && use_batch_attn_kernel && !mtp1a_rows)
+            ok = glm_graph_indexed_prefill_attention_boundary();
 
-        if (use_batch_attn_kernel) {
+        if (use_batch_attn_kernel && !mtp1a_rows) {
             const uint32_t attn_slice_cap =
                 glm_graph_indexed_prefill_batch_attn_slice_tokens();
             for (uint32_t t0 = 0; ok && t0 < n_tokens; ) {
@@ -52438,7 +52485,55 @@ static bool glm_graph_forward_indexed_tokens(
                                         (uint64_t)last_indexer_selected_count * sizeof(uint32_t));
                 ok = q_view && qk_low_view && heads_view && selected_view;
                 if (!ok) fprintf(stderr, "ds4: GLM scalar indexed prefill failed to create attention row views at layer %u token %u\n", il, t);
-                if (ok) {
+                if (ok && mtp1a_rows) {
+                    const uint32_t split_rows =
+                        glm_graph_indexed_decode_split_block_rows_for(
+                                last_indexer_selected_count);
+                    const uint32_t split_blocks =
+                        (last_indexer_selected_count + split_rows - 1u) /
+                        split_rows;
+                    int rc =
+                        ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
+                                heads_view,
+                                g->attn_partial_lora,
+                                g->attn_partial_ms,
+                                q_view,
+                                qk_low_view,
+                                g->layer_kv_lora_cache[il],
+                                g->layer_k_rope_cache[il],
+                                model->map,
+                                model->size,
+                                l->attn_v_b->abs_offset,
+                                l->attn_v_b->type,
+                                selected_view,
+                                last_indexer_selected_count,
+                                false,
+                                g->compact_cache_cap,
+                                glm_graph_compact_cache_is_f16(),
+                                DS4_N_HEAD,
+                                DS4_N_KV_LORA,
+                                (uint32_t)g->q_nope,
+                                DS4_N_ROT,
+                                DS4_N_VALUE_MLA,
+                                0,
+                                split_rows,
+                                split_blocks,
+                                rope_base,
+                                rope_scale,
+                                0.0f,
+                                1.0f,
+                                DS4_ROPE_YARN_BETA_FAST,
+                                DS4_ROPE_YARN_BETA_SLOW);
+                    ok = rc != 0;
+                    if (ok) {
+                        glm53_mtp1a_note_d4_call();
+                    } else {
+                        fprintf(stderr,
+                                "ds4: GLM MTP1A split-K attention failed at "
+                                "layer %u row %u\n",
+                                il, t);
+                    }
+                } else if (ok) {
                     int rc = ds4_gpu_glm_attention_indexed_decode_typed_tensor(heads_view,
                                                                                q_view,
                                                                                qk_low_view,
@@ -68570,6 +68665,9 @@ static int ds4_session_glm_spec_cycle_impl(
         const double t2 = now_sec();
         char *dt = ds4_token_text(e, d, NULL);
         char *nt = ds4_token_text(e, n1, NULL);
+        /* Eleven DSA layers times two verifier rows. A mismatch means the
+         * experimental path did not cover the cycle being timed. */
+        glm53_mtp1a_report_cycle(11u);
         /* Emit one machine-readable row per cycle so aggregate statistics can
          * be computed directly rather than inferred from subgroup summaries. */
         fprintf(stderr,
