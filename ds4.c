@@ -41908,6 +41908,17 @@ typedef struct ds4_glm_gpu_graph {
     ds4_gpu_tensor *kda_out;
     ds4_gpu_tensor *layer_kda_conv_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_kda_recurrent_state[DS4_MAX_LAYER];
+    /* MTP3-MIN: the KDA state as of row 0 of the two-row speculative verify.
+     * The recurrence and prepare kernels write these alongside the live state
+     * -- one guarded store each, the value is already in registers.  On
+     * rejection the live and bank pointers are SWAPPED, which is why the
+     * rejected cycle no longer needs a restore or a replay forward.
+     * Allocated only when MTP is enabled; NULL means banking is off. */
+    ds4_gpu_tensor *layer_kda_conv_bank[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_kda_recurrent_bank[DS4_MAX_LAYER];
+    /* Set for the duration of the two-row verify so the KDA path knows to bank;
+     * cleared immediately after, so ordinary prefill and decode never do. */
+    int             mtp_bank_active;
     ds4_gpu_tensor *router_logits;
     ds4_gpu_tensor *router_probs;
     ds4_gpu_tensor *router_selected;
@@ -42827,6 +42838,30 @@ static void glm53_mtp1a_report_cycle(uint32_t expect_layers) {
  * the smallest block size with the largest selection count describes a shape
  * that can never dispatch and used to over-size GLM 5.3 from 32 to 65 blocks,
  * putting it just beyond the availability cap. */
+/* MTP3-MIN.  DEFAULT OFF.
+ *
+ * On rejection the engine restores a pre-verify snapshot and re-runs row 0 as a
+ * full forward -- 28.4 ms per reject, about exactly one decode, and ~60% of
+ * everything in an MTP cycle that is not the verifier (2026-09-08-MTPP).  It
+ * does that only to rebuild state the verify already computed: the logits are
+ * already kept (the non-GLM branch just memcpys glm_mtp_logits0).
+ *
+ * With banking, the KDA recurrence and prepare kernels also write their state
+ * as of row 0 -- one guarded store each, the value is already in registers --
+ * and rejection becomes a POINTER SWAP.  No restore, no replay.
+ *
+ * The DSA pooled-indexer tail is handled differently on purpose: at 4 KB a
+ * layer it is small enough to keep snapshotting, and its pool-update inputs are
+ * const so row 0 can simply be re-run on the reject path. */
+static bool glm53_mtp3_bank_active(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_GLM_MTP3_BANK");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 static uint32_t glm_graph_split_blocks_for_limit(uint32_t top_k) {
     const uint32_t small_n = top_k < 1024u ? top_k : 1024u;
     const uint32_t small_rows =
@@ -43973,6 +44008,8 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
         ds4_gpu_tensor_free(g->layer_kda_conv_state[il]);
         ds4_gpu_tensor_free(g->layer_kda_recurrent_state[il]);
         ds4_gpu_tensor_free(g->layer_indexer_key_cache[il]);
+        ds4_gpu_tensor_free(g->layer_kda_conv_bank[il]);
+        ds4_gpu_tensor_free(g->layer_kda_recurrent_bank[il]);
         ds4_gpu_tensor_free(g->layer_indexer_tail_k[il]);
         ds4_gpu_tensor_free(g->layer_indexer_tail_gate[il]);
         ds4_gpu_tensor_free(g->layer_k_rope_cache[il]);
@@ -45213,10 +45250,24 @@ static bool glm53_graph_kda_attention_rows(
             (uint64_t)rows * projection, il, pos0);
     if (ok) failed_stage = "KDA recurrence";
     if (ok) failed_weight = NULL;
-    if (ok) ok = ds4_gpu_glm53_kda_prefill(
+    /* MTP3-MIN: bank row 0's state during the two-row speculative verify.
+     * mtp_bank_active is set only for that call, so ordinary prefill -- which
+     * shares this function -- never banks and never pays the store. */
+    ds4_gpu_tensor *kda_rec_bank = NULL, *kda_conv_bank = NULL;
+    uint32_t kda_bank_row = UINT32_MAX;
+    if (g->mtp_bank_active && rows == 2u &&
+        g->layer_kda_recurrent_bank[il] && g->layer_kda_conv_bank[il]) {
+        kda_rec_bank  = g->layer_kda_recurrent_bank[il];
+        kda_conv_bank = g->layer_kda_conv_bank[il];
+        kda_bank_row  = 0u;
+    }
+    if (ok) ok = ds4_gpu_glm53_kda_prefill_banked(
             g->batch_kda_out,
             g->layer_kda_conv_state[il],
             g->layer_kda_recurrent_state[il],
+            kda_rec_bank,
+            kda_conv_bank,
+            kda_bank_row,
             g->batch_kda_q,
             g->batch_kda_k,
             g->batch_kda_v,
@@ -49032,6 +49083,30 @@ static uint64_t glm53_graph_spec_state_bytes(const ds4_glm_gpu_graph *g) {
     return total;
 }
 
+/* MTP3-MIN reject path.  Swap the KDA live state with the banked row-0 state:
+ * the bank IS the correct post-row-0 state, so this replaces a 76 MB restore
+ * AND the full replay forward with two pointer assignments per KDA layer.
+ *
+ * The next cycle overwrites the bank, so the old live buffer becomes the new
+ * bank -- no allocation churn, and nothing aliases because every reader goes
+ * through g->layer_kda_*_state[il]. */
+static bool glm53_graph_mtp3_select_bank(ds4_glm_gpu_graph *g) {
+    if (!g || !g->glm53) return false;
+    bool any = false;
+    for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
+        if (!ds4_glm53_layer_is_kda(il)) continue;
+        ds4_gpu_tensor *rb = g->layer_kda_recurrent_bank[il];
+        ds4_gpu_tensor *cb = g->layer_kda_conv_bank[il];
+        if (!rb || !cb) return false;          /* all or nothing */
+        g->layer_kda_recurrent_bank[il]  = g->layer_kda_recurrent_state[il];
+        g->layer_kda_recurrent_state[il] = rb;
+        g->layer_kda_conv_bank[il]  = g->layer_kda_conv_state[il];
+        g->layer_kda_conv_state[il] = cb;
+        any = true;
+    }
+    return any;
+}
+
 static bool glm53_graph_copy_spec_state(
         ds4_glm_gpu_graph *g,
         bool save) {
@@ -49086,6 +49161,35 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
     const uint64_t state_backup_bytes = glm53_graph_spec_state_bytes(g);
     if (g->glm53 && state_backup_bytes != 0) {
         g->mtp_state_backup = ds4_gpu_tensor_alloc(state_backup_bytes);
+    }
+    /* MTP3-MIN banks.  One extra copy of the KDA state per KDA layer -- about
+     * 76 MB per rank at TP2 -- allocated only when MTP is on, and only if the
+     * arm is enabled, because it is dead weight otherwise.  A failure here is
+     * NOT fatal: banking simply stays off and the engine keeps the existing
+     * restore-and-replay path. */
+    if (g->glm53 && glm53_mtp3_bank_active()) {
+        for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
+            if (!ds4_glm53_layer_is_kda(il)) continue;
+            ds4_gpu_tensor *rs = g->layer_kda_recurrent_state[il];
+            ds4_gpu_tensor *cs = g->layer_kda_conv_state[il];
+            if (!rs || !cs) continue;
+            g->layer_kda_recurrent_bank[il] =
+                ds4_gpu_tensor_alloc(ds4_gpu_tensor_bytes(rs));
+            g->layer_kda_conv_bank[il] =
+                ds4_gpu_tensor_alloc(ds4_gpu_tensor_bytes(cs));
+            if (!g->layer_kda_recurrent_bank[il] || !g->layer_kda_conv_bank[il]) {
+                fprintf(stderr,
+                        "ds4: GLM MTP3-MIN bank allocation failed at layer %u; "
+                        "falling back to restore-and-replay\n", il);
+                for (uint32_t j = g->layer_start; j <= g->layer_end; j++) {
+                    ds4_gpu_tensor_free(g->layer_kda_recurrent_bank[j]);
+                    ds4_gpu_tensor_free(g->layer_kda_conv_bank[j]);
+                    g->layer_kda_recurrent_bank[j] = NULL;
+                    g->layer_kda_conv_bank[j] = NULL;
+                }
+                break;
+            }
+        }
     }
     g->mtp_logits_host = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     if (!g->mtp_kv_lora_cache || !g->mtp_k_rope_cache || !g->mtp_concat ||
@@ -68414,6 +68518,7 @@ static int ds4_session_glm_spec_cycle_impl(
                     glm53_graph_copy_spec_state(g, true);
         if (timing) t_save = now_sec();
         if (state_saved) {
+            g->mtp_bank_active = glm53_mtp3_bank_active() ? 1 : 0;
             if (!glm53_graph_use_indexed_prefill(g) &&
                 glm_graph_span_fits_full_attention(g, pos, 2u)) {
                 verified = glm_graph_forward_tokens(g,
@@ -68450,6 +68555,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                                              0,
                                                              2);
             }
+            g->mtp_bank_active = 0;
         }
     } else if (pos + 2u <= glm_graph_indexer_top_k_limit()) {
         /* GLM-5.2 verification must use the compact caches populated by
