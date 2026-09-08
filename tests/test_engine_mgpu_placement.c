@@ -92,6 +92,8 @@ int ds4_test_glm_memory_guard_disabled(void);
 uint32_t ds4_test_glm53_tp_split_flags(void);
 int ds4_test_glm53_kda_phase_splits(int mode, int phase);
 int ds4_test_glm53_kda_split_mode_of(const char *env);
+int ds4_test_glm53_idx_split_decide(int gate_due, uint32_t score_rows,
+                                    uint32_t selected_pools, uint32_t min_ctx);
 void ds4_test_glm53_layer_tp_indexer_gate(uint32_t il,
                                           uint32_t n_layer,
                                           uint32_t n_nextn,
@@ -882,6 +884,39 @@ static void test_prefill_watchdog_bound(void) {
             }
             CHECK(dsa_seen == 11,
                   "GLM 5.3 has exactly 11 DSA layers to exchange on");
+        }
+
+        /* IDX-SPLIT's split-or-replicate decision, at the boundaries.  The
+         * layer owes an INDEXER gate whenever it is due; this only picks
+         * between a real exchange and a dummy, so "0" here still means a gate
+         * is sent.  POOL_SIZE 4, 512 selected pools -> exactness needs
+         * score_rows >= 1024, i.e. visible >= 4096. */
+        {
+            const uint32_t POOL = 4u, POOLS = 512u;
+            const uint32_t MIN = 65536u;   /* the shipped default */
+            struct { uint32_t visible; int want; const char *why; } cases[] = {
+                { 1u,      0, "visible 1: nowhere near the exactness bound" },
+                { 2051u,   0, "visible 2051: the dense limit, still no split" },
+                { 2052u,   0, "visible 2052: sparse but under the exactness bound" },
+                { 4095u,   0, "visible 4095: one short of exactness" },
+                { 4096u,   0, "visible 4096: exact, but under the profit bound" },
+                { MIN - POOL, 0, "one pool under the profitability bound" },
+                { MIN,     1, "at the profitability bound: split" },
+                { 310000u, 1, "production: split" },
+            };
+            for (size_t i = 0; i < sizeof(cases)/sizeof(cases[0]); i++) {
+                const uint32_t rows = cases[i].visible / POOL;
+                CHECK(ds4_test_glm53_idx_split_decide(1, rows, POOLS, MIN)
+                          == cases[i].want, cases[i].why);
+                /* Not due -> never split, whatever the context. */
+                CHECK(ds4_test_glm53_idx_split_decide(0, rows, POOLS, MIN) == 0,
+                      "a layer that owes no gate never splits");
+            }
+            /* Both ranks derive it from score_rows alone, so a sequence that
+             * crosses the bound flips both at the same token or neither. */
+            CHECK(ds4_test_glm53_idx_split_decide(1, (MIN - POOL)/POOL, POOLS, MIN) == 0 &&
+                  ds4_test_glm53_idx_split_decide(1, MIN/POOL, POOLS, MIN) == 1,
+                  "the crossing is a step function of score_rows, identical on both ranks");
         }
 
         /* Layer 3 is the first DSA layer and the first routed FFN. */
