@@ -1961,7 +1961,7 @@ kernel void kernel_glm_indexer_score_one(
             (device const float *)(q + (uint64_t)h * args.head_dim * sizeof(float));
         for (uint d = tid; d < args.head_dim; d += nth) {
             const float k = glm_cache_load_f32_or_f16(indexer_key_cache,
-                                                      (uint64_t)(args.row_base + row) * args.head_dim + d,
+                                                      ((uint64_t)args.row_base + row) * args.head_dim + d,
                                                       args.cache_f16);
             partial += qh[d] * k;
         }
@@ -2000,7 +2000,7 @@ kernel void kernel_glm_indexer_score_one_direct(
 
     if (tid < 128u) {
         ktg[tid] = glm_cache_load_f32_or_f16(indexer_key_cache,
-                                             (uint64_t)(args.row_base + row) * 128u + tid,
+                                             ((uint64_t)args.row_base + row) * 128u + tid,
                                              args.cache_f16);
     }
 
@@ -2099,7 +2099,7 @@ kernel void kernel_glm_indexer_score_one_vpt(
 
         if (tid < 128u) {
             ktg[tid] = glm_cache_load_f32_or_f16(indexer_key_cache,
-                                                 (uint64_t)(args.row_base + row) * 128u + tid,
+                                                 ((uint64_t)args.row_base + row) * 128u + tid,
                                                  args.cache_f16);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

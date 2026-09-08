@@ -13334,6 +13334,22 @@ static int glm53_idx_split_dec_active(void) {
     if (cached < 0) {
         const char *e = getenv("DS4_GLM_IDX_SPLIT_DEC");
         cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+        /* IDX-HALF and IDX-SPLIT compose into nonsense: IDX-HALF ceiling-halves
+         * score_rows for the pricing arm, IDX-SPLIT then halves the remainder
+         * per rank, and the pair searches a QUARTER of the context while
+         * claiming exactness.  Refuse rather than measure that -- IDX-HALF's
+         * output is wrong by construction and IDX-SPLIT's is supposed not to
+         * be, so the combination is not a configuration anyone wants. */
+        if (cached) {
+            const char *h = getenv("DS4_GLM_IDX_HALF_SCAN");
+            if (h && h[0] && h[0] != '0') {
+                fprintf(stderr,
+                        "ds4: DS4_GLM_IDX_SPLIT_DEC and DS4_GLM_IDX_HALF_SCAN "
+                        "are mutually exclusive -- together they search a "
+                        "quarter of the context.  IDX-SPLIT disabled.\n");
+                cached = 0;
+            }
+        }
     }
     return cached;
 }
@@ -13349,11 +13365,13 @@ static void glm53_idx_split_announce(uint32_t rows, uint32_t begin,
     if (announced) return;
     announced = 1;
     fprintf(stderr,
-            "ds4: IDX-SPLIT-DEC %s (pooled rows %u -> [%u, %u) = %u, top_k pools %u)%s\n",
-            active ? "ACTIVE" : "INACTIVE",
-            rows, begin, begin + count, count, want_pools,
+            "ds4: IDX-SPLIT-DEC %s (pooled rows %u -> [%u, %u) = %u, "
+            "top_k pools %u, crossover %u)%s\n",
+            active ? "ACTIVE" : "GATE-ONLY",
+            rows, begin, begin + count, count, want_pools, 2u * want_pools,
             active ? "" :
-            "  <-- half is below the top-k, both ranks scan everything here");
+            "  <-- below crossover: both ranks scan everything and the gate "
+            "fires empty to keep the ordinal");
 }
 
 /* The rank's half of `rows`, by the quotient/remainder form pass 1 already uses
@@ -56503,19 +56521,38 @@ static bool glm_graph_forward_token(
                      * scan everything, exactly as before. */
                     const uint32_t idx_selected_pools =
                         indexer_top_k / DS4_GLM53_INDEX_POOL_SIZE;
+                    /* Ask the SHARED policy which gates this layer fires rather
+                     * than re-deriving the layer set here.  A graph that fires a
+                     * gate the mask omits -- or skips one it reserves -- shifts
+                     * every later ordinal and kills the pair, which is how S6a
+                     * and S6c each died once. */
+                    bool idx_gate_fires = false;
+                    glm53_layer_tp_gates(il, DS4_N_LAYER, DS4_N_NEXTN_PREDICT,
+                                         DS4_N_LEADING_DENSE, false, false,
+                                         false, glm53_idx_split_dec_active(),
+                                         &idx_gate_fires, NULL, NULL, NULL);
+                    const int idx_gate_here =
+                        idx_gate_fires && g->glm53 && g->tp_world == 2u &&
+                        g->tp_out && g->tp_in && !g->ssd_streaming;
+                    /* GLOBAL condition, evaluated identically on both ranks from
+                     * score_rows alone.  `count >= selected_pools` per rank was
+                     * WRONG and one-sided: at score_rows = 1023 the remainder
+                     * gives rank 0 512 rows and rank 1 511, so rank 0 would fire
+                     * the exchange and rank 1 would not.  Both halves are big
+                     * enough exactly when score_rows >= 2 * selected_pools, and
+                     * that is a statement about a number both ranks already
+                     * agree on. */
+                    const int idx_split_here =
+                        idx_gate_here && score_rows >= 2u * idx_selected_pools;
                     uint32_t idx_begin = 0u, idx_count = score_rows;
-                    int idx_split_here = 0;
-                    if (g->glm53 && glm53_idx_split_dec_active() &&
-                        g->tp_world == 2u && g->tp_out && g->tp_in &&
-                        !g->ssd_streaming) {
-                        uint32_t b = 0, c = 0;
+                    if (idx_split_here) {
                         glm53_idx_split_range(score_rows, g->tp_rank,
-                                              g->tp_world, &b, &c);
-                        if (c >= idx_selected_pools) {
-                            idx_begin = b; idx_count = c; idx_split_here = 1;
-                        }
-                        glm53_idx_split_announce(score_rows, b, c,
-                                                 idx_selected_pools,
+                                              g->tp_world, &idx_begin,
+                                              &idx_count);
+                    }
+                    if (idx_gate_here) {
+                        glm53_idx_split_announce(score_rows, idx_begin,
+                                                 idx_count, idx_selected_pools,
                                                  idx_split_here);
                     }
                     ok = ds4_gpu_glm_indexer_score_one_base_tensor(
@@ -56585,6 +56622,21 @@ static bool glm_graph_forward_token(
                                 indexer_top_k,
                                 DS4_GLM53_INDEX_POOL_SIZE,
                                 glm53_graph_indexer_selected_limit()) != 0;
+                        /* CONSUME THE RESERVED SLOT.  The mask is negotiated
+                         * once at TP creation and reserves an INDEXER gate on
+                         * every DSA layer whenever the flag is on, but the split
+                         * itself only makes sense above the crossover.  Below it
+                         * both ranks scan everything and still have to fire the
+                         * gate, or the ordinal walk slips and every later gate
+                         * on this layer lands on the wrong slot.
+                         *
+                         * The payload is whatever the out slot holds and nobody
+                         * reads it; the exchange exists for its ordinal.  Both
+                         * ranks reach this together because the condition above
+                         * is global. */
+                        if (ok && idx_gate_here) {
+                            ok = ds4_gpu_tp_gate_encode(il, DS4_TP_GATE_INDEXER) != 0;
+                        }
                     } else if (ok) {
                         ok = ds4_gpu_indexer_topk_tensor(g->indexer_selected,
                                                          g->indexer_scores,

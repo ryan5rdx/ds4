@@ -677,7 +677,28 @@ kernel void kernel_glm53_idxsplit_pack(
      * sorts to the bottom of a descending merge and is dropped, which is the
      * same convention pass 1 uses for a short slice. */
     if (idx < 0 || (uint)idx >= args.count) { keys[gid] = 0ul; return; }
-    keys[gid] = ds4_topk_pack_key(scores[idx], (uint32_t)idx + args.index_base);
+    /* NORMALISE -0.0 TO +0.0 BEFORE PACKING.  ds4_topk_pack_key maps the sign
+     * bit through `~u`, so -0.0 becomes 0x7fffffff and +0.0 becomes 0x80000000
+     * -- it orders them, strictly, with +0.0 above.  The canonical argsort
+     * comparator this path must reproduce compares FLOATS, where -0.0 == +0.0,
+     * and resolves the tie by index.  Two rows scoring exactly ±0.0 would
+     * therefore order differently in the merge than in the replicated answer.
+     *
+     * Reachable rather than theoretical: the scorer accumulates
+     * max(qk*scale, 0) * weights[h], and max() returns +0.0 for a
+     * non-positive qk, so a head with a NEGATIVE weight contributes -0.0.  A
+     * row whose every head is clamped yields -0.0 while a row with any positive
+     * contribution yields a positive value; two all-clamped rows differing only
+     * in weight signs give -0.0 and +0.0.
+     *
+     * `v + 0.0f` would not do it under fast-math; the compare does.
+     *
+     * NaN is out of scope by assumption, and deliberately: the ordered
+     * transform is monotone only on finite floats, and a NaN score means the
+     * indexer has already produced garbage that no ordering can rescue. */
+    float v = scores[idx];
+    if (v == 0.0f) v = 0.0f;
+    keys[gid] = ds4_topk_pack_key(v, (uint32_t)idx + args.index_base);
 }
 
 struct ds4_metal_args_idxsplit_merge {

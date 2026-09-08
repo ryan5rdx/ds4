@@ -1675,6 +1675,7 @@ static uint64_t g_rdma_stat_count[DS4_TP_GATES_PER_LAYER];
 static int g_rdma_stat_enabled = -1;
 static const char *tp_gate_slot_name(uint32_t gate) {
     switch (gate) {
+    case DS4_TP_GATE_INDEXER: return "indexer";
     case DS4_TP_GATE_ATTN:   return "attn";
     case DS4_TP_GATE_ROUTER: return "router";
     case DS4_TP_GATE_FFN:    return "ffn";

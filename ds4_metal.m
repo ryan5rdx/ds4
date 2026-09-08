@@ -12477,7 +12477,11 @@ static void ds4_gpu_tp_fence_calibrate_spin(void) {
  * along with DS4_TP_GATE_PROFILE rather than needing its own cadence. */
 static void ds4_gpu_tp_fence_spin_report(void) {
     if (!g_tp_fence_spin_profile || !g_tp_fence_spin_words) return;
-    static const char *bank_name[DS4_TP_GATES_PER_LAYER] = { "attn", "router", "ffn" };
+    /* One name per gate, in enum order.  This was three entries against a
+     * four-entry array after the INDEXER renumber: every bank was
+     * mislabelled by one and FFN printed a NULL. */
+    static const char *bank_name[DS4_TP_GATES_PER_LAYER] = {
+        "indexer", "attn", "router", "ffn" };
     for (uint32_t b = 0; b < DS4_TP_GATES_PER_LAYER; b++) {
         const volatile uint32_t *w =
             g_tp_fence_spin_words + (size_t)b * DS4_TP_FENCE_SPIN_WORDS;
@@ -39032,13 +39036,21 @@ int ds4_gpu_glm_indexer_score_one_base_tensor(
         const uint64_t score_bytes = (uint64_t)n_rows * sizeof(float);
         const uint64_t q_bytes = (uint64_t)n_head * head_dim * sizeof(float);
         const uint64_t weights_bytes = (uint64_t)n_head * sizeof(float);
-        const uint64_t cache_bytes = (uint64_t)n_rows * head_dim * cache_elem_bytes;
+        /* The SHADER reads row_base + row, so the cache bound is the END of the
+         * window, not its length.  Validating n_rows alone would have let a
+         * bad row_base read past the cache with the check passing -- the score
+         * buffer is n_rows long and only the cache side shifts. */
+        const uint64_t cache_rows_end = (uint64_t)row_base + n_rows;
+        const uint64_t cache_bytes = cache_rows_end * head_dim * cache_elem_bytes;
         if (!scoresbuf || !qbuf || !weightsbuf || !cachebuf ||
             ds4_gpu_tensor_bytes(scores) < score_bytes ||
             ds4_gpu_tensor_bytes(q) < q_bytes ||
             ds4_gpu_tensor_bytes(weights) < weights_bytes ||
             ds4_gpu_tensor_bytes(indexer_key_cache) < cache_bytes) {
-            fprintf(stderr, "ds4: Metal GLM indexer score received undersized buffers\n");
+            fprintf(stderr,
+                    "ds4: Metal GLM indexer score received undersized buffers "
+                    "(rows %u at base %u needs %llu cache bytes)\n",
+                    n_rows, row_base, (unsigned long long)cache_bytes);
             return 0;
         }
 
