@@ -50975,6 +50975,8 @@ static bool glm_graph_forward_indexed_tokens(
                         (uint64_t)g->tp_rank * k_cnt,
                         k_cnt,
                         g->batch_heads,
+                        g->heads_dim,
+                        (uint64_t)g->tp_rank * k_cnt,
                         sliced_rows) != 0;
                 if (ok && sliced_rows != n_tokens) {
                     const uint32_t tail_rows = n_tokens - sliced_rows;
@@ -72839,7 +72841,7 @@ static bool metal_graph_encode_attn_post_session_batch(
                 &peer_out, model->map, model->size,
                 layer->attn_output_b->abs_offset,
                 low_dim, DS4_N_EMBD, tp_low_dim, tp_low_dim,
-                &peer_low, rows) != 0;
+                &peer_low, tp_low_dim, 0u, rows) != 0;
     }
     if (ds4_gpu_set_current_device(home) != 0) ok = false;
     if (ok) {
@@ -72855,7 +72857,7 @@ static bool metal_graph_encode_attn_post_session_batch(
                 &home_out, model->map, model->size,
                 layer->attn_output_b->abs_offset,
                 low_dim, DS4_N_EMBD, 0u, tp_low_dim,
-                &home_low, rows) != 0;
+                &home_low, tp_low_dim, 0u, rows) != 0;
     }
     if (ok) {
         ok = ds4_gpu_tensor_copy_xdev_default(

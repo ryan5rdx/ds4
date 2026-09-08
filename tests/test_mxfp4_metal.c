@@ -197,7 +197,8 @@ static int run_kslice_rows(void) {
                                                 (uint64_t)R * KHALF * sizeof(float));
             step = step && ds4_gpu_matmul_q8_0_kslice_rows_tensor(
                     lane ? p1 : p0, kmodel, (uint64_t)kbytes + 4096, 0,
-                    KIN, KOUT, (uint64_t)lane * KHALF, KHALF, tL, R);
+                    KIN, KOUT, (uint64_t)lane * KHALF, KHALF, tL,
+                    KHALF, 0u, R);
         }
         step = step && ds4_gpu_add_tensor(p0, p0, p1, (uint32_t)((uint64_t)R * KOUT));
         step = step && ds4_gpu_tensor_read(oF, 0, hf, (uint64_t)R * KOUT * sizeof(float));

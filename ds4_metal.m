@@ -26496,6 +26496,40 @@ static uint64_t g_kslice_matvec_count;
 uint64_t ds4_gpu_kslice_tiled_count(void) { return g_kslice_tiled_count; }
 uint64_t ds4_gpu_kslice_matvec_count(void) { return g_kslice_matvec_count; }
 
+/* Validate the activation window before selecting either the MPP or fallback
+ * implementation.  A wider allocation is not proof that each logical row uses
+ * a compact stride; confusing those geometries previously made the GLM
+ * attention-output split walk half rows. */
+static int ds4_gpu_kslice_rows_geometry_ok(
+        const ds4_gpu_tensor *out,
+        const ds4_gpu_tensor *x,
+        const void           *model_map,
+        uint64_t              full_in_dim,
+        uint64_t              out_dim,
+        uint64_t              k_off,
+        uint64_t              k_cnt,
+        uint64_t              x_row_stride,
+        uint64_t              x_col_off,
+        uint64_t              n_rows) {
+    if (!out || !x || !model_map || n_rows == 0 || out_dim == 0 ||
+        n_rows > (uint64_t)INT32_MAX ||
+        (full_in_dim & 31u) != 0 || (k_off & 31u) != 0 ||
+        (k_cnt & 31u) != 0 || k_cnt == 0 ||
+        k_off > full_in_dim || k_cnt > full_in_dim - k_off ||
+        full_in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        k_cnt > UINT32_MAX ||
+        x_row_stride == 0 || x_row_stride < x_col_off + k_cnt ||
+        x_row_stride > UINT32_MAX ||
+        n_rows > UINT64_MAX / x_row_stride / sizeof(float) ||
+        n_rows > UINT64_MAX / out_dim / sizeof(float) ||
+        ds4_gpu_tensor_bytes(x) <
+            ((n_rows - 1u) * x_row_stride + x_col_off + k_cnt) * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < n_rows * out_dim * sizeof(float)) {
+        return 0;
+    }
+    return 1;
+}
+
 /* The staged mm kernel is far faster once there are enough rows to fill a
  * tile, but it only accepts the 64/32-aligned extents that tiling assumes.
  * It is the fast path; the single-row and ragged shapes the cross-device and
@@ -26511,6 +26545,8 @@ static int ds4_gpu_matmul_q8_0_kslice_rows_mpp(
         uint64_t              k_off,
         uint64_t              k_cnt,
         const ds4_gpu_tensor *x,
+        uint64_t              x_row_stride,
+        uint64_t              x_col_off,
         uint64_t              n_rows) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!ds4_gpu_mpp_available() ||
@@ -26572,8 +26608,8 @@ static int ds4_gpu_matmul_q8_0_kslice_rows_mpp(
         args.nb01 = row_bytes;
         args.nb02 = row_bytes * out_dim;
         args.nb03 = row_bytes * out_dim;
-        args.nb11 = k_cnt * sizeof(float);
-        args.nb12 = n_rows * k_cnt * sizeof(float);
+        args.nb11 = x_row_stride * sizeof(float);
+        args.nb12 = n_rows * x_row_stride * sizeof(float);
         args.nb13 = args.nb12;
 
         int owned = 0;
@@ -26586,7 +26622,8 @@ static int ds4_gpu_matmul_q8_0_kslice_rows_mpp(
                 offset:(NSUInteger)(inner_offset + (k_off / 32u) * 34u)
                atIndex:1];
         [enc setBuffer:xbuf
-                offset:(NSUInteger)ds4_gpu_tensor_offset(x)
+                offset:(NSUInteger)(ds4_gpu_tensor_offset(x) +
+                                    x_col_off * sizeof(float))
                atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
         [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t)
@@ -26612,10 +26649,18 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         uint64_t              k_off,
         uint64_t              k_cnt,
         const ds4_gpu_tensor *x,
+        uint64_t              x_row_stride,
+        uint64_t              x_col_off,
         uint64_t              n_rows) {
+    if (!ds4_gpu_kslice_rows_geometry_ok(out, x, model_map, full_in_dim,
+                                         out_dim, k_off, k_cnt,
+                                         x_row_stride, x_col_off, n_rows)) {
+        return 0;
+    }
     if (ds4_gpu_matmul_q8_0_kslice_rows_mpp(out, model_map, model_size,
                                             weight_offset, full_in_dim,
                                             out_dim, k_off, k_cnt, x,
+                                            x_row_stride, x_col_off,
                                             n_rows)) {
         return 1;
     }
@@ -26626,9 +26671,17 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         k_off > full_in_dim || k_cnt > full_in_dim - k_off ||
         full_in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
         k_cnt > UINT32_MAX ||
-        n_rows > UINT64_MAX / k_cnt / sizeof(float) ||
+        /* The window must fit inside a row, and the LAST row's window inside
+         * the buffer.  The old form was `bytes(x) < n_rows * k_cnt * 4`, a
+         * lower bound that any wider buffer satisfies -- which is exactly how
+         * a full-width activation sailed through and the kernel then walked
+         * half rows (D1). */
+        x_row_stride == 0 || x_row_stride < x_col_off + k_cnt ||
+        x_row_stride > UINT32_MAX ||
+        n_rows > UINT64_MAX / x_row_stride / sizeof(float) ||
         n_rows > UINT64_MAX / out_dim / sizeof(float) ||
-        ds4_gpu_tensor_bytes(x) < n_rows * k_cnt * sizeof(float) ||
+        ds4_gpu_tensor_bytes(x) <
+            ((n_rows - 1u) * x_row_stride + x_col_off + k_cnt) * sizeof(float) ||
         ds4_gpu_tensor_bytes(out) < n_rows * out_dim * sizeof(float)) {
         return 0;
     }
@@ -26685,8 +26738,14 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
             if (mm) {
                 ds4_gpu_mul_mm_args margs =
                     ds4_gpu_make_mm_args(k_cnt, out_dim, n_rows, row_bytes);
-                /* make_mm_args derives the activation strides from its in_dim,
-                 * which is already k_cnt here, so nb1x are correct as built. */
+                /* make_mm_args derives the activation strides from its
+                 * in_dim (k_cnt), which is right only when the activation is
+                 * already sliced.  Override from the caller's declared
+                 * geometry so a full-width activation strides by its real row
+                 * pitch rather than by the window width. */
+                margs.nb11 = x_row_stride * sizeof(float);
+                margs.nb12 = n_rows * x_row_stride * sizeof(float);
+                margs.nb13 = margs.nb12;
                 int mm_owned = 0;
                 id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&mm_owned);
                 if (!cb) return 0;
@@ -26695,7 +26754,10 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
                 [enc setBytes:&margs length:sizeof(margs) atIndex:0];
                 [enc setBuffer:wbuf
                         offset:(NSUInteger)(inner + k_off_bytes) atIndex:1];
-                [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+                [enc setBuffer:xbuf
+                        offset:(NSUInteger)(ds4_gpu_tensor_offset(x) +
+                                            x_col_off * sizeof(float))
+                       atIndex:2];
                 [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
                 [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u)
                                          atIndex:0];
@@ -26728,8 +26790,8 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         args.ne00 = (int32_t)k_cnt;
         args.ne10 = (int32_t)k_cnt;
         args.ne11 = (int32_t)n_rows;
-        args.nb11 = k_cnt * sizeof(float);
-        args.nb12 = n_rows * k_cnt * sizeof(float);
+        args.nb11 = x_row_stride * sizeof(float);
+        args.nb12 = n_rows * x_row_stride * sizeof(float);
         args.nb13 = args.nb12;
         args.ne1 = (int32_t)n_rows;
         args.nr0 = dispatch.nr0;
@@ -26746,7 +26808,10 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         [enc setBuffer:wbuf
                 offset:(NSUInteger)(inner + (k_off / 32u) * 34u)
                atIndex:1];
-        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:xbuf
+                offset:(NSUInteger)(ds4_gpu_tensor_offset(x) +
+                                    x_col_off * sizeof(float))
+               atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
         [enc setThreadgroupMemoryLength:dispatch.smem atIndex:0];
         [enc dispatchThreadgroups:
