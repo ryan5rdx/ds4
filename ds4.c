@@ -967,6 +967,70 @@ static uint32_t glm_graph_indexed_decode_split_block_rows_for(uint32_t n_selecte
  * availability gate independently checks needed_blocks <= this value and simply
  * refuses split-K when it does not hold.  The failure mode is a silently
  * disabled optimisation, which is how this went unnoticed the first time. */
+/* MTP1A -- route the GLM 5.3 two-row speculative verifier's DSA attention
+ * through the shipping D4 split-K decode kernel, one call per row.
+ *
+ * DEFAULT OFF.  This is an experimental proof, not a shipping design.  It
+ * exists to answer one question with a DIRECT measurement -- how much of
+ * target_ms is the batch-LORA attention kernel -- because every indirect answer
+ * this campaign produced was wrong.  The head-count proxy from probe_d4 does
+ * NOT bound it: ds4.c slices the selection per token, so the two rows carry
+ * distinct Q/QK and distinct selected lists, and doubling heads is not doubling
+ * tokens.  Read target_ms, not a ratio.
+ *
+ * The verifier runs the batch/prefill substrate, whose attention kernel
+ * dispatches ~16 threadgroups at n_tokens == 2 and starves a 60-core GPU.  D4
+ * exists precisely to fill that grid at one row.  Two sequential D4 calls is
+ * the cheapest way to find out whether that matters here; a native two-token
+ * kernel is a separate build and is only justified if this one pays.
+ *
+ * Deliberately conservative:
+ *   - 64 replicated heads, no new TP attention gate (arm 2).  The 32-head split
+ *     is arm 3 and needs its own gate accounting.
+ *   - selected_rows_valid = false.  The batch path has no equivalent of the
+ *     decode path's last_indexer_selected_dense, and production selections are
+ *     2051 entries with an 0xffffffff tail, so the bounds-checked form is the
+ *     correct one regardless.  It costs ~10%; that cost is part of the answer.
+ *   - the split-K partial scratch is reused sequentially across the two rows,
+ *     so no new allocation. */
+static bool glm53_mtp1a_d4_active(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_GLM_MTP1A_D4");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+/* Engagement census.  "It ran" is not observable from throughput, and an arm
+ * that silently did not engage reads as a null result -- this campaign has lost
+ * a rig cycle to exactly that more than once.  The verifier touches 11 DSA
+ * layers and MTP1A must issue one D4 call per row on each, so a complete
+ * two-row cycle is exactly 22.  Reported, not enforced: an instrument that
+ * changes control flow is worse than the silence it replaces. */
+static uint32_t g_glm53_mtp1a_d4_calls;
+
+static void glm53_mtp1a_note_d4_call(void) {
+    g_glm53_mtp1a_d4_calls++;
+    static int announced;
+    if (!announced) {
+        announced = 1;
+        fprintf(stderr,
+                "ds4: GLM MTP1A ACTIVE -- two-row verify DSA attention through "
+                "the D4 split-K decode kernel, one call per row, 64 replicated "
+                "heads, selected_rows_valid=false\n");
+    }
+}
+
+static void glm53_mtp1a_report_cycle(uint32_t expect_layers) {
+    if (!glm53_mtp1a_d4_active()) return;
+    const uint32_t want = expect_layers * 2u;
+    fprintf(stderr, "ds4: glm mtp1a d4census: calls=%u expect=%u%s\n",
+            g_glm53_mtp1a_d4_calls, want,
+            g_glm53_mtp1a_d4_calls == want ? "" : "  MISMATCH");
+    g_glm53_mtp1a_d4_calls = 0;
+}
+
 static uint32_t glm_graph_split_blocks_for_limit(uint32_t top_k) {
     const uint32_t small_n =
         top_k < DS4_GLM_SPLIT_SMALL_ROWS_MAX ? top_k : DS4_GLM_SPLIT_SMALL_ROWS_MAX;
@@ -54698,9 +54762,31 @@ static bool glm_graph_forward_indexed_tokens(
                                       (uint64_t)n_tokens * DS4_N_HEAD * DS4_N_KV_LORA,
                                       il,
                                       pos0);
-        if (ok && use_batch_attn_kernel) ok = glm_graph_indexed_prefill_attention_boundary();
+        /* MTP1A takes the per-row path even though the batch kernel is
+         * available: the row views it needs are exactly the ones that path
+         * already builds, so the arm reuses tested code instead of adding a
+         * parallel one. */
+        /* !tp_attn_head_split is a CORRECTNESS guard, not a scoping choice.
+         * tp_attn_head_split is computed at the top of this function from
+         * use_batch_attn_kernel, which MTP1A does not clear, so it can still be
+         * true here.  This branch projects all DS4_N_HEAD heads on every rank;
+         * under the head split each rank must own only its half, and the
+         * partials are combined over the big gate.  Running it split would
+         * double-count.  Arm 3 (32 heads/rank plus a TP attention gate) is a
+         * separate change -- it needs head-range slicing of q/qk_low/attn_v_b
+         * and its own gate ordinal, and gate-ordinal changes killed S6a and
+         * S6c.  At the default DS4_GLM_TP_HEAD_SPLIT_MIN this is already false
+         * at n_tokens 2; the guard is here so hsm2's =2 override cannot make it
+         * silently wrong. */
+        const bool mtp1a_rows =
+            glm53_mtp1a_d4_active() && g->glm53 && n_tokens == 2u &&
+            !tp_attn_head_split &&
+            glm_graph_indexed_decode_split_group8_available(
+                    last_indexer_selected_count, g->ctx_cap, DS4_N_HEAD);
+        if (ok && use_batch_attn_kernel && !mtp1a_rows)
+            ok = glm_graph_indexed_prefill_attention_boundary();
 
-        if (use_batch_attn_kernel) {
+        if (use_batch_attn_kernel && !mtp1a_rows) {
             const uint32_t attn_slice_cap =
                 glm_graph_indexed_prefill_batch_attn_slice_tokens();
             for (uint32_t t0 = 0; ok && t0 < n_tokens; ) {
@@ -54952,7 +55038,50 @@ static bool glm_graph_forward_indexed_tokens(
                                         (uint64_t)last_indexer_selected_count * sizeof(uint32_t));
                 ok = q_view && qk_low_view && heads_view && selected_view;
                 if (!ok) fprintf(stderr, "ds4: GLM scalar indexed prefill failed to create attention row views at layer %u token %u\n", il, t);
-                if (ok) {
+                if (ok && mtp1a_rows) {
+                    /* One D4 call per row, each with THIS row's own selection.
+                     * The scratch is reused sequentially -- the two calls are
+                     * ordered on the same queue through g->attn_partial_lora,
+                     * so no fence is needed and none is added. */
+                    const uint32_t sbr =
+                        glm_graph_indexed_decode_split_block_rows_for(last_indexer_selected_count);
+                    const uint32_t sblk =
+                        (last_indexer_selected_count + sbr - 1u) / sbr;
+                    int rc = ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
+                            heads_view,
+                            g->attn_partial_lora,
+                            g->attn_partial_ms,
+                            q_view,
+                            qk_low_view,
+                            g->layer_kv_lora_cache[il],
+                            g->layer_k_rope_cache[il],
+                            model->map,
+                            model->size,
+                            l->attn_v_b->abs_offset,
+                            l->attn_v_b->type,
+                            selected_view,
+                            last_indexer_selected_count,
+                            false,   /* selected_rows_valid: production pads with 0xffffffff */
+                            g->compact_cache_cap,
+                            glm_graph_compact_cache_is_f16(),
+                            DS4_N_HEAD,
+                            DS4_N_KV_LORA,
+                            (uint32_t)g->q_nope,
+                            DS4_N_ROT,
+                            DS4_N_VALUE_MLA,
+                            0,
+                            sbr,
+                            sblk,
+                            rope_base,
+                            rope_scale,
+                            0.0f,
+                            1.0f,
+                            DS4_ROPE_YARN_BETA_FAST,
+                            DS4_ROPE_YARN_BETA_SLOW);
+                    ok = rc != 0;
+                    if (ok) glm53_mtp1a_note_d4_call();
+                    else fprintf(stderr, "ds4: GLM MTP1A D4 attention failed at layer %u row %u\n", il, t);
+                } else if (ok) {
                     int rc = ds4_gpu_glm_attention_indexed_decode_typed_tensor(heads_view,
                                                                                q_view,
                                                                                qk_low_view,
@@ -71963,6 +72092,10 @@ static int ds4_session_glm_spec_cycle_impl(
                 t_save > 0.0 ? (t1 - t_save) * 1000.0 : -1.0,
                 t_head > 0.0 ? (t_head - t1) * 1000.0 : -1.0,
                 t_replay > 0.0 ? (t_replay - t_head) * 1000.0 : -1.0);
+        /* 11 DSA layers x 2 rows = 22 when MTP1A engaged; a mismatch means
+         * the arm did not run on every layer and the timing is not the
+         * thing it is labelled as. */
+        glm53_mtp1a_report_cycle(11u);
         fprintf(stderr,
                 "ds4: glm mtp cycle: verify2 %.1f ms, head+draft %.1f ms, %s "
                 "(draft %d '%s' vs true %d '%s')\n",
