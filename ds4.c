@@ -71933,9 +71933,20 @@ static int ds4_session_glm_spec_cycle_impl(
     int toks[2] = { first_token, d };
     bool verified = false;
     bool state_saved = false;
+    /* MTP0 asked for the pieces the budget model had only inferred.  These are
+     * host timestamps at points the code ALREADY blocks on -- the two-row
+     * verify and the row-0 head each end in a logits readback, and the replay
+     * is a full forward -- so no synchronisation is added to the measured path.
+     *
+     * t_save is the exception and is labelled as such: nothing forces a wait
+     * between the state copy and the verify submission, so time before it is
+     * attributed rather than measured.  It still bounds the copy from above,
+     * which is the question ("is state handling a real cost or noise?"). */
+    double t_save = 0.0, t_head = 0.0, t_replay = 0.0;
     if (g->glm53) {
         state_saved = glm_graph_mtp_ensure(g) &&
                     glm53_graph_copy_spec_state(g, true);
+        if (timing) t_save = now_sec();
         if (state_saved) {
             if (!glm53_graph_use_indexed_prefill(g) &&
                 glm_graph_span_fits_full_attention(g, pos, 2u)) {
@@ -72044,6 +72055,7 @@ static int ds4_session_glm_spec_cycle_impl(
         s->checkpoint_valid = false;
         return -1;
     }
+    if (timing) t_head = now_sec();
     const int n1 = glm_session_logits_argmax(s->glm_mtp_logits0);
     int replacement = -1;
     int accept = n1 == d;
@@ -72118,6 +72130,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                                 NULL,
                                                 s->logits,
                                                 false);
+            if (timing) t_replay = now_sec();
         } else {
             memcpy(s->logits, s->glm_mtp_logits0,
                    (size_t)DS4_N_VOCAB * sizeof(float));
@@ -72186,6 +72199,19 @@ static int ds4_session_glm_spec_cycle_impl(
         const double t2 = now_sec();
         char *dt = ds4_token_text(e, d, NULL);
         char *nt = ds4_token_text(e, n1, NULL);
+        /* One machine-readable row per cycle, so the analysis never has to
+         * re-derive a mean from subgroup medians -- which is what the previous
+         * Cbar did, and it is not the same number. */
+        fprintf(stderr,
+                "ds4: glm mtp cyclecsv: accepted=%d verify_ms=%.3f tail_ms=%.3f "
+                "total_ms=%.3f save_ms=%.3f target_ms=%.3f head_ms=%.3f "
+                "replay_ms=%.3f\n",
+                accept ? 1 : 0,
+                (t1 - t0) * 1000.0, (t2 - t1) * 1000.0, (t2 - t0) * 1000.0,
+                t_save > 0.0 ? (t_save - t0) * 1000.0 : -1.0,
+                t_save > 0.0 ? (t1 - t_save) * 1000.0 : -1.0,
+                t_head > 0.0 ? (t_head - t1) * 1000.0 : -1.0,
+                t_replay > 0.0 ? (t_replay - t_head) * 1000.0 : -1.0);
         fprintf(stderr,
                 "ds4: glm mtp cycle: verify2 %.1f ms, head+draft %.1f ms, %s "
                 "(draft %d '%s' vs true %d '%s')\n",
