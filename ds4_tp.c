@@ -132,6 +132,40 @@ typedef struct {
  * decode keeps a receive window posted by sequence number: recv for seq s
  * lands in the slab in-slot (s-1) % slots and its completion is the arrival
  * signal. */
+/* The Thunderbolt NHI frames everything at 4 KB: a message is a run of <=4 KB
+ * frames ending in one whose `eof` nibble is 3.  Queue depths are counted in
+ * FRAMES, so every max_send_wr / max_recv_wr in this file is a frame budget and
+ * must be divided by this before it means "messages". */
+/* Frame budget requested from create_qp, in 4 KB frames.  Keep the established
+ * 1024-frame default; larger windows reduce bulk-transfer rendezvous but also
+ * consume more queue and completion-ring state.  The environment override is
+ * useful for transport qualification without changing the production default.
+ * Apple's ring holds at most 4095 usable frames. */
+static uint32_t tp_rdma_want_frames(void) {
+    static uint32_t cached;
+    if (!cached) {
+        cached = 1024u;
+        const char *e = getenv("DS4_TP_RDMA_RECV_FRAMES");
+        if (e && e[0]) {
+            const int v = atoi(e);
+            /* Floor at one whole message: below 16 KiB / 4 KiB = 4 frames the
+             * window rounds to zero messages and the bulk path posts nothing,
+             * which presents as a hang rather than a refusal. */
+            if (v > 0) {
+                uint32_t want = (uint32_t)v > 4095u ? 4095u : (uint32_t)v;
+                if (want < 4u) {
+                    fprintf(stderr, "ds4-tp: DS4_TP_RDMA_RECV_FRAMES=%d is below "
+                                    "one 16 KiB message; using 4\n", v);
+                    want = 4u;
+                }
+                cached = want;
+            }
+        }
+    }
+    return cached;
+}
+
+#define DS4_TP_RDMA_FRAME_BYTES 4096u
 #define DS4_TP_RDMA_MAX_MSG 16384
 #define DS4_TP_RDMA_RECV_WINDOW 16
 #define DS4_TP_RDMA_BULK_SLOTS 64
@@ -706,6 +740,42 @@ static int tp_rdma_probe(ds4_tp_verbs_api *api) {
     return num > 0;
 }
 
+/* Size the completion queue for a full receive window and a full, explicitly
+ * signalled send window, plus slack for decode traffic.  A fixed 512-entry CQ
+ * is insufficient when the frame-budget override grows the bulk window, and a
+ * CQ overrun presents as lost completions followed by a timeout. */
+static uint32_t tp_rdma_cq_entries(uint32_t frames, uint32_t max_cqe) {
+    const uint32_t fpm =
+        (DS4_TP_RDMA_MAX_MSG + DS4_TP_RDMA_FRAME_BYTES - 1u) / DS4_TP_RDMA_FRAME_BYTES;
+    const uint32_t msgs = frames / fpm ? frames / fpm : 1u;
+    uint64_t want = (uint64_t)msgs * 2u + 256u;
+    if (want < 512u) want = 512u;            /* never below the old floor */
+    if (max_cqe && want > max_cqe) want = max_cqe;
+    return (uint32_t)want;
+}
+
+/* Shared by bring-up and the retry path so the two cannot drift apart. */
+static struct ibv_cq *tp_rdma_make_cq(ds4_tp_rdma *r) {
+    struct ibv_device_attr cqa;
+    memset(&cqa, 0, sizeof(cqa));
+    uint32_t max_cqe = 0;
+    if (r->api.query_device && r->api.query_device(r->ctx, &cqa) == 0)
+        max_cqe = (uint32_t)cqa.max_cqe;
+    const uint32_t cqe = tp_rdma_cq_entries(tp_rdma_want_frames(), max_cqe);
+    struct ibv_cq *cq = r->api.create_cq(r->ctx, (int)cqe, NULL, NULL, 0);
+    if (!cq && cqe > 512u) {
+        fprintf(stderr, "ds4-tp: create_cq(%u) refused; retrying at 512\n", cqe);
+        cq = r->api.create_cq(r->ctx, 512, NULL, NULL, 0);
+    }
+    static int announced;
+    if (cq && !announced) {
+        announced = 1;
+        fprintf(stderr, "ds4-tp: completion queue %u entries (frame budget %u, "
+                        "device max_cqe %u)\n", cqe, tp_rdma_want_frames(), max_cqe);
+    }
+    return cq;
+}
+
 static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     ds4_tp_rdma *r = &tp->rdma;
     int num = 0;
@@ -792,7 +862,7 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
                     da.max_qp_wr, da.max_sge, da.max_cqe, (unsigned long long)da.max_mr_size);
         }
     }
-    r->cq = r->api.create_cq(r->ctx, 512, NULL, NULL, 0);
+    r->cq = tp_rdma_make_cq(r);
     if (!r->cq) {
         tp_set_err(err, errlen, "tp rdma: create_cq failed");
         return 0;
@@ -801,12 +871,21 @@ static int tp_rdma_open(ds4_tp *tp, char *err, size_t errlen) {
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
     qia.qp_type = IBV_QPT_UC;
-    qia.cap.max_send_wr = 1024;
-    qia.cap.max_recv_wr = 1024;
+    const uint32_t want_frames = tp_rdma_want_frames();
+    qia.cap.max_send_wr = want_frames;
+    qia.cap.max_recv_wr = want_frames;
     qia.cap.max_send_sge = 1;
     qia.cap.max_recv_sge = 1;
     qia.cap.max_inline_data = 0;
     r->qp = r->api.create_qp(r->pd, &qia);
+    if (!r->qp && want_frames > 1024u) {
+        /* Preserve the established queue size when an overridden larger
+         * request is refused; the minimal fallback is substantially smaller. */
+        fprintf(stderr, "ds4-tp: create_qp refused %u frames; retrying at 1024\n",
+                want_frames);
+        qia.cap.max_send_wr = qia.cap.max_recv_wr = 1024u;
+        r->qp = r->api.create_qp(r->pd, &qia);
+    }
     if (!r->qp) {
         qia.cap.max_send_wr = 256;
         qia.cap.max_recv_wr = 64;
@@ -953,7 +1032,7 @@ static int tp_rdma_recreate_qp(ds4_tp *tp, char *err, size_t errlen) {
     ds4_tp_rdma *r = &tp->rdma;
     if (r->qp) { r->api.destroy_qp(r->qp); r->qp = NULL; }
     if (r->cq) { r->api.destroy_cq(r->cq); r->cq = NULL; }
-    r->cq = r->api.create_cq(r->ctx, 512, NULL, NULL, 0);
+    r->cq = tp_rdma_make_cq(r);
     if (!r->cq) {
         tp_set_err(err, errlen, "tp rdma: create_cq (retry) failed");
         return 0;
@@ -962,12 +1041,21 @@ static int tp_rdma_recreate_qp(ds4_tp *tp, char *err, size_t errlen) {
     qia.send_cq = r->cq;
     qia.recv_cq = r->cq;
     qia.qp_type = IBV_QPT_UC;
-    qia.cap.max_send_wr = 1024;
-    qia.cap.max_recv_wr = 1024;
+    const uint32_t want_frames = tp_rdma_want_frames();
+    qia.cap.max_send_wr = want_frames;
+    qia.cap.max_recv_wr = want_frames;
     qia.cap.max_send_sge = 1;
     qia.cap.max_recv_sge = 1;
     qia.cap.max_inline_data = 0;
     r->qp = r->api.create_qp(r->pd, &qia);
+    if (!r->qp && want_frames > 1024u) {
+        /* Preserve the established queue size when an overridden larger
+         * request is refused; the minimal fallback is substantially smaller. */
+        fprintf(stderr, "ds4-tp: create_qp refused %u frames; retrying at 1024\n",
+                want_frames);
+        qia.cap.max_send_wr = qia.cap.max_recv_wr = 1024u;
+        r->qp = r->api.create_qp(r->pd, &qia);
+    }
     if (!r->qp) {
         qia.cap.max_send_wr = 256;
         qia.cap.max_recv_wr = 64;
@@ -1553,13 +1641,76 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
     uint8_t *stage_send = tp->slab + tp->batch_out_off;
     uint8_t *stage_recv = tp->slab + tp->batch_in_off;
     const uint64_t stage_bytes = (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * tp->vec_bytes;
-    uint32_t depth = r->recv_depth ? r->recv_depth : 64u;
-    if (depth > 256u) depth = 256u;
+    /* WINDOW DEPTH IS IN MESSAGES.  THE QUEUE IS IN FRAMES.  Getting this
+     * wrong wedges both ranks.
+     *
+     * TN3205: "Queues are sized in units of 4 KB frames... two 4 KB sends and
+     * a single 8 KB send would both take up 2 queue spaces."  A 16 KiB message
+     * is therefore FOUR receive slots, not one, and the granted max_recv_wr of
+     * 1024 buys 256 outstanding messages.
+     *
+     * That is where the bare `if (depth > 256u) depth = 256u;` came from -- it
+     * was exactly this conversion, written as a constant with nothing saying
+     * so, which reads as an arbitrary cap with headroom above it.  It is not.
+     * Over-posting the ring does not error: per APPLE-RDMA.md 3.1 completions
+     * simply never arrive and both ends spin forever.
+     *
+     * Derived from the grant now, so it cannot drift from the QP or from
+     * DS4_TP_RDMA_MAX_MSG. */
+    const uint32_t frames_per_msg =
+        (DS4_TP_RDMA_MAX_MSG + DS4_TP_RDMA_FRAME_BYTES - 1u) / DS4_TP_RDMA_FRAME_BYTES;
+    const uint32_t recv_frames = r->recv_depth ? r->recv_depth : 64u;
+    const uint32_t depth_granted = recv_frames / frames_per_msg;
+    uint32_t depth = depth_granted ? depth_granted : 1u;
+    /* Allow a smaller effective window for transport diagnostics, or a larger
+     * one when the QP was explicitly created with more frames.  Never exceed
+     * the capacity implied by the provider's granted frame count. */
+    const uint32_t depth_base = depth;
+    {
+        static int win_override = -2;
+        if (win_override == -2) {
+            const char *e = getenv("DS4_TP_RDMA_WINDOW_DEPTH");
+            win_override = (e && e[0]) ? atoi(e) : -1;
+        }
+        if (win_override > 0) {
+            uint32_t want = (uint32_t)win_override;
+            if (want > depth_granted) {
+                static int warned;
+                if (!warned) {
+                    warned = 1;
+                    fprintf(stderr,
+                            "ds4-tp: window depth %u messages exceeds what the "
+                            "granted queue holds (%u frames / %u per message = "
+                            "%u messages); clamping.  Over-posting this ring does "
+                            "not error -- completions stop arriving and both "
+                            "ranks spin.  Raise DS4_TP_RDMA_RECV_FRAMES instead.\n",
+                            want, recv_frames, frames_per_msg, depth_granted);
+                }
+                want = depth_granted;
+            }
+            depth = want;
+        }
+    }
     if (!direct) {
         const uint32_t stage_slots = (uint32_t)(stage_bytes / DS4_TP_RDMA_MAX_MSG);
         if (depth > stage_slots) depth = stage_slots;
         if (depth == 0u) return 0;
         out_mr = in_mr = r->mr;
+    }
+    /* Announce the effective message depth after the queue and staging clamps. */
+    {
+        static int announced_depth;
+        if (!announced_depth) {
+            announced_depth = 1;
+            fprintf(stderr,
+                    "ds4-tp: bulk window depth %u -> %u messages "
+                    "(frames asked %u granted %u / %u per msg = %u max, "
+                    "%.2f MiB/window, %s)\n",
+                    depth_base, depth, tp_rdma_want_frames(), recv_frames,
+                    frames_per_msg, depth_granted,
+                    (double)depth * DS4_TP_RDMA_MAX_MSG / 1048576.0,
+                    depth == depth_base ? "no override" : "override or clamp applied");
+        }
     }
     if (!r->win_sge) {
         const uint32_t cap = r->recv_depth > r->send_depth ? r->recv_depth : r->send_depth;
@@ -1618,16 +1769,32 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
             return 0;
         }
         tag++;
-        /* Sends in sub-batches bounded by the send depth; the last of each
-         * sub-batch is signaled. */
-        uint32_t sent = 0, send_done = 0, recv_done = 0, signaled = 0;
+        /* Pace sends in message units.  The provider reports queue capacity in
+         * 4 KB frames, and may reserve a few descriptors internally, so learn
+         * a lower effective capacity if a partial post reports EAGAIN. */
+        uint32_t sent = 0, send_done = 0, recv_done = 0, post_batches = 0;
+        static uint32_t g_send_msgs_cap;
+        const uint32_t send_msgs_from_frames =
+            send_depth / frames_per_msg ? send_depth / frames_per_msg : 1u;
+        if (!g_send_msgs_cap || g_send_msgs_cap > send_msgs_from_frames)
+            g_send_msgs_cap = send_msgs_from_frames;
+        /* Read live below, not snapshotted: an EAGAIN mid-window lowers the cap
+         * and the remainder of THIS window should already respect it. */
+#define SEND_MSGS_MAX (g_send_msgs_cap)
         const double deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0 + 2.0;
         uint32_t peer_poll = 0;
-        while (recv_done < chunks || send_done < signaled || sent < chunks) {
-            if (sent < chunks && (signaled - send_done) < 4u) {
+        while (recv_done < chunks || send_done < sent) {
+            const uint32_t in_flight = sent - send_done;
+            if (sent < chunks && in_flight < SEND_MSGS_MAX) {
                 uint32_t n = chunks - sent;
-                if (n > 64u) n = 64u;
-                if (n > send_depth / 4u && send_depth / 4u > 0u) n = send_depth / 4u;
+                if (n > 64u) n = 64u;   /* chain length the driver accepts */
+                /* Never offer more than the queue can still hold.  The old
+                 * bound was `send_depth / 4u`, which is the frames-per-message
+                 * divisor written as a bare 4 -- correct only while a message
+                 * is 16 KiB, and it bounded the BATCH rather than the
+                 * OUTSTANDING total, so it never prevented an overflow. */
+                const uint32_t room = SEND_MSGS_MAX - in_flight;
+                if (n > room) n = room;
                 if (n == 0u) n = 1u;
                 for (uint32_t i = 0; i < n; i++) {
                     struct ibv_send_wr *w = &r->win_swr[i];
@@ -1636,17 +1803,71 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                     w->sg_list = &r->win_sge[depth + sent + i];
                     w->num_sge = 1;
                     w->opcode = IBV_WR_SEND;
-                    w->send_flags = i + 1u == n ? IBV_SEND_SIGNALED : 0;
+                    /* Flow control counts completed messages, so request one
+                     * completion for every message instead of depending on the
+                     * provider to complete unsignalled work requests. */
+                    w->send_flags = IBV_SEND_SIGNALED;
                     w->next = i + 1u < n ? &r->win_swr[i + 1u] : NULL;
                 }
                 struct ibv_send_wr *bad_send = NULL;
-                if (ibv_post_send(r->qp, r->win_swr, &bad_send) != 0) {
-                    fprintf(stderr, "ds4-tp: big gate post_send(%u): %s\n", n, strerror(errno));
+                const int psrc = ibv_post_send(r->qp, r->win_swr, &bad_send);
+                if (psrc != 0) {
+                    /* post_send is not atomic: bad_send identifies the first
+                     * rejected WR and all preceding requests were accepted.
+                     * Credit that prefix before draining and retrying EAGAIN. */
+                    uint32_t accepted = 0;
+                    if (bad_send) {
+                        while (accepted < n && bad_send != &r->win_swr[accepted])
+                            accepted++;
+                        if (accepted == n) accepted = 0;
+                    }
+                    /* The RETURN CODE is the error: verbs returns errno by
+                     * value and is not required to set the global.  Reading
+                     * errno can pick up whatever the last unrelated syscall
+                     * left, and a misclassified EAGAIN is a discarded partial
+                     * post -- the desync this path exists to prevent. */
+                    if (psrc == EAGAIN || psrc == ENOMEM) {
+                        sent += accepted;
+                        if (accepted) post_batches++;
+                        /* The queue told us its real size.  Back the cap off
+                         * below what was in flight when it refused, so the next
+                         * window paces itself instead of rediscovering this. */
+                        const uint32_t observed = sent - send_done;
+                        const uint32_t learned = observed > 8u ? observed - 8u : 1u;
+                        if (learned < g_send_msgs_cap) {
+                            fprintf(stderr,
+                                    "ds4-tp: big gate send queue refused at %u "
+                                    "messages in flight (frame budget implied "
+                                    "%u); capping at %u for the rest of the run\n",
+                                    observed, send_msgs_from_frames, learned);
+                            g_send_msgs_cap = learned;
+                        }
+                        goto poll_completions;
+                    }
+                    fprintf(stderr,
+                            "ds4-tp: big gate post_send(%u): %s (%u of %u accepted, "
+                            "%u/%u sent, %u in flight of %u)\n",
+                            n, strerror(psrc), accepted, n, sent, chunks,
+                            in_flight, SEND_MSGS_MAX);
                     return 0;
                 }
+                {
+                    /* Report the effective unit conversion once; a frame count
+                     * otherwise looks like a directly usable message depth. */
+                    static int announced_batch;
+                    if (!announced_batch) {
+                        announced_batch = 1;
+                        fprintf(stderr,
+                                "ds4-tp: bulk gate send BATCHED (%u chunks this "
+                                "round, up to %u per post, send queue %u frames "
+                                "= %u messages)\n",
+                                chunks, n, send_depth, SEND_MSGS_MAX);
+                    }
+                }
                 sent += n;
-                signaled++;
+                post_batches++;
             }
+        poll_completions:;
             struct ibv_wc wc[64];
             int nwc = ibv_poll_cq(r->cq, 64, wc);
             if (nwc < 0) return 0;
@@ -1683,8 +1904,10 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
                 return 0;
             }
             if (nwc == 0 && tp_now_sec() > deadline) {
-                fprintf(stderr, "ds4-tp: timeout in big gate window (%u/%u recvs, %u/%u sends, %u sent)\n",
-                        recv_done, chunks, send_done, signaled, sent);
+                fprintf(stderr,
+                        "ds4-tp: timeout in big gate window (%u/%u recvs, %u/%u send "
+                        "completions, %u posts, queue cap %u messages)\n",
+                        recv_done, chunks, send_done, sent, post_batches, SEND_MSGS_MAX);
                 return 0;
             }
         }
@@ -1692,6 +1915,7 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         if (!direct) {
             memcpy((uint8_t *)in + off, stage_recv, win_bytes);
         }
+#undef SEND_MSGS_MAX
         off += win_bytes;
     }
     return 1;

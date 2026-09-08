@@ -9,6 +9,12 @@ int main(void) {
     char err[256] = "";
     ds4_tp_command cmd;
     assert(DS4_TP_PROTOCOL_VERSION == 11);
+#ifdef DS4_TP_HAVE_VERBS
+    assert(tp_rdma_cq_entries(4, 0) == 512);
+    assert(tp_rdma_cq_entries(1024, 0) == 768);
+    assert(tp_rdma_cq_entries(4095, 0) == 2302);
+    assert(tp_rdma_cq_entries(4095, 2048) == 2048);
+#endif
     for (int i = 0; i < 4; i++) {
         assert(ds4_tp_send_eval(&leader, 42, 2*i, 100+i));
         assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
