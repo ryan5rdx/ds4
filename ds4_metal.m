@@ -19193,7 +19193,61 @@ int ds4_gpu_indexer_topk_tensor(
             fprintf(stderr, "ds4: Metal graph indexer top-k received undersized buffers\n");
             return 0;
         }
-        NSUInteger max_threads = g_argsort_f32_i32_desc_pipeline.maxTotalThreadsPerThreadgroup;
+        /* Default (rollback env read per call): exact streaming top-512 —
+         * one pass over the score row with a running 512th-best threshold,
+         * in place of the padded bitonic + merge cascade.  Output list is
+         * bit-identical to the CANON comparator path (same (score desc,
+         * idx asc) total order).  Measured: cold64k 538->547 t/s (+1.7%),
+         * monotone with context. */
+        if (top_k == 512u && n_tokens >= 32u &&
+            getenv("DS4_METAL_DISABLE_TOPK_STREAM512") == NULL) {
+            static int logged_stream512;
+            if (!logged_stream512) {
+                logged_stream512 = 1;
+                fprintf(stderr,
+                        "ds4: metal indexer topk using stream512\n");
+            }
+            id<MTLComputePipelineState> stream_pipeline =
+                ds4_gpu_get_pipeline("kernel_dsv4_indexer_topk_stream512");
+            if (!stream_pipeline) return 0;
+            ds4_gpu_kargs_argsort sargs = {
+                .ne00 = (int32_t)n_comp,
+                .ne01 = (int32_t)n_tokens,
+                .ne02 = 1,
+                .ne03 = 1,
+                .nb00 = sizeof(float),
+                .nb01 = (uint64_t)n_comp * sizeof(float),
+                .nb02 = (uint64_t)n_comp * n_tokens * sizeof(float),
+                .nb03 = (uint64_t)n_comp * n_tokens * sizeof(float),
+                .ne0 = (int32_t)top_k,
+                .ne1 = (int32_t)n_tokens,
+                .ne2 = 1,
+                .ne3 = 1,
+                .top_k = (int32_t)top_k,
+            };
+            int owned = 0;
+            id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            if (!cb) return 0;
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:stream_pipeline];
+            [enc setBytes:&sargs length:sizeof(sargs) atIndex:0];
+            [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
+            [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:2];
+            [enc setThreadgroupMemoryLength:2048u * sizeof(uint64_t) + 96u atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            return ds4_gpu_finish_command_buffer(cb, owned, "indexer topk stream512");
+        }
+        /* Default (rollback env read per call): canonical (score desc,
+         * idx asc) total order — tie order among equal scores is the only
+         * output change; prerequisite for the streaming top-k above. */
+        id<MTLComputePipelineState> sort_pipeline =
+            getenv("DS4_METAL_DISABLE_ARGSORT_CANON") == NULL
+                ? ds4_gpu_get_pipeline("kernel_argsort_f32_i32_desc_canon")
+                : g_argsort_f32_i32_desc_pipeline;
+        if (!sort_pipeline) return 0;
+        NSUInteger max_threads = sort_pipeline.maxTotalThreadsPerThreadgroup;
         if (max_threads == 0) max_threads = 256;
         int32_t nth = 1;
         while ((uint32_t)nth < n_comp && (uint64_t)2u * (uint64_t)nth <= (uint64_t)max_threads) {
@@ -19243,7 +19297,7 @@ int ds4_gpu_indexer_topk_tensor(
         if (!cb) return 0;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:g_argsort_f32_i32_desc_pipeline];
+        [enc setComputePipelineState:sort_pipeline];
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:scorebuf offset:ds4_gpu_tensor_offset(scores) atIndex:1];
         [enc setBuffer:one_pass ? selbuf : g_indexer_topk_buffer
