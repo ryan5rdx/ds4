@@ -22,6 +22,19 @@ struct glm53_kda_args {
     /* KDA-PREPARE-PAR: tokens each prepare threadgroup owns.  0 means the
      * original whole-sequence kernel, which ignores it. */
     uint tokens_per_block;
+    /* MTP3-MIN: emit the mid-sequence recurrent state to a second buffer.
+     *
+     * The recurrence carries `h` in registers across the token loop and stores
+     * only the final value, so the state after any interior row already exists
+     * and is simply never written.  Speculative rejection needs exactly the
+     * after-row-0 state: today the engine throws it away, restores the
+     * pre-verify snapshot, and re-runs row 0 as a full forward -- measured at
+     * 28.4 ms per reject, ~60% of everything in an MTP cycle that is not the
+     * verifier (2026-09-08-MTPP).  One store here removes that forward.
+     *
+     * UINT_MAX disables it and the `bank` buffer is then never written; the
+     * host still binds a valid buffer because Metal requires one. */
+    uint bank_after_row;
 };
 
 /*
@@ -739,6 +752,7 @@ kernel void kernel_glm53_kda_prefill_recurrence(
         device const float   *raw_beta,
         device float         *state,
         device float         *out,
+        device float         *bank,
         uint2 tgpig [[threadgroup_position_in_grid]],
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -766,6 +780,15 @@ kernel void kernel_glm53_kda_prefill_recurrence(
         h = fma(k4, float4(delta_v), h);
         const float result = simd_sum(dot(h, q4));
         if (lane == 0u) out[base + value] = result;
+        /* MTP3-MIN.  Same address arithmetic as state_ptr -- the bank is a
+         * full-width state buffer with identical layout, so a rank that owns a
+         * head subrange writes at its true head index exactly as it does for
+         * `state`.  Guarded, so with banking off this kernel is unchanged. */
+        if (token == args.bank_after_row) {
+            device float4 *bank_ptr = (device float4 *)(
+                bank + ((ulong)(args.head_first + head) * D + value) * D + k0);
+            *bank_ptr = h;
+        }
     }
     *state_ptr = h;
 }
@@ -794,6 +817,7 @@ kernel void kernel_glm53_kda_prefill_recurrence_vpt4(
         device const float   *raw_beta,
         device float         *state,
         device float         *out,
+        device float         *bank,
         uint2 tgpig [[threadgroup_position_in_grid]],
         ushort lane [[thread_index_in_simdgroup]],
         ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -828,6 +852,14 @@ kernel void kernel_glm53_kda_prefill_recurrence_vpt4(
             h[i] = fma(k4, float4(delta_v), h[i]);
             const float result = simd_sum(dot(h[i], q4));
             if (lane == 0u) out[base + value0 + i] = result;
+        }
+        /* MTP3-MIN -- see the baseline kernel. */
+        if (token == args.bank_after_row) {
+            for (uint i = 0; i < VPT; i++) {
+                device float4 *bank_ptr = (device float4 *)(
+                    bank + ((ulong)(args.head_first + head) * D + value0 + i) * D + k0);
+                *bank_ptr = h[i];
+            }
         }
     }
     for (uint i = 0; i < VPT; i++) *state_ptr[i] = h[i];

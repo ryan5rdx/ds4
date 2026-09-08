@@ -978,6 +978,103 @@ int main(void) {
     for (uint32_t i = 0; i < TOKENS * PROJECTION; i++)
         require_close("KDA prefill/decode", prefill_outputs[i], decode_outputs[i], 5e-5f);
 
+    /* MTP3-MIN: the mid-sequence state bank.
+     *
+     * Speculative rejection needs the recurrent state as of row 0 of the
+     * two-row verify.  The recurrence already carries it in registers across
+     * the token loop and stores only the final value, so today the engine
+     * throws it away, restores a pre-verify snapshot, and re-runs row 0 as a
+     * full forward -- measured at 28.4 ms per reject, ~60% of everything in an
+     * MTP cycle that is not the verifier (2026-09-08-MTPP).  Emitting it costs
+     * one guarded store inside the existing loop.
+     *
+     * Reference is SEQUENTIAL DECODE, per the campaign plan.  A shorter prefill
+     * is NOT a valid reference: q/k/v/raw_gate are non-const and the prepare
+     * stage rewrites them in place, so a second prefill over the same buffers
+     * prepares already-prepared data.  Every run below re-writes the raw
+     * inputs first.
+     *
+     * Seeded non-zero: a zero state hides an addressing bug that only shows
+     * once the carried value actually matters. */
+    {
+        const uint64_t state_elems = (uint64_t)HEADS * D * D;
+        const uint64_t state_bytes = state_elems * sizeof(float);
+        float *seed  = malloc((size_t)state_bytes);
+        float *ref   = malloc((size_t)state_bytes);
+        float *bankv = malloc((size_t)state_bytes);
+        float *fin   = malloc((size_t)state_bytes);
+        require_ok(seed && ref && bankv && fin, "MTP3 host alloc");
+        for (uint64_t i = 0; i < state_elems; i++)
+            seed[i] = 0.05f * sinf((float)i * 0.37f) + 0.01f;
+
+        ds4_gpu_tensor *bank = ds4_gpu_tensor_alloc(state_bytes);
+        require_ok(bank != NULL, "MTP3 bank alloc");
+
+        /* (chunk rows, row to bank).  2 rows is the MTP verify shape; the
+         * longer chunk and row 1 cover the interior of the loop. */
+        const uint32_t cases[][2] = { {2u, 0u}, {2u, 1u}, {TOKENS, 0u}, {TOKENS, 4u} };
+        for (uint32_t c = 0; c < 4u; c++) {
+            const uint32_t nrows = cases[c][0], brow = cases[c][1];
+
+            /* ground truth: decode brow+1 tokens from the seed */
+            require_ok(ds4_gpu_tensor_fill_f32(conv, 0.0f, 9u * PROJECTION), "MTP3 dconv");
+            require_ok(ds4_gpu_tensor_write(state, 0, seed, state_bytes), "MTP3 dstate");
+            for (uint32_t t = 0; t <= brow; t++) {
+                const uint32_t off = t * PROJECTION;
+                require_ok(ds4_gpu_tensor_write(q, 0, qs + off, PROJECTION * sizeof(float)), "MTP3 dq");
+                require_ok(ds4_gpu_tensor_write(k, 0, ks + off, PROJECTION * sizeof(float)), "MTP3 dk");
+                require_ok(ds4_gpu_tensor_write(v, 0, vs + off, PROJECTION * sizeof(float)), "MTP3 dv");
+                require_ok(ds4_gpu_tensor_write(gate, 0, gates + off, PROJECTION * sizeof(float)), "MTP3 dg");
+                require_ok(ds4_gpu_tensor_write(output_gate, 0, output_gates + off, PROJECTION * sizeof(float)), "MTP3 dog");
+                require_ok(ds4_gpu_tensor_write(beta, 0, betas + t * HEADS, HEADS * sizeof(float)), "MTP3 dbeta");
+                require_ok(ds4_gpu_glm53_kda_decode(
+                    out, conv, state, q, k, v, gate, beta, output_gate,
+                    model, MODEL_BYTES, Q_CONV_OFFSET, K_CONV_OFFSET, V_CONV_OFFSET,
+                    A_LOG_OFFSET, DT_BIAS_OFFSET, NORM_OFFSET,
+                    HEADS, 1, HEADS, 0u, -5.0f, 1e-5f), "MTP3 reference decode");
+            }
+            require_ok(ds4_gpu_tensor_read(state, 0, ref, state_bytes), "MTP3 ref read");
+
+            /* candidate: banked prefill over nrows from the same seed */
+            require_ok(ds4_gpu_tensor_write(pq, 0, qs, sizeof(qs)), "MTP3 pq");
+            require_ok(ds4_gpu_tensor_write(pk, 0, ks, sizeof(ks)), "MTP3 pk");
+            require_ok(ds4_gpu_tensor_write(pv, 0, vs, sizeof(vs)), "MTP3 pv");
+            require_ok(ds4_gpu_tensor_write(pg, 0, gates, sizeof(gates)), "MTP3 pg");
+            require_ok(ds4_gpu_tensor_write(poutput_gate, 0, output_gates, sizeof(output_gates)), "MTP3 pog");
+            require_ok(ds4_gpu_tensor_write(pbeta, 0, betas, sizeof(betas)), "MTP3 pbeta");
+            require_ok(ds4_gpu_tensor_fill_f32(pconv, 0.0f, 9u * PROJECTION), "MTP3 pconv");
+            require_ok(ds4_gpu_tensor_write(pstate, 0, seed, state_bytes), "MTP3 pstate");
+            require_ok(ds4_gpu_tensor_fill_f32(bank, -7.0f, state_elems), "MTP3 poison");
+            require_ok(ds4_gpu_glm53_kda_prefill_banked(
+                pout, pconv, pstate, bank, brow, pq, pk, pv, pg, pbeta, poutput_gate,
+                model, MODEL_BYTES, Q_CONV_OFFSET, K_CONV_OFFSET, V_CONV_OFFSET,
+                A_LOG_OFFSET, DT_BIAS_OFFSET, NORM_OFFSET,
+                HEADS, nrows, HEADS, 0u, -5.0f, 1e-5f), "MTP3 banked prefill");
+            require_ok(ds4_gpu_tensor_read(bank, 0, bankv, state_bytes), "MTP3 bank read");
+            require_ok(ds4_gpu_tensor_read(pstate, 0, fin, state_bytes), "MTP3 final read");
+
+            uint64_t poison = 0, differs = 0;
+            double worst = 0.0;
+            for (uint64_t i = 0; i < state_elems; i++) {
+                require_close("MTP3 bank vs sequential decode", bankv[i], ref[i], 5e-5f);
+                const double d = fabs((double)bankv[i] - (double)ref[i]);
+                if (d > worst) worst = d;
+                if (bankv[i] == -7.0f && ref[i] != -7.0f) poison++;
+                if (fabsf(fin[i] - ref[i]) > 5e-5f) differs++;
+            }
+            require_ok(poison == 0, "MTP3 bank fully written");
+            /* Without this, a bank that never fired would pass whenever the
+             * remaining rows happened to leave the state unchanged. */
+            if (brow + 1u < nrows)
+                require_ok(differs > 0, "MTP3 negative control: final state differs from bank");
+            fprintf(stderr, "  MTP3 bank rows=%u after_row=%u: worst |d| %.3g\n",
+                    nrows, brow, worst);
+        }
+        ds4_gpu_tensor_free(bank);
+        free(fin); free(bankv); free(ref); free(seed);
+        puts("GLM-5.3 MTP3-MIN state bank: PASS");
+    }
+
     ds4_gpu_tensor_free(pstate);
     ds4_gpu_tensor_free(pconv);
     ds4_gpu_tensor_free(pout);
