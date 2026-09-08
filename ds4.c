@@ -44103,6 +44103,14 @@ typedef struct ds4_glm_gpu_graph {
      * Allocated only when MTP is enabled; NULL means banking is off. */
     ds4_gpu_tensor *layer_kda_conv_bank[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_kda_recurrent_bank[DS4_MAX_LAYER];
+    /* MTP3-MIN, DSA side.  The pooled-indexer tail is NOT banked in-kernel: it
+     * is written per pool-slot, so the row-0 tail is what the existing kernel
+     * produces at n_tokens == 1.  All that is missing on the reject path is
+     * row 0's indexer k/gate, because batch_indexer_k is transient per layer.
+     * Saving it is 2 x DS4_N_INDEXER_HEAD_DIM floats a layer -- ~11 KB over the
+     * 11 DSA layers -- which is cheaper than any banking scheme and needs no
+     * change to kernel_glm53_indexer_pool_update (in dsv4_misc.metal). */
+    ds4_gpu_tensor *layer_mtp_indexer_row0[DS4_MAX_LAYER];
     /* Set for the duration of the two-row verify so the KDA path knows to bank;
      * cleared immediately after, so ordinary prefill and decode never do. */
     int             mtp_bank_active;
@@ -46108,6 +46116,7 @@ static void glm_graph_free(ds4_glm_gpu_graph *g) {
         ds4_gpu_tensor_free(g->layer_kda_conv_state[il]);
         ds4_gpu_tensor_free(g->layer_kda_recurrent_state[il]);
         ds4_gpu_tensor_free(g->layer_indexer_key_cache[il]);
+        ds4_gpu_tensor_free(g->layer_mtp_indexer_row0[il]);
         ds4_gpu_tensor_free(g->layer_kda_conv_bank[il]);
         ds4_gpu_tensor_free(g->layer_kda_recurrent_bank[il]);
         ds4_gpu_tensor_free(g->layer_indexer_tail_k[il]);
@@ -51596,6 +51605,70 @@ static bool glm53_graph_mtp3_select_bank(ds4_glm_gpu_graph *g) {
     return any;
 }
 
+/* MTP3-MIN, DSA half.  Put the pooled-indexer tail back to where row 0 left it.
+ *
+ * Restore the tail from the pre-verify snapshot, then re-run the EXISTING pool
+ * update for row 0 alone using the inputs stashed during the verify.  That is a
+ * one-token dispatch over 11 layers, not a forward: the expensive part of the
+ * old replay was the whole target graph, not this.
+ *
+ * Re-writing a completed pool into the key cache is idempotent -- same pos0,
+ * same inputs, same result -- so the cache needs no rollback of its own; the
+ * plan's append-only-with-a-logical-frontier property still holds. */
+static bool glm53_graph_mtp3_restore_indexer_tail(ds4_glm_gpu_graph *g,
+                                                  const ds4_model *model,
+                                                  const ds4_weights *w,
+                                                  uint32_t pos) {
+    if (!g || !g->glm53 || !g->mtp_state_backup) return false;
+    bool ok = glm_graph_begin_commands_if_needed();
+    /* DSA-only restore: the KDA layers come from the pointer swap, so touching
+     * them here would undo it. */
+    uint64_t offset = 0;
+    for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
+        ds4_gpu_tensor *state[2];
+        glm53_graph_spec_state_tensors(g, il, state);
+        for (uint32_t i = 0; ok && i < 2; i++) {
+            if (!state[i]) continue;
+            const uint64_t bytes = ds4_gpu_tensor_bytes(state[i]);
+            if (!ds4_glm53_layer_is_kda(il)) {
+                ok = ds4_gpu_tensor_copy(state[i], 0, g->mtp_state_backup,
+                                         offset, bytes) != 0;
+            }
+            offset += bytes;
+        }
+    }
+    for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
+        if (!glm_graph_layer_uses_full_indexer(il)) continue;
+        ds4_gpu_tensor *row0 = g->layer_mtp_indexer_row0[il];
+        if (!row0 || !g->layer_indexer_tail_k[il]) { ok = false; break; }
+        const uint64_t vec = (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+        ds4_gpu_tensor *kv = ds4_gpu_tensor_view(row0, 0, vec);
+        ds4_gpu_tensor *gv = ds4_gpu_tensor_view(row0, vec, vec);
+        const ds4_layer_weights *l = &w->layer[il];
+        ok = kv && gv &&
+             ds4_gpu_glm53_indexer_pool_update_tensor(
+                 g->layer_indexer_key_cache[il],
+                 g->layer_indexer_tail_k[il],
+                 g->layer_indexer_tail_gate[il],
+                 kv, gv,
+                 model->map, model->size,
+                 l->indexer_k_norm->abs_offset,
+                 l->indexer_k_norm_b->abs_offset,
+                 l->indexer_compressor_ape->abs_offset,
+                 pos, 1u,
+                 g->compact_cache_cap,
+                 DS4_N_INDEXER_HEAD_DIM,
+                 DS4_GLM53_INDEX_POOL_SIZE,
+                 1.0e-6f,
+                 glm_graph_compact_cache_is_f16()) != 0;
+        ds4_gpu_tensor_free(gv);
+        ds4_gpu_tensor_free(kv);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    return ok;
+}
+
 static bool glm53_graph_copy_spec_state(
         ds4_glm_gpu_graph *g,
         bool save) {
@@ -51605,6 +51678,11 @@ static bool glm53_graph_copy_spec_state(
         return false;
     }
     bool ok = glm_graph_begin_commands_if_needed();
+    /* MTP3-MIN: with banking on, the KDA half of the snapshot is dead weight --
+     * rejection swaps to the bank instead of restoring -- so only the DSA
+     * pooled-indexer tail needs saving.  That is ~45 KB against ~76 MB, and the
+     * save was measured at 0.68 ms (2026-09-08-MTPP). */
+    const bool dsa_only = glm53_mtp3_bank_active();
     uint64_t offset = 0;
     for (uint32_t il = g->layer_start; ok && il <= g->layer_end; il++) {
         ds4_gpu_tensor *state[2];
@@ -51612,6 +51690,10 @@ static bool glm53_graph_copy_spec_state(
         for (uint32_t i = 0; ok && i < 2; i++) {
             if (!state[i]) continue;
             const uint64_t bytes = ds4_gpu_tensor_bytes(state[i]);
+            if (dsa_only && ds4_glm53_layer_is_kda(il)) {
+                offset += bytes;   /* keep the layout; skip the copy */
+                continue;
+            }
             if (save) {
                 ok = ds4_gpu_tensor_copy(g->mtp_state_backup,
                                          offset,
@@ -51658,6 +51740,11 @@ static bool glm_graph_mtp_ensure(ds4_glm_gpu_graph *g) {
      * restore-and-replay path. */
     if (g->glm53 && glm53_mtp3_bank_active()) {
         for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
+            if (glm_graph_layer_uses_full_indexer(il) && !g->layer_mtp_indexer_row0[il]) {
+                /* k and gate, contiguous: [0] = k, [head_dim] = gate. */
+                g->layer_mtp_indexer_row0[il] = ds4_gpu_tensor_alloc(
+                    2ull * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+            }
             if (!ds4_glm53_layer_is_kda(il)) continue;
             ds4_gpu_tensor *rs = g->layer_kda_recurrent_state[il];
             ds4_gpu_tensor *cs = g->layer_kda_conv_state[il];
@@ -53243,6 +53330,21 @@ static bool glm_graph_forward_tokens(
                         g->batch_attn_norm,
                         n_tokens);
             }
+            /* MTP3-MIN: stash row 0's indexer inputs while they are still
+             * live.  batch_indexer_k is reused by the next layer, so the reject
+             * path cannot recover them, and re-deriving them would mean
+             * recomputing the indexer projection -- a partial forward, which is
+             * exactly what banking exists to remove. */
+            if (ok && g->glm53 && g->mtp_bank_active && n_tokens == 2u &&
+                g->layer_mtp_indexer_row0[il]) {
+                const uint64_t vec = (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+                ok = ds4_gpu_tensor_copy(g->layer_mtp_indexer_row0[il], 0,
+                                         g->batch_indexer_k, 0, vec) != 0 &&
+                     ds4_gpu_tensor_copy(g->layer_mtp_indexer_row0[il], vec,
+                                         g->batch_indexer_gate, 0, vec) != 0;
+                if (!ok) fprintf(stderr,
+                        "ds4: GLM MTP3-MIN indexer row0 stash failed at layer %u\n", il);
+            }
             if (ok && g->glm53) {
                 ok = ds4_gpu_glm53_indexer_pool_update_tensor(
                         g->layer_indexer_key_cache[il],
@@ -54471,6 +54573,21 @@ static bool glm_graph_forward_indexed_tokens(
                         DS4_N_INDEXER_HEAD_DIM,
                         g->batch_attn_norm,
                         n_tokens);
+            }
+            /* MTP3-MIN: stash row 0's indexer inputs while they are still
+             * live.  batch_indexer_k is reused by the next layer, so the reject
+             * path cannot recover them, and re-deriving them would mean
+             * recomputing the indexer projection -- a partial forward, which is
+             * exactly what banking exists to remove. */
+            if (ok && g->glm53 && g->mtp_bank_active && n_tokens == 2u &&
+                g->layer_mtp_indexer_row0[il]) {
+                const uint64_t vec = (uint64_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float);
+                ok = ds4_gpu_tensor_copy(g->layer_mtp_indexer_row0[il], 0,
+                                         g->batch_indexer_k, 0, vec) != 0 &&
+                     ds4_gpu_tensor_copy(g->layer_mtp_indexer_row0[il], vec,
+                                         g->batch_indexer_gate, 0, vec) != 0;
+                if (!ok) fprintf(stderr,
+                        "ds4: GLM MTP3-MIN indexer row0 stash failed at layer %u\n", il);
             }
             if (ok && g->glm53) {
                 ok = ds4_gpu_glm53_indexer_pool_update_tensor(
@@ -72105,7 +72222,22 @@ static int ds4_session_glm_spec_cycle_impl(
         accepted[1] = d;
     } else {
         bool replay_ok = true;
-        if (g->glm53) {
+        if (g->glm53 && glm53_mtp3_bank_active() &&
+            glm53_graph_mtp3_select_bank(g)) {
+            /* MTP3-MIN.  The KDA banks already hold the state as of row 0, so
+             * the swap above IS the rollback -- no 76 MB restore and, crucially,
+             * no replay forward.  Row 0's logits were produced by the verify and
+             * kept; recomputing them was never why the forward existed, as the
+             * non-GLM branch below shows by simply reusing glm_mtp_logits0.
+             *
+             * Only the DSA pooled-indexer tail still needs work, and it is a
+             * one-token dispatch over 11 layers rather than a graph pass. */
+            memcpy(s->logits, s->glm_mtp_logits0,
+                   (size_t)DS4_N_VOCAB * sizeof(float));
+            replay_ok = glm53_graph_mtp3_restore_indexer_tail(
+                    g, &e->model, &e->weights, pos);
+            if (timing) t_replay = now_sec();
+        } else if (g->glm53) {
             replay_ok = glm53_graph_copy_spec_state(g, false) &&
                         glm_graph_forward_token(g,
                                                 &e->model,
