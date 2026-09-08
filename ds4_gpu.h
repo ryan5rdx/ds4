@@ -3359,6 +3359,7 @@ int ds4_gpu_glm53_kda_prefill_banked(
         ds4_gpu_tensor       *conv_state,
         ds4_gpu_tensor       *recurrent_state,
         ds4_gpu_tensor       *bank_state,
+        ds4_gpu_tensor       *bank_conv,
         uint32_t              bank_after_row,
         ds4_gpu_tensor       *q,
         ds4_gpu_tensor       *k,

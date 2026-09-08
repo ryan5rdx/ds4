@@ -1008,7 +1008,11 @@ int main(void) {
             seed[i] = 0.05f * sinf((float)i * 0.37f) + 0.01f;
 
         ds4_gpu_tensor *bank = ds4_gpu_tensor_alloc(state_bytes);
-        require_ok(bank != NULL, "MTP3 bank alloc");
+        const uint64_t conv_bytes = 9u * PROJECTION * sizeof(float);
+        ds4_gpu_tensor *cbank = ds4_gpu_tensor_alloc(conv_bytes);
+        float *convref = malloc((size_t)conv_bytes);
+        float *convb   = malloc((size_t)conv_bytes);
+        require_ok(bank && cbank && convref && convb, "MTP3 bank alloc");
 
         /* (chunk rows, row to bank).  2 rows is the MTP verify shape; the
          * longer chunk and row 1 cover the interior of the loop. */
@@ -1034,6 +1038,7 @@ int main(void) {
                     HEADS, 1, HEADS, 0u, -5.0f, 1e-5f), "MTP3 reference decode");
             }
             require_ok(ds4_gpu_tensor_read(state, 0, ref, state_bytes), "MTP3 ref read");
+            require_ok(ds4_gpu_tensor_read(conv, 0, convref, conv_bytes), "MTP3 conv ref read");
 
             /* candidate: banked prefill over nrows from the same seed */
             require_ok(ds4_gpu_tensor_write(pq, 0, qs, sizeof(qs)), "MTP3 pq");
@@ -1045,13 +1050,19 @@ int main(void) {
             require_ok(ds4_gpu_tensor_fill_f32(pconv, 0.0f, 9u * PROJECTION), "MTP3 pconv");
             require_ok(ds4_gpu_tensor_write(pstate, 0, seed, state_bytes), "MTP3 pstate");
             require_ok(ds4_gpu_tensor_fill_f32(bank, -7.0f, state_elems), "MTP3 poison");
+            require_ok(ds4_gpu_tensor_fill_f32(cbank, -7.0f, 9u * PROJECTION), "MTP3 conv poison");
             require_ok(ds4_gpu_glm53_kda_prefill_banked(
-                pout, pconv, pstate, bank, brow, pq, pk, pv, pg, pbeta, poutput_gate,
+                pout, pconv, pstate, bank, cbank, brow, pq, pk, pv, pg, pbeta, poutput_gate,
                 model, MODEL_BYTES, Q_CONV_OFFSET, K_CONV_OFFSET, V_CONV_OFFSET,
                 A_LOG_OFFSET, DT_BIAS_OFFSET, NORM_OFFSET,
                 HEADS, nrows, HEADS, 0u, -5.0f, 1e-5f), "MTP3 banked prefill");
             require_ok(ds4_gpu_tensor_read(bank, 0, bankv, state_bytes), "MTP3 bank read");
             require_ok(ds4_gpu_tensor_read(pstate, 0, fin, state_bytes), "MTP3 final read");
+            require_ok(ds4_gpu_tensor_read(cbank, 0, convb, conv_bytes), "MTP3 conv bank read");
+            /* The conv ring is a shift register of raw inputs -- decode and
+             * prefill write the identical bytes, so this must be EXACT. */
+            for (uint32_t i = 0; i < 9u * PROJECTION; i++)
+                require_ok(convb[i] == convref[i], "MTP3 conv bank == decode conv ring, exactly");
 
             uint64_t poison = 0, differs = 0;
             double worst = 0.0;
@@ -1070,7 +1081,9 @@ int main(void) {
             fprintf(stderr, "  MTP3 bank rows=%u after_row=%u: worst |d| %.3g\n",
                     nrows, brow, worst);
         }
+        ds4_gpu_tensor_free(cbank);
         ds4_gpu_tensor_free(bank);
+        free(convb); free(convref);
         free(fin); free(bankv); free(ref); free(seed);
         puts("GLM-5.3 MTP3-MIN state bank: PASS");
     }

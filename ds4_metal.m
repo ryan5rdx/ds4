@@ -48578,6 +48578,7 @@ int ds4_gpu_glm53_kda_prefill_banked(
         ds4_gpu_tensor       *conv_state,
         ds4_gpu_tensor       *recurrent_state,
         ds4_gpu_tensor       *bank_state,
+        ds4_gpu_tensor       *bank_conv,
         uint32_t              bank_after_row,
         ds4_gpu_tensor       *q,
         ds4_gpu_tensor       *k,
@@ -48606,6 +48607,11 @@ int ds4_gpu_glm53_kda_prefill_banked(
     if (bank_state &&
         ds4_gpu_tensor_bytes(bank_state) < ds4_gpu_tensor_bytes(recurrent_state)) {
         fprintf(stderr, "ds4: glm53 kda prefill: bank smaller than recurrent state\n");
+        return 0;
+    }
+    if (bank_conv &&
+        ds4_gpu_tensor_bytes(bank_conv) < ds4_gpu_tensor_bytes(conv_state)) {
+        fprintf(stderr, "ds4: glm53 kda prefill: conv bank smaller than conv state\n");
         return 0;
     }
     uint64_t projection = 0, activation_elements = 0;
@@ -48694,6 +48700,14 @@ int ds4_gpu_glm53_kda_prefill_banked(
         id<MTLComputePipelineState> prologue_pipeline = nil;
         id<MTLComputePipelineState> prep_blocked_pipeline = nil;
         uint32_t prepare_blocks = 1u;
+        /* MTP3-MIN: the conv bank lives in the plain prepare only.  The verify
+         * is two rows and never blocks, so refuse rather than silently skip. */
+        if (bank_conv && prepare_tpb && n_tokens > prepare_tpb) {
+            fprintf(stderr, "ds4: glm53 kda prefill: conv banking unsupported "
+                            "on the blocked prepare (n_tokens %u > tpb %u)\n",
+                    n_tokens, prepare_tpb);
+            return 0;
+        }
         if (prepare_tpb && n_tokens > prepare_tpb) {
             prologue_pipeline =
                 ds4_gpu_get_pipeline("kernel_glm53_kda_prefill_prologue");
@@ -48804,6 +48818,14 @@ int ds4_gpu_glm53_kda_prefill_banked(
                 offset:ds4_gpu_tensor_offset(conv_state) atIndex:10];
         if (prep_blocked_pipeline) {
             [enc setBuffer:g_kda_prologue_buffer offset:0 atIndex:11];
+        } else {
+            /* MTP3-MIN conv-ring bank.  Index 11 is the blocked kernel's
+             * prologue slot and is free on the plain path.  Aliased to
+             * conv_state when banking is off; the kernel's store is guarded so
+             * the alias is never written. */
+            ds4_gpu_tensor *cb = bank_conv ? bank_conv : conv_state;
+            [enc setBuffer:ds4_gpu_tensor_buffer(cb)
+                    offset:ds4_gpu_tensor_offset(cb) atIndex:11];
         }
         [enc setThreadgroupMemoryLength:DS4_TG16(264u * sizeof(float)) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_heads, prepare_blocks, 1)
@@ -48884,7 +48906,7 @@ int ds4_gpu_glm53_kda_prefill(
         float                 gate_lower_bound,
         float                 norm_eps) {
     return ds4_gpu_glm53_kda_prefill_banked(
-            out, conv_state, recurrent_state, NULL, UINT32_MAX,
+            out, conv_state, recurrent_state, NULL, NULL, UINT32_MAX,
             q, k, v, raw_gate, raw_beta, output_gate,
             model_map, model_size, q_conv_offset, k_conv_offset, v_conv_offset,
             a_log_offset, dt_bias_offset, output_norm_offset,

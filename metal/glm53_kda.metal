@@ -554,6 +554,7 @@ kernel void kernel_glm53_kda_prefill_prepare(
         device const float   *a_log,
         device const float   *dt_bias,
         device float         *conv_state,
+        device float         *conv_bank,
         threadgroup float    *scratch [[threadgroup(0)]],
         uint head [[threadgroup_position_in_grid]],
         ushort tid [[thread_index_in_threadgroup]],
@@ -606,6 +607,25 @@ kernel void kernel_glm53_kda_prefill_prepare(
             v_state[2ul * state_projection + state_channel];
         v_state[2ul * state_projection + state_channel] = v_new;
 
+        /* MTP3-MIN: bank the conv ring as of this row, alongside the recurrent
+         * bank the recurrence kernel writes.  Both are needed -- on speculative
+         * rejection the next cycle must see the ring as of the ACCEPTED token;
+         * a ring still carrying the rejected draft would feed a token that was
+         * never emitted into the next three convolutions.
+         *
+         * Only the plain prepare needs it: blocking engages above
+         * prepare_tpb = 64 rows and the two-row verify never reaches that. */
+        if (token == args.bank_after_row) {
+            device float *qb = conv_bank;
+            device float *kb = qb + HISTORY * state_projection;
+            device float *vb = kb + HISTORY * state_projection;
+            for (uint w = 0; w < HISTORY; w++) {
+                const ulong o = (ulong)w * state_projection + state_channel;
+                qb[o] = q_state[o];
+                kb[o] = k_state[o];
+                vb[o] = v_state[o];
+            }
+        }
         sq[tid] = q_acc / (1.0f + exp(-q_acc));
         sk[tid] = k_acc / (1.0f + exp(-k_acc));
         v[index] = v_acc / (1.0f + exp(-v_acc));
