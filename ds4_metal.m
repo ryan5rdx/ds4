@@ -26490,7 +26490,18 @@ int ds4_gpu_matmul_q8_0_kslice_tensor(
     }
 }
 
-int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+static uint64_t g_kslice_tiled_count;
+static uint64_t g_kslice_matvec_count;
+
+uint64_t ds4_gpu_kslice_tiled_count(void) { return g_kslice_tiled_count; }
+uint64_t ds4_gpu_kslice_matvec_count(void) { return g_kslice_matvec_count; }
+
+/* The staged mm kernel is far faster once there are enough rows to fill a
+ * tile, but it only accepts the 64/32-aligned extents that tiling assumes.
+ * It is the fast path; the single-row and ragged shapes the cross-device and
+ * tensor-parallel attention-output callers pass fall through to the matvec
+ * path in the caller below. */
+static int ds4_gpu_matmul_q8_0_kslice_rows_mpp(
         ds4_gpu_tensor       *out,
         const void           *model_map,
         uint64_t              model_size,
@@ -26516,7 +26527,15 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
     @autoreleasepool {
         const uint64_t row_bytes = (full_in_dim / 32u) * 34u;
         const uint64_t weight_bytes = out_dim * row_bytes;
-        const uint64_t x_bytes = n_rows * full_in_dim * sizeof(float);
+        /* The activation is COMPACT at k_cnt -- this rank's slice packed at its
+         * own base -- not a window into a full-width row.  Validating and
+         * striding at full_in_dim was doubly wrong: the size check passes
+         * whenever the caller's buffer happens to be allocated at full width
+         * (the KDA case allocates the unsplit projection and packs half of it),
+         * and then the kernel strides across the wrong rows and reads garbage.
+         * Silent, and only on M5 -- M2 Ultra disables MPP, so the rig never saw
+         * it. Matches the matvec and tiled paths below. */
+        const uint64_t x_bytes = n_rows * k_cnt * sizeof(float);
         const uint64_t out_bytes = n_rows * out_dim * sizeof(float);
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
@@ -26553,8 +26572,8 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         args.nb01 = row_bytes;
         args.nb02 = row_bytes * out_dim;
         args.nb03 = row_bytes * out_dim;
-        args.nb11 = full_in_dim * sizeof(float);
-        args.nb12 = n_rows * full_in_dim * sizeof(float);
+        args.nb11 = k_cnt * sizeof(float);
+        args.nb12 = n_rows * k_cnt * sizeof(float);
         args.nb13 = args.nb12;
 
         int owned = 0;
@@ -26567,8 +26586,7 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
                 offset:(NSUInteger)(inner_offset + (k_off / 32u) * 34u)
                atIndex:1];
         [enc setBuffer:xbuf
-                offset:(NSUInteger)(ds4_gpu_tensor_offset(x) +
-                                    k_off * sizeof(float))
+                offset:(NSUInteger)ds4_gpu_tensor_offset(x)
                atIndex:2];
         [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
         [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t)
@@ -26581,6 +26599,168 @@ int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         return ds4_gpu_finish_command_buffer(cb,
                                              owned,
                                              "Q8_0 NAX kslice rows matmul");
+    }
+}
+
+int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              full_in_dim,
+        uint64_t              out_dim,
+        uint64_t              k_off,
+        uint64_t              k_cnt,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_rows) {
+    if (ds4_gpu_matmul_q8_0_kslice_rows_mpp(out, model_map, model_size,
+                                            weight_offset, full_in_dim,
+                                            out_dim, k_off, k_cnt, x,
+                                            n_rows)) {
+        return 1;
+    }
+    if (!out || !x || !model_map || n_rows == 0 || out_dim == 0 ||
+        n_rows > (uint64_t)INT32_MAX ||
+        (full_in_dim & 31u) != 0 || (k_off & 31u) != 0 ||
+        (k_cnt & 31u) != 0 || k_cnt == 0 ||
+        k_off > full_in_dim || k_cnt > full_in_dim - k_off ||
+        full_in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        k_cnt > UINT32_MAX ||
+        n_rows > UINT64_MAX / k_cnt / sizeof(float) ||
+        n_rows > UINT64_MAX / out_dim / sizeof(float) ||
+        ds4_gpu_tensor_bytes(x) < n_rows * k_cnt * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < n_rows * out_dim * sizeof(float)) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t row_bytes = (full_in_dim / 32u) * 34u;
+        if (!xbuf || !outbuf || out_dim > UINT64_MAX / row_bytes) return 0;
+        const uint64_t weight_bytes = out_dim * row_bytes;
+        if (weight_offset > model_size ||
+            weight_bytes > model_size - weight_offset) {
+            return 0;
+        }
+        uint64_t inner = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(
+                model_map, model_size, weight_offset, weight_bytes, &inner);
+        if (!wbuf) return 0;
+
+        /* Multi-row k-slices take the tiled kernel, not the matvec below.
+         *
+         * The matvec re-reads the weight for every row, so at a prefill chunk it
+         * turns a 17.8 MB weight into ~36 GB of traffic per layer -- which is
+         * what made the S6b prefill split lose: it compared a full-width TILED
+         * GEMM against a half-width MATVEC, and the lost cross-row weight reuse
+         * swamped the halved arithmetic.
+         *
+         * A k-slice is expressible in the tiled kernel's own arguments with no
+         * new shader: walk only k_cnt (ne00), keep the FULL row stride so output
+         * rows are still addressed in the whole matrix (nb01), start each row at
+         * k_off, and read the activation compactly because it is already sliced
+         * (nb11 = k_cnt). k_off is 32-aligned by the caller's check above, so the
+         * byte offset lands on a Q8_0 block boundary. */
+        /* Mirror the generic Q8_0 path's kernel choice exactly, contraction
+         * width and all: it takes the extended matvec while
+         * n_tok <= DS4_METAL_Q8_MV_EXT_MAX_TOKENS (default 16, not 8) AND the
+         * contraction is a multiple of 128, otherwise the tiled kernel.
+         * Diverging from it would make the split and unsplit paths pick
+         * different kernels for the same shape, and the mv/mm precision fork is
+         * ~1.5e-04 -- two orders above the reduction band -- so that shows up as
+         * a correctness signal that is really a kernel-selection artefact.
+         * Note the width that matters here is k_cnt, this rank's slice. */
+        const uint64_t mv_ext_max = ds4_gpu_env_u64(
+                "DS4_METAL_Q8_MV_EXT_MAX_TOKENS", 16u, 2u, 128u);
+        const bool generic_would_use_mv =
+                n_rows <= mv_ext_max && (k_cnt % 128u) == 0;
+        if (!generic_would_use_mv && n_rows > 1) {
+            const uint64_t k_off_bytes = (k_off / 32u) * 34u;
+            const bool bc_inp = (k_cnt % 32u) != 0;
+            const bool bc_out = (out_dim % 64u) != 0 || (n_rows % 32u) != 0;
+            id<MTLComputePipelineState> mm =
+                ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_q8_0_f32",
+                                            bc_inp, bc_out);
+            if (mm) {
+                ds4_gpu_mul_mm_args margs =
+                    ds4_gpu_make_mm_args(k_cnt, out_dim, n_rows, row_bytes);
+                /* make_mm_args derives the activation strides from its in_dim,
+                 * which is already k_cnt here, so nb1x are correct as built. */
+                int mm_owned = 0;
+                id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&mm_owned);
+                if (!cb) return 0;
+                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+                [enc setComputePipelineState:mm];
+                [enc setBytes:&margs length:sizeof(margs) atIndex:0];
+                [enc setBuffer:wbuf
+                        offset:(NSUInteger)(inner + k_off_bytes) atIndex:1];
+                [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+                [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+                [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u)
+                                         atIndex:0];
+                [enc dispatchThreadgroups:
+                        MTLSizeMake(((NSUInteger)n_rows + 31u) / 32u,
+                                    ((NSUInteger)out_dim + 63u) / 64u, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                ds4_gpu_end_compute_encoder(cb, enc);
+                g_kslice_tiled_count++;
+                {
+                    static int announced;
+                    if (!announced) {
+                        announced = 1;
+                        fprintf(stderr,
+                                "ds4: Q8_0 k-slice using the tiled kernel "
+                                "(k_cnt %llu, %llu rows)\n",
+                                (unsigned long long)k_cnt,
+                                (unsigned long long)n_rows);
+                    }
+                }
+                return ds4_gpu_finish_command_buffer(
+                        cb, mm_owned, "Q8_0 k-slice tiled matmul");
+            }
+        }
+
+        ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        if (out_dim > 65536u) dispatch.nsg = 8;
+        ds4_gpu_q8_0_matvec_args args =
+            ds4_gpu_make_q8_0_mv_args(full_in_dim, out_dim);
+        args.ne00 = (int32_t)k_cnt;
+        args.ne10 = (int32_t)k_cnt;
+        args.ne11 = (int32_t)n_rows;
+        args.nb11 = k_cnt * sizeof(float);
+        args.nb12 = n_rows * k_cnt * sizeof(float);
+        args.nb13 = args.nb12;
+        args.ne1 = (int32_t)n_rows;
+        args.nr0 = dispatch.nr0;
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_mul_mv_pipeline(dispatch.function_name, dispatch.nsg);
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf
+                offset:(NSUInteger)(inner + (k_off / 32u) * 34u)
+               atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:dispatch.smem atIndex:0];
+        [enc dispatchThreadgroups:
+                MTLSizeMake(((NSUInteger)out_dim +
+                             (NSUInteger)dispatch.nr0 - 1u) /
+                                (NSUInteger)dispatch.nr0,
+                            (NSUInteger)n_rows,
+                            1)
+             threadsPerThreadgroup:
+                MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        g_kslice_matvec_count++;
+        return ds4_gpu_finish_command_buffer(
+                cb, owned, "Q8_0 k-slice row matvec");
     }
 }
 

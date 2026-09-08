@@ -16,11 +16,20 @@
 #define N_EXPERT 6u
 #define DIM 256u
 #define BATCH_TOKENS 48u
+#define QK_Q8_0 32u
 
 typedef struct {
     uint8_t e;
     uint8_t qs[QK_MXFP4 / 2u];
 } block_mxfp4;
+
+typedef struct {
+    _Float16 d;
+    int8_t qs[QK_Q8_0];
+} block_q8_0;
+
+typedef char block_q8_0_must_be_34_bytes[
+    sizeof(block_q8_0) == 34u ? 1 : -1];
 
 static const float mxfp4_values[16] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -81,6 +90,25 @@ static void fill_matrix(block_mxfp4 *matrix, uint32_t salt) {
     }
 }
 
+static void fill_q8_matrix(block_q8_0 *matrix,
+                           uint32_t rows,
+                           uint32_t cols,
+                           uint32_t salt) {
+    const uint32_t blocks_per_row = cols / QK_Q8_0;
+    for (uint32_t row = 0; row < rows; row++) {
+        for (uint32_t block = 0; block < blocks_per_row; block++) {
+            block_q8_0 *b = matrix +
+                (uint64_t)row * blocks_per_row + block;
+            b->d = (_Float16)((float)(1u +
+                ((salt + row * 3u + block * 5u) % 7u)) / 512.0f);
+            for (uint32_t i = 0; i < QK_Q8_0; i++) {
+                b->qs[i] = (int8_t)((int32_t)(
+                    (salt + row * 11u + block * 7u + i * 5u) % 31u) - 15);
+            }
+        }
+    }
+}
+
 static int compare_values(const char *name, const float *actual,
                           const float *expected, uint64_t count,
                           float tolerance) {
@@ -105,6 +133,113 @@ static int compare_values(const char *name, const float *actual,
             "MXFP4 Metal %-4s max_abs=%g rms=%g at=%llu\n",
             name, max_abs, rms, (unsigned long long)max_index);
     return max_abs <= tolerance;
+}
+
+/* The k-slice at prefill row counts.
+ *
+ * The existing TP case runs 5 rows, which is BELOW the mv/mm threshold
+ * (use_mv = n_rows <= 8), so it never reaches the tiled path and passed
+ * identically before and after that path existed. Prefill runs thousands of
+ * rows, and taking the matvec there re-reads the weight per row -- which is what
+ * made the S6b prefill split lose: full-width tiled GEMM versus half-width
+ * matvec, with the lost cross-row reuse swamping the halved arithmetic.
+ *
+ * Straddle the threshold and check the property that matters: two k-slices must
+ * sum to the unsplit result, at every row count, on whichever kernel each side
+ * picks. */
+static int run_kslice_rows(void) {
+    enum { KIN = 512, KOUT = 128, KHALF = KIN / 2 };
+    const uint64_t krow = (uint64_t)(KIN / QK_Q8_0) * sizeof(block_q8_0);
+    const uint64_t kbytes = (uint64_t)KOUT * krow;
+    uint8_t *kmodel = calloc(1, (size_t)kbytes + 4096);
+    if (!kmodel) return 0;
+
+    fill_q8_matrix((block_q8_0 *)kmodel, KOUT, KIN, 24601u);
+    uint32_t seed = 24601u;
+
+    int ok = ds4_gpu_set_model_map(kmodel, (uint64_t)kbytes + 4096) != 0;
+    const uint32_t counts[] = { 1u, 8u, 9u, 32u, 128u };
+    int failures = 0;
+    /* Correctness alone cannot see a silent fallback -- both kernels give the
+     * right answer, one just re-reads the weight per row. Assert the dispatch
+     * actually crossed to the tiled path, or this test would keep passing while
+     * the optimisation it guards quietly stopped happening. */
+    const uint64_t tiled_before = ds4_gpu_kslice_tiled_count();
+
+    for (size_t ci = 0; ok && ci < sizeof(counts) / sizeof(counts[0]); ci++) {
+        const uint32_t R = counts[ci];
+        float *xf = malloc((size_t)R * KIN * sizeof(float));
+        float *xl = malloc((size_t)R * KHALF * sizeof(float));
+        float *hf = malloc((size_t)R * KOUT * sizeof(float));
+        float *hs = malloc((size_t)R * KOUT * sizeof(float));
+        if (!xf || !xl || !hf || !hs) { failures++; free(xf); free(xl); free(hf); free(hs); break; }
+        for (uint64_t i = 0; i < (uint64_t)R * KIN; i++) {
+            seed = seed * 1664525u + 1013904223u;
+            xf[i] = (float)((int32_t)(seed >> 8) - 8388608) / 8388608.0f;
+        }
+
+        ds4_gpu_tensor *tF = ds4_gpu_tensor_alloc((uint64_t)R * KIN * sizeof(float));
+        ds4_gpu_tensor *tL = ds4_gpu_tensor_alloc((uint64_t)R * KHALF * sizeof(float));
+        ds4_gpu_tensor *oF = ds4_gpu_tensor_alloc((uint64_t)R * KOUT * sizeof(float));
+        ds4_gpu_tensor *p0 = ds4_gpu_tensor_alloc((uint64_t)R * KOUT * sizeof(float));
+        ds4_gpu_tensor *p1 = ds4_gpu_tensor_alloc((uint64_t)R * KOUT * sizeof(float));
+        int step = tF && tL && oF && p0 && p1;
+        step = step && ds4_gpu_tensor_write(tF, 0, xf, (uint64_t)R * KIN * sizeof(float));
+        step = step && ds4_gpu_matmul_quant_tensor(oF, kmodel, (uint64_t)kbytes + 4096,
+                                                   0, 8u, KIN, KOUT, tF, R);
+        for (int lane = 0; step && lane < 2; lane++) {
+            for (uint32_t t = 0; t < R; t++) {
+                memcpy(xl + (size_t)t * KHALF,
+                       xf + (size_t)t * KIN + (size_t)lane * KHALF,
+                       KHALF * sizeof(float));
+            }
+            step = step && ds4_gpu_tensor_write(tL, 0, xl,
+                                                (uint64_t)R * KHALF * sizeof(float));
+            step = step && ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+                    lane ? p1 : p0, kmodel, (uint64_t)kbytes + 4096, 0,
+                    KIN, KOUT, (uint64_t)lane * KHALF, KHALF, tL, R);
+        }
+        step = step && ds4_gpu_add_tensor(p0, p0, p1, (uint32_t)((uint64_t)R * KOUT));
+        step = step && ds4_gpu_tensor_read(oF, 0, hf, (uint64_t)R * KOUT * sizeof(float));
+        step = step && ds4_gpu_tensor_read(p0, 0, hs, (uint64_t)R * KOUT * sizeof(float));
+
+        if (!step) {
+            fprintf(stderr, "  kslice rows=%u: dispatch failed\n", R);
+            failures++;
+        } else {
+            double sa = 0.0, sd = 0.0;
+            for (uint64_t i = 0; i < (uint64_t)R * KOUT; i++) {
+                const double d = (double)hf[i] - (double)hs[i];
+                sa += (double)hf[i] * hf[i];
+                sd += d * d;
+            }
+            const double rel = sa > 0.0 ? sqrt(sd / sa) : 0.0;
+            /* A reduction split, so last-bit only.  1e-5 is loose enough for
+             * either kernel and far tighter than a wrong k offset or a
+             * transposed dispatch grid, both of which land at O(1). */
+            if (!(rel < 1e-5)) {
+                fprintf(stderr,
+                        "  kslice rows=%u: halves do not sum to the whole "
+                        "(rms-rel %.3e)\n", R, rel);
+                failures++;
+            }
+        }
+        ds4_gpu_tensor_free(p1); ds4_gpu_tensor_free(p0);
+        ds4_gpu_tensor_free(oF); ds4_gpu_tensor_free(tL); ds4_gpu_tensor_free(tF);
+        free(xf); free(xl); free(hf); free(hs);
+    }
+    free(kmodel);
+    if (!ok) return 0;
+    /* rows 32 and 128 are above the mv/mm threshold with k_cnt = 256, which is
+     * not a multiple of 128, so the generic rule sends them to the tiled path. */
+    const uint64_t tiled = ds4_gpu_kslice_tiled_count() - tiled_before;
+    if (tiled == 0) {
+        fprintf(stderr,
+                "  kslice: no tiled dispatch happened -- every row count fell "
+                "back to the matvec\n");
+        failures++;
+    }
+    return failures == 0;
 }
 
 int main(void) {
@@ -774,6 +909,7 @@ int main(void) {
     ds4_gpu_tensor_free(weights_tensor);
     ds4_gpu_tensor_free(selected_tensor);
     ds4_gpu_tensor_free(x_tensor);
+    const int kslice_ok = run_kslice_rows();
     ds4_gpu_cleanup();
     free(out_fast);
     free(experts_fast);
@@ -792,5 +928,7 @@ int main(void) {
     free(model);
 
     fprintf(stderr, "MXFP4 Metal fused MoE: %s\n", ok ? "PASS" : "FAIL");
-    return ok ? 0 : 1;
+    fprintf(stderr, "Q8_0 k-slice across the mv/mm threshold: %s\n",
+            kslice_ok ? "PASS" : "FAIL");
+    return (ok && kslice_ok) ? 0 : 1;
 }
