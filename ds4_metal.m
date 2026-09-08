@@ -51045,6 +51045,10 @@ typedef struct {
     uint32_t n_heads_total;
     uint32_t head_first;
     uint32_t tokens_per_block;   /* KDA-PREPARE-PAR; 0 = original kernel */
+    /* MTP3-MIN: row after which the recurrence also writes its state to the
+     * `bank` buffer.  UINT32_MAX = off.  Appended, so every existing field
+     * keeps its offset; see glm53_kda_args in glm53_kda.metal. */
+    uint32_t bank_after_row;
 } glm53_gpu_kda_args;
 
 /* R1 -- f_a + beta + g_a in one dispatch.  See the kernel comment in
@@ -51381,10 +51385,19 @@ int ds4_gpu_glm53_kda_decode(
     }
 }
 
-int ds4_gpu_glm53_kda_prefill(
+/* MTP3-MIN.  New entry point rather than a changed signature: every existing
+ * caller keeps working through the wrapper below, which is how
+ * ds4_gpu_glm_indexer_score_one_base_tensor was added.
+ *
+ * bank_state == NULL disables banking entirely -- the kernel's store is guarded
+ * and the buffer binding aliases recurrent_state, so the emitted code path is
+ * identical to before. */
+int ds4_gpu_glm53_kda_prefill_banked(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
         ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *bank_state,
+        uint32_t              bank_after_row,
         ds4_gpu_tensor       *q,
         ds4_gpu_tensor       *k,
         ds4_gpu_tensor       *v,
@@ -51407,6 +51420,13 @@ int ds4_gpu_glm53_kda_prefill(
         float                 norm_eps) {
     enum { GLM53_KDA_DIM = 128, GLM53_KDA_HISTORY = 3 };
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    /* A bank must be the same full-width shape as the state it mirrors, or the
+     * absolute head addressing writes outside it. */
+    if (bank_state &&
+        ds4_gpu_tensor_bytes(bank_state) < ds4_gpu_tensor_bytes(recurrent_state)) {
+        fprintf(stderr, "ds4: glm53 kda prefill: bank smaller than recurrent state\n");
+        return 0;
+    }
     uint64_t projection = 0, activation_elements = 0;
     uint64_t state_projection = 0;
     uint64_t conv_elements = 0, state_elements = 0;
@@ -51558,6 +51578,8 @@ int ds4_gpu_glm53_kda_prefill(
             .n_heads_total = n_heads_total,
             .head_first = head_first,
             .tokens_per_block = prepare_tpb,
+            /* off unless the caller supplied a bank */
+            .bank_after_row = bank_state ? bank_after_row : UINT32_MAX,
         };
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -51623,6 +51645,15 @@ int ds4_gpu_glm53_kda_prefill(
                 offset:ds4_gpu_tensor_offset(recurrent_state) atIndex:6];
         [enc setBuffer:ds4_gpu_tensor_buffer(out)
                 offset:ds4_gpu_tensor_offset(out) atIndex:7];
+        /* MTP3-MIN.  Metal requires a bound buffer for every declared
+         * parameter, so with banking off this aliases `recurrent_state` -- the
+         * kernel's store is guarded by bank_after_row and never fires, so the
+         * alias is never written. */
+        {
+            ds4_gpu_tensor *bank_bind = bank_state ? bank_state : recurrent_state;
+            [enc setBuffer:ds4_gpu_tensor_buffer(bank_bind)
+                    offset:ds4_gpu_tensor_offset(bank_bind) atIndex:8];
+        }
         /* 128 value rows per head. Baseline: 4 simdgroups x 1 value = 4 per
          * threadgroup -> 32. K1: 4 simdgroups x 4 values = 16 -> 8. The grid
          * MUST track the kernel or value rows are dropped or double-computed. */
@@ -51645,6 +51676,41 @@ int ds4_gpu_glm53_kda_prefill(
         return ds4_gpu_finish_command_buffer(
             cb, owned, "GLM-5.3 KDA layer-major prefill");
     }
+}
+
+/* Compatibility wrapper: banking off.  Keeps every existing call site --
+ * glm53_graph_kda_attention_rows and the tests -- unchanged. */
+int ds4_gpu_glm53_kda_prefill(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              n_tokens,
+        uint32_t              n_heads_total,
+        uint32_t              head_first,
+        float                 gate_lower_bound,
+        float                 norm_eps) {
+    return ds4_gpu_glm53_kda_prefill_banked(
+            out, conv_state, recurrent_state, NULL, UINT32_MAX,
+            q, k, v, raw_gate, raw_beta, output_gate,
+            model_map, model_size, q_conv_offset, k_conv_offset, v_conv_offset,
+            a_log_offset, dt_bias_offset, output_norm_offset,
+            n_heads, n_tokens, n_heads_total, head_first,
+            gate_lower_bound, norm_eps);
 }
 
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {

@@ -3475,6 +3475,36 @@ int ds4_gpu_glm53_kda_decode(
         float                 gate_lower_bound,
         float                 norm_eps);
 
+/* MTP3-MIN: also emit the state after row `bank_after_row` to `bank_state`.
+ * The recurrence already carries it in registers, so this is one extra store.
+ * bank_state == NULL (or the plain entry point below) disables it. */
+int ds4_gpu_glm53_kda_prefill_banked(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *conv_state,
+        ds4_gpu_tensor       *recurrent_state,
+        ds4_gpu_tensor       *bank_state,
+        uint32_t              bank_after_row,
+        ds4_gpu_tensor       *q,
+        ds4_gpu_tensor       *k,
+        ds4_gpu_tensor       *v,
+        ds4_gpu_tensor       *raw_gate,
+        const ds4_gpu_tensor *raw_beta,
+        const ds4_gpu_tensor *output_gate,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_conv_offset,
+        uint64_t              k_conv_offset,
+        uint64_t              v_conv_offset,
+        uint64_t              a_log_offset,
+        uint64_t              dt_bias_offset,
+        uint64_t              output_norm_offset,
+        uint32_t              n_heads,
+        uint32_t              n_tokens,
+        uint32_t              n_heads_total,
+        uint32_t              head_first,
+        float                 gate_lower_bound,
+        float                 norm_eps);
+
 int ds4_gpu_glm53_kda_prefill(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *conv_state,
