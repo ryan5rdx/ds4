@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <netdb.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
@@ -41,7 +42,10 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-#define DS4_TP_PROTOCOL_VERSION 11u
+/* Version 12 adds acknowledged rewind modes plus cancel and rollback-capture
+ * frames. Frames 19-21 belong to upstream RDMA warmup and GLM MTP, so the new
+ * commands use 22-23 and refuse peers that assign them differently. */
+#define DS4_TP_PROTOCOL_VERSION 12u
 
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
@@ -239,6 +243,9 @@ struct ds4_tp {
     uint64_t timeout_sec;
     uint64_t gate_timeout_ms;
     atomic_bool failed;
+    /* Serializes control_fd and complete command/ack transactions. Recursive
+     * so public helpers remain usable while a caller holds the transaction. */
+    pthread_mutex_t control_lock;
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma rdma;
 #endif
@@ -414,6 +421,71 @@ static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes) {
     *type = h.type;
     *bytes = h.bytes;
     return 1;
+}
+
+/* Worker-side cancel poll for one mirrored prefill. It runs between chunks
+ * while the normal command loop is blocked in ds4_session_sync(). */
+typedef struct {
+    ds4_tp *tp;
+    uint64_t session_id;
+    bool cancelled;
+    bool broken;
+} tp_worker_cancel_state;
+
+static bool tp_worker_prefill_cancelled(void *ud) {
+    tp_worker_cancel_state *st = (tp_worker_cancel_state *)ud;
+    if (!st) return false;
+    if (st->cancelled) return true;
+    if (st->broken || getenv("DS4_TP_DISABLE_CANCEL_POLL") != NULL) return false;
+
+    /* Other control-plane round trips can run during a sync. Never steal their
+     * response: defer the poll when one owns the recursive control lock. */
+    if (pthread_mutex_trylock(&st->tp->control_lock) != 0) return false;
+    const int fd = st->tp->control_fd;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+    const int ready = poll(&pfd, 1, 0);
+    if (ready <= 0 || !(pfd.revents & POLLIN)) {
+        pthread_mutex_unlock(&st->tp->control_lock);
+        return false;
+    }
+
+    uint32_t type = 0, bytes = 0;
+    if (!tp_read_frame_header(fd, &type, &bytes)) {
+        pthread_mutex_unlock(&st->tp->control_lock);
+        st->broken = true;
+        ds4_log(stderr, DS4_LOG_ERROR,
+                "tp worker: bad frame header while polling for cancel");
+        ds4_tp_mark_failed(st->tp);
+        return false;
+    }
+    if (type != (uint32_t)DS4_TP_FRAME_CANCEL || bytes != sizeof(uint64_t)) {
+        pthread_mutex_unlock(&st->tp->control_lock);
+        st->broken = true;
+        ds4_log(stderr, DS4_LOG_ERROR,
+                "tp worker: unexpected frame %u (%u bytes) during mirrored prefill",
+                type, bytes);
+        ds4_tp_mark_failed(st->tp);
+        return false;
+    }
+    uint64_t session_id = 0;
+    if (!tp_read_full(fd, &session_id, sizeof(session_id))) {
+        pthread_mutex_unlock(&st->tp->control_lock);
+        st->broken = true;
+        ds4_tp_mark_failed(st->tp);
+        return false;
+    }
+    pthread_mutex_unlock(&st->tp->control_lock);
+    if (session_id != st->session_id) {
+        st->broken = true;
+        ds4_log(stderr, DS4_LOG_ERROR,
+                "tp worker: cancel for session %llu during sync of %llu",
+                (unsigned long long)session_id,
+                (unsigned long long)st->session_id);
+        ds4_tp_mark_failed(st->tp);
+        return false;
+    }
+    st->cancelled = true;
+    return true;
 }
 
 /* ------------------------------------------------------------------------
@@ -924,13 +996,12 @@ static const char *tp_wc_status_str(int status);
  * sends (one control-channel round trip). */
 static int tp_rdma_posted_barrier(ds4_tp *tp, uint32_t tag) {
     uint32_t t = 0, b = 0, theirs = 0;
-    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_POSTED, &tag, sizeof(tag))) return 0;
-    if (!tp_read_frame_header(tp->control_fd, &t, &b) ||
-        t != DS4_TP_FRAME_RDMA_POSTED || b != sizeof(theirs) ||
-        !tp_read_full(tp->control_fd, &theirs, sizeof(theirs)) || theirs != tag) {
-        return 0;
-    }
-    return 1;
+    if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_POSTED,
+                       &tag, sizeof(tag))) return 0;
+    return tp_read_frame_header(tp->control_fd, &t, &b) &&
+           t == DS4_TP_FRAME_RDMA_POSTED && b == sizeof(theirs) &&
+           tp_read_full(tp->control_fd, &theirs, sizeof(theirs)) &&
+           theirs == tag;
 }
 
 static int tp_rdma_warm_up(ds4_tp *tp, char *err, size_t errlen) {
@@ -2070,6 +2141,11 @@ int ds4_tp_create(
         const long value = strtol(gate_tmo, NULL, 10);
         if (value > 0 && value <= 60000) tp->gate_timeout_ms = (uint64_t)value;
     }
+    pthread_mutexattr_t control_attr;
+    pthread_mutexattr_init(&control_attr);
+    pthread_mutexattr_settype(&control_attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&tp->control_lock, &control_attr);
+    pthread_mutexattr_destroy(&control_attr);
 
     int rdma_ok = 0;
 #ifdef DS4_TP_HAVE_VERBS
@@ -2167,7 +2243,16 @@ void ds4_tp_free(ds4_tp *tp) {
 #endif
     if (tp->control_fd >= 0) close(tp->control_fd);
     if (tp->data_fd >= 0) close(tp->data_fd);
+    pthread_mutex_destroy(&tp->control_lock);
     free(tp);
+}
+
+void ds4_tp_control_lock(ds4_tp *tp) {
+    if (tp) pthread_mutex_lock(&tp->control_lock);
+}
+
+void ds4_tp_control_unlock(ds4_tp *tp) {
+    if (tp) pthread_mutex_unlock(&tp->control_lock);
 }
 
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
@@ -2508,19 +2593,28 @@ static int tp_send_token_command(ds4_tp *tp, uint32_t type,
 
 int ds4_tp_send_session_create(ds4_tp *tp, uint64_t session_id, int ctx_size) {
     ds4_tp_value_command msg = { session_id, (int32_t)ctx_size, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_CREATE,
-                         &msg, sizeof(msg));
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_CREATE,
+                                 &msg, sizeof(msg));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
 }
 
 int ds4_tp_send_session_destroy(ds4_tp *tp, uint64_t session_id) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_DESTROY,
-                         &session_id, sizeof(session_id));
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_DESTROY,
+                                 &session_id, sizeof(session_id));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
 }
 
 int ds4_tp_send_sync(ds4_tp *tp, uint64_t session_id,
                      const int *tokens, uint32_t n_tokens) {
-    return tp_send_token_command(tp, DS4_TP_FRAME_SYNC, session_id,
-                                 tokens, n_tokens);
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_token_command(tp, DS4_TP_FRAME_SYNC, session_id,
+                                         tokens, n_tokens);
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
 }
 
 int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
@@ -2574,8 +2668,10 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
         memcpy(p, embedding->data, (size_t)data_bytes);
         p += data_bytes;
     }
+    pthread_mutex_lock(&tp->control_lock);
     int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_SYNC_MULTIMODAL,
                            payload, (uint32_t)bytes64);
+    pthread_mutex_unlock(&tp->control_lock);
     free(payload);
     return ok;
 }
@@ -2583,25 +2679,74 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token) {
     ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL,
+                                 &msg, sizeof(msg));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
 }
 
 int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
                        uint64_t seq, int token, int limit) {
     if (limit < 1 || limit > 2) return 0;
     ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, (uint32_t)limit };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_GLM_MTP, &msg, sizeof(msg));
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_GLM_MTP,
+                                 &msg, sizeof(msg));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
 }
 
-int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos) {
+int ds4_tp_send_rewind_mode(ds4_tp *tp, uint64_t session_id, int pos,
+                            ds4_tp_rewind_mode mode) {
+    /* The mode rides the previously-unused `reserved` word, so the frame keeps
+     * its size and the decoder keeps its exact-length check. */
+    ds4_tp_value_command msg = { session_id, (int32_t)pos, (uint32_t)mode };
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_REWIND,
+                                 &msg, sizeof(msg));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
+}
+
+int ds4_tp_rewind_ack_status(bool want_keep, int requested_pos,
+                             int reusable_pos) {
+    /* KEEP at or below zero is not a representable request -- there is nothing
+     * to keep -- so refuse it rather than letting it read as a match against a
+     * zero reusable position.  Fail closed: the leader sees the mismatch and
+     * invalidates both ranks. */
+    if (want_keep && requested_pos <= 0) return 1;
+    /* Position equality, not "still reusable > 0": the rewind clamps to this
+     * rank's own checkpoint length, so a worker holding less than the leader
+     * lands lower and must not report that as a match. */
+    const int expected = want_keep ? requested_pos : 0;
+    return reusable_pos == expected ? 0 : 1;
+}
+
+int ds4_tp_send_rollback_capture(ds4_tp *tp, uint64_t session_id, int pos) {
     ds4_tp_value_command msg = { session_id, (int32_t)pos, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_REWIND,
-                         &msg, sizeof(msg));
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_frame(tp->control_fd,
+                                 DS4_TP_FRAME_ROLLBACK_CAPTURE,
+                                 &msg, sizeof(msg));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
 }
 
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_INVALIDATE,
-                         &session_id, sizeof(session_id));
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_INVALIDATE,
+                                 &session_id, sizeof(session_id));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
+}
+
+int ds4_tp_send_cancel(ds4_tp *tp, uint64_t session_id) {
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_CANCEL,
+                                 &session_id, sizeof(session_id));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
 }
 
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
@@ -2615,8 +2760,10 @@ int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
     ds4_tp_batch_command_header h = { count, 0 };
     memcpy(payload, &h, sizeof(h));
     memcpy(payload + sizeof(h), items, (size_t)count * sizeof(*items));
+    pthread_mutex_lock(&tp->control_lock);
     const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL_BATCH,
                                  payload, bytes);
+    pthread_mutex_unlock(&tp->control_lock);
     free(payload);
     return ok;
 }
@@ -2643,20 +2790,27 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
         wire_tokens[i] = (int32_t)prompt[i];
     }
     memcpy(payload + sizeof(h) + prompt_bytes, items, (size_t)item_bytes);
+    pthread_mutex_lock(&tp->control_lock);
     const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_MIXED_BATCH,
                                  payload, bytes);
+    pthread_mutex_unlock(&tp->control_lock);
     free(payload);
     return ok;
 }
 
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status) {
     ds4_tp_command_ack ack = { session_id, (int32_t)status, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_COMMAND_ACK,
-                         &ack, sizeof(ack));
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_COMMAND_ACK,
+                                 &ack, sizeof(ack));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
 }
 
-int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
-                            const char *operation, char *err, size_t errlen) {
+static int ds4_tp_wait_command_ack_unlocked(
+        ds4_tp *tp, uint64_t session_id,
+        const char *operation, int *status_out, char *err, size_t errlen) {
+    if (status_out) *status_out = -1;
     uint32_t type = 0, bytes = 0;
     ds4_tp_command_ack ack;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
@@ -2668,17 +2822,40 @@ int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
         return 0;
     }
     if (ack.session_id != session_id || ack.status != 0) {
+        if (status_out && ack.session_id == session_id) {
+            *status_out = (int)ack.status;
+        }
         tp_set_err(err, errlen,
                    "tp: worker %s failed (session %llu, status %d)",
                    operation ? operation : "command",
                    (unsigned long long)ack.session_id, (int)ack.status);
         return 0;
     }
+    if (status_out) *status_out = 0;
     return 1;
 }
 
+int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
+                            const char *operation, char *err, size_t errlen) {
+    return ds4_tp_wait_command_ack_status(tp, session_id, operation, NULL,
+                                          err, errlen);
+}
+
+int ds4_tp_wait_command_ack_status(ds4_tp *tp, uint64_t session_id,
+                                   const char *operation, int *status_out,
+                                   char *err, size_t errlen) {
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = ds4_tp_wait_command_ack_unlocked(
+        tp, session_id, operation, status_out, err, errlen);
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
+}
+
 int ds4_tp_send_stop(ds4_tp *tp) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_STOP, NULL, 0);
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_STOP, NULL, 0);
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
 }
 
 void ds4_tp_command_free(ds4_tp_command *command) {
@@ -2787,8 +2964,8 @@ allocation_failed:
     return 0;
 }
 
-int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
-                        char *err, size_t errlen) {
+static int ds4_tp_recv_command_unlocked(ds4_tp *tp, ds4_tp_command *command,
+                                        char *err, size_t errlen) {
     memset(command, 0, sizeof(*command));
     command->type = DS4_TP_FRAME_ERROR;
     uint32_t ftype = 0, bytes = 0;
@@ -2816,16 +2993,21 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
                                           err, errlen);
         break;
     case DS4_TP_FRAME_SESSION_CREATE:
+    case DS4_TP_FRAME_ROLLBACK_CAPTURE:
     case DS4_TP_FRAME_REWIND: {
         ds4_tp_value_command msg;
         if (bytes != sizeof(msg)) { ok = 0; break; }
         memcpy(&msg, payload, sizeof(msg));
         command->session_id = msg.session_id;
         command->value = msg.value;
+        command->flags = msg.reserved;
         break;
     }
     case DS4_TP_FRAME_SESSION_DESTROY:
     case DS4_TP_FRAME_INVALIDATE:
+    /* Normally consumed by the in-sync poll. It can reach the command loop if
+     * the worker finished just before the leader sent it. */
+    case DS4_TP_FRAME_CANCEL:
         if (bytes != sizeof(command->session_id)) { ok = 0; break; }
         memcpy(&command->session_id, payload, sizeof(command->session_id));
         break;
@@ -2911,36 +3093,58 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     return 1;
 }
 
+int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
+                        char *err, size_t errlen) {
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = ds4_tp_recv_command_unlocked(tp, command, err, errlen);
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
+}
+
 int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count) {
     ds4_tp_frame_header h = { DS4_TP_MAGIC, DS4_TP_FRAME_LOGITS,
                               count * (uint32_t)sizeof(float) };
-    return tp_write_full(tp->control_fd, &h, sizeof(h)) &&
-           tp_write_full(tp->control_fd, half, count * sizeof(float));
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_write_full(tp->control_fd, &h, sizeof(h)) &&
+                   tp_write_full(tp->control_fd, half, count * sizeof(float));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
 }
 
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count) {
+    pthread_mutex_lock(&tp->control_lock);
     uint32_t type = 0, bytes = 0;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
         type != DS4_TP_FRAME_LOGITS || bytes != count * sizeof(float)) {
         fprintf(stderr, "ds4-tp: bad logits frame (type %u bytes %u)\n", type, bytes);
+        pthread_mutex_unlock(&tp->control_lock);
         return 0;
     }
-    return tp_read_full(tp->control_fd, half, count * sizeof(float));
+    const int ok = tp_read_full(tp->control_fd, half, count * sizeof(float));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
 }
 
 int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
                        const int *drafts, uint32_t n) {
-    return tp_send_token_command(tp, DS4_TP_FRAME_VERIFY, session_id,
-                                 drafts, n);
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_token_command(tp, DS4_TP_FRAME_VERIFY, session_id,
+                                         drafts, n);
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
 }
 
 int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t mode, int32_t token_count) {
     struct { int32_t mode; int32_t count; } msg = { mode, token_count };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_VERIFY_COMMIT,
-                         &msg, sizeof(msg));
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_VERIFY_COMMIT,
+                                 &msg, sizeof(msg));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
 }
 
 int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *mode, int32_t *token_count) {
+    pthread_mutex_lock(&tp->control_lock);
     uint32_t type = 0, bytes = 0;
     struct { int32_t mode; int32_t count; } msg;
     if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
@@ -2948,17 +3152,21 @@ int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *mode, int32_t *token_count) {
         !tp_read_full(tp->control_fd, &msg, sizeof(msg))) {
         fprintf(stderr, "ds4-tp: bad verify-commit frame (type %u bytes %u)\n",
                 type, bytes);
+        pthread_mutex_unlock(&tp->control_lock);
         return 0;
     }
     *mode = msg.mode;
     *token_count = msg.count;
+    pthread_mutex_unlock(&tp->control_lock);
     return 1;
 }
 
 int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t errlen) {
     struct { uint64_t seq; uint64_t hash; } mine = { seq, hash }, theirs;
+    pthread_mutex_lock(&tp->control_lock);
     if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_HASH, &mine, sizeof(mine))) {
         tp_set_err(err, errlen, "tp: hash send failed");
+        pthread_mutex_unlock(&tp->control_lock);
         return 0;
     }
     uint32_t type = 0, bytes = 0;
@@ -2966,6 +3174,7 @@ int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t
         type != DS4_TP_FRAME_HASH || bytes != sizeof(theirs) ||
         !tp_read_full(tp->control_fd, &theirs, sizeof(theirs))) {
         tp_set_err(err, errlen, "tp: hash recv failed");
+        pthread_mutex_unlock(&tp->control_lock);
         return 0;
     }
     if (theirs.seq != seq || theirs.hash != hash) {
@@ -2973,8 +3182,10 @@ int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t
                    "tp: LOCKSTEP DIVERGENCE at seq %llu: local %016llx peer %016llx",
                    (unsigned long long)seq,
                    (unsigned long long)hash, (unsigned long long)theirs.hash);
+        pthread_mutex_unlock(&tp->control_lock);
         return -1;
     }
+    pthread_mutex_unlock(&tp->control_lock);
     return 1;
 }
 
@@ -3130,6 +3341,14 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             continue;
         }
 
+        if (command.type == DS4_TP_FRAME_CANCEL) {
+            /* A late cancel lost the race with the sync it targeted. That sync
+             * has already completed and been acknowledged, so this frame is a
+             * harmless no-op and intentionally has no acknowledgement. */
+            ds4_tp_command_free(&command);
+            continue;
+        }
+
         ds4_session *session =
             tp_worker_session_find(&sessions, command.session_id);
         if (command.type != DS4_TP_FRAME_EVAL_BATCH &&
@@ -3149,16 +3368,31 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             for (uint32_t i = 0; i < command.n_tokens; i++) {
                 ds4_tokens_push(&prompt, command.tokens[i]);
             }
+            tp_worker_cancel_state cancel_state = {
+                .tp = tp,
+                .session_id = command.session_id,
+                .cancelled = false,
+                .broken = false,
+            };
+            ds4_session_set_cancel(session, tp_worker_prefill_cancelled,
+                                   &cancel_state);
             int sync_rc = command.type == DS4_TP_FRAME_SYNC_MULTIMODAL ?
                 ds4_session_sync_multimodal(session, &prompt,
                                             command.images, command.n_images,
                                             err, sizeof(err)) :
                 ds4_session_sync(session, &prompt, err, sizeof(err));
+            ds4_session_set_cancel(session, NULL, NULL);
             if (!ds4_tp_send_command_ack(tp, command.session_id, sync_rc)) {
                 rc = 1;
+            } else if (sync_rc == DS4_SESSION_SYNC_INTERRUPTED) {
+                ds4_log(stderr, DS4_LOG_KVCACHE,
+                        "tp worker sync: cancelled by leader; checkpoint kept at %d",
+                        ds4_session_pos(session));
             } else if (sync_rc != 0) {
-                ds4_log(stderr, DS4_LOG_ERROR, "tp worker sync: %s", err);
-                rc = 1;
+                ds4_log(stderr, DS4_LOG_ERROR,
+                        "tp worker sync: %s (session invalidated, worker continuing)",
+                        err);
+                ds4_session_invalidate(session);
             } else if (ds4_engine_tp_vocab_split(engine) &&
                        !tp_worker_send_logits(tp, session, logits, vocab)) {
                 rc = 1;
@@ -3185,7 +3419,34 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
                 rc = 1;
             }
         } else if (command.type == DS4_TP_FRAME_REWIND) {
-            ds4_session_rewind(session, command.value);
+            /* Obey the leader's mode rather than re-deriving one, then report
+             * what was actually applied -- not that the frame was received.
+             * The leader compares the two and invalidates both ranks if they
+             * differ, so a restore this rank could not perform must come back
+             * as INVALIDATE.  See ds4_tp_rewind_mode. */
+            const bool want = command.flags == DS4_TP_REWIND_KEEP;
+            ds4_session_rewind_mode(session, command.value, want);
+            const int status = ds4_tp_rewind_ack_status(
+                want, command.value, ds4_session_reusable_pos(session));
+            if (!ds4_tp_send_command_ack(tp, command.session_id, status)) rc = 1;
+        } else if (command.type == DS4_TP_FRAME_ROLLBACK_CAPTURE) {
+            /* Capture only where the leader says, and only if we are where it
+             * thinks we are.  A position mismatch means the two ranks are not
+             * at the same frontier, which is the one thing the snapshot
+             * protocol assumes; refuse rather than record a snapshot the leader
+             * would later ask us to restore from the wrong place. */
+            int status = 0;
+            if (ds4_session_pos(session) != command.value) {
+                fprintf(stderr,
+                        "ds4: tp: rollback capture at %d but this rank is at "
+                        "%d; refusing\n",
+                        command.value, ds4_session_pos(session));
+                status = 1;
+            } else if (!ds4_session_glm53_rollback_capture(session)) {
+                status = 1;
+            }
+            if (status != 0) ds4_session_glm53_rollback_drop(session);
+            if (!ds4_tp_send_command_ack(tp, command.session_id, status)) rc = 1;
         } else if (command.type == DS4_TP_FRAME_INVALIDATE) {
             ds4_session_invalidate(session);
         } else if (command.type == DS4_TP_FRAME_EVAL_BATCH ||

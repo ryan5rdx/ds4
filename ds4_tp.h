@@ -110,6 +110,10 @@ bool ds4_tp_is_rdma(const ds4_tp *tp);
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp);
 bool ds4_tp_failed(const ds4_tp *tp);
 void ds4_tp_mark_failed(ds4_tp *tp);
+/* Serialize control-channel command/ack transactions. The mutex is recursive
+ * so helpers can be used while a caller holds the transaction lock. */
+void ds4_tp_control_lock(ds4_tp *tp);
+void ds4_tp_control_unlock(ds4_tp *tp);
 
 /* Gate slab.  The engine allocates one shared GPU-visible block and hands
  * its base VA here; ds4_tp registers it with the NIC (RDMA) and exchanges
@@ -177,8 +181,43 @@ int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token);
 int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
                        uint64_t seq, int token, int limit);
-int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
+/* How a mirrored rewind must leave the checkpoint.  The leader decides and
+ * sends it rather than each rank deciding locally: on GLM-5.3 the decision
+ * depends on whether a rollback snapshot covers `pos`, and a rank that stopped
+ * exactly at `pos` would otherwise keep a checkpoint the other rank drops.
+ * INVALIDATE is always safe, so it is the value to send when in doubt.
+ *
+ * KEEP means "the checkpoint is still reusable at pos", NOT "GLM-5.3 restored a
+ * snapshot".  Those are the same thing only on GLM-5.3; an ordinary truncating
+ * rewind on Flash or GLM-5.2 also keeps it.  Conflating the two made the leader
+ * send INVALIDATE for every non-GLM-5.3 rewind while both ranks actually kept
+ * their checkpoints, so the ack never matched and both were invalidated. */
+typedef enum {
+    DS4_TP_REWIND_INVALIDATE = 0,
+    DS4_TP_REWIND_KEEP       = 1,
+} ds4_tp_rewind_mode;
+
+int ds4_tp_send_rewind_mode(ds4_tp *tp, uint64_t session_id, int pos,
+                            ds4_tp_rewind_mode mode);
+/* Acknowledged; the ack status is 0 when the worker captured at `pos`. */
+int ds4_tp_send_rollback_capture(ds4_tp *tp, uint64_t session_id, int pos);
+
+/* Ack status a worker must report for a mirrored rewind: 0 iff it applied the
+ * outcome the leader asked for, non-zero otherwise.
+ *
+ * The ack channel reserves 0 for success and the reader rejects every other
+ * value, so the *applied mode* cannot be encoded in the status -- doing that
+ * made a successful KEEP (mode 1) read as a failed command, and the leader fell
+ * into invalidate-both every single time.  Exposed so that stays a tested
+ * property rather than a comment.
+ *
+ * `want_keep` is model-independent: the expected reusable position is `pos` for
+ * a keep (ordinary rewind or GLM-5.3 restore alike) and 0 for an invalidation. */
+int ds4_tp_rewind_ack_status(bool want_keep, int requested_pos,
+                             int reusable_pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
+/* Abort a mirrored prefill that is still executing for this session. */
+int ds4_tp_send_cancel(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
                            uint32_t count);
 int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
@@ -188,6 +227,9 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
 int ds4_tp_send_command_ack(ds4_tp *tp, uint64_t session_id, int status);
 int ds4_tp_wait_command_ack(ds4_tp *tp, uint64_t session_id,
                             const char *operation, char *err, size_t errlen);
+int ds4_tp_wait_command_ack_status(ds4_tp *tp, uint64_t session_id,
+                                   const char *operation, int *status_out,
+                                   char *err, size_t errlen);
 int ds4_tp_send_stop(ds4_tp *tp);
 
 /* Worker: blocks for the next mirrored command.  Frame types below; for
@@ -216,6 +258,23 @@ typedef enum {
     DS4_TP_FRAME_RDMA_WARM = 19,
     DS4_TP_FRAME_RDMA_POSTED = 20,
     DS4_TP_FRAME_GLM_MTP = 21,
+    /* Leader -> worker, valid only while the worker is executing a mirrored
+     * SYNC.  The prefill cancel predicate is host-side and leader-only, so
+     * without this the worker keeps prefilling chunks whose gates the leader
+     * has already stopped sending and eats a bounded fence timeout per chunk.
+     * On receipt the worker stops at its next chunk boundary, leaving its
+     * checkpoint at the pre-sync length the leader also holds. */
+    DS4_TP_FRAME_CANCEL = 22,
+    /* Leader -> worker, acknowledged.  Take a GLM-5.3 rollback snapshot at
+     * `value`, which must be the worker's current frontier.
+     *
+     * The worker must NOT capture on its own at the end of its sync.  If it
+     * did, a sync the worker finished while the leader was cancelled would
+     * overwrite the previous frontier's snapshot -- the exact one the leader is
+     * about to ask it to restore, because the leader rewinds to its pre-sync
+     * length.  Capturing only on this command keeps the two snapshots at the
+     * same frontier at all times. */
+    DS4_TP_FRAME_ROLLBACK_CAPTURE = 23,
 } ds4_tp_frame_type;
 
 typedef struct {
@@ -223,6 +282,7 @@ typedef struct {
     uint64_t session_id;
     uint64_t seq;
     int value;
+    uint32_t flags;
     int limit;
     int *tokens;
     uint32_t n_tokens;

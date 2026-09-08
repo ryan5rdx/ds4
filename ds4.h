@@ -557,8 +557,43 @@ void ds4_session_invalidate(ds4_session *s);
  * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
+/* checkpoint.len, but 0 when the checkpoint has been invalidated.  Use this,
+ * not ds4_session_pos(), for any cache-reuse decision or cache diagnostic:
+ * a GLM-5.3 rewind leaves the length set on an invalid checkpoint. */
+int ds4_session_reusable_pos(ds4_session *s);
+/* The live token vector, or NULL when the checkpoint has been invalidated.
+ * Companion to ds4_session_reusable_pos(); ds4_session_tokens() hands back the
+ * stale vector regardless of validity. */
+const ds4_tokens *ds4_session_reusable_tokens(ds4_session *s);
+/* Apply a rewind whose GLM-5.3 restore-vs-invalidate outcome was decided by
+ * the TP leader.  Workers only; everyone else calls ds4_session_rewind(). */
+void ds4_session_rewind_mode(ds4_session *s, int pos, bool want_restore);
+/* GLM-5.3 rollback snapshot at the current frontier.  A TP worker calls these
+ * only from the mirrored DS4_TP_FRAME_ROLLBACK_CAPTURE handler -- capturing
+ * from its own sync would overwrite the frontier the leader may rewind to. */
+bool ds4_session_glm53_rollback_capture(ds4_session *s);
+void ds4_session_glm53_rollback_drop(ds4_session *s);
+/* Suppress rollback capture for the duration of an INTERNAL sync -- one that
+ * advances the session past the prompt the client sent (tool-recovery suffix,
+ * canonical rewrite, cold-checkpoint prefix).  The next request will not carry
+ * the tokens those add, so a snapshot at their frontier falls outside its
+ * common prefix and is unusable; the snapshot must stay pinned at the external
+ * prompt frontier.  Always pair with a matching `false`. */
+void ds4_session_rollback_hold(ds4_session *s, bool hold);
+/* Test-only hook for the otherwise hard-to-reach canonical rebuild path. */
+void ds4_session_force_canon_rebuild(ds4_session *s, bool force);
+/* The one position a GLM-5.3 rewind can restore rather than re-prefill, or -1
+ * if there is none.  A caller choosing a rewind target should prefer this over
+ * a deeper one whenever it still lies inside the common prefix: on GLM-5.3 any
+ * other target costs the whole conversation. */
+int ds4_session_rollback_frontier(ds4_session *s);
+/* Bytes the rollback snapshot costs PER SESSION (0 when it does not apply).
+ * Every resident slot that has synced holds one, so multiply by slot count. */
+uint64_t ds4_glm53_rollback_session_bytes(void);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
+uint32_t ds4_session_raw_rewind_budget(const ds4_session *s);
+uint32_t ds4_session_rewind_align(const ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);

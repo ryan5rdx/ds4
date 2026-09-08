@@ -9861,6 +9861,78 @@ static void request_live_state_clear(server *s, server_slot *slot) {
     thinking_live_clear(s, slot);
 }
 
+/* Where a cancelled generation should land the session.
+ *
+ * ALWAYS the frontier of the prompt the client actually sent.  This function is
+ * only reached when the turn was not delivered, so the retry will send that
+ * same prompt again and nothing past it can be reused -- see the caller, whose
+ * comment has said so all along: "The client never received this turn, so it
+ * will retry without it."
+ *
+ * That is why every internal sync is held (ds4_session_rollback_hold): the
+ * rollback snapshot must still be sitting at this frontier when we get here.
+ * A previous revision let canonicalization move the snapshot forward, on the
+ * (true) grounds that the canonical frontier matches what a client replays --
+ * but only for a turn the client received.  Following it here pointed the
+ * rewind at tokens the retry does not contain, so the rewind was rejected and
+ * the whole conversation re-prefilled: the exact regression this path exists to
+ * prevent.
+ *
+ * GLM-5.3 lands on the frontier exactly, because the restored snapshot carries
+ * the logits.  Everything else has none: landing exactly would give an
+ * identical retry nothing to evaluate -- ds4_session_sync() runs zero forward
+ * passes when the prompt equals the checkpoint -- so it would sample logits
+ * left behind by the cancelled generation and calmly resume producing the
+ * output that was just cancelled.  Leave it one token to re-evaluate, the way
+ * live_prefix_rewind_target() caps at prompt_len - 1. */
+static int cancel_rollback_target(bool is_glm53, int committed_frontier) {
+    if (committed_frontier <= 0) return 0;
+    return is_glm53 ? committed_frontier : committed_frontier - 1;
+}
+
+static void request_cancel_rollback(server *s, server_slot *slot,
+                                    int committed_frontier) {
+    request_live_state_clear(s, slot);
+    /* Where to land.
+     *
+     * GLM-5.3 rewinds to the frontier exactly: ds4_session_rewind() restores
+     * the rollback snapshot taken at that same frontier by the prompt sync,
+     * and the snapshot carries the logits, so the retry samples the logits the
+     * prompt produced rather than the abandoned generation's.
+     *
+     * Everything else has no snapshot and no restored logits, so landing on the
+     * frontier exactly would leave the next identical retry with nothing to
+     * evaluate -- ds4_session_sync() does zero forward passes when the prompt
+     * equals the checkpoint -- and it would sample stale logits and simply
+     * carry on producing the output that was just cancelled.  Give it a token
+     * to re-evaluate, the same way live_prefix_rewind_target() caps at
+     * prompt_len - 1. */
+    const int target = cancel_rollback_target(ds4_engine_is_glm53(s->engine),
+                                              committed_frontier);
+    pthread_mutex_lock(&s->inference_mu);
+    /* Safe to rewind under tensor parallelism as well, because this is only
+     * reachable once the prompt sync has *succeeded*: an interrupted or failed
+     * sync returns long before committed_frontier is captured, and the leader
+     * only gets past ds4_session_sync() when the worker acked success.  From
+     * that shared position both ranks move together -- decode appends mirror
+     * per token, and canonicalize_tool_checkpoint() mutates only through
+     * ds4_session_sync()/ds4_session_invalidate(), which mirror too -- so both
+     * are at the same length here and clamp the same way. */
+    ds4_session_rewind(slot->session, target);
+    /* Clamp against where the rewind actually landed, not what was asked for:
+     * it snaps down to a compressor-window boundary and can end below
+     * committed_frontier. */
+    const int landed = ds4_session_reusable_pos(slot->session);
+    pthread_mutex_unlock(&s->inference_mu);
+    /* The rewind also un-does the continued-store high-water mark: leaving it
+     * above the frontier makes the next generation skip its disk snapshot at
+     * that boundary, because the retry now cache-hits and the cached == 0 reset
+     * no longer fires. */
+    if (slot->continued_last_store_tokens > landed) {
+        slot->continued_last_store_tokens = landed;
+    }
+}
+
 static bool responses_live_has_call_id(server *s, const char *id) {
     if (!s || !id || !id[0]) return false;
     pthread_mutex_lock(&s->tool_mu);
@@ -10782,7 +10854,7 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
 static void kv_cache_store_current(server *s, server_slot *slot,
                                    const char *reason) {
     if (!s || !slot) return;
-    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+    const ds4_tokens *tokens = ds4_session_reusable_tokens(slot->session);
     if (!tokens) return;
 
     char *visible_text = NULL;
@@ -10888,7 +10960,7 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!s || !slot) return;
     kv_disk_cache *kc = &s->kv;
-    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+    const ds4_tokens *tokens = ds4_session_reusable_tokens(slot->session);
     if (!tokens) return;
     const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
     if (target == 0) return;
@@ -11003,7 +11075,11 @@ static int live_text_prefix_prompt(server *s, server_slot *slot,
                                    const request *req,
                                    ds4_tokens *effective_prompt) {
     if (!s || !slot || !req || !req->prompt_text || !effective_prompt) return 0;
-    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
+    /* Reusable, not raw.  An invalidated GLM-5.3 checkpoint keeps its tokens,
+     * and rendering them would produce a byte-prefix match and a non-zero
+     * return -- a phantom hit that recreates the mislabelled ctx span and the
+     * stuck progress bar, and suppresses the disk fallback below it. */
+    const ds4_tokens *live_tokens = ds4_session_reusable_tokens(slot->session);
     if (!live_tokens || live_tokens->len <= 0) return 0;
 
     size_t live_text_len = 0;
@@ -11239,8 +11315,19 @@ static void trace_cache_capture(
     memset(d, 0, sizeof(*d));
     d->valid = true;
     d->rewind_to = -1;
+    /* Reconcile old_pos against the token vector we were actually handed,
+     * rather than trusting it.  Callers source it from a session, and an
+     * invalidated GLM-5.3 checkpoint reports a stale length while
+     * ds4_session_reusable_tokens() correctly reports nothing -- pairing those
+     * two is what produced "leading-block-divergence diverge=154822/154822",
+     * a divergence at index 0 between two identical tokens.  Deriving the
+     * bound here makes that combination unrepresentable. */
+    const int live_avail = live ? live->len : 0;
+    if (old_pos > live_avail) old_pos = live_avail;
+    if (old_pos < 0) old_pos = 0;
     d->old_pos = old_pos;
     d->prompt_len = prompt ? prompt->len : 0;
+    if (common > old_pos) common = old_pos;
     d->common = common;
 
     const int live_len = live ? live->len : 0;
@@ -11266,9 +11353,25 @@ static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
     if (!d || !d->valid) return "unknown";
     if (d->old_pos == 0) return "no-live-checkpoint";
     if (d->rewind_to >= 0) return "live-prefix-rewind";
-    if (d->common != d->old_pos) return "token-mismatch";
+    if (d->common != d->old_pos) {
+        if (d->common < d->old_pos / 8) return "leading-block-divergence";
+        if (d->old_pos - d->common > d->old_pos / 8)
+            return "mid-prefix-divergence";
+        return "token-mismatch";
+    }
     if (d->prompt_len < d->old_pos) return "incoming-prompt-shorter-than-live-checkpoint";
     return "live-prefix-match";
+}
+
+static void trace_cache_diverge_tokens(const trace_cache_diag *d,
+                                       int *live_tok, int *prompt_tok) {
+    *live_tok = -1;
+    *prompt_tok = -1;
+    if (!d || !d->valid) return;
+    const int idx = d->common - d->start;
+    if (idx < 0 || idx >= d->count) return;
+    *live_tok = d->live_id[idx];
+    *prompt_tok = d->prompt_id[idx];
 }
 
 static bool trace_cache_memory_reusable(const trace_cache_diag *d) {
@@ -11378,11 +11481,94 @@ static void trace_write_cache_diag(
     }
 }
 
+/* Where to rewind the live session so the incoming prompt can be extended,
+ * or -1 when there is nothing to gain.  Two shapes:
+ *
+ *   shrinking  common == prompt_len < old_pos.  The prompt is a strict prefix
+ *              of the checkpoint (retry/regenerate).  Target prompt_len - 1, so
+ *              the sync that follows still has a token to evaluate for logits.
+ *
+ *   diverging  common < prompt_len.  The prompt shares a prefix and then
+ *              differs -- the shape an agentic client produces constantly, e.g.
+ *              a completed assistant turn the user abandoned:
+ *                live=50561 prompt=49326 common=49274
+ *              Reuse [0, common) instead of scoring zero and re-prefilling all
+ *              49326 tokens to avoid re-evaluating 52.
+ *
+ * The caller is responsible for the raw-cache budget; see the discard
+ * computation at the call site.  It must be measured as old_pos - common, the
+ * tail actually thrown away, which for the shrinking shape equals
+ * old_pos - prompt_len and for the diverging shape is larger. */
+/* Can this backend reuse anything after a rewind?
+ *
+ * Three cases, and the middle one is the trap:
+ *
+ *   GLM-5.2  yes -- the dense KV cache truncates cleanly.
+ *   GLM-5.3  only at ONE position: the rollback frontier.  Its KDA layers hold
+ *            a running recurrence rather than a per-token cache, so a rewind
+ *            anywhere else has nothing to truncate and drops the checkpoint,
+ *            leaving checkpoint.len == pos on an invalid checkpoint -- a prefix
+ *            ds4_session_pos() reports and the next sync will not honour.
+ *            `rollback_frontier` is that position, or negative when there is
+ *            no snapshot.  See live_prefix_rewind_target(), which is what
+ *            actually confines the target to it.
+ *   Flash    only while the discarded tail has not wrapped a ring row the
+ *            rewound tail still needs.
+ *
+ * Split out from the call site so the GLM-5.3 restriction is a tested property
+ * rather than a clause someone can reorder. */
+static bool live_prefix_backend_can_rewind(bool is_glm, bool is_glm53,
+                                           uint32_t raw_budget,
+                                           uint32_t align_slack,
+                                           uint32_t discard,
+                                           int rollback_frontier) {
+    if (is_glm) return is_glm53 ? rollback_frontier > 0 : true;
+    return raw_budget > align_slack && discard > 0 &&
+           discard + align_slack < raw_budget;
+}
+
 static int live_prefix_rewind_target(bool backend_can_rewind,
-                                     int old_pos, int prompt_len, int common) {
-    if (!backend_can_rewind || prompt_len <= 1 || prompt_len >= old_pos) return -1;
-    if (common != prompt_len) return -1;
-    return prompt_len - 1;
+                                     int old_pos, int prompt_len, int common,
+                                     int rollback_frontier) {
+    if (!backend_can_rewind || prompt_len <= 1 || old_pos <= 0) return -1;
+    if (common <= 0) return -1;
+    /* Kill switch.  This path is default-on and it is the one that increases
+     * mirrored REWIND traffic under TP, so it needs to be removable without a
+     * rebuild when bisecting a control-plane fault. */
+    {
+        static int disabled = -1;
+        if (disabled < 0) disabled = getenv("DS4_DISABLE_LIVE_PREFIX_REWIND") != NULL;
+        if (disabled) return -1;
+    }
+    /* The whole checkpoint already matches: the plain prefix-match path scores
+     * that higher than any rewind.
+     *
+     * This MUST stay ahead of the GLM-5.3 snapshot branch below.  An ordinary
+     * multi-turn append arrives here with common == old_pos and a snapshot
+     * sitting at the PREVIOUS prompt frontier, far below both; the snapshot
+     * branch would happily "rewind" there and re-prefill the answer the session
+     * already holds.  That is the single most common request shape there is. */
+    if (common >= old_pos) return -1;
+    /* GLM-5.3 can only land on its rollback frontier; anywhere else drops the
+     * checkpoint and re-prefills the conversation, which is strictly worse than
+     * not rewinding.  Take it when it is still inside what the two sides share
+     * -- for a follow-up that diverges inside the previous assistant turn, that
+     * turns a full re-prefill into one of the generated tail. */
+    if (rollback_frontier > 0) {
+        /* `> prompt_len`, not `>=`.  Ordinary rewinds must leave a token to
+         * re-evaluate because a zero-token sync samples whatever logits were
+         * left behind; this snapshot restores the logits too, so landing
+         * exactly on prompt_len is correct and reuses the entire prompt. */
+        if (rollback_frontier > common || rollback_frontier >= old_pos ||
+            rollback_frontier > prompt_len) {
+            return -1;
+        }
+        return rollback_frontier;
+    }
+    /* Reached only by the non-GLM-5.3 backends. */
+    const int target = common < prompt_len ? common : prompt_len - 1;
+    if (target <= 0 || target >= old_pos) return -1;
+    return target;
 }
 
 static void trace_time(FILE *fp) {
@@ -11850,7 +12036,7 @@ static int server_session_sync(server *s, server_slot *slot,
     }
 
     pthread_mutex_lock(&s->inference_mu);
-    int live = ds4_session_pos(slot->session);
+    int live = ds4_session_reusable_pos(slot->session);
     int common = ds4_session_common_prefix(slot->session, prompt);
     pthread_mutex_unlock(&s->inference_mu);
     int done = common == live && prompt->len >= live ? live : 0;
@@ -11972,7 +12158,7 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
                                                    char *err, size_t errlen) {
     if (tokens_appended) *tokens_appended = 0;
     if (!s || !slot || !suffix || !suffix[0]) return true;
-    const ds4_tokens *live = ds4_session_tokens(slot->session);
+    const ds4_tokens *live = ds4_session_reusable_tokens(slot->session);
     if (!live) {
         if (err && errlen) snprintf(err, errlen, "live session is unavailable");
         return false;
@@ -11981,7 +12167,14 @@ static bool append_rendered_suffix_to_live_session(server *s, server_slot *slot,
     ds4_tokens target = {0};
     build_prompt_from_exact_prefix_and_text_suffix(s->engine, live, suffix, &target);
     const int before = ds4_session_pos(slot->session);
+    /* Internal: the tokens this appends are ours, not the client's, so the next
+     * request will not contain them.  A rollback snapshot taken at this
+     * frontier would sit outside that request's common prefix and be rejected,
+     * turning a recoverable cancel into a full re-prefill.  Keep the snapshot
+     * pinned where the client's prompt ended. */
+    ds4_session_rollback_hold(slot->session, true);
     bool ok = server_session_sync(s, slot, &target, err, errlen) == 0;
+    ds4_session_rollback_hold(slot->session, false);
     if (ok && tokens_appended) {
         int delta = ds4_session_pos(slot->session) - before;
         *tokens_appended = delta > 0 ? delta : 0;
@@ -12286,6 +12479,26 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                                          const char *reasoning, const tool_calls *calls) {
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
 
+    /* Make the rebuild branch reachable in end-to-end rollback tests. The
+     * renderer otherwise replays raw tool bytes exactly and exits early. */
+    tool_calls forced_calls;
+    static int force_canon_rebuild = -1;
+    if (force_canon_rebuild < 0) {
+        const char *value = getenv("DS4_SERVER_TEST_FORCE_CANON_REBUILD");
+        force_canon_rebuild = value ? atoi(value) : 0;
+    }
+    bool forced = false;
+    if (force_canon_rebuild > 0) {
+        force_canon_rebuild--;
+        forced = true;
+        forced_calls = *calls;
+        forced_calls.raw_tool_text = NULL;
+        calls = &forced_calls;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: TEST HOOK forcing canonical rebuild (%d remaining)",
+                   force_canon_rebuild);
+    }
+
     char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
 
     buf rendered = {0};
@@ -12294,13 +12507,13 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
 
     ds4_tokens canonical = {0};
     ds4_tokenize_rendered_chat(s->engine, rendered.ptr ? rendered.ptr : "", &canonical);
-    const int live_len = ds4_session_pos(slot->session);
+    const int live_len = ds4_session_reusable_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &canonical);
     if (common == live_len && canonical.len == live_len) goto done;
 
     size_t live_text_len = 0;
     char *live_text = render_tokens_text(s->engine,
-                                         ds4_session_tokens(slot->session),
+                                         ds4_session_reusable_tokens(slot->session),
                                          &live_text_len);
     if (live_text_len == rendered.len &&
         (live_text_len == 0 || memcmp(live_text, rendered.ptr, live_text_len) == 0))
@@ -12335,9 +12548,22 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
 
     char err[160] = {0};
     pthread_mutex_lock(&s->inference_mu);
+    /* Held for the whole rewrite.  The hold suppresses rollback *capture*, so
+     * the append-only branch -- which syncs internally -- leaves the snapshot
+     * sitting at the client's prompt frontier, where the cancel rollback needs
+     * it if the response write then fails.
+     *
+     * It does NOT survive the REBUILD_NEEDED branch: that invalidates, and the
+     * drop is unconditional on both ranks by design (see
+     * ds4_session_invalidate() -- preserving it was coordinator-only and could
+     * brick the TP pair).  A REBUILD-canonicalized turn therefore has no
+     * rollback point; that is a known gap, not an oversight. */
+    ds4_session_rollback_hold(slot->session, true);
+    if (forced) ds4_session_force_canon_rebuild(slot->session, true);
     ds4_session_rewrite_result rr =
         ds4_session_rewrite_from_common(slot->session, &canonical, common,
                                         err, sizeof(err));
+    if (forced) ds4_session_force_canon_rebuild(slot->session, false);
     pthread_mutex_unlock(&s->inference_mu);
     if (rr == DS4_SESSION_REWRITE_OK) {
         server_log(DS4_LOG_KVCACHE,
@@ -12410,8 +12636,14 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(slot->session, server_progress_cb, &rebuild_progress);
         ds4_session_set_display_progress(slot->session, server_progress_cb, &rebuild_progress);
-        if (server_session_sync(s, slot, sync_prompt,
-                                sync_err, sizeof(sync_err)) == 0) {
+        /* Still held, so this sync will not capture a NEW snapshot at the
+         * canonical frontier -- but the invalidate just above already dropped
+         * the old one, on both ranks.  So a turn canonicalized down this branch
+         * ends with no rollback point at all, and a cancel after it costs a
+         * full re-prefill.  Known gap; see ds4_session_invalidate(). */
+        const int rebuild_rc = server_session_sync(s, slot, sync_prompt,
+                                                   sync_err, sizeof(sync_err));
+        if (rebuild_rc == 0) {
             ds4_session_set_progress(slot->session, NULL, NULL);
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             const double rebuild_sec = now_sec() - rebuild_t0;
@@ -12449,13 +12681,20 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     }
 
 done:
+    /* Unconditional, and after both branches: every `goto done` above either
+     * never took the hold or must release it.  Leaving it set would silently
+     * disable rollback capture for the rest of the session. */
+    ds4_session_rollback_hold(slot->session, false);
     ds4_tokens_free(&canonical);
     buf_free(&rendered);
     free(suffix_text);
 }
 
-static bool should_canonicalize_tool_checkpoint(const server *s, const tool_calls *calls) {
+static bool should_canonicalize_tool_checkpoint(const server *s,
+                                                const tool_calls *calls,
+                                                bool recovery_attempted) {
     if (!calls || calls->len == 0) return false;
+    if (recovery_attempted) return true;
     if (s && !s->disable_exact_dsml_tool_replay &&
         calls->raw_tool_text && calls->raw_tool_text[0])
     {
@@ -12675,14 +12914,18 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     err[0] = '\0';
     const bool multimodal = j->req.image_count != 0;
     pthread_mutex_lock(&s->inference_mu);
-    const int old_pos = ds4_session_pos(slot->session);
+    /* Reusable, not raw: an invalidated checkpoint can retain its token vector
+     * even though no backend state is reusable. */
+    const int old_pos = ds4_session_reusable_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
     const bool live_vision_match =
         ds4_session_vision_prefix_matches(slot->session,
                                          j->req.images, j->req.image_count);
     pthread_mutex_unlock(&s->inference_mu);
+    /* Captured after the prompt sync and before generation appends tokens. */
+    int committed_frontier = 0;
     trace_cache_diag cache_diag = {0};
-    trace_cache_capture(&cache_diag, ds4_session_tokens(slot->session),
+    trace_cache_capture(&cache_diag, ds4_session_reusable_tokens(slot->session),
                         &j->req.prompt, old_pos, common);
     ds4_tokens effective_prompt = {0};
     const ds4_tokens *prompt_for_sync = &j->req.prompt;
@@ -12763,31 +13006,84 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
     } else if (cached == 0 && live_vision_match) {
+        const bool is_glm = ds4_engine_is_glm_dsa(s->engine);
+        /* GLM-5.2's dense KV cache can always rewind: ds4_session_glm_cap_dense_cache()
+         * keeps it consistent. Flash's raw SWA cache is a ring buffer instead
+         * (see ds4_session_raw_rewind_budget()), so only rewind it while the
+         * discarded tail is still guaranteed not to have wrapped a row the
+         * rewound tail will need. */
+        /* GLM-5.3 is neither: its KDA layers hold a running recurrence rather
+         * than a per-token cache, so a rewind to an arbitrary position has
+         * nothing to truncate and drops the checkpoint outright, leaving the
+         * next ds4_session_sync() to re-prefill from zero.  It still sets
+         * checkpoint.len = pos, so ds4_session_pos() reports a reusable prefix
+         * that is worth nothing.  Claiming it is actively harmful: the request
+         * logs a short ctx span for a full-length prefill, reports a bogus
+         * cache_read, renders a progress bar that sits at 0% until the engine
+         * passes the phantom offset, and -- because every remaining recovery
+         * path below is gated on `cached == 0` -- suppresses the
+         * thinking-visible, live-text and disk lookups that could produce a
+         * real hit.
+         *
+         * The one exception is the rollback frontier, where a snapshot lets the
+         * rewind restore.  For a follow-up that diverges inside the previous
+         * assistant turn -- a stripped think block, a re-rendered tool call --
+         * that turns a full re-prefill into one of the generated tail. */
+        const bool is_glm53 = ds4_engine_is_glm53(s->engine);
+        const int rollback_frontier = is_glm53 ?
+            ds4_session_rollback_frontier(slot->session) : -1;
+        const uint32_t raw_budget = is_glm ? 0 : ds4_session_raw_rewind_budget(slot->session);
+        /* Budget against the tail actually discarded, old_pos - common, not
+         * old_pos - prompt_len.  They coincide for a shrinking prompt; for one
+         * that diverges before its end the discard is larger and using the
+         * smaller number would authorise a rewind past rows the ring has
+         * already overwritten.  This is the bound whose absence corrupted a
+         * compaction: there the discard is tens of thousands of tokens and the
+         * budget correctly refuses, while an abandoned assistant turn discards
+         * ~1.3k against a 4224 budget and is safely reusable. */
+        const uint32_t discard = old_pos > common ? (uint32_t)(old_pos - common) : 0u;
+        /* ds4_session_rewind() snaps down to a compressor-window boundary, so
+         * the tail it actually discards can exceed old_pos - common by up to
+         * one alignment.  Charge that against the ring budget here rather than
+         * discovering it as an over-deep rewind. */
+        const uint32_t align_slack = is_glm ? 0u :
+            ds4_session_rewind_align(slot->session) - 1u;
+        const bool can_rewind = live_prefix_backend_can_rewind(
+            is_glm, is_glm53, raw_budget, align_slack, discard,
+            rollback_frontier);
         const int rewind_to = live_prefix_rewind_target(
-            ds4_engine_is_glm_dsa(s->engine), old_pos,
-            j->req.prompt.len, common);
+            can_rewind, old_pos, j->req.prompt.len, common,
+            is_glm53 ? rollback_frontier : -1);
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_rewind(slot->session, rewind_to);
+            /* Read the landing position back: the alignment can put it below
+             * the requested one, and reporting the request as `cached` would
+             * claim rows the session no longer has. */
+            const int landed = ds4_session_reusable_pos(slot->session);
+            /* Validate the actual aligned landing position. It may be below
+             * rewind_to, so equality with the requested target is too strict. */
             const bool rewind_valid =
-                ds4_session_common_prefix(slot->session, &j->req.prompt) ==
-                    rewind_to &&
+                landed > 0 &&
+                ds4_session_common_prefix(slot->session, &j->req.prompt) >= landed &&
                 (!multimodal ||
                  ds4_session_vision_prefix_matches(slot->session,
                                                   j->req.images,
                                                   j->req.image_count));
             pthread_mutex_unlock(&s->inference_mu);
             if (rewind_valid) {
-                cached = rewind_to;
+                cached = landed;
                 cache_source = "memory-rewind";
-                cache_diag.rewind_to = rewind_to;
+                cache_diag.rewind_to = landed;
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
-                           old_pos, rewind_to);
+                           "ds4-server: rewound %s live prefix from %d to %d "
+                           "(requested %d); final prompt token will be reevaluated",
+                           is_glm ? "GLM" : "Flash", old_pos, landed, rewind_to);
             } else {
                 server_log(DS4_LOG_KVCACHE,
-                           "ds4-server: GLM live prefix rewind from %d to %d requires rebuild",
-                           old_pos, rewind_to);
+                           "ds4-server: %s live prefix rewind from %d to %d "
+                           "(requested %d) requires rebuild",
+                           is_glm ? "GLM" : "Flash", old_pos, landed, rewind_to);
             }
         } else {
             cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
@@ -12970,7 +13266,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
-        if (server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
+        /* Internal: a strict prefix of the prompt, synced only so the cold
+         * checkpoint lands on the right boundary.  The full sync follows and
+         * takes the snapshot at the real frontier. */
+        ds4_session_rollback_hold(slot->session, true);
+        const int cold_rc = server_session_sync(s, slot, &prefix, err, sizeof(err));
+        ds4_session_rollback_hold(slot->session, false);
+        if (cold_rc != 0) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
@@ -13023,6 +13325,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         return;
     }
     free(disk_cache_path);
+    committed_frontier = ds4_session_pos(slot->session);
     if (job_cancelled(j)) {
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
@@ -13497,7 +13800,7 @@ decode_again:
     server_generation_leave(s);
 
     if (job_cancelled(j)) {
-        request_live_state_clear(s, slot);
+        request_cancel_rollback(s, slot, committed_frontier);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
@@ -13623,7 +13926,7 @@ decode_again:
         free(tail);
     }
     if (job_cancelled(j)) {
-        request_live_state_clear(s, slot);
+        request_cancel_rollback(s, slot, committed_frontier);
         trace_event(s, trace_id, "cancelled while flushing generation");
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
@@ -13731,7 +14034,7 @@ decode_again:
             }
         }
         if (job_cancelled(j)) {
-            request_live_state_clear(s, slot);
+            request_cancel_rollback(s, slot, committed_frontier);
             trace_event(s, trace_id, "cancelled during response parsing");
             free(parsed_content);
             free(parsed_reasoning);
@@ -13755,7 +14058,7 @@ decode_again:
         }
     }
     if (job_cancelled(j)) {
-        request_live_state_clear(s, slot);
+        request_cancel_rollback(s, slot, committed_frontier);
         trace_event(s, trace_id, "cancelled before publishing response state");
         free(parsed_content);
         free(parsed_reasoning);
@@ -13818,16 +14121,40 @@ decode_again:
         }
     }
 
-    if (j->req.kind == REQ_CHAT && parsed_calls.len &&
+    /* Step 3 (recovery edge): the dsml_recovery_attempted case -- where the
+     * live checkpoint holds a hidden tool-error exchange the client never saw,
+     * which exact DSML replay cannot repair -- is folded into
+     * should_canonicalize_tool_checkpoint so the whole decision stays in one
+     * tested pure function. */
+    /* Chat/completions has no protocol object that binds the next request to
+     * this live KV state.  Canonicalize only the fallback tool-call path where
+     * we lack exact sampled DSML replay; when raw DSML is known, replaying
+     * those bytes keeps future prompts aligned without rebuilding hidden
+     * reasoning.  Responses deliberately skips this path because its
+     * previous_response_id contract binds the next turn to live state.
+     *
+     * Runs BEFORE the response is written, and must.  Deferring it until after
+     * delivery looked like it removed a family of cache bugs -- the session no
+     * longer advances past the client's prompt before a write that might fail
+     * -- but post-delivery work is not free to run here: disconnect
+     * cancellation stays armed until the job returns, so an ordinary client
+     * closing its socket after Content-Length or [DONE] cancels the rebuild;
+     * the rebuild's progress callback writes SSE keepalives after [DONE]; and
+     * the slot stays busy, so an immediate tool-result follow-up is routed to a
+     * different slot and the rebuild finishes somewhere nobody will use it.
+     *
+     * The cache bugs are instead fixed where they belong: the rollback snapshot
+     * is pinned at the client's prompt frontier across canonicalization
+     * (ds4_session_rollback_hold suppresses capture), so a write that fails
+     * afterwards still has somewhere to roll back to.  The REBUILD_NEEDED
+     * branch is the exception -- it invalidates, which drops the snapshot on
+     * both ranks -- and that case falls back to a full re-prefill. */
+    const bool want_canonicalize =
+        j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
-        should_canonicalize_tool_checkpoint(s, &parsed_calls))
-    {
-        /* Chat/completions has no protocol object that binds the next request
-         * to this live KV state.  Canonicalize only the fallback tool-call
-         * path where we lack exact sampled DSML replay; when raw DSML is known,
-         * replaying those bytes keeps future prompts aligned without rebuilding
-         * hidden reasoning.  Responses deliberately skips this path because its
-         * previous_response_id contract binds the next turn to live state. */
+        should_canonicalize_tool_checkpoint(s, &parsed_calls,
+                                            dsml_recovery_attempted);
+    if (want_canonicalize) {
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
@@ -13899,11 +14226,35 @@ decode_again:
                                      prompt_tokens, completion);
     }
     if (job_cancelled(j)) response_ok = false;
+    /* Test hook: treat the next N terminal writes as failed, so the
+     * cancel-rollback path runs deterministically *after* canonicalization.
+     *
+     * There is no client-side way to reach that ordering.  Closing the socket
+     * early trips the disconnect watcher within ~100 ms, which cancels
+     * generation before canonicalization ever runs -- so a test that closes
+     * early exercises the plain cancel path and silently reports it as the
+     * canonicalized one.  Off unless DS4_SERVER_TEST_FAIL_FINAL_WRITE is set to
+     * a positive count; it counts down so a retry in the same run succeeds.
+     * Racy across worker threads by design -- it is a single-slot test aid. */
+    {
+        static int fail_final_writes = -1;
+        if (fail_final_writes < 0) {
+            const char *v = getenv("DS4_SERVER_TEST_FAIL_FINAL_WRITE");
+            fail_final_writes = v ? atoi(v) : 0;
+        }
+        if (response_ok && fail_final_writes > 0) {
+            fail_final_writes--;
+            response_ok = false;
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: TEST HOOK forcing terminal write failure "
+                       "(%d remaining)", fail_final_writes);
+        }
+    }
     if (!response_ok) {
         job_mark_cancelled(j);
         final_finish = "error";
         snprintf(err, sizeof(err), "client disconnected");
-        request_live_state_clear(s, slot);
+        request_cancel_rollback(s, slot, committed_frontier);
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: %s ctx=%s%s%s client disconnected",
                    j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -14062,13 +14413,14 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
                                 &j->req.chat_live_call_ids)) {
         return SLOT_BAND_BOUND;
     }
+    if (!slot->session) return SLOT_BAND_EMPTY;
+    const int live_pos = ds4_session_reusable_pos(slot->session);
+    if (live_pos <= 0) return SLOT_BAND_EMPTY;
+
     /* A visible replay can omit sampled reasoning and shift image positions.
      * Select its live slot before falling back to token-prefix scoring. The
      * continuation builder independently verifies image identities on reuse.
      * The dispatcher already holds tool_mu here. */
-    if (!slot->session) return SLOT_BAND_EMPTY;
-    int live_pos = ds4_session_pos(slot->session);
-    if (live_pos <= 0) return SLOT_BAND_EMPTY;
     const request *req = &j->req;
     visible_image_key images;
     char *key = req->prompt_text ? visible_prompt_key(req, req->prompt_text, &images) : NULL;
@@ -14732,6 +15084,21 @@ static void log_context_memory(ds4_backend backend, int ctx_size,
                    (double)m.total_bytes * (double)session_count /
                        (1024.0 * 1024.0 * 1024.0));
     }
+    /* Not part of the context-buffer estimate: the GLM-5.3 rollback snapshot is
+     * allocated lazily per session on its first sync, so a server with many
+     * warmed slots pays it many times over.  Report it separately rather than
+     * folding it in, because it appears only after traffic. */
+    const uint64_t rb = ds4_glm53_rollback_session_bytes();
+    if (rb != 0) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: glm53 rollback snapshot %.2f MiB per session, "
+                   "up to %.2f GiB across %d slots once warmed "
+                   "(DS4_GLM_KDA_ROLLBACK=0 to disable)",
+                   (double)rb / (1024.0 * 1024.0),
+                   (double)rb * (double)(session_count > 0 ? session_count : 1) /
+                       (1024.0 * 1024.0 * 1024.0),
+                   session_count > 0 ? session_count : 1);
+    }
 }
 static void server_close_resources(server *s) {
     if (s->trace) {
@@ -15367,7 +15734,7 @@ int main(int argc, char **argv) {
 
     for (int i = 0; s.kv.enabled && i < s.slot_count; i++) {
         server_slot *slot = &s.slots[i];
-        const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+        const ds4_tokens *tokens = ds4_session_reusable_tokens(slot->session);
         if (!tokens || tokens->len < s.kv.opt.min_tokens) continue;
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting resident KV cache before shutdown slot=%d tokens=%d",
@@ -18429,15 +18796,18 @@ static void test_tool_checkpoint_canonicalization_gate_exact_replay(void) {
         "</｜DSML｜invoke>\n"
         DS4_TOOL_CALLS_END);
 
-    TEST_ASSERT(!should_canonicalize_tool_checkpoint(&s, &calls));
+    TEST_ASSERT(!should_canonicalize_tool_checkpoint(&s, &calls, false));
+
+    /* A hidden recovery exchange cannot be reproduced by exact DSML replay. */
+    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls, true));
 
     s.disable_exact_dsml_tool_replay = true;
-    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls));
+    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls, false));
 
     s.disable_exact_dsml_tool_replay = false;
     free(calls.raw_tool_text);
     calls.raw_tool_text = NULL;
-    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls));
+    TEST_ASSERT(should_canonicalize_tool_checkpoint(&s, &calls, false));
 
     tool_calls_free(&calls);
 }
@@ -19443,13 +19813,221 @@ static void test_tool_store_file_is_bounded(void) {
     unlink(path);
 }
 
+static void test_tp_rewind_ack_status(void) {
+    /* 0 means "I reached the state you asked for".  The ack reader rejects
+     * every non-zero status, so the applied mode must NOT be encoded here --
+     * doing that made a successful KEEP read as a failed command and the leader
+     * invalidated both ranks on every restore. */
+    TEST_ASSERT(ds4_tp_rewind_ack_status(true, 32050, 32050) == 0);
+    TEST_ASSERT(ds4_tp_rewind_ack_status(false, 32050, 0) == 0);
+    TEST_ASSERT(ds4_tp_rewind_ack_status(true, 32050, 0) != 0);
+
+    /* KEEP is "still reusable at pos", NOT "GLM-5.3 restored a snapshot".  An
+     * ordinary truncating rewind on Flash or GLM-5.2 keeps the checkpoint too,
+     * and it is the common case: treating that as a mismatch made EVERY
+     * non-GLM-5.3 TP rewind invalidate both ranks. */
+    TEST_ASSERT(ds4_tp_rewind_ack_status(true, 49274, 49274) == 0);
+    TEST_ASSERT(ds4_tp_rewind_ack_status(true, 49274, 0) != 0);
+    TEST_ASSERT(ds4_tp_rewind_ack_status(false, 49274, 49274) != 0);
+
+    /* Position equality, not "reusable at all".  A worker holding a shorter
+     * checkpoint clamps lower; reporting that as a match would leave the two
+     * ranks at different frontiers both believing they agreed. */
+    TEST_ASSERT(ds4_tp_rewind_ack_status(true, 32050, 31000) != 0);
+    TEST_ASSERT(ds4_tp_rewind_ack_status(true, 32050, 32051) != 0);
+
+    /* KEEP at zero is not representable and must be refused, not blessed.
+     * reusable_pos == pos == 0 after an invalidation, so an earlier version
+     * scored it a match, mirrored KEEP, and the worker tried to restore a
+     * snapshot that cannot exist at zero -- failing, and marking the transport
+     * permanently failed.  An interrupted FIRST prefill hits this every time,
+     * because pre_sync_len is 0. */
+    TEST_ASSERT(ds4_tp_rewind_ack_status(true, 0, 0) != 0);
+    TEST_ASSERT(ds4_tp_rewind_ack_status(true, -1, 0) != 0);
+    /* Invalidating at zero is the normal, representable case. */
+    TEST_ASSERT(ds4_tp_rewind_ack_status(false, 0, 0) == 0);
+}
+
+static void test_cancel_rollback_target(void) {
+    /* Non-GLM-5.3 must leave a token to re-evaluate.  Landing on the frontier
+     * exactly makes an identical retry a zero-token sync, which samples the
+     * cancelled generation's logits and resumes it. */
+    TEST_ASSERT(cancel_rollback_target(false, 32050) == 32049);
+    TEST_ASSERT(cancel_rollback_target(false, 1) == 0);
+
+    /* GLM-5.3 lands on the client's prompt frontier exactly: the restored
+     * snapshot carries the logits, and every internal sync is held so the
+     * snapshot is still sitting there.
+     *
+     * It must NOT chase a snapshot that moved forward.  A canonical rewrite
+     * produces a frontier matching what a client replays -- but only for a turn
+     * the client received, and this function only runs when it did not.  A
+     * revision that followed it forward pointed the rewind at tokens the retry
+     * does not contain, so the rewind was rejected and the conversation
+     * re-prefilled: exactly the regression this path exists to prevent.  There
+     * is no snapshot argument any more, so that cannot be reintroduced here. */
+    TEST_ASSERT(cancel_rollback_target(true, 32050) == 32050);
+    TEST_ASSERT(cancel_rollback_target(true, 1) == 1);
+
+    /* Never negative, whichever model. */
+    TEST_ASSERT(cancel_rollback_target(false, 0) == 0);
+    TEST_ASSERT(cancel_rollback_target(true, 0) == 0);
+    TEST_ASSERT(cancel_rollback_target(false, -5) == 0);
+    TEST_ASSERT(cancel_rollback_target(true, -5) == 0);
+}
+
+static void test_cache_miss_reason_names_an_invalid_checkpoint(void) {
+    /* The reported misdiagnosis.  An invalidated GLM-5.3 checkpoint used to
+     * arrive here as old_pos=32050 with common=0 -- because
+     * ds4_session_common_prefix() returns 0 without comparing anything when the
+     * checkpoint is invalid -- and got classified as the client injecting a
+     * per-request block into its system prompt.  Feeding old_pos from
+     * ds4_session_reusable_pos() makes it 0, and the reason names the real
+     * cause. */
+    int ids[4] = {154822, 17, 18, 19};
+    ds4_tokens prompt = { ids, 4, 4 };
+    trace_cache_diag d;
+
+    /* Exactly the reported shape: a stale old_pos alongside no live tokens.
+     * trace_cache_capture() must reconcile the two rather than believe the
+     * caller, so this cannot be reported as a token divergence. */
+    trace_cache_capture(&d, NULL, &prompt, 32050, 0);
+    TEST_ASSERT(d.old_pos == 0);
+    TEST_ASSERT(!strcmp(trace_cache_miss_reason(&d), "no-live-checkpoint"));
+
+    trace_cache_capture(&d, NULL, &prompt, 0, 0);
+    TEST_ASSERT(!strcmp(trace_cache_miss_reason(&d), "no-live-checkpoint"));
+
+    /* With no live side the diverge pair must not invent one.  The old log
+     * printed "diverge=154822/154822" -- the same token on both sides,
+     * reported as the point where they differ. */
+    int live_tok = 0, prompt_tok = 0;
+    trace_cache_diverge_tokens(&d, &live_tok, &prompt_tok);
+    TEST_ASSERT(live_tok == -1);
+    TEST_ASSERT(!trace_cache_memory_reusable(&d));
+
+    /* A genuine leading-block divergence must still be classified as one, so
+     * the fix does not simply mute the reason. */
+    int live_ids[64];
+    for (int i = 0; i < 64; i++) live_ids[i] = 1000 + i;
+    int diff_ids[64];
+    for (int i = 0; i < 64; i++) diff_ids[i] = (i < 3) ? live_ids[i] : 9000 + i;
+    ds4_tokens live = { live_ids, 64, 64 };
+    ds4_tokens diff = { diff_ids, 64, 64 };
+    trace_cache_capture(&d, &live, &diff, 64, 3);
+    TEST_ASSERT(!strcmp(trace_cache_miss_reason(&d), "leading-block-divergence"));
+    trace_cache_diverge_tokens(&d, &live_tok, &prompt_tok);
+    TEST_ASSERT(live_tok != prompt_tok);
+}
+
+static void test_live_prefix_backend_can_rewind(void) {
+    /* GLM-5.3 with no snapshot must refuse.  Rewinding it drops the checkpoint,
+     * so the landing position ds4_session_pos() reports back is a phantom: the
+     * caller logs a short ctx span for a full-length prefill, reports a cache
+     * read that never happened, and skips the cached==0 recovery paths that
+     * could have produced a real hit.  The raw-cache arguments are irrelevant
+     * for GLM and must not be able to talk it back into rewinding. */
+    TEST_ASSERT(!live_prefix_backend_can_rewind(true, true, 0, 0, 0, -1));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(true, true, 4224, 0, 1300, -1));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(true, true, 99999, 7, 3077, -1));
+    /* Frontier 0 is not a frontier: a rewind to 0 reuses nothing. */
+    TEST_ASSERT(!live_prefix_backend_can_rewind(true, true, 0, 0, 0, 0));
+
+    /* With a snapshot it may -- but only onto that frontier, which is
+     * live_prefix_rewind_target()'s job to enforce. */
+    TEST_ASSERT(live_prefix_backend_can_rewind(true, true, 0, 0, 0, 17343));
+
+    /* GLM-5.2 always may: the dense KV cache truncates cleanly. */
+    TEST_ASSERT(live_prefix_backend_can_rewind(true, false, 0, 0, 0, -1));
+    TEST_ASSERT(live_prefix_backend_can_rewind(true, false, 0, 0, 3077, -1));
+
+    /* Flash: budget-gated on the tail actually discarded. */
+    TEST_ASSERT(live_prefix_backend_can_rewind(false, false, 4224, 0, 1300, -1));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 4224, 0, 0, -1));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 4224, 0, 4224, -1));
+    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 0, 0, 1300, -1));
+    /* Alignment slack is charged against the budget, not ignored. */
+    TEST_ASSERT(!live_prefix_backend_can_rewind(false, false, 1301, 7, 1300, -1));
+    TEST_ASSERT(live_prefix_backend_can_rewind(false, false, 1400, 7, 1300, -1));
+}
+
+static void test_live_prefix_rewind_target_glm53_frontier(void) {
+    /* An ORDINARY multi-turn append must not be turned into a rewind.  The
+     * whole live checkpoint matches (common == old_pos) and the snapshot sits
+     * at the PREVIOUS prompt frontier, far below both -- an earlier ordering
+     * checked the snapshot branch first and happily "rewound" there, throwing
+     * away the answer already in the cache and re-prefilling it.  That is the
+     * single most common request shape there is. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 22000, 20623, 17343) < 0);
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 20624, 20623, 17343) < 0);
+    /* Same shape without a snapshot, for contrast: also -1, via the plain
+     * prefix-match path. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 22000, 20623, -1) < 0);
+
+    /* The reported re-render case: live 20623, new prompt 20639, diverging at
+     * 17546 inside the previous assistant turn, snapshot at the prompt frontier
+     * 17343.  GLM-5.3 must land on the snapshot, not on the divergence -- any
+     * other target drops the checkpoint and re-prefills all 20639. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 20639, 17546, 17343)
+                == 17343);
+
+    /* Outside the common prefix: restoring there would resume over tokens the
+     * new prompt does not have. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 20639, 17000, 17343) < 0);
+    /* Not a rewind at all. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 17343, 20639, 17546, 17343) < 0);
+    /* Landing exactly on prompt_len IS valid here, unlike an ordinary rewind:
+     * the snapshot restores the logits, so a zero-token sync samples the right
+     * distribution instead of the abandoned generation's. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 17343, 17546, 17343)
+                == 17343);
+    /* Past the end of the prompt is still refused. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 17000, 17546, 17343) < 0);
+    /* No snapshot -> no GLM-5.3 rewind, whatever the common prefix says. */
+    TEST_ASSERT(live_prefix_rewind_target(false, 20623, 20639, 17546, -1) < 0);
+
+    /* Exactly at the divergence is fine -- it is still within the prefix. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 20623, 20639, 17343, 17343)
+                == 17343);
+}
+
 static void test_live_prefix_rewind_target(void) {
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
-    TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
-    TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8) == -1);
-    TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1) == -1);
+    /* Shrinking prompt: strict prefix of the checkpoint, capped one short so
+     * the following sync still has a token to evaluate. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8, -1) == 7);
+    TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379, -1) == 48378);
+    TEST_ASSERT(live_prefix_rewind_target(false, 17, 8, 8, -1) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 8, 8, 8, -1) == -1);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 1, 1, -1) == -1);
+
+    /* Diverging tail: shares a prefix, then differs before its own end.  This
+     * used to score zero and re-prefill everything.  Real numbers from an
+     * abandoned assistant turn: live=50561 prompt=49326 common=49274, i.e.
+     * re-evaluate 52 tokens rather than 49326. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 50561, 49326, 49274, -1) == 49274);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 7, -1) == 7);
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 20, 7, -1) == 7);
+
+    /* Whole checkpoint already matches -- the plain prefix path owns it. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 20, 17, -1) == -1);
+    /* Nothing shared: a rewind to 0 discards the DSpark caches for no reuse. */
+    TEST_ASSERT(live_prefix_rewind_target(true, 17, 20, 0, -1) == -1);
+
+    /* The target must always leave a token to evaluate, never move the session
+     * forward, and never exceed what the two sides share. */
+    for (int old_pos = 0; old_pos < 12; old_pos++) {
+        for (int prompt_len = 0; prompt_len < 12; prompt_len++) {
+            const int cap = old_pos < prompt_len ? old_pos : prompt_len;
+            for (int common = 0; common <= cap; common++) {
+                const int t = live_prefix_rewind_target(true, old_pos, prompt_len, common, -1);
+                if (t < 0) continue;
+                TEST_ASSERT(t < prompt_len);
+                TEST_ASSERT(t < old_pos);
+                TEST_ASSERT(t <= common);
+                TEST_ASSERT(t > 0);
+            }
+        }
+    }
 }
 
 static void test_client_socket_nonblocking_flag(void) {
@@ -21166,7 +21744,12 @@ static void ds4_server_unit_tests_run(void) {
     test_model_metadata_clamps_completion_to_context();
     test_tool_store_survives_restart();
     test_tool_store_file_is_bounded();
+    test_tp_rewind_ack_status();
+    test_cancel_rollback_target();
+    test_cache_miss_reason_names_an_invalid_checkpoint();
+    test_live_prefix_backend_can_rewind();
     test_live_prefix_rewind_target();
+    test_live_prefix_rewind_target_glm53_frontier();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
     test_cancelled_progress_callback_is_inert();
