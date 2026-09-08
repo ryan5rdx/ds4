@@ -13394,8 +13394,27 @@ static int g_glm53_idx_split_negotiated = -1;
 static int glm53_idx_split_dec_active(void) {
     static int cached = -1;
     if (cached < 0) {
+        /* Banked and DEFAULT ON (2026-09-07): +7.93% decode @310k, measured
+         * three times, byte-identical output, both ranks with complementary
+         * halves.  =0 disables; on v4 an omitted knob is ON, so a control arm
+         * must write it.
+         *
+         * Shipped knowing the short-context cost.  A fixed ~0.364 ms/token of
+         * 11 gates plus the merge against a saving that scales with context
+         * crosses zero near 40,000 tokens, so the MODELLED curve is -1.25% at
+         * 2048 and -0.25% at 32768 against +7.93% measured at 310k.  Those
+         * negatives have never been measured and the call was to take the
+         * long-context win rather than withhold it for an unmeasured ~1%.
+         * harness-certify.sh carries a `nosplit` arm across 2048..131072 that
+         * measures exactly this; if it comes back worse than modelled, that is
+         * the evidence to revisit.
+         *
+         * THIS FLAG CHANGES THE TP GATE SCHEDULE, not just a kernel.  With it on
+         * every DSA layer reserves an INDEXER slot, so gate_slot_mask differs
+         * from a build with it off and the hello refuses such a pairing --
+         * loudly, not silently, but both ranks must agree. */
         const char *e = getenv("DS4_GLM_IDX_SPLIT_DEC");
-        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+        cached = !(e && e[0] == '0');
         /* IDX-HALF and IDX-SPLIT compose into nonsense: IDX-HALF ceiling-halves
          * score_rows for the pricing arm, IDX-SPLIT then halves the remainder
          * per rank, and the pair searches a QUARTER of the context while
