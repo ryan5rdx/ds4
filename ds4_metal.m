@@ -21975,7 +21975,11 @@ int ds4_gpu_matmul_f32_tensor(
             return 1;
         }
 
-        if (n_tok <= 8 && (in_dim % 128u) == 0) {
+        /* Keep the extended matvec path available for prefill-sized batches;
+         * the plain matvec below re-reads the weight independently per token. */
+        const uint64_t f32_mv_ext_max_tokens =
+            ds4_gpu_env_u64("DS4_METAL_F32_MV_EXT_MAX_TOKENS", 4096u, 2u, 4096u);
+        if (n_tok <= f32_mv_ext_max_tokens && (in_dim % 128u) == 0) {
             const int16_t nsg = 2;
             const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
             const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
