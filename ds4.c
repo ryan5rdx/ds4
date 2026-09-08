@@ -13329,6 +13329,43 @@ static uint32_t ds4_prefill_watchdog_chunk(uint32_t prompt_len) {
  *
  * Decode only.  Prefill exchanges 4 KiB per TOKEN rather than per token-step,
  * which is a different transport problem (2d). */
+/* Profitability, which is NOT the exactness bound.
+ *
+ * The split is EXACT above 2 * selected_pools = 4096 visible tokens, and the
+ * graph refuses below that.  But exact is not the same as worth it: the saving
+ * is half the indexer scan and grows with context, while the cost -- 11 gates
+ * at ~20 us of skew plus the merge -- is FIXED at about 0.46 ms/token.  Measured
+ * indexer 5.578 ms/token at 310k puts break-even at ~51,500 tokens, so between
+ * 4096 and there the arm is active, correct, and slower:
+ *
+ *     ctx     8192   -1.4%      ctx  131072   +2.5%
+ *     ctx    32768   -0.6%      ctx  310000   +7.9%  (measured)
+ *
+ * Default 131072: positive with margin, and supported twice -- the arithmetic
+ * above and IDX-HALF's measured +4.43% ceiling at that rung.  The rig's writeup
+ * suggested ~256k, which is safer still; this is one env var either way. */
+static uint32_t glm53_idx_split_min_ctx(void) {
+    static uint32_t cached;
+    static int done;
+    if (!done) {
+        done = 1;
+        cached = 131072u;
+        const char *e = getenv("DS4_GLM_IDX_SPLIT_MIN_CTX");
+        if (e && e[0]) {
+            const unsigned long v = strtoul(e, NULL, 10);
+            if (v >= 4096ul && v <= (1ul << 22)) cached = (uint32_t)v;
+        }
+    }
+    return cached;
+}
+
+/* The decision the gate schedule made, so the graph cannot re-derive it and get
+ * a different answer.  The hello compares gate_slot_mask between RANKS, which
+ * catches a two-rank disagreement; nothing catches the schedule and the graph
+ * disagreeing on ONE rank, and that is the S6a shape.  One variable, written
+ * where the mask is built, read where the gate fires. */
+static int g_glm53_idx_split_negotiated = -1;
+
 static int glm53_idx_split_dec_active(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -13372,6 +13409,18 @@ static void glm53_idx_split_announce(uint32_t rows, uint32_t begin,
             active ? "" :
             "  <-- below crossover: both ranks scan everything and the gate "
             "fires empty to keep the ordinal");
+    /* Advisory, not a behaviour change: anything that altered the gate pattern
+     * per context would desync the pair (see the note in the schedule).  The
+     * split is EXACT above 4096 visible tokens but only PROFITABLE above about
+     * 51,500 -- the saving is half the indexer scan and scales with context,
+     * the ~0.46 ms of gates and merge does not. */
+    if (active && rows * 4u < glm53_idx_split_min_ctx()) {
+        fprintf(stderr,
+                "ds4: IDX-SPLIT-DEC is active at ~%u visible tokens, below the "
+                "~%u break-even -- correct, but slower than the replicated "
+                "scan here (+7.9%% at 310k, -1.4%% at 8k)\n",
+                rows * 4u, glm53_idx_split_min_ctx());
+    }
 }
 
 /* The rank's half of `rows`, by the quotient/remainder form pass 1 already uses
@@ -56529,7 +56578,8 @@ static bool glm_graph_forward_token(
                     bool idx_gate_fires = false;
                     glm53_layer_tp_gates(il, DS4_N_LAYER, DS4_N_NEXTN_PREDICT,
                                          DS4_N_LEADING_DENSE, false, false,
-                                         false, glm53_idx_split_dec_active(),
+                                         false,
+                                         g_glm53_idx_split_negotiated == 1,
                                          &idx_gate_fires, NULL, NULL, NULL);
                     const int idx_gate_here =
                         idx_gate_fires && g->glm53 && g->tp_world == 2u &&
@@ -69397,10 +69447,20 @@ void ds4_engine_tp_gate_schedule(ds4_engine *e,
             const bool router_split =
                 glm53_tp_router_split_requested() != 0 &&
                 glm53_tp_router_split_shape_ok();
-            /* Read through the SAME predicate the graph uses, so a one-sided
-             * env setting is caught by the hello's mask comparison rather than
-             * by a gate that hangs. */
+            /* THE THRESHOLD CANNOT LIVE HERE, and it was tried.  The mask is
+             * built before the hello, and the WORKER sets ctx_size = 0 there
+             * and adopts the leader's afterwards (ds4_tp.c: "adopt the
+             * leader's").  So a ctx-dependent mask would have the leader
+             * reserving INDEXER slots and the worker not, the hello's mask
+             * comparison would refuse the pairing, and the feature would be
+             * unusable rather than merely mis-sized.
+             *
+             * So the mask depends on the env alone -- which both ranks set
+             * identically, and a one-sided setting is exactly what the mask
+             * comparison already catches.  Profitability is the operator's
+             * call, advised at runtime by glm53_idx_split_announce(). */
             const bool idx_split = glm53_idx_split_dec_active();
+            g_glm53_idx_split_negotiated = idx_split ? 1 : 0;
             /* From layer 0, not DS4_N_LEADING_DENSE: the leading layers are
              * dense only in their FFN and their KDA attention gates too.  See
              * glm53_layer_tp_gates(), which owns both rules. */
