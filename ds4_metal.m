@@ -47156,13 +47156,13 @@ int ds4_gpu_glm53_matmul_bf16(
         if (!weightbuf) return 0;
         const bool use_mv = n_rows <= 8u;
         /* B1: split the contraction across simdgroups instead of giving one
-         * simdgroup a whole 16384-long row. Default off; needs a quality gate
-         * because the reduction order changes. */
+         * simdgroup a whole 16384-long row. Default on after its quality gate;
+         * DS4_METAL_GLM53_BF16_MV_SPLITK=0 disables it. */
         const char *bf16_splitk_env = getenv("DS4_METAL_GLM53_BF16_MV_SPLITK");
         const int bf16_splitk_shape =
             out_dim <= 64u && in_dim >= 4096u && (in_dim % 32u) == 0u;
         const int bf16_splitk =
-            bf16_splitk_env && bf16_splitk_env[0] && bf16_splitk_env[0] != '0' &&
+            !(bf16_splitk_env && bf16_splitk_env[0] == '0') &&
             bf16_splitk_shape;
         /* HCMIX-WIDE: a third grid axis over the contraction.  B1 took hc_mix
          * from 3 to 12 threadgroups by splitting K across simdgroups; this
