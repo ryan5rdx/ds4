@@ -28855,7 +28855,8 @@ static bool metal_graph_encode_token_raw_swa(
 #if defined(__APPLE__)
     const bool tp_split_flush_safe =
         g->tp_world == 2 &&
-        ds4_gpu_tp_decode_split_flush_safe() != 0 &&
+        ds4_gpu_tp_decode_split_flush_safe(
+            (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER) != 0 &&
         getenv("DS4_METAL_DISABLE_TP_DECODE_SPLIT_FLUSH") == NULL;
 #else
     const bool tp_split_flush_safe = false;
@@ -28945,10 +28946,9 @@ static bool metal_graph_encode_token_raw_swa(
             ok = metal_graph_flush_hc_expand(g);
         }
         if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
-        /* Shared-event TP arrival is monotonic: a later command buffer could
-         * satisfy an earlier gate before that gate's payload is ready. The
-         * default single-session flag path instead publishes an exact value
-         * in a distinct layer/gate slot and is safe to submit in-order. */
+        /* Shared-event TP arrival/release is monotonic: a later command buffer
+         * could satisfy an earlier gate before that gate's payload is ready.
+         * Split only when both directions use exact per-slot words. */
         if (ok && allow_split_flush &&
             (g->tp_world != 2 || tp_split_flush_safe) &&
             ((split_after_layers != 0 && il + 1u == split_after_layers) ||

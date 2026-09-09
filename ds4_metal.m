@@ -10366,9 +10366,11 @@ void ds4_gpu_tp_set_session_batch_mode(int enabled) {
     g_tp_session_batch_mode = enabled ? 1 : 0;
 }
 
-int ds4_gpu_tp_decode_split_flush_safe(void) {
-    return g_tp_thread_running && g_tp_flag_gates &&
-           !g_tp_session_batch_mode;
+int ds4_gpu_tp_decode_split_flush_safe(uint32_t gate_slots) {
+    return g_initialized && g_tp_thread_running && g_tp_flag_gates &&
+           !g_tp_session_batch_mode && g_tp_fast_sync &&
+           g_tp_release_words != NULL && gate_slots != 0u &&
+           gate_slots <= DS4_TP_FENCE_SLOTS;
 }
 
 int ds4_gpu_tp_gate_prefetch_plan(uint32_t gate,

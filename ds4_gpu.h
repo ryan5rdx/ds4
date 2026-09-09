@@ -359,10 +359,10 @@ void ds4_gpu_tp_shutdown(void);
  * Shared-event arrival is required in that mode to make each partial vector
  * CPU-visible before the transport thread reads it. */
 void ds4_gpu_tp_set_session_batch_mode(int enabled);
-/* Single-session flag gates use one exact arrival word per layer/gate, so
- * decode command buffers may be submitted in layer order without a later
- * monotonic event signal satisfying an earlier arrival. */
-int ds4_gpu_tp_decode_split_flush_safe(void);
+/* Nonzero when both directions of every decode gate use per-slot words, so a
+ * token may safely span command buffers.  gate_slots is the model's full slab
+ * schedule and must fit the release-word bank. */
+int ds4_gpu_tp_decode_split_flush_safe(uint32_t gate_slots);
 /* Weight ranges to pull into the GPU cache while the given gate (0 attention,
  * 1 FFN) waits for the peer: consumed by the next poll gate of that kind. */
 int ds4_gpu_tp_gate_prefetch_plan(uint32_t gate,
