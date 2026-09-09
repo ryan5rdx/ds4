@@ -49555,6 +49555,34 @@ static bool glm_graph_mtp_matmul(
  * hidden h[pos] (g->cur for GLM-5.2, g->hc_cur for GLM-5.3) and next_token
  * (= token[pos+1]), writes the nextn KV at slot pos, and returns the
  * drafted token[pos+2] by greedy argmax. Clobbers the decode scratch. */
+/* MTP4A.  DEFAULT OFF.
+ *
+ * The accepted path runs TWO nextn steps, and the FIRST one's draft is written
+ * into a local `dummy` and discarded -- it exists only to advance the nextn
+ * state through the accepted draft token. It nevertheless computes the full
+ * shared output head, reads the logits back, and runs a CPU argmax:
+ *
+ *   output head : DS4_N_EMBD x DS4_N_VOCAB = 4096 x 154880 = 634M params,
+ *                 ~674 MB of q8_0 weights, ~0.84 ms at 800 GB/s
+ *   readback    : 620 KB
+ *   argmax      : 154,880 elements on the CPU
+ *
+ * All of it discarded. This lets the caller say so: draft_out == NULL means
+ * "advance the state, do not produce a draft", and the head, readback and
+ * argmax are skipped.
+ *
+ * The end_commands is KEPT. The caller writes target_hidden from the host
+ * before the next step, and that write must not race pending GPU work reading
+ * the same buffer, so the flush is load-bearing rather than part of the waste. */
+static bool glm53_mtp4a_skip_dead_head_active(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_GLM_MTP4A_SKIP_DEAD_HEAD");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 static bool glm_graph_mtp_step(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -49563,7 +49591,10 @@ static bool glm_graph_mtp_step(
         uint32_t           pos,
         uint32_t           min_pos,
         int               *draft_out) {
-    if (!g || !model || !weights || !draft_out) return false;
+    if (!g || !model || !weights) return false;
+    /* MTP4A: NULL means state-only; otherwise a draft is required. */
+    const bool want_draft = (draft_out != NULL);
+    if (!want_draft && !glm53_mtp4a_skip_dead_head_active()) return false;
     if (DS4_N_NEXTN_PREDICT == 0) return false;
     const uint32_t cache_cap = glm_graph_mtp_cache_cap(g);
     if (pos >= cache_cap || min_pos > pos) {
@@ -49926,7 +49957,7 @@ static bool glm_graph_mtp_step(
                                      DS4_N_EMBD) != 0;
     /* Shared output head behind the nextn head norm. */
     DS4_GLM_MTP_STAGE("head_norm");
-    if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
+    if (ok && want_draft) ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
                                                 g->next,
                                                 model->map,
                                                 model->size,
@@ -49934,7 +49965,7 @@ static bool glm_graph_mtp_step(
                                                 DS4_N_EMBD,
                                                 DS4_RMS_EPS) != 0;
     DS4_GLM_MTP_STAGE("head");
-    if (ok) ok = glm_graph_mtp_matmul(g,
+    if (ok && want_draft) ok = glm_graph_mtp_matmul(g,
                                       g->logits,
                                       model,
                                       weights->output,
@@ -49944,7 +49975,7 @@ static bool glm_graph_mtp_step(
     DS4_GLM_MTP_STAGE("end");
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
-    if (ok) {
+    if (ok && want_draft) {
         ok = ds4_gpu_tensor_read(g->logits,
                                  0,
                                  g->mtp_logits_host,
@@ -49958,6 +49989,16 @@ static bool glm_graph_mtp_step(
         return false;
     }
 #undef DS4_GLM_MTP_STAGE
+    if (!want_draft) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "ds4: GLM MTP4A ACTIVE -- state-only nextn step "
+                            "skips the shared output head, its 620 KB readback "
+                            "and the %u-element argmax\n", (unsigned)DS4_N_VOCAB);
+        }
+        return true;
+    }
     int best = 0;
     float best_v = g->mtp_logits_host[0];
     for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
@@ -68996,7 +69037,8 @@ static int ds4_session_glm_spec_cycle_impl(
             ds4_gpu_tensor_write(target_hidden, 0, s->glm_mtp_hc,
                                  hc_row_bytes) != 0 &&
             glm_graph_mtp_step(g, &e->model, &e->weights, d, pos,
-                               s->glm_mtp_min_pos, &dummy) &&
+                               s->glm_mtp_min_pos,
+                               glm53_mtp4a_skip_dead_head_active() ? NULL : &dummy) &&
             ds4_gpu_tensor_write(target_hidden,
                                  0,
                                  s->glm_mtp_hc + hc_row_values,
