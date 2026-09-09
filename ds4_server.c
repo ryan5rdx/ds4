@@ -9317,6 +9317,10 @@ struct server {
     tool_memory tool_mem;
     server_image_cache image_cache; /* Protected by inference_mu. */
     bool disable_exact_dsml_tool_replay;
+    /* This host-side text map is independent of the TP KV checkpoint path. */
+    char *tool_store_path;
+    FILE *tool_store_fp;
+    uint64_t tool_store_appends;
     bool enable_cors;
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
@@ -9787,13 +9791,21 @@ static const char *tool_memory_lookup_locked(tool_memory *m, const char *id,
     return e->block->dsml;
 }
 
+static void tool_store_append_locked(server *s, const char *id,
+                                     const char *dsml);
+
 static void tool_memory_remember(server *s, const tool_calls *calls) {
     if (!s || s->disable_exact_dsml_tool_replay ||
         !calls || !calls->raw_tool_text || !calls->raw_tool_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     for (int i = 0; i < calls->len; i++) {
+        const bool known =
+            tool_memory_find_entry_locked(&s->tool_mem, calls->v[i].id) != NULL;
         tool_memory_put_locked(&s->tool_mem, calls->v[i].id, calls->raw_tool_text,
                                TOOL_MEMORY_RAM);
+        if (!known) {
+            tool_store_append_locked(s, calls->v[i].id, calls->raw_tool_text);
+        }
     }
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -10206,6 +10218,173 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
         if (!ok) return loaded;
     }
     return loaded;
+}
+
+/* -------------------------------------------------------------------------
+ * Standalone exact-DSML tool-memory store.
+ *
+ * The KV disk cache is unavailable under tensor parallelism because restoring
+ * graph state is not mirrored to the worker.  Tool memory is only host-side
+ * text keyed by call id, so it can safely persist independently.  The file
+ * uses the existing KV tool-map record layout, is append-only while running,
+ * and is compacted at startup and when the appended tail grows as large as the
+ * live map.  Reading to EOF makes a partially written final record harmless.
+ * ------------------------------------------------------------------------- */
+
+#define TOOL_STORE_COMPACT_FLOOR_BYTES (1024u * 1024u)
+
+static bool tool_store_write_header(FILE *fp, uint32_t count) {
+    uint8_t h[KV_TOOL_MAP_HEADER];
+    h[0] = KV_TOOL_MAP_MAGIC0;
+    h[1] = KV_TOOL_MAP_MAGIC1;
+    h[2] = KV_TOOL_MAP_MAGIC2;
+    h[3] = KV_TOOL_MAP_VERSION;
+    le_put32(h + 4, count);
+    return fwrite(h, 1, sizeof(h), fp) == sizeof(h);
+}
+
+static bool tool_store_write_record(FILE *fp, const char *id, const char *dsml,
+                                    size_t dsml_len) {
+    const size_t id_len = strlen(id);
+    if (id_len == 0 || id_len > UINT32_MAX || dsml_len == 0 ||
+        dsml_len > UINT32_MAX) {
+        return true;
+    }
+    uint8_t lens[8];
+    le_put32(lens, (uint32_t)id_len);
+    le_put32(lens + 4, (uint32_t)dsml_len);
+    return fwrite(lens, 1, sizeof(lens), fp) == sizeof(lens) &&
+           fwrite(id, 1, id_len, fp) == id_len &&
+           fwrite(dsml, 1, dsml_len, fp) == dsml_len;
+}
+
+/* Rewrite the file from the in-memory map. Caller holds tool_mu. */
+static bool tool_store_compact_locked(server *s) {
+    if (!s || !s->tool_store_path) return false;
+    char *tmp = xmalloc(strlen(s->tool_store_path) + 5);
+    sprintf(tmp, "%s.tmp", s->tool_store_path);
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) {
+        free(tmp);
+        return false;
+    }
+
+    uint32_t count = 0;
+    for (tool_memory_entry *e = s->tool_mem.head; e; e = e->next) count++;
+    bool ok = tool_store_write_header(fp, count);
+    for (tool_memory_entry *e = s->tool_mem.head; ok && e; e = e->next) {
+        if (!e->id || !e->block || !e->block->dsml) continue;
+        ok = tool_store_write_record(fp, e->id, e->block->dsml, e->block->len);
+    }
+    ok = (fflush(fp) == 0) && ok;
+    fclose(fp);
+    if (ok && rename(tmp, s->tool_store_path) != 0) ok = false;
+    if (!ok) unlink(tmp);
+    free(tmp);
+    if (!ok) return false;
+
+    if (s->tool_store_fp) fclose(s->tool_store_fp);
+    s->tool_store_fp = fopen(s->tool_store_path, "ab");
+    s->tool_store_appends = 0;
+    return s->tool_store_fp != NULL;
+}
+
+/* Caller holds tool_mu. */
+static void tool_store_append_locked(server *s, const char *id,
+                                     const char *dsml) {
+    if (!s || !s->tool_store_fp || !id || !id[0] || !dsml || !dsml[0]) return;
+    if (!tool_store_write_record(s->tool_store_fp, id, dsml, strlen(dsml)) ||
+        fflush(s->tool_store_fp) != 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: tool memory store write failed (%s); "
+                   "persistence disabled for this run",
+                   s->tool_store_path ? s->tool_store_path : "?");
+        fclose(s->tool_store_fp);
+        s->tool_store_fp = NULL;
+        return;
+    }
+
+    s->tool_store_appends += 8u + strlen(id) + strlen(dsml);
+    const uint64_t live = (uint64_t)s->tool_mem.bytes;
+    const uint64_t budget = live > TOOL_STORE_COMPACT_FLOOR_BYTES ?
+                            live : TOOL_STORE_COMPACT_FLOOR_BYTES;
+    if (s->tool_store_appends > budget) {
+        (void)tool_store_compact_locked(s);
+    }
+}
+
+static int tool_store_load(server *s, const char *path) {
+    if (!s || s->disable_exact_dsml_tool_replay || !path) return 0;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+    uint8_t h[KV_TOOL_MAP_HEADER];
+    if (fread(h, 1, sizeof(h), fp) != sizeof(h) ||
+        h[0] != KV_TOOL_MAP_MAGIC0 || h[1] != KV_TOOL_MAP_MAGIC1 ||
+        h[2] != KV_TOOL_MAP_MAGIC2 || h[3] != KV_TOOL_MAP_VERSION) {
+        fclose(fp);
+        return 0;
+    }
+
+    int loaded = 0;
+    for (;;) {
+        uint8_t lens[8];
+        if (fread(lens, 1, sizeof(lens), fp) != sizeof(lens)) break;
+        const uint32_t id_len = le_get32(lens);
+        const uint32_t dsml_len = le_get32(lens + 4);
+        if (id_len == 0 || id_len > 256 || dsml_len == 0 ||
+            dsml_len > DS4_TOOL_MEMORY_MAX_BYTES) break;
+        char *id = xmalloc((size_t)id_len + 1);
+        char *dsml = xmalloc((size_t)dsml_len + 1);
+        const bool ok = fread(id, 1, id_len, fp) == id_len &&
+                        fread(dsml, 1, dsml_len, fp) == dsml_len;
+        id[id_len] = '\0';
+        dsml[dsml_len] = '\0';
+        if (ok) {
+            tool_memory_put_source(s, id, dsml, TOOL_MEMORY_DISK);
+            loaded++;
+        }
+        free(id);
+        free(dsml);
+        if (!ok) break;
+    }
+    fclose(fp);
+    return loaded;
+}
+
+static void tool_store_open(server *s, const char *path) {
+    if (!s || !path || !path[0]) return;
+    if (s->disable_exact_dsml_tool_replay) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --tool-memory-file ignored; exact DSML tool "
+                   "replay is disabled");
+        return;
+    }
+    s->tool_store_path = xstrdup(path);
+    const int loaded = tool_store_load(s, path);
+
+    pthread_mutex_lock(&s->tool_mu);
+    const bool ok = tool_store_compact_locked(s);
+    pthread_mutex_unlock(&s->tool_mu);
+    if (!ok) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: could not open tool memory store %s; tool "
+                   "replay will not survive a restart", path);
+        free(s->tool_store_path);
+        s->tool_store_path = NULL;
+        return;
+    }
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: tool memory store %s (%d ids loaded)", path, loaded);
+}
+
+static void tool_store_close(server *s) {
+    if (!s) return;
+    if (s->tool_store_fp) {
+        fclose(s->tool_store_fp);
+        s->tool_store_fp = NULL;
+    }
+    free(s->tool_store_path);
+    s->tool_store_path = NULL;
 }
 
 #ifdef DS4_SERVER_TEST
@@ -14232,6 +14411,7 @@ typedef struct {
     const char *chdir_path;
     const char *trace_path;
     const char *kv_disk_dir;
+    const char *tool_memory_file;
     uint64_t kv_disk_space_mb;
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;
@@ -14313,6 +14493,7 @@ static void server_close_resources(server *s) {
         s->trace = NULL;
     }
     kv_cache_close(&s->kv);
+    tool_store_close(s);
     tool_memory_free(&s->tool_mem);
     server_image_cache_clear(&s->image_cache);
     for (int i = 0; i < s->slot_count; i++) {
@@ -14500,6 +14681,8 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
             c.kv_cache_reject_different_quant = true;
+        } else if (!strcmp(arg, "--tool-memory-file")) {
+            c.tool_memory_file = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--disable-exact-dsml-tool-replay")) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
@@ -14801,6 +14984,7 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: exact DSML tool replay disabled; tool history uses canonical JSON rendering");
     }
+    if (cfg.tool_memory_file) tool_store_open(&s, cfg.tool_memory_file);
     if (s.batched_mode) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: batched mode enabled resident_sessions=%d prefill_quantum=%d mixed_prefill_quantum=%d decode_coalesce_us=%ld",
@@ -18655,6 +18839,138 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 }
 
+static void test_tool_store_survives_restart(void) {
+    char path[] = "/tmp/ds4_tool_store_testXXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    close(fd);
+    unlink(path);
+
+    char *argv[] = {"ds4-server", "--tool-memory-file", path};
+    server_config cfg = parse_options(3, argv);
+    TEST_ASSERT(cfg.tool_memory_file != NULL &&
+                !strcmp(cfg.tool_memory_file, path));
+
+    const char *dsml_a = "<DSML>call_a bytes exactly as sampled</DSML>";
+    const char *dsml_b = "<DSML>call_b different bytes</DSML>";
+
+    {
+        server s = {0};
+        pthread_mutex_init(&s.tool_mu, NULL);
+        tool_store_open(&s, path);
+        TEST_ASSERT(s.tool_store_path != NULL);
+        pthread_mutex_lock(&s.tool_mu);
+        tool_memory_put_locked(&s.tool_mem, "call_a", dsml_a, TOOL_MEMORY_RAM);
+        tool_store_append_locked(&s, "call_a", dsml_a);
+        tool_memory_put_locked(&s.tool_mem, "call_b", dsml_b, TOOL_MEMORY_RAM);
+        tool_store_append_locked(&s, "call_b", dsml_b);
+        pthread_mutex_unlock(&s.tool_mu);
+        tool_store_close(&s);
+        tool_memory_free(&s.tool_mem);
+        pthread_mutex_destroy(&s.tool_mu);
+    }
+
+    {
+        server s = {0};
+        pthread_mutex_init(&s.tool_mu, NULL);
+        tool_store_open(&s, path);
+        pthread_mutex_lock(&s.tool_mu);
+        tool_memory_source src = TOOL_MEMORY_RAM;
+        tool_memory_block *block = NULL;
+        const char *got_a =
+            tool_memory_lookup_locked(&s.tool_mem, "call_a", &src, &block);
+        const char *got_b =
+            tool_memory_lookup_locked(&s.tool_mem, "call_b", &src, &block);
+        TEST_ASSERT(got_a != NULL && !strcmp(got_a, dsml_a));
+        TEST_ASSERT(got_b != NULL && !strcmp(got_b, dsml_b));
+        pthread_mutex_unlock(&s.tool_mu);
+        tool_store_close(&s);
+        tool_memory_free(&s.tool_mem);
+        pthread_mutex_destroy(&s.tool_mu);
+    }
+
+    /* A kill during an append may leave a short final record. Earlier records
+     * must still load, and startup compaction must repair the file. */
+    {
+        FILE *fp = fopen(path, "ab");
+        TEST_ASSERT(fp != NULL);
+        uint8_t partial[6] = {1, 2, 3, 4, 5, 6};
+        fwrite(partial, 1, sizeof(partial), fp);
+        fclose(fp);
+
+        server s = {0};
+        pthread_mutex_init(&s.tool_mu, NULL);
+        tool_store_open(&s, path);
+        pthread_mutex_lock(&s.tool_mu);
+        tool_memory_source src = TOOL_MEMORY_RAM;
+        tool_memory_block *block = NULL;
+        const char *got_a =
+            tool_memory_lookup_locked(&s.tool_mem, "call_a", &src, &block);
+        TEST_ASSERT(got_a != NULL && !strcmp(got_a, dsml_a));
+        pthread_mutex_unlock(&s.tool_mu);
+        tool_store_close(&s);
+        tool_memory_free(&s.tool_mem);
+        pthread_mutex_destroy(&s.tool_mu);
+    }
+
+    {
+        server s = {0};
+        s.disable_exact_dsml_tool_replay = true;
+        pthread_mutex_init(&s.tool_mu, NULL);
+        tool_store_open(&s, path);
+        TEST_ASSERT(s.tool_store_path == NULL);
+        TEST_ASSERT(s.tool_store_fp == NULL);
+        tool_store_close(&s);
+        pthread_mutex_destroy(&s.tool_mu);
+    }
+    unlink(path);
+}
+
+static void test_tool_store_file_is_bounded(void) {
+    char path[] = "/tmp/ds4_tool_bound_testXXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    close(fd);
+    unlink(path);
+
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    /* Leave the entry cap at its production default and force eviction with a
+     * byte cap, so an obsolete record-count compaction rule cannot pass. */
+    s.tool_mem.max_bytes = 64u * 1024u;
+    tool_store_open(&s, path);
+    TEST_ASSERT(s.tool_store_path != NULL);
+
+    char dsml[512];
+    memset(dsml, 'x', sizeof(dsml) - 1);
+    dsml[sizeof(dsml) - 1] = '\0';
+    pthread_mutex_lock(&s.tool_mu);
+    for (int i = 0; i < 20000; i++) {
+        char id[32];
+        snprintf(id, sizeof(id), "call_%06d", i);
+        tool_memory_put_locked(&s.tool_mem, id, dsml, TOOL_MEMORY_RAM);
+        tool_store_append_locked(&s, id, dsml);
+    }
+    const uint64_t live_bytes = (uint64_t)s.tool_mem.bytes;
+    pthread_mutex_unlock(&s.tool_mu);
+
+    FILE *fp = fopen(path, "rb");
+    TEST_ASSERT(fp != NULL);
+    fseek(fp, 0, SEEK_END);
+    const long file_bytes = ftell(fp);
+    fclose(fp);
+    const long ceiling =
+        (long)(2u * TOOL_STORE_COMPACT_FLOOR_BYTES + 2u * live_bytes);
+    TEST_ASSERT(file_bytes > 0);
+    TEST_ASSERT(file_bytes < ceiling);
+    TEST_ASSERT((uint64_t)s.tool_mem.bytes <= 64u * 1024u);
+
+    tool_store_close(&s);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+    unlink(path);
+}
+
 static void test_live_prefix_rewind_target(void) {
     TEST_ASSERT(live_prefix_rewind_target(true, 17, 8, 8) == 7);
     TEST_ASSERT(live_prefix_rewind_target(true, 49826, 48379, 48379) == 48378);
@@ -20371,6 +20687,8 @@ static void ds4_server_unit_tests_run(void) {
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
+    test_tool_store_survives_restart();
+    test_tool_store_file_is_bounded();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
