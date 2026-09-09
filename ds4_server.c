@@ -792,6 +792,11 @@ typedef struct {
     stop_list stops;
     char *raw_body;
     char *prompt_text;
+    /* Number of terminal tokens added by the renderer solely to open the next
+     * assistant generation.  Model-specific session code may checkpoint just
+     * before this server-owned suffix so a cancelled turn can be replaced by
+     * a new client message without rebuilding the whole prompt. */
+    int generation_suffix_tokens;
     tool_schema_orders tool_orders;
     int max_tokens;
     int top_k;
@@ -3204,6 +3209,44 @@ done:
     return ok;
 }
 
+static bool chat_messages_end_for_generation(const chat_msgs *msgs) {
+    bool pending_assistant = false;
+    for (int i = 0; msgs && i < msgs->len; i++) {
+        const char *role = msgs->v[i].role;
+        if (role_is_system(role)) continue;
+        if (role_is_user_like(role)) pending_assistant = true;
+        else if (!strcmp(role, "assistant")) pending_assistant = false;
+    }
+    return pending_assistant;
+}
+
+/* Record the precise token width of the renderer-owned generation cue.  Build
+ * it through the model API and verify the tokenized prompt tail rather than
+ * baking in GLM's two- versus three-token thinking variants here. */
+static bool request_record_generation_suffix(ds4_engine *e, request *r,
+                                             const chat_msgs *msgs,
+                                             char *err, size_t errlen) {
+    r->generation_suffix_tokens = 0;
+    if (!chat_messages_end_for_generation(msgs)) return true;
+    if (!e) {
+        snprintf(err, errlen, "cannot identify assistant generation prefix without a model");
+        return false;
+    }
+
+    ds4_tokens suffix = {0};
+    ds4_chat_append_assistant_prefix(e, &suffix, r->think_mode);
+    const bool matches = suffix.len > 0 && suffix.len <= r->prompt.len &&
+        !memcmp(r->prompt.v + r->prompt.len - suffix.len,
+                suffix.v, (size_t)suffix.len * sizeof(suffix.v[0]));
+    if (matches) r->generation_suffix_tokens = suffix.len;
+    ds4_tokens_free(&suffix);
+    if (!matches) {
+        snprintf(err, errlen, "rendered assistant prefix does not match tokenized prompt");
+        return false;
+    }
+    return true;
+}
+
 /* Render only the semantic tail that must be appended to the live KV for a
  * tool-result continuation.
  *
@@ -3765,6 +3808,12 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         request_free(r);
         return false;
     }
+    if (!request_record_generation_suffix(e, r, &msgs, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     chat_msgs_free(&msgs);
     free(tool_schemas);
     return true;
@@ -3981,6 +4030,13 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    if (!request_record_generation_suffix(e, r, &msgs, err, errlen)) {
         chat_msgs_free(&msgs);
         free(system);
         free(tool_schemas);
@@ -5011,6 +5067,15 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
         r->model_syntax, &msgs, active_tool_schemas,
         &r->tool_orders, r->think_mode);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) {
+        chat_msgs_free(&msgs);
+        buf_free(&combined_tool_schemas);
+        buf_free(&loaded_tool_schemas);
+        free(instructions);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    if (!request_record_generation_suffix(e, r, &msgs, err, errlen)) {
         chat_msgs_free(&msgs);
         buf_free(&combined_tool_schemas);
         buf_free(&loaded_tool_schemas);
@@ -18137,6 +18202,36 @@ static void test_chat_render_is_append_only_across_tool_turn(void) {
     chat_msgs_free(&turn_n1);
 }
 
+static void test_chat_generation_boundary_classification(void) {
+    chat_msgs msgs = {0};
+    TEST_ASSERT(!chat_messages_end_for_generation(&msgs));
+
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("hello");
+    chat_msgs_push(&msgs, user);
+    TEST_ASSERT(chat_messages_end_for_generation(&msgs));
+
+    chat_msg system = {0};
+    system.role = xstrdup("system");
+    system.content = xstrdup("late metadata");
+    chat_msgs_push(&msgs, system);
+    TEST_ASSERT(chat_messages_end_for_generation(&msgs));
+
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("done");
+    chat_msgs_push(&msgs, assistant);
+    TEST_ASSERT(!chat_messages_end_for_generation(&msgs));
+
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("result");
+    chat_msgs_push(&msgs, tool);
+    TEST_ASSERT(chat_messages_end_for_generation(&msgs));
+    chat_msgs_free(&msgs);
+}
+
 static void test_chat_live_match_requires_visible_prefix(void) {
     server s = {0};
     server_slot slot;
@@ -21000,6 +21095,7 @@ static void ds4_server_unit_tests_run(void) {
     test_anthropic_live_tail_renders_tool_results_only();
     test_chat_live_tail_renders_tool_results_only();
     test_chat_render_is_append_only_across_tool_turn();
+    test_chat_generation_boundary_classification();
     test_chat_live_match_requires_visible_prefix();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
