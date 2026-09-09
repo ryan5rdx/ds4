@@ -47618,6 +47618,32 @@ static bool glm53_graph_hc_pre(
  *
  * No new code path; the scalar branch is already written and already loops
  * rows. */
+/* MTP2A.  DEFAULT OFF.  The first PHASE-2 arm.
+ *
+ * MTP1A-E all call the one-row path twice, so they pay its per-call overhead
+ * twice: MTP1A's measured result backs out a two-row factor of 2.76x, and +10%
+ * needs <= 1.15x. Only a kernel that reads the weights ONCE and carries two
+ * rows of activations can get there.
+ *
+ * For the attention output projection that kernel already exists.
+ * ds4_gpu_matmul_q8_0_decode_rows_exact_tensor is described in ds4_gpu.h as a
+ * "multi-row decode projection that preserves the one-row reduction order" and
+ * is already used on the session-batch paths -- so this arm is a call swap, not
+ * a new kernel, and the reduction order guarantee means it should not perturb
+ * output at all.
+ *
+ * This is the cheapest available test of the phase-2 premise: if the native
+ * two-row factor really is ~1.2x here, the same approach is worth writing for
+ * the stages that do not already have such a kernel. */
+static bool glm53_mtp2a_attnout_rows_active(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_GLM_MTP2A_ATTNOUT_ROWS");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 static bool glm53_mtp1e_indexer_rows_active(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -55642,6 +55668,25 @@ static bool glm_graph_forward_indexed_tokens(
                     ds4_gpu_tensor_free(out_tail);
                     ds4_gpu_tensor_free(heads_tail);
                 }
+            } else if (glm53_mtp2a_attnout_rows_active() && g->mtp_verify_active &&
+                       n_tokens == 2u) {
+                /* MTP2A: one weight pass, two rows of activations. */
+                static int announced;
+                if (!announced) {
+                    announced = 1;
+                    fprintf(stderr, "ds4: GLM MTP2A ACTIVE -- two-row verify attn "
+                                    "output projection through the exact multi-row "
+                                    "decode matmul\n");
+                }
+                ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                        attn_out_dst,
+                        model->map,
+                        model->size,
+                        l->attn_output->abs_offset,
+                        g->heads_dim,
+                        DS4_N_EMBD,
+                        g->batch_heads,
+                        n_tokens) != 0;
             } else {
                 ok = (use_batch_attn_out_proj ?
                       glm_graph_matmul_q8_0_tensor(attn_out_dst,
