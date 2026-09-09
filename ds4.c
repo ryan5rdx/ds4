@@ -45404,7 +45404,25 @@ static bool glm53_graph_hc_pre(
     return ok;
 }
 
-/* MTP1C.  DEFAULT OFF.
+/* MTP1C.  WITHDRAWN -- it does not compute the same thing and is now a no-op.
+ *
+ * MTPF-SINGLES: acceptance collapsed 71.6% -> 6.7% with this arm on, and
+ * target_ms got WORSE (93.08 vs 90.36). A 65-point acceptance drop is not a
+ * performance result, it is the draft failing to match the target -- so the
+ * per-row hc_pre changes the hidden states the draft is compared against.
+ *
+ * Same failure as MTP1E: "a per-row/decode variant exists" is not the same
+ * claim as "it computes the same thing". The mHC pre block straddles the
+ * attn/ffn stage boundary differently on the two substrates
+ * (2026-09-07-MTP0C-SOURCE), and per-row application reorders it relative to
+ * the batched path.
+ *
+ * Left as a warning no-op so the census's +18.11 attn_out+hc_pre excess does
+ * not invite a third attempt down this route.
+ *
+ * ORIGINAL RATIONALE BELOW, kept for the record.
+ *
+ * MTP1C.  DEFAULT OFF.
  *
  * Route the two-row verifier's mHC pre block through the DECODE variant, one
  * call per row -- the third application of MTP1A's pattern.
@@ -45447,12 +45465,16 @@ static bool glm53_mtp1d_qklow_rows_active(void) {
 }
 
 static bool glm53_mtp1c_hc_rows_active(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("DS4_GLM_MTP1C_HC_ROWS");
-        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    static int warned;
+    const char *e = getenv("DS4_GLM_MTP1C_HC_ROWS");
+    if (e && e[0] && e[0] != '0' && !warned) {
+        warned = 1;
+        fprintf(stderr,
+                "ds4: DS4_GLM_MTP1C_HC_ROWS is WITHDRAWN and ignored -- it "
+                "collapsed acceptance 71.6%% -> 6.7%% on MTPF-SINGLES; the "
+                "per-row hc_pre does not compute what the batched path does\n");
     }
-    return cached != 0;
+    return false;
 }
 
 static bool glm53_graph_hc_pre_rows_decode(
