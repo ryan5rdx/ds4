@@ -28125,9 +28125,13 @@ static DS4_MAYBE_UNUSED bool metal_graph_decode_pipeline_fast_lookup_eligible(
         uint32_t             pos,
         bool                 allow_split_flush) {
 #if defined(__APPLE__)
+    /* The mirror key is the complete pipeline specialization, which carries no
+     * rank-dependent state, so the cache is as valid under tensor parallelism
+     * as without it. Excluding tp_world > 1 only denies TP a host-side lookup
+     * cache on the order of 500 fetches per token. */
     if (!g || !weights || !allow_split_flush ||
         g->quality || g->ssd_streaming || g->ssd_streaming_cold ||
-        g->placement != NULL || g->tp_world > 1u || g->mtp_enabled ||
+        g->placement != NULL || g->mtp_enabled ||
         DS4_N_LAYER <= 4u) {
         return false;
     }
@@ -28206,10 +28210,13 @@ static uint32_t metal_graph_token_adaptive_second_split_after_layers(
         layer->ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
         layer->ffn_up_exps->type == DS4_TENSOR_MXFP4 &&
         layer->ffn_down_exps->type == DS4_TENSOR_MXFP4;
+    /* The actual flush site independently requires exact per-slot TP release
+     * words before acting on either split value. Keeping a second TP exclusion
+     * here would disable the whole overlap schedule even when it is safe. */
     const bool eligible =
         allow_split_flush && pos < 3328u &&
         g && !g->quality && !g->ssd_streaming && !g->ssd_streaming_cold &&
-        g->tp_world != 2u && mxfp4_routed &&
+        mxfp4_routed &&
         ds4_gpu_device_is_pre_m5_apple_silicon();
     /* Once the raw SWA window is full, short eval prompts leave less GPU work
      * in the four-layer prefix while the host still has the same remaining
