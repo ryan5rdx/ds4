@@ -45404,6 +45404,70 @@ static bool glm53_graph_hc_pre(
     return ok;
 }
 
+/* MTP1C.  DEFAULT OFF.
+ *
+ * Route the two-row verifier's mHC pre block through the DECODE variant, one
+ * call per row -- the third application of MTP1A's pattern.
+ *
+ * The indexed census (2026-09-08-MTP0B-SPARSE) puts attn_out+hc_pre at 28.08 ms
+ * in the verifier against 9.97 ms on the decode substrate (2.87x), +18.11 ms of
+ * excess and the largest item left once routed_moe (MTP1B) and DSA attention
+ * (MTP1A) are moved.
+ *
+ * attn_output and ffn_norm are one census key on purpose: the HC pre-FFN block
+ * sits on opposite sides of the attn/ffn stage split in the two graphs, so only
+ * their sum is comparable (2026-09-07-MTP0C-SOURCE).
+ *
+ * glm53_graph_hc_pre uses the decode-sized g->hc_* scratch; the two calls are
+ * ordered on one queue through it, so no fence is added. */
+static bool glm53_mtp1c_hc_rows_active(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_GLM_MTP1C_HC_ROWS");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+static bool glm53_graph_hc_pre_rows_decode(
+        ds4_glm_gpu_graph    *g,
+        const ds4_model      *model,
+        const ds4_tensor     *fn,
+        const ds4_tensor     *scale,
+        const ds4_tensor     *base,
+        const ds4_tensor     *norm,
+        const ds4_gpu_tensor *residual_hc,
+        ds4_gpu_tensor       *collapsed,
+        ds4_gpu_tensor       *normalized,
+        uint32_t              rows) {
+    if (rows != 2u) return false;
+    const uint64_t hc_bytes   = (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    bool ok = true;
+    for (uint32_t t = 0; ok && t < rows; t++) {
+        ds4_gpu_tensor *rv = ds4_gpu_tensor_view((ds4_gpu_tensor *)residual_hc,
+                                                 (uint64_t)t * hc_bytes, hc_bytes);
+        ds4_gpu_tensor *cv = ds4_gpu_tensor_view(collapsed,
+                                                 (uint64_t)t * embd_bytes, embd_bytes);
+        ds4_gpu_tensor *nv = ds4_gpu_tensor_view(normalized,
+                                                 (uint64_t)t * embd_bytes, embd_bytes);
+        ok = rv && cv && nv &&
+             glm53_graph_hc_pre(g, model, fn, scale, base, norm, rv, cv, nv);
+        if (!ok) fprintf(stderr, "ds4: GLM MTP1C per-row hc_pre failed at row %u\n", t);
+        ds4_gpu_tensor_free(nv); ds4_gpu_tensor_free(cv); ds4_gpu_tensor_free(rv);
+    }
+    if (ok) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "ds4: GLM MTP1C ACTIVE -- two-row verify mHC pre "
+                            "through the decode path, one call per row\n");
+        }
+    }
+    return ok;
+}
+
+
 
 static bool glm53_graph_kda_attention(
         ds4_glm_gpu_graph       *g,
@@ -51996,6 +52060,13 @@ static bool glm_graph_forward_indexed_tokens(
         }
 
         if (ok && g->glm53) {
+            if (glm53_mtp1c_hc_rows_active() && g->mtp_verify_active &&
+                n_tokens == 2u) {
+                ok = glm53_graph_hc_pre_rows_decode(
+                        g, model, l->hc_attn_fn, l->hc_attn_scale,
+                        l->hc_attn_base, l->attn_norm, hc_cur, cur,
+                        g->batch_attn_norm, n_tokens);
+            } else
             ok = glm53_graph_hc_pre_rows(g,
                                          model,
                                          l->hc_attn_fn,
