@@ -56392,12 +56392,10 @@ struct ds4_session {
      * same length must not be able to restore into it. */
     uint64_t glm53_rollback_token_hash;
     bool glm53_rollback_valid;
-    /* Set while an INTERNAL sync runs -- a tool-recovery suffix, a canonical
-     * rewrite, a cold-checkpoint prefix.  Those advance the session past the
-     * prompt the client actually sent, and the next request will not contain
-     * the tokens they added, so a snapshot taken at their frontier is outside
-     * the next request's common prefix and cannot be reused.  Hold the snapshot
-     * at the externally supplied prompt frontier instead. */
+    /* Set while a sync advances past stable client history -- the assistant
+     * generation cue, a tool-recovery suffix, a canonical rewrite, or a cold
+     * checkpoint prefix.  A replacement request may not contain those tokens,
+     * so a snapshot there can fall outside its common prefix. */
     bool glm53_rollback_held;
 #endif
 };
@@ -69436,7 +69434,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
      * whether a later rewind can restore.
      *
      * It also happens to be the frontier both hot rewinds target: a cancelled
-     * generation rolls back to the post-prompt frontier, and an interrupted
+     * generation rolls back to the stable pre-cue boundary, and an interrupted
      * prefill rolls back to the previous sync's frontier.
      *
      * A TP worker must not capture from its own sync: it does not know whether

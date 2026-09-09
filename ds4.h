@@ -573,12 +573,11 @@ void ds4_session_rewind_mode(ds4_session *s, int pos, bool want_restore);
  * from its own sync would overwrite the frontier the leader may rewind to. */
 bool ds4_session_glm53_rollback_capture(ds4_session *s);
 void ds4_session_glm53_rollback_drop(ds4_session *s);
-/* Suppress rollback capture for the duration of an INTERNAL sync -- one that
- * advances the session past the prompt the client sent (tool-recovery suffix,
- * canonical rewrite, cold-checkpoint prefix).  The next request will not carry
- * the tokens those add, so a snapshot at their frontier falls outside its
- * common prefix and is unusable; the snapshot must stay pinned at the external
- * prompt frontier.  Always pair with a matching `false`. */
+/* Suppress rollback capture for a sync whose frontier is not stable client
+ * history (the assistant-generation cue, a tool-recovery suffix, canonical
+ * rewrite, or cold-checkpoint prefix).  A replacement request may not carry
+ * those tokens, so the snapshot stays pinned at the last stable boundary.
+ * Always pair with a matching `false`. */
 void ds4_session_rollback_hold(ds4_session *s, bool hold);
 /* Test-only hook for the otherwise hard-to-reach canonical rebuild path. */
 void ds4_session_force_canon_rebuild(ds4_session *s, bool force);

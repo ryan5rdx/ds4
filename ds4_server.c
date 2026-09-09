@@ -9863,11 +9863,11 @@ static void request_live_state_clear(server *s, server_slot *slot) {
 
 /* Where a cancelled generation should land the session.
  *
- * ALWAYS the frontier of the prompt the client actually sent.  This function is
- * only reached when the turn was not delivered, so the retry will send that
- * same prompt again and nothing past it can be reused -- see the caller, whose
- * comment has said so all along: "The client never received this turn, so it
- * will retry without it."
+ * For GLM-5.3 this is the stable rendered history before the server-owned
+ * assistant generation cue.  A replacement user message retains that history
+ * but replaces the trailing <assistant>/<think> cue, so a snapshot after the
+ * cue lies two or three tokens beyond the next request's common prefix.  Other
+ * backends keep the historical full-prompt-minus-one behavior below.
  *
  * That is why every internal sync is held (ds4_session_rollback_hold): the
  * rollback snapshot must still be sitting at this frontier when we get here.
@@ -9885,13 +9885,13 @@ static void request_live_state_clear(server *s, server_slot *slot) {
  * left behind by the cancelled generation and calmly resume producing the
  * output that was just cancelled.  Leave it one token to re-evaluate, the way
  * live_prefix_rewind_target() caps at prompt_len - 1. */
-static int cancel_rollback_target(bool is_glm53, int committed_frontier) {
-    if (committed_frontier <= 0) return 0;
-    return is_glm53 ? committed_frontier : committed_frontier - 1;
+static int cancel_rollback_target(bool is_glm53, int rollback_frontier) {
+    if (rollback_frontier <= 0) return 0;
+    return is_glm53 ? rollback_frontier : rollback_frontier - 1;
 }
 
 static void request_cancel_rollback(server *s, server_slot *slot,
-                                    int committed_frontier) {
+                                    int rollback_frontier) {
     request_live_state_clear(s, slot);
     /* Where to land.
      *
@@ -9908,11 +9908,11 @@ static void request_cancel_rollback(server *s, server_slot *slot,
      * to re-evaluate, the same way live_prefix_rewind_target() caps at
      * prompt_len - 1. */
     const int target = cancel_rollback_target(ds4_engine_is_glm53(s->engine),
-                                              committed_frontier);
+                                              rollback_frontier);
     pthread_mutex_lock(&s->inference_mu);
     /* Safe to rewind under tensor parallelism as well, because this is only
      * reachable once the prompt sync has *succeeded*: an interrupted or failed
-     * sync returns long before committed_frontier is captured, and the leader
+     * sync returns long before rollback_frontier is captured, and the leader
      * only gets past ds4_session_sync() when the worker acked success.  From
      * that shared position both ranks move together -- decode appends mirror
      * per token, and canonicalize_tool_checkpoint() mutates only through
@@ -9921,7 +9921,7 @@ static void request_cancel_rollback(server *s, server_slot *slot,
     ds4_session_rewind(slot->session, target);
     /* Clamp against where the rewind actually landed, not what was asked for:
      * it snaps down to a compressor-window boundary and can end below
-     * committed_frontier. */
+     * rollback_frontier. */
     const int landed = ds4_session_reusable_pos(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
     /* The rewind also un-does the continued-store high-water mark: leaving it
@@ -11571,6 +11571,32 @@ static int live_prefix_rewind_target(bool backend_can_rewind,
     return target;
 }
 
+/* Return the client-stable frontier immediately before the renderer-owned
+ * assistant cue, or the full prompt length when this request cannot be split
+ * safely.  Live-continuation prompts are assembled from exact sampled tokens,
+ * so verify their terminal cue against the canonical request before using the
+ * request's recorded width. */
+static int stable_generation_frontier(bool is_glm53,
+                                      const ds4_tokens *effective_prompt,
+                                      const ds4_tokens *canonical_prompt,
+                                      int generation_suffix_tokens) {
+    if (!effective_prompt) return 0;
+    const int full = effective_prompt->len;
+    if (!is_glm53 || !effective_prompt->v || !canonical_prompt ||
+        !canonical_prompt->v || generation_suffix_tokens <= 0 ||
+        generation_suffix_tokens >= full ||
+        generation_suffix_tokens > canonical_prompt->len) {
+        return full;
+    }
+    const int n = generation_suffix_tokens;
+    if (memcmp(effective_prompt->v + full - n,
+               canonical_prompt->v + canonical_prompt->len - n,
+               (size_t)n * sizeof(effective_prompt->v[0]))) {
+        return full;
+    }
+    return full - n;
+}
+
 static void trace_time(FILE *fp) {
     time_t now = time(NULL);
     struct tm tm;
@@ -12550,8 +12576,8 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     pthread_mutex_lock(&s->inference_mu);
     /* Held for the whole rewrite.  The hold suppresses rollback *capture*, so
      * the append-only branch -- which syncs internally -- leaves the snapshot
-     * sitting at the client's prompt frontier, where the cancel rollback needs
-     * it if the response write then fails.
+     * sitting at the stable pre-generation boundary, where cancel rollback
+     * needs it if the response write then fails.
      *
      * It does NOT survive the REBUILD_NEEDED branch: that invalidates, and the
      * drop is unconditional on both ranks by design (see
@@ -12922,8 +12948,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_session_vision_prefix_matches(slot->session,
                                          j->req.images, j->req.image_count);
     pthread_mutex_unlock(&s->inference_mu);
-    /* Captured after the prompt sync and before generation appends tokens. */
-    int committed_frontier = 0;
+    /* Stable history restored when this turn is cancelled. */
+    int rollback_frontier = 0;
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_reusable_tokens(slot->session),
                         &j->req.prompt, old_pos, common);
@@ -13030,7 +13056,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * assistant turn -- a stripped think block, a re-rendered tool call --
          * that turns a full re-prefill into one of the generated tail. */
         const bool is_glm53 = ds4_engine_is_glm53(s->engine);
-        const int rollback_frontier = is_glm53 ?
+        const int snapshot_frontier = is_glm53 ?
             ds4_session_rollback_frontier(slot->session) : -1;
         const uint32_t raw_budget = is_glm ? 0 : ds4_session_raw_rewind_budget(slot->session);
         /* Budget against the tail actually discarded, old_pos - common, not
@@ -13050,10 +13076,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             ds4_session_rewind_align(slot->session) - 1u;
         const bool can_rewind = live_prefix_backend_can_rewind(
             is_glm, is_glm53, raw_budget, align_slack, discard,
-            rollback_frontier);
+            snapshot_frontier);
         const int rewind_to = live_prefix_rewind_target(
             can_rewind, old_pos, j->req.prompt.len, common,
-            is_glm53 ? rollback_frontier : -1);
+            is_glm53 ? snapshot_frontier : -1);
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
             ds4_session_rewind(slot->session, rewind_to);
@@ -13235,6 +13261,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_progress(slot->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
+    const int stable_frontier = stable_generation_frontier(
+        ds4_engine_is_glm53(s->engine), prompt_for_sync, &j->req.prompt,
+        j->req.generation_suffix_tokens);
+    const bool wants_stable_snapshot =
+        stable_frontier > 0 && stable_frontier < prompt_for_sync->len;
     int cold_store_len = 0;
     if (!multimodal && cached == 0 &&
         s->kv.enabled &&
@@ -13248,6 +13279,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
     }
+    /* Never let an internal cold-cache sync step over the state we need to
+     * snapshot for cancellation. */
+    if (wants_stable_snapshot && cold_store_len > stable_frontier)
+        cold_store_len = stable_frontier;
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
         /* A cold checkpoint can land exactly on the continued-checkpoint
@@ -13267,8 +13302,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
         /* Internal: a strict prefix of the prompt, synced only so the cold
-         * checkpoint lands on the right boundary.  The full sync follows and
-         * takes the snapshot at the real frontier. */
+         * checkpoint lands on the right boundary.  The stable/full prompt sync
+         * follows and takes the rollback snapshot at its chosen frontier. */
         ds4_session_rollback_hold(slot->session, true);
         const int cold_rc = server_session_sync(s, slot, &prefix, err, sizeof(err));
         ds4_session_rollback_hold(slot->session, false);
@@ -13302,11 +13337,39 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&prefix);
     }
 
+    ds4_tokens stable_prompt = {0};
+    const ds4_tokens *initial_sync_prompt = prompt_for_sync;
+    if (wants_stable_snapshot) {
+        tokens_copy_prefix(&stable_prompt, prompt_for_sync, stable_frontier);
+        initial_sync_prompt = &stable_prompt;
+    }
     int prompt_sync_rc = multimodal ?
-        server_session_sync_multimodal(s, slot, prompt_for_sync,
+        server_session_sync_multimodal(s, slot, initial_sync_prompt,
                                        j->req.images, j->req.image_count,
                                        err, sizeof(err)) :
-        server_session_sync(s, slot, prompt_for_sync, err, sizeof(err));
+        server_session_sync(s, slot, initial_sync_prompt, err, sizeof(err));
+    bool stable_snapshot = false;
+    if (prompt_sync_rc == 0 && wants_stable_snapshot) {
+        stable_snapshot =
+            ds4_session_rollback_frontier(slot->session) == stable_frontier;
+        if (stable_snapshot) {
+            /* The cue is required to produce the first-token logits, but it is
+             * server-owned and disappears when a user steers the session. Keep
+             * the snapshot at the history boundary while evaluating it. */
+            ds4_session_rollback_hold(slot->session, true);
+        } else {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: GLM stable rollback snapshot unavailable at %d; using full prompt frontier",
+                       stable_frontier);
+        }
+        prompt_sync_rc = multimodal ?
+            server_session_sync_multimodal(s, slot, prompt_for_sync,
+                                           j->req.images, j->req.image_count,
+                                           err, sizeof(err)) :
+            server_session_sync(s, slot, prompt_for_sync, err, sizeof(err));
+        if (stable_snapshot) ds4_session_rollback_hold(slot->session, false);
+    }
+    ds4_tokens_free(&stable_prompt);
     if (prompt_sync_rc != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(slot->session, NULL, NULL);
@@ -13325,11 +13388,21 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         return;
     }
     free(disk_cache_path);
-    committed_frontier = ds4_session_pos(slot->session);
+    rollback_frontier = stable_snapshot ?
+        stable_frontier : ds4_session_pos(slot->session);
+    if (stable_snapshot) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: GLM stable rollback frontier=%d cue_tokens=%d prompt=%d",
+                   rollback_frontier, j->req.generation_suffix_tokens,
+                   prompt_for_sync->len);
+        trace_event(s, trace_id,
+                    "stable rollback frontier=%d cue_tokens=%d",
+                    rollback_frontier, j->req.generation_suffix_tokens);
+    }
     if (job_cancelled(j)) {
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
-        request_live_state_clear(s, slot);
+        request_cancel_rollback(s, slot, rollback_frontier);
         trace_event(s, trace_id, "cancelled after prefill");
         ds4_tokens_free(&effective_prompt);
         return;
@@ -13379,7 +13452,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
-            request_live_state_clear(s, slot);
+            request_cancel_rollback(s, slot, rollback_frontier);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -13394,7 +13467,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                        ctx_span,
                        req_flags[0] ? " " : "",
                        req_flags);
-            request_live_state_clear(s, slot);
+            request_cancel_rollback(s, slot, rollback_frontier);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -13404,7 +13477,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                       prompt_tokens, &anthropic_live)) {
             job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
-            request_live_state_clear(s, slot);
+            request_cancel_rollback(s, slot, rollback_frontier);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -13412,7 +13485,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
             job_mark_cancelled(j);
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
-            request_live_state_clear(s, slot);
+            request_cancel_rollback(s, slot, rollback_frontier);
             ds4_tokens_free(&effective_prompt);
             return;
         }
@@ -13428,7 +13501,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                            req_flags[0] ? " " : "",
                            req_flags);
                 responses_stream_free(&responses_live);
-                request_live_state_clear(s, slot);
+                request_cancel_rollback(s, slot, rollback_frontier);
                 ds4_tokens_free(&effective_prompt);
                 return;
             }
@@ -13800,7 +13873,7 @@ decode_again:
     server_generation_leave(s);
 
     if (job_cancelled(j)) {
-        request_cancel_rollback(s, slot, committed_frontier);
+        request_cancel_rollback(s, slot, rollback_frontier);
         trace_event(s, trace_id, "cancelled during generation after %d tokens", completion);
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
@@ -13926,7 +13999,7 @@ decode_again:
         free(tail);
     }
     if (job_cancelled(j)) {
-        request_cancel_rollback(s, slot, committed_frontier);
+        request_cancel_rollback(s, slot, rollback_frontier);
         trace_event(s, trace_id, "cancelled while flushing generation");
         anthropic_stream_free(&anthropic_live);
         openai_stream_free(&openai_live);
@@ -14034,7 +14107,7 @@ decode_again:
             }
         }
         if (job_cancelled(j)) {
-            request_cancel_rollback(s, slot, committed_frontier);
+            request_cancel_rollback(s, slot, rollback_frontier);
             trace_event(s, trace_id, "cancelled during response parsing");
             free(parsed_content);
             free(parsed_reasoning);
@@ -14058,7 +14131,7 @@ decode_again:
         }
     }
     if (job_cancelled(j)) {
-        request_cancel_rollback(s, slot, committed_frontier);
+        request_cancel_rollback(s, slot, rollback_frontier);
         trace_event(s, trace_id, "cancelled before publishing response state");
         free(parsed_content);
         free(parsed_reasoning);
@@ -14144,7 +14217,7 @@ decode_again:
      * different slot and the rebuild finishes somewhere nobody will use it.
      *
      * The cache bugs are instead fixed where they belong: the rollback snapshot
-     * is pinned at the client's prompt frontier across canonicalization
+     * is pinned at the stable pre-generation frontier across canonicalization
      * (ds4_session_rollback_hold suppresses capture), so a write that fails
      * afterwards still has somewhere to roll back to.  The REBUILD_NEEDED
      * branch is the exception -- it invalidates, which drops the snapshot on
@@ -14254,7 +14327,7 @@ decode_again:
         job_mark_cancelled(j);
         final_finish = "error";
         snprintf(err, sizeof(err), "client disconnected");
-        request_cancel_rollback(s, slot, committed_frontier);
+        request_cancel_rollback(s, slot, rollback_frontier);
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: %s ctx=%s%s%s client disconnected",
                    j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -19855,8 +19928,8 @@ static void test_cancel_rollback_target(void) {
     TEST_ASSERT(cancel_rollback_target(false, 32050) == 32049);
     TEST_ASSERT(cancel_rollback_target(false, 1) == 0);
 
-    /* GLM-5.3 lands on the client's prompt frontier exactly: the restored
-     * snapshot carries the logits, and every internal sync is held so the
+    /* GLM-5.3 lands on the stable pre-cue frontier exactly: the restored
+     * snapshot carries the logits, and every later sync is held so the
      * snapshot is still sitting there.
      *
      * It must NOT chase a snapshot that moved forward.  A canonical rewrite
@@ -19874,6 +19947,33 @@ static void test_cancel_rollback_target(void) {
     TEST_ASSERT(cancel_rollback_target(true, 0) == 0);
     TEST_ASSERT(cancel_rollback_target(false, -5) == 0);
     TEST_ASSERT(cancel_rollback_target(true, -5) == 0);
+}
+
+static void test_stable_generation_frontier(void) {
+    int canonical_ids[] = { 1, 2, 3, 90, 91 };
+    int effective_ids[] = { 7, 8, 9, 10, 90, 91 };
+    ds4_tokens canonical = {
+        .v = canonical_ids,
+        .len = (int)(sizeof(canonical_ids) / sizeof(canonical_ids[0])),
+    };
+    ds4_tokens effective = {
+        .v = effective_ids,
+        .len = (int)(sizeof(effective_ids) / sizeof(effective_ids[0])),
+    };
+    TEST_ASSERT(stable_generation_frontier(true, &effective,
+                                            &canonical, 2) == 4);
+    TEST_ASSERT(stable_generation_frontier(false, &effective,
+                                            &canonical, 2) == effective.len);
+    TEST_ASSERT(stable_generation_frontier(true, &effective,
+                                            &canonical, 0) == effective.len);
+
+    canonical_ids[4] = 92;
+    TEST_ASSERT(stable_generation_frontier(true, &effective,
+                                            &canonical, 2) == effective.len);
+    canonical_ids[4] = 91;
+    TEST_ASSERT(stable_generation_frontier(true, &effective,
+                                            &canonical, effective.len) ==
+                effective.len);
 }
 
 static void test_cache_miss_reason_names_an_invalid_checkpoint(void) {
@@ -21746,6 +21846,7 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_store_file_is_bounded();
     test_tp_rewind_ack_status();
     test_cancel_rollback_target();
+    test_stable_generation_frontier();
     test_cache_miss_reason_names_an_invalid_checkpoint();
     test_live_prefix_backend_can_rewind();
     test_live_prefix_rewind_target();
