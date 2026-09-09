@@ -156,6 +156,14 @@ check-mxfp4-half-lut:
 # MTL_SHADER_VALIDATION=1; this is the half that costs nothing.
 check-threadgroup-memory:
 	@python3 tools/tgmem_census.py
+	@bare=$$(grep -oE 'setThreadgroupMemoryLength:[^D]' ds4_metal.m | wc -l | tr -d ' '); \
+	 if [ "$$bare" != "0" ]; then \
+	   echo "ds4: $$bare setThreadgroupMemoryLength site(s) not wrapped in DS4_TG16."; \
+	   echo "     Metal requires a multiple of 16 and only the debug layer enforces it."; \
+	   grep -n 'setThreadgroupMemoryLength:[^D]' ds4_metal.m | head -5; \
+	   exit 1; \
+	 fi; \
+	 echo "ds4: all setThreadgroupMemoryLength sites are 16-rounded"
 test-mxfp4-metal: check-mxfp4-half-lut tests/test_mxfp4_metal
 	./tests/test_mxfp4_metal
 
