@@ -9183,6 +9183,8 @@ typedef struct {
 struct server_slot {
     server *srv;
     int id;
+    /* Monotonic stamp used to evict the least-recently-used warm session. */
+    uint64_t last_used;
     ds4_session *session;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
@@ -9305,6 +9307,7 @@ struct server {
     ds4_tp *tp_leader;
     server_slot *slots;
     int slot_count;
+    uint64_t slot_clock;
     int ctx_size;
     bool batched_mode;
     pthread_t *slot_threads;
@@ -9324,6 +9327,7 @@ struct server {
     bool model_stopping;
     int decode_pending;
     int active_generations;
+    int prefill_quantum;
     int mixed_prefill_quantum;
     int last_prefill_slot;
     pthread_mutex_t mu;
@@ -11433,9 +11437,17 @@ static void server_prefill_leave(server *s) {
     pthread_mutex_unlock(&s->model_mu);
 }
 
+/* Idle prefill should match the engine's 4096-token GLM chunk.  A smaller
+ * server quantum creates extra graph passes and TP big gates without reducing
+ * model work.  The mixed quantum remains deliberately small so an arriving
+ * generation is not blocked behind a long prefill. */
+#define DS4_SERVER_DEFAULT_PREFILL_QUANTUM 4096
+
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    int quantum = generation_active ? s->mixed_prefill_quantum : 2048;
+    const int idle = s->prefill_quantum > 0 ? s->prefill_quantum :
+                     DS4_SERVER_DEFAULT_PREFILL_QUANTUM;
+    int quantum = generation_active ? s->mixed_prefill_quantum : idle;
     if (generation_active && quantum < 1024 && s->engine &&
         ds4_engine_is_glm53(s->engine)) {
         quantum = 1024;
@@ -13613,6 +13625,14 @@ static int job_required_slot_locked(server *s, const job *j) {
     return -1;
 }
 
+/* Prefer a genuine conversation prefix over an empty slot, an empty slot over
+ * evicting live state, then evict least-recently-used.  A tiny shared system
+ * prefix is not enough to classify a different conversation as a match. */
+enum {
+    SLOT_BAND_MATCH = 1 << 30,
+    SLOT_BAND_EMPTY = 1 << 29,
+};
+
 static int job_slot_score(server *s, server_slot *slot, const job *j,
                           int required_slot) {
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
@@ -13622,7 +13642,9 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
      * Select its live slot before falling back to token-prefix scoring. The
      * continuation builder independently verifies image identities on reuse.
      * The dispatcher already holds tool_mu here. */
+    if (!slot->session) return SLOT_BAND_EMPTY;
     int live_pos = ds4_session_pos(slot->session);
+    if (live_pos <= 0) return SLOT_BAND_EMPTY;
     const request *req = &j->req;
     visible_image_key images;
     char *key = req->prompt_text ? visible_prompt_key(req, req->prompt_text, &images) : NULL;
@@ -13641,14 +13663,20 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
             byte_prefix_match(key, strlen(key), state->visible_text, state->visible_len);
     }
     free(key);
-    if (visible_match) return live_pos;
-    if (ds4_session_pos(slot->session) > 0 &&
-        !ds4_session_vision_prefix_matches(slot->session,
-                                          j->req.images, j->req.image_count)) {
-        return -1;
+    if (visible_match) {
+        const int capped = live_pos < SLOT_BAND_EMPTY ? live_pos : SLOT_BAND_EMPTY - 1;
+        return SLOT_BAND_MATCH + capped;
+    }
+    if (!ds4_session_vision_prefix_matches(slot->session,
+                                           j->req.images, j->req.image_count)) {
+        return -(int)(slot->last_used & 0x3FFFFFFFu);
     }
     int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    return common;
+    if (common > 0 && (int64_t)common * 8 >= (int64_t)j->req.prompt.len) {
+        const int capped = common < SLOT_BAND_EMPTY ? common : SLOT_BAND_EMPTY - 1;
+        return SLOT_BAND_MATCH + capped;
+    }
+    return -(int)(slot->last_used & 0x3FFFFFFFu);
 }
 
 static void dispatch_jobs_locked(server *s) {
@@ -13727,12 +13755,31 @@ static job *dequeue(server *s) {
     return j;
 }
 
+/* Serialized resident mode has one worker but several warm sessions. */
+static server_slot *worker_pick_slot(server *s, job *j) {
+    if (s->slot_count <= 1) return &s->slots[0];
+    pthread_mutex_lock(&s->tool_mu);
+    const int required = job_required_slot_locked(s, j);
+    server_slot *best = &s->slots[0];
+    int best_score = INT_MIN;
+    for (int i = 0; i < s->slot_count; i++) {
+        const int score = job_slot_score(s, &s->slots[i], j, required);
+        if (score > best_score) {
+            best_score = score;
+            best = &s->slots[i];
+        }
+    }
+    best->last_used = ++s->slot_clock;
+    pthread_mutex_unlock(&s->tool_mu);
+    return best;
+}
+
 static void *worker_main(void *arg) {
     server *s = arg;
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
-        generate_job(s, &s->slots[0], j);
+        generate_job(s, worker_pick_slot(s, j), j);
         job_complete(j);
     }
     return NULL;
@@ -14192,6 +14239,8 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
     int batched_sessions;
+    int resident_sessions;
+    int prefill_quantum;
     int mixed_prefill_quantum;
 } server_config;
 
@@ -14334,6 +14383,7 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .prefill_quantum = DS4_SERVER_DEFAULT_PREFILL_QUANTUM,
         .mixed_prefill_quantum = 128,
     };
     c.kv_cache = kv_cache_default_options();
@@ -14427,6 +14477,10 @@ static server_config parse_options(int argc, char **argv) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--resident-sessions")) {
+            c.resident_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--prefill-quantum")) {
+            c.prefill_quantum = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
@@ -14611,8 +14665,10 @@ int main(int argc, char **argv) {
     cfg.engine.context_size = cfg.ctx_size;
     cfg.engine.placement_ctx_hint = cfg.ctx_size;
     cfg.engine.placement_session_count_hint =
-        cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
-    cfg.engine.share_session_prefill_workspace = cfg.batched_sessions > 0;
+        cfg.batched_sessions > 0 ? cfg.batched_sessions :
+        cfg.resident_sessions > 0 ? cfg.resident_sessions : 1;
+    cfg.engine.share_session_prefill_workspace =
+        cfg.batched_sessions > 0 || cfg.resident_sessions > 0;
     ds4_engine *engine = NULL;
     if (cfg.gpu_vram_arg || cfg.gpu_devices_arg) {
         ds4_gpu_config gpu_cfg = {0};
@@ -14681,7 +14737,9 @@ int main(int argc, char **argv) {
         }
     }
 
-    const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
+    const int slot_count =
+        cfg.batched_sessions > 0 ? cfg.batched_sessions :
+        cfg.resident_sessions > 0 ? cfg.resident_sessions : 1;
     log_context_memory(cfg.engine.backend,
                        cfg.ctx_size,
                        ds4_engine_prefill_chunk(engine),
@@ -14694,6 +14752,7 @@ int main(int argc, char **argv) {
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
+    s.prefill_quantum = cfg.prefill_quantum;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
@@ -14753,6 +14812,10 @@ int main(int argc, char **argv) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
         }
+    } else if (s.slot_count > 1) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: resident mode enabled resident_sessions=%d "
+                   "(serialized decode)", s.slot_count);
     }
     if (cfg.trace_path) {
         s.trace = fopen(cfg.trace_path, "w");
@@ -14923,6 +14986,33 @@ static void test_batched_prefill_round_robin(void) {
     TEST_ASSERT(server_next_prefill_slot_locked(&s) == -1);
 }
 
+static void test_prefill_quantum_and_resident_options(void) {
+    char *default_argv[] = {"ds4-server"};
+    server_config defaults = parse_options(1, default_argv);
+    TEST_ASSERT(defaults.prefill_quantum == DS4_SERVER_DEFAULT_PREFILL_QUANTUM);
+    TEST_ASSERT(defaults.resident_sessions == 0);
+
+    char *custom_argv[] = {
+        "ds4-server", "--prefill-quantum", "2048",
+        "--resident-sessions", "3"
+    };
+    server_config custom = parse_options(5, custom_argv);
+    TEST_ASSERT(custom.prefill_quantum == 2048);
+    TEST_ASSERT(custom.resident_sessions == 3);
+    TEST_ASSERT(custom.batched_sessions == 0);
+
+    server s = {
+        .prefill_quantum = custom.prefill_quantum,
+        .mixed_prefill_quantum = 128,
+    };
+    TEST_ASSERT(server_prefill_quantum_for(&s, false) == 2048);
+    TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+
+    server zero = {.mixed_prefill_quantum = 128};
+    TEST_ASSERT(server_prefill_quantum_for(&zero, false) ==
+                DS4_SERVER_DEFAULT_PREFILL_QUANTUM);
+}
+
 static void test_mixed_prefill_quantum_option(void) {
     char *default_argv[] = {"ds4-server"};
     server_config defaults = parse_options(1, default_argv);
@@ -14934,8 +15024,12 @@ static void test_mixed_prefill_quantum_option(void) {
     server_config custom = parse_options(3, custom_argv);
     TEST_ASSERT(custom.mixed_prefill_quantum == 2048);
 
-    server s = {.mixed_prefill_quantum = custom.mixed_prefill_quantum};
-    TEST_ASSERT(server_prefill_quantum_for(&s, false) == 2048);
+    server s = {
+        .prefill_quantum = defaults.prefill_quantum,
+        .mixed_prefill_quantum = custom.mixed_prefill_quantum,
+    };
+    TEST_ASSERT(server_prefill_quantum_for(&s, false) ==
+                DS4_SERVER_DEFAULT_PREFILL_QUANTUM);
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
@@ -20172,6 +20266,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_tool_image_output();
     test_server_image_embedding_cache();
     test_batched_prefill_round_robin();
+    test_prefill_quantum_and_resident_options();
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
