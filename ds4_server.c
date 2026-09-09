@@ -774,6 +774,8 @@ static void stop_list_clear(stop_list *stops);
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 static void id_list_free(stop_list *ids);
+static bool byte_prefix_match(const char *text, size_t text_len,
+                              const char *prefix, size_t prefix_len);
 static bool responses_live_has_call_id(server *s, const char *id);
 static bool anthropic_live_has_call_id(server *s, const char *id);
 
@@ -837,6 +839,12 @@ typedef struct {
     bool anthropic_requires_live_tool_state;
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
+    /* Plain OpenAI chat tool-result continuation.  The sampled assistant
+     * tool-call turn is already live in KV; these fields bind the following
+     * result messages to that exact frontier so only their rendered suffix is
+     * appended. */
+    stop_list chat_live_call_ids;
+    char *chat_live_suffix_text;
     tool_replay_stats tool_replay;
 } request;
 
@@ -996,6 +1004,9 @@ static void request_free(request *r) {
     stop_list_clear(&r->anthropic_live_call_ids);
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
+    stop_list_clear(&r->chat_live_call_ids);
+    free(r->chat_live_call_ids.v);
+    free(r->chat_live_suffix_text);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
 }
@@ -3534,6 +3545,40 @@ static void anthropic_prepare_live_continuation(request *r,
                                          &r->tool_orders, r->think_mode);
 }
 
+/* A chat/completions tool result must carry the call id it answers.  A plain
+ * trailing user message is a new turn and must never arm this path. */
+static bool chat_msg_is_tool_result_tail(const chat_msg *m) {
+    return m && (role_is_user_like(m->role) ||
+                 !strcmp(m->role, "tool") ||
+                 !strcmp(m->role, "function")) &&
+           ((m->tool_call_id && m->tool_call_id[0]) ||
+            m->tool_call_ids_len > 0);
+}
+
+static void chat_prepare_live_continuation(request *r,
+                                           const chat_msgs *msgs) {
+    if (!r || r->api != API_OPENAI || !msgs || msgs->len == 0) return;
+
+    int tail_end = msgs->len;
+    while (tail_end > 0 && role_is_system(msgs->v[tail_end - 1].role)) tail_end--;
+    int tail_start = tail_end;
+    while (tail_start > 0 &&
+           chat_msg_is_tool_result_tail(&msgs->v[tail_start - 1])) {
+        tail_start--;
+    }
+    if (tail_start == tail_end) return;
+
+    stop_list_clear(&r->chat_live_call_ids);
+    for (int i = tail_start; i < msgs->len; i++)
+        chat_msg_collect_tool_call_ids(&msgs->v[i], &r->chat_live_call_ids);
+    if (r->chat_live_call_ids.len == 0) return;
+
+    free(r->chat_live_suffix_text);
+    r->chat_live_suffix_text =
+        render_live_tool_tail_for_syntax(r->model_syntax, msgs, tail_start,
+                                         &r->tool_orders, r->think_mode);
+}
+
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
@@ -3707,6 +3752,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         think_mode_from_enabled(thinking_enabled, reasoning_effort), ctx_size);
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
+    chat_prepare_live_continuation(r, &msgs);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
@@ -9188,6 +9234,7 @@ struct server_slot {
     ds4_session *session;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
+    live_tool_state chat_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
 
@@ -9698,6 +9745,29 @@ static void anthropic_live_remember(server *s, server_slot *slot,
     pthread_mutex_unlock(&s->tool_mu);
 }
 
+/* Plain chat has no protocol response id, so retain both the call ids and the
+ * rendered visible prefix.  The latter prevents a matching call id from
+ * binding a request whose system prompt or earlier history was rewritten. */
+static void chat_live_remember(server *s, server_slot *slot,
+                               const char *visible_text,
+                               const tool_calls *calls,
+                               const request *req) {
+    if (!s || !slot || !visible_text || !visible_text[0] ||
+        !calls || calls->len == 0) return;
+    visible_image_key images;
+    char *key = visible_prompt_key(req, visible_text, &images);
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clear_locked(&slot->chat_live);
+    slot->chat_live.visible_text = key;
+    slot->chat_live.visible_len = key ? strlen(key) : 0;
+    slot->chat_live.images = images;
+    for (int i = 0; i < calls->len; i++)
+        id_list_push_unique(&slot->chat_live.call_ids, calls->v[i].id);
+    slot->chat_live.live_tokens = ds4_session_pos(slot->session);
+    slot->chat_live.valid = key != NULL && slot->chat_live.call_ids.len > 0;
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
 static void responses_live_clear(server *s, server_slot *slot) {
     if (!s || !slot) return;
     pthread_mutex_lock(&s->tool_mu);
@@ -9712,9 +9782,17 @@ static void anthropic_live_clear(server *s, server_slot *slot) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
+static void chat_live_clear(server *s, server_slot *slot) {
+    if (!s || !slot) return;
+    pthread_mutex_lock(&s->tool_mu);
+    live_tool_state_clear_locked(&slot->chat_live);
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
 static void request_live_state_clear(server *s, server_slot *slot) {
     responses_live_clear(s, slot);
     anthropic_live_clear(s, slot);
+    chat_live_clear(s, slot);
     thinking_live_clear(s, slot);
 }
 
@@ -9769,6 +9847,34 @@ static bool anthropic_live_matches_request(server *s, server_slot *slot,
         ok = id_list_contains(&slot->anthropic_live.call_ids, ids->v[i]);
     }
     pthread_mutex_unlock(&s->tool_mu);
+    return ok;
+}
+
+static bool chat_live_matches_request(server *s, server_slot *slot,
+                                      const stop_list *ids,
+                                      int live_tokens,
+                                      const request *req) {
+    if (!s || !slot || !ids || ids->len == 0 ||
+        !req || !req->prompt_text) return false;
+    visible_image_key images;
+    char *key = visible_prompt_key(req, req->prompt_text, &images);
+    if (!key) return false;
+    const size_t prompt_len = strlen(key);
+    pthread_mutex_lock(&s->tool_mu);
+    bool ok = slot->chat_live.valid &&
+              slot->chat_live.live_tokens == live_tokens &&
+              slot->chat_live.call_ids.len == ids->len &&
+              slot->chat_live.visible_text &&
+              slot->chat_live.visible_len < prompt_len &&
+              visible_image_prefix_matches(&images, &slot->chat_live.images,
+                                            slot->chat_live.visible_len) &&
+              byte_prefix_match(key, prompt_len,
+                                slot->chat_live.visible_text,
+                                slot->chat_live.visible_len);
+    for (int i = 0; ok && i < ids->len; i++)
+        ok = id_list_contains(&slot->chat_live.call_ids, ids->v[i]);
+    pthread_mutex_unlock(&s->tool_mu);
+    free(key);
     return ok;
 }
 
@@ -10906,6 +11012,28 @@ static int anthropic_live_continuation_prompt(server *s, server_slot *slot,
     if (!build_live_prompt_suffix(s, slot, req, req->anthropic_live_suffix_text,
                                   effective_prompt)) return 0;
     if (matched_ids) *matched_ids = req->anthropic_live_call_ids.len;
+    return live_tokens->len;
+}
+
+/* Continue a plain OpenAI chat tool round from its exact sampled frontier.
+ * Unlike a canonical transcript replay, this preserves hidden reasoning and
+ * the exact DSML bytes that produced the tool call. */
+static int chat_live_continuation_prompt(server *s, server_slot *slot,
+                                         const request *req,
+                                         int live_pos,
+                                         ds4_tokens *effective_prompt,
+                                         int *matched_ids) {
+    if (!s || !slot || !req || !effective_prompt) return 0;
+    if (req->api != API_OPENAI || !req->chat_live_suffix_text ||
+        req->chat_live_call_ids.len == 0) return 0;
+    if (!chat_live_matches_request(s, slot, &req->chat_live_call_ids,
+                                   live_pos, req)) return 0;
+
+    const ds4_tokens *live_tokens = ds4_session_tokens(slot->session);
+    if (!live_tokens || live_tokens->len != live_pos) return 0;
+    if (!build_live_prompt_suffix(s, slot, req, req->chat_live_suffix_text,
+                                  effective_prompt)) return 0;
+    if (matched_ids) *matched_ids = req->chat_live_call_ids.len;
     return live_tokens->len;
 }
 
@@ -12497,9 +12625,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     bool responses_live_continuation = false;
     bool anthropic_live_continuation = false;
     bool thinking_live_continuation = false;
+    bool chat_live_continuation = false;
     const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
+    int chat_live_match_ids = 0;
     /* Responses gets the first chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
      * output by visible transcript or tool call ids does not need to prove an
@@ -12536,6 +12666,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         if (cached > 0) {
             anthropic_live_continuation = true;
             cache_source = "anthropic-tool-output";
+            prompt_for_sync = &effective_prompt;
+        }
+    }
+    if (cached == 0) {
+        cached = chat_live_continuation_prompt(s, slot, &j->req, old_pos,
+                                               &effective_prompt,
+                                               &chat_live_match_ids);
+        if (cached > 0) {
+            chat_live_continuation = true;
+            cache_source = "chat-tool-output";
             prompt_for_sync = &effective_prompt;
         }
     }
@@ -12696,6 +12836,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    anthropic_live_match_ids,
                    cached,
                    prompt_tokens);
+    } else if (chat_live_continuation) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: chat live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   chat_live_match_ids,
+                   cached,
+                   prompt_tokens);
     } else if (thinking_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
@@ -12825,6 +12971,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!responses_live_continuation) responses_live_clear(s, slot);
     if (!anthropic_live_continuation) anthropic_live_clear(s, slot);
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
+    if (!chat_live_continuation) chat_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
     ds4_session_set_display_progress(slot->session, NULL, NULL);
     if (!multimodal) kv_cache_maybe_store_continued(s, slot);
@@ -13595,6 +13742,16 @@ decode_again:
             anthropic_live_clear(s, slot);
         }
     }
+    if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT) {
+        if (parsed_calls.len && strcmp(final_finish, "error") &&
+            strcmp(final_finish, "length"))
+        {
+            chat_live_remember(s, slot, j->req.prompt_text,
+                               &parsed_calls, &j->req);
+        } else {
+            chat_live_clear(s, slot);
+        }
+    }
 
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
         j->req.api != API_RESPONSES &&
@@ -13609,6 +13766,9 @@ decode_again:
         canonicalize_tool_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "",
                                      parsed_reasoning, &parsed_calls);
+        /* Canonicalization rebuilt the session away from the sampled frontier
+         * remembered above, so its exact continuation binding is stale. */
+        chat_live_clear(s, slot);
         thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
         thinking_live_clear(s, slot);
@@ -13810,6 +13970,9 @@ static int job_required_slot_locked(server *s, const job *j) {
 enum {
     SLOT_BAND_MATCH = 1 << 30,
     SLOT_BAND_EMPTY = 1 << 29,
+    /* Plain chat continuation is soft affinity: prefer its sampled slot over
+     * any ordinary prefix match, but do not pin behind a busy slot. */
+    SLOT_BAND_BOUND = 3 << 29,
 };
 
 static int job_slot_score(server *s, server_slot *slot, const job *j,
@@ -13817,6 +13980,11 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
     if (required_slot >= 0 && slot->id != required_slot) return INT_MIN;
     if (required_slot == slot->id) return INT_MAX;
+    if (j->req.chat_live_call_ids.len > 0 &&
+        live_state_contains_all(&slot->chat_live,
+                                &j->req.chat_live_call_ids)) {
+        return SLOT_BAND_BOUND;
+    }
     /* A visible replay can omit sampled reasoning and shift image positions.
      * Select its live slot before falling back to token-prefix scoring. The
      * continuation builder independently verifies image identities on reuse.
@@ -14500,6 +14668,7 @@ static void server_close_resources(server *s) {
         server_slot *slot = &s->slots[i];
         live_tool_state_free(&slot->responses_live);
         live_tool_state_free(&slot->anthropic_live);
+        live_tool_state_free(&slot->chat_live);
         visible_live_free(&slot->thinking_live);
         if (slot->session) ds4_session_free(slot->session);
     }
@@ -15251,6 +15420,33 @@ static void test_batched_live_continuation_slot_binding(void) {
     request_free(&j.req);
     live_tool_state_free(&slots[1].responses_live);
     live_tool_state_free(&slots[2].anthropic_live);
+
+    /* Plain chat is soft affinity, not a required-slot pin. */
+    server cs = {0};
+    server_slot cslots[3] = {0};
+    cs.slots = cslots;
+    cs.slot_count = 3;
+    for (int i = 0; i < 3; i++) cslots[i].id = i;
+
+    job cj = {0};
+    id_list_push_unique(&cj.req.chat_live_call_ids, "call-chat-1");
+    cslots[1].chat_live.valid = true;
+    id_list_push_unique(&cslots[1].chat_live.call_ids, "call-chat-1");
+    TEST_ASSERT(job_required_slot_locked(&cs, &cj) == -1);
+    TEST_ASSERT(job_slot_score(&cs, &cslots[1], &cj, -1) == SLOT_BAND_BOUND);
+    TEST_ASSERT(SLOT_BAND_BOUND >
+                SLOT_BAND_MATCH + (SLOT_BAND_EMPTY - 1));
+    TEST_ASSERT(job_slot_score(&cs, &cslots[0], &cj, -1) == SLOT_BAND_EMPTY);
+
+    cslots[1].busy = true;
+    TEST_ASSERT(job_slot_score(&cs, &cslots[1], &cj, -1) == INT_MIN);
+    cslots[1].busy = false;
+    stop_list_clear(&cj.req.chat_live_call_ids);
+    id_list_push_unique(&cj.req.chat_live_call_ids, "call-other");
+    TEST_ASSERT(job_slot_score(&cs, &cslots[1], &cj, -1) != SLOT_BAND_BOUND);
+
+    request_free(&cj.req);
+    live_tool_state_free(&cslots[1].chat_live);
 }
 
 static void test_tool_schema_order_from_anthropic_schema(void) {
@@ -17825,6 +18021,158 @@ static void test_anthropic_live_tail_renders_tool_results_only(void) {
 
     chat_msgs_free(&msgs);
     request_free(&r);
+}
+
+static void test_chat_live_tail_renders_tool_results_only(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.think_mode = DS4_THINK_HIGH;
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_live");
+    tc.name = xstrdup("Bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("/tmp");
+    tool.tool_call_id = xstrdup("call_live");
+    chat_msgs_push(&msgs, tool);
+
+    chat_msg system = {0};
+    system.role = xstrdup("system");
+    system.content = xstrdup("You are terse.");
+    chat_msgs_push(&msgs, system);
+
+    chat_prepare_live_continuation(&r, &msgs);
+    TEST_ASSERT(r.chat_live_call_ids.len == 1);
+    TEST_ASSERT(!strcmp(r.chat_live_call_ids.v[0], "call_live"));
+    TEST_ASSERT(r.chat_live_suffix_text != NULL);
+    TEST_ASSERT(strstr(r.chat_live_suffix_text, "/tmp") != NULL);
+    TEST_ASSERT(strstr(r.chat_live_suffix_text, "Bash") == NULL);
+
+    chat_msgs_free(&msgs);
+    request_free(&r);
+
+    request r2;
+    request_init(&r2, REQ_CHAT, 128);
+    r2.api = API_OPENAI;
+    chat_msgs plain = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("what now?");
+    chat_msgs_push(&plain, user);
+    chat_prepare_live_continuation(&r2, &plain);
+    TEST_ASSERT(r2.chat_live_call_ids.len == 0);
+    TEST_ASSERT(r2.chat_live_suffix_text == NULL);
+    chat_msgs_free(&plain);
+    request_free(&r2);
+}
+
+/* The visible-prefix guard relies on rendering being append-only across the
+ * tool round trip.  Pin the invariant for both supported model syntaxes. */
+static void test_chat_render_is_append_only_across_tool_turn(void) {
+    const char *tool_schemas =
+        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"command\":{}}}}";
+
+    chat_msgs turn_n = {0};
+    chat_msg sys_n = {0};
+    sys_n.role = xstrdup("system");
+    sys_n.content = xstrdup("You are terse.");
+    chat_msgs_push(&turn_n, sys_n);
+    chat_msg user_n = {0};
+    user_n.role = xstrdup("user");
+    user_n.content = xstrdup("what dir?");
+    chat_msgs_push(&turn_n, user_n);
+
+    chat_msgs turn_n1 = {0};
+    chat_msg sys_n1 = {0};
+    sys_n1.role = xstrdup("system");
+    sys_n1.content = xstrdup("You are terse.");
+    chat_msgs_push(&turn_n1, sys_n1);
+    chat_msg user_n1 = {0};
+    user_n1.role = xstrdup("user");
+    user_n1.content = xstrdup("what dir?");
+    chat_msgs_push(&turn_n1, user_n1);
+    chat_msg asst = {0};
+    asst.role = xstrdup("assistant");
+    tool_call call = {0};
+    call.id = xstrdup("call_1");
+    call.name = xstrdup("bash");
+    call.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&asst.calls, call);
+    chat_msgs_push(&turn_n1, asst);
+    chat_msg result = {0};
+    result.role = xstrdup("tool");
+    result.content = xstrdup("/tmp");
+    result.tool_call_id = xstrdup("call_1");
+    chat_msgs_push(&turn_n1, result);
+
+    const server_model_syntax syntaxes[] = {
+        SERVER_MODEL_SYNTAX_DEEPSEEK, SERVER_MODEL_SYNTAX_GLM,
+    };
+    const ds4_think_mode modes[] = { DS4_THINK_NONE, DS4_THINK_HIGH };
+    for (size_t s = 0; s < sizeof(syntaxes) / sizeof(syntaxes[0]); s++) {
+        for (size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); m++) {
+            char *a = render_chat_prompt_text_for_syntax(
+                syntaxes[s], &turn_n, tool_schemas, NULL, modes[m]);
+            char *b = render_chat_prompt_text_for_syntax(
+                syntaxes[s], &turn_n1, tool_schemas, NULL, modes[m]);
+            TEST_ASSERT(a != NULL && b != NULL);
+            TEST_ASSERT(strlen(b) > strlen(a));
+            TEST_ASSERT(!strncmp(b, a, strlen(a)));
+            free(a);
+            free(b);
+        }
+    }
+
+    chat_msgs_free(&turn_n);
+    chat_msgs_free(&turn_n1);
+}
+
+static void test_chat_live_match_requires_visible_prefix(void) {
+    server s = {0};
+    server_slot slot;
+    test_server_bind_slot(&s, &slot);
+    pthread_mutex_init(&s.tool_mu, NULL);
+
+    const char *live_prompt = "SYSTEM v1\nUser: hi\nAssistant:";
+    slot.chat_live.valid = true;
+    slot.chat_live.live_tokens = 42;
+    slot.chat_live.visible_text = xstrdup(live_prompt);
+    slot.chat_live.visible_len = strlen(live_prompt);
+    id_list_push_unique(&slot.chat_live.call_ids, "call_live");
+
+    stop_list ids = {0};
+    id_list_push_unique(&ids, "call_live");
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.prompt_text = xstrdup(
+        "SYSTEM v1\nUser: hi\nAssistant: tool result\nAssistant:");
+    TEST_ASSERT(chat_live_matches_request(&s, &slot, &ids, 42, &r));
+
+    free(r.prompt_text);
+    r.prompt_text = xstrdup(
+        "SYSTEM v2\nUser: hi\nAssistant: tool result\nAssistant:");
+    TEST_ASSERT(!chat_live_matches_request(&s, &slot, &ids, 42, &r));
+    TEST_ASSERT(!chat_live_matches_request(&s, &slot, &ids, 43, &r));
+
+    stop_list other = {0};
+    id_list_push_unique(&other, "call_other");
+    TEST_ASSERT(!chat_live_matches_request(&s, &slot, &other, 42, &r));
+
+    id_list_free(&other);
+    id_list_free(&ids);
+    request_free(&r);
+    live_tool_state_free(&slot.chat_live);
+    pthread_mutex_destroy(&s.tool_mu);
 }
 
 static void test_anthropic_tool_result_id_validation(void) {
@@ -20650,6 +20998,9 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();
     test_anthropic_live_tail_renders_tool_results_only();
+    test_chat_live_tail_renders_tool_results_only();
+    test_chat_render_is_append_only_across_tool_turn();
+    test_chat_live_match_requires_visible_prefix();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
     test_anthropic_tool_use_parses_before_role();
