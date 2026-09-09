@@ -44114,6 +44114,11 @@ typedef struct ds4_glm_gpu_graph {
     /* Set for the duration of the two-row verify so the KDA path knows to bank;
      * cleared immediately after, so ordinary prefill and decode never do. */
     int             mtp_bank_active;
+    /* Set around the verify regardless of banking.  Arms that only need to know
+     * "this is the speculative verify" use this, so they are independent of
+     * MTP3 -- and so a two-token PREFILL chunk tail cannot trip them, which
+     * n_tokens == 2 alone would. */
+    int             mtp_verify_active;
     ds4_gpu_tensor *router_logits;
     ds4_gpu_tensor *router_probs;
     ds4_gpu_tensor *router_selected;
@@ -50441,6 +50446,81 @@ static bool glm_graph_seed_streaming_expert_cache_from_full_layer(
 
 static bool glm_graph_disable_add3_residual(void);
 
+/* MTP1B.  DEFAULT OFF.
+ *
+ * Route the two-row verifier's routed MoE through the DECODE dispatch, one call
+ * per row, exactly as MTP1A did for DSA attention.
+ *
+ * The indexed census (2026-09-08-MTP0B-SPARSE) puts routed_moe at 30.43 ms in
+ * the verifier against 8.36 ms for the same work on the decode substrate --
+ * 3.71x, the single largest item in the 61.96 ms excess. Two decode calls are
+ * ~16.7 ms, so this is worth ~13.7 ms of target_ms if the ratio holds.
+ *
+ * Read target_ms, not the ratio: MTP1A's lesson is that the only number that
+ * counts is the measured end-to-end one. */
+static bool glm53_mtp1b_moe_rows_active(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_GLM_MTP1B_MOE_ROWS");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+/* Per-row MoE for the two-row verify.  Row views over out/x/selected/weights and
+ * the per-row slice of the shared mid scratch, then the decode dispatch. The two
+ * calls are ordered on one queue through `mid`, so no fence is added. */
+static bool glm53_graph_moe_rows_decode(
+        ds4_glm_gpu_graph       *g,
+        const ds4_model         *model,
+        const ds4_layer_weights *l,
+        uint32_t                 il,
+        ds4_gpu_tensor          *out,
+        ds4_gpu_tensor          *mid,
+        uint64_t gate_off, uint64_t gate_row,
+        uint64_t up_off,   uint64_t up_row,
+        uint64_t down_off, uint64_t down_row,
+        ds4_gpu_tensor          *selected,
+        ds4_gpu_tensor          *weights,
+        ds4_gpu_tensor          *x,
+        uint32_t                 n_tokens,
+        uint32_t                 mid_token_stride) {
+    if (n_tokens != 2u) return false;
+    const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t sel_bytes  = (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t);
+    const uint64_t wt_bytes   = (uint64_t)DS4_N_EXPERT_USED * sizeof(float);
+    const uint64_t mid_bytes  = (uint64_t)mid_token_stride * sizeof(float);
+    bool ok = true;
+    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+        ds4_gpu_tensor *ov = ds4_gpu_tensor_view(out, (uint64_t)t * embd_bytes, embd_bytes);
+        ds4_gpu_tensor *xv = ds4_gpu_tensor_view(x,   (uint64_t)t * embd_bytes, embd_bytes);
+        ds4_gpu_tensor *sv = ds4_gpu_tensor_view(selected, (uint64_t)t * sel_bytes, sel_bytes);
+        ds4_gpu_tensor *wv = ds4_gpu_tensor_view(weights,  (uint64_t)t * wt_bytes,  wt_bytes);
+        ds4_gpu_tensor *mv = ds4_gpu_tensor_view(mid, (uint64_t)t * mid_bytes, mid_bytes);
+        ok = ov && xv && sv && wv && mv;
+        if (ok) {
+            ok = glm_graph_routed_moe_one_dispatch(
+                    g, model, l, il, ov, mv,
+                    gate_off, gate_row, up_off, up_row, down_off, down_row,
+                    sv, wv, xv, false) != 0;
+        }
+        if (!ok) fprintf(stderr,
+                "ds4: GLM MTP1B per-row MoE failed at layer %u row %u\n", il, t);
+        ds4_gpu_tensor_free(mv); ds4_gpu_tensor_free(wv);
+        ds4_gpu_tensor_free(sv); ds4_gpu_tensor_free(xv);
+        ds4_gpu_tensor_free(ov);
+    }
+    if (ok) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "ds4: GLM MTP1B ACTIVE -- two-row verify routed MoE "
+                            "through the decode dispatch, one call per row\n");
+        }
+    }
+    return ok;
+}
+
 static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -50586,12 +50666,23 @@ static bool glm_graph_encode_sparse_ffn_indexed_batch_routed_moe(
         ds4_gpu_trace_tag_layer(il, "routed_moe");
         const bool use_grouped_moe =
             glm_graph_indexed_prefill_grouped_moe_default(g);
+        ds4_gpu_tensor *moe_out =
+                tp_batch_split_ffn2 ? g->tp_bounce_out : g->batch_ffn_out;
+        if (glm53_mtp1b_moe_rows_active() && g->mtp_verify_active && n_tokens == 2u) {
+            ok = glm53_graph_moe_rows_decode(
+                    g, model, l, il, moe_out, g->batch_ffn_mid,
+                    gate_out * gate_row_bytes, gate_row_bytes,
+                    up_out * up_row_bytes, up_row_bytes,
+                    down_out * down_row_bytes, down_row_bytes,
+                    g->batch_router_selected, g->batch_router_weights,
+                    g->batch_ffn_norm, n_tokens, (uint32_t)g->ffn_mid_elems);
+        } else
         ok = glm_graph_routed_moe_batch_dispatch(
                 g,
                 model,
                 l,
                 il,
-                tp_batch_split_ffn2 ? g->tp_bounce_out : g->batch_ffn_out,
+                moe_out,
                 g->batch_ffn_mid,
                 gate_out * gate_row_bytes,
                 gate_row_bytes,
@@ -72050,6 +72141,7 @@ static int ds4_session_glm_spec_cycle_impl(
         if (timing) t_save = now_sec();
         if (state_saved) {
             g->mtp_bank_active = glm53_mtp3_bank_active() ? 1 : 0;
+            g->mtp_verify_active = 1;
             if (!glm53_graph_use_indexed_prefill(g) &&
                 glm_graph_span_fits_full_attention(g, pos, 2u)) {
                 verified = glm_graph_forward_tokens(g,
@@ -72087,6 +72179,7 @@ static int ds4_session_glm_spec_cycle_impl(
                                                              2);
             }
             g->mtp_bank_active = 0;
+            g->mtp_verify_active = 0;
         }
     } else if (pos + 2u <= glm_graph_indexer_top_k_limit()) {
         /* GLM-5.2 verification must use the compact caches populated by
