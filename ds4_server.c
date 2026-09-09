@@ -14040,6 +14040,18 @@ enum {
     SLOT_BAND_BOUND = 3 << 29,
 };
 
+/* A prefix match may displace an empty resident slot only when it looks like a
+ * continuation of the resident conversation, not merely a new request sharing
+ * its template/system prefix.  Require the existing 1/8 incoming-prompt match
+ * and preserve at least half of the resident state. */
+static bool slot_prefix_is_conversation_match(int common,
+                                              int prompt_len,
+                                              int live_pos) {
+    return common > 0 && prompt_len > 0 && live_pos > 0 &&
+           (int64_t)common * 8 >= (int64_t)prompt_len &&
+           (int64_t)common * 2 >= (int64_t)live_pos;
+}
+
 static int job_slot_score(server *s, server_slot *slot, const job *j,
                           int required_slot) {
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
@@ -14084,7 +14096,8 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
         return -(int)(slot->last_used & 0x3FFFFFFFu);
     }
     int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
-    if (common > 0 && (int64_t)common * 8 >= (int64_t)j->req.prompt.len) {
+    if (slot_prefix_is_conversation_match(common, j->req.prompt.len,
+                                           live_pos)) {
         const int capped = common < SLOT_BAND_EMPTY ? common : SLOT_BAND_EMPTY - 1;
         return SLOT_BAND_MATCH + capped;
     }
@@ -15512,6 +15525,21 @@ static void test_batched_live_continuation_slot_binding(void) {
 
     request_free(&cj.req);
     live_tool_state_free(&cslots[1].chat_live);
+}
+
+static void test_resident_prefix_match_preserves_other_sessions(void) {
+    /* Regression: a fresh 14-token request shared eight generic template
+     * tokens with a 63k resident session and displaced it while another slot
+     * was empty.  Incoming similarity alone is not conversation identity. */
+    TEST_ASSERT(!slot_prefix_is_conversation_match(8, 14, 63256));
+
+    /* A real continuation or steer retains almost all resident history. */
+    TEST_ASSERT(slot_prefix_is_conversation_match(62914, 63576, 63256));
+    TEST_ASSERT(slot_prefix_is_conversation_match(21763, 21772, 23815));
+
+    /* Small sessions are cheap and may reuse when most state really matches. */
+    TEST_ASSERT(slot_prefix_is_conversation_match(8, 14, 14));
+    TEST_ASSERT(!slot_prefix_is_conversation_match(0, 14, 14));
 }
 
 static void test_tool_schema_order_from_anthropic_schema(void) {
@@ -21029,6 +21057,7 @@ static void ds4_server_unit_tests_run(void) {
     test_mixed_prefill_quantum_option();
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
+    test_resident_prefix_match_preserves_other_sessions();
     test_request_defaults_use_min_p_filtering();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
