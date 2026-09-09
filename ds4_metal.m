@@ -10914,7 +10914,13 @@ int ds4_gpu_tp_init(uint32_t rank,
     }
     pthread_attr_destroy(&attr);
     g_tp_thread_running = 1;
-    if (getenv("DS4_TP_NO_KEEPALIVE") == NULL) {
+    /* The keep-alive exists to stop the GPU power-gating between gates, but
+     * production TP decode already keeps the GPU at its top P-state. Its spin
+     * dispatch therefore competes with model work for the whole token; the
+     * qualified M2 Ultra pair measured roughly one-third lower throughput
+     * while it ran. Keep it available for experiments, but default it off. */
+    if (getenv("DS4_TP_KEEPALIVE") != NULL &&
+        getenv("DS4_TP_NO_KEEPALIVE") == NULL) {
         uint32_t ka_tgs = ds4_gpu_tp_keepalive_tgs_from_env();
         g_tp_keepalive_queue = [g_device newCommandQueue];
         g_tp_keepalive_buffer = [g_device newBufferWithLength:(NSUInteger)ka_tgs * 256u * sizeof(float)
