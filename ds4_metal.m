@@ -10806,12 +10806,20 @@ int ds4_gpu_tp_init(uint32_t rank,
     g_tp_poll_prev_valid = 0;
     g_tp_gate_prefetch = getenv("DS4_TP_DISABLE_GATE_PREFETCH") == NULL;
     memset(g_tp_prefetch_count, 0, sizeof(g_tp_prefetch_count));
-    /* Default with flag gates: byte-identical to the event wait and about
-     * 20 us cheaper per gate on the M5 Max pair (A/B 2026-09-01, README
-     * ctx 128: 46.6-47.2 vs 43.6 t/s). DS4_TP_DISABLE_POLL_GATES restores
-     * the shared-event wait for diagnosis. */
-    if (g_tp_flag_gates && getenv("DS4_METAL_FAST_SYNC") == NULL &&
-        getenv("DS4_TP_DISABLE_POLL_GATES") == NULL) {
+    /* Poll gates and the fast release fence are alternative CPU->GPU wake
+     * paths.  Upstream defaults poll gates on, but the M1/M2 production path
+     * was qualified with DS4_METAL_FAST_SYNC and poll gates visibly pin the
+     * GPU while waiting.  Preserve that release contract here: both mechanisms
+     * are opt-in, and the shared-event path is the fallback. */
+    const bool poll_gates_requested =
+        getenv("DS4_TP_ENABLE_POLL_GATES") != NULL &&
+        getenv("DS4_TP_DISABLE_POLL_GATES") == NULL;
+    const bool fast_sync_requested = getenv("DS4_METAL_FAST_SYNC") != NULL;
+    if (g_tp_flag_gates && poll_gates_requested && fast_sync_requested) {
+        fprintf(stderr,
+                "ds4: DS4_TP_ENABLE_POLL_GATES and DS4_METAL_FAST_SYNC are "
+                "alternative release mechanisms; poll gates stay OFF\n");
+    } else if (g_tp_flag_gates && poll_gates_requested) {
         const NSUInteger region_bytes =
             (NSUInteger)DS4_TP_POLL_LINES * DS4_TP_POLL_LINE_BYTES * DS4_TP_POLL_RING;
         const NSUInteger status_bytes =
@@ -10825,6 +10833,7 @@ int ds4_gpu_tp_init(uint32_t rank,
             g_tp_poll_status =
                 (volatile uint32_t *)((uint8_t *)[g_tp_poll_buffer contents] + region_bytes);
             g_tp_poll_gates = true;
+            fprintf(stderr, "ds4: TP poll release gates enabled\n");
         } else {
             fprintf(stderr, "ds4: TP poll gate buffer failed; using event gates\n");
         }
@@ -10832,8 +10841,7 @@ int ds4_gpu_tp_init(uint32_t rank,
     /* The release fence and poll gates are alternative CPU->GPU wake paths.
      * Keep the shared-event path as the fallback when the private Metal
      * coherent qualifier or its pipeline is unavailable. */
-    g_tp_fast_sync = g_tp_flag_gates &&
-                     getenv("DS4_METAL_FAST_SYNC") != NULL;
+    g_tp_fast_sync = g_tp_flag_gates && fast_sync_requested;
     /* Verifier batches use a distinct sequence space. Enable their matching
      * fence bank by default with fast sync; =0 remains an A/B escape hatch. */
     g_tp_fast_batch_sync =
