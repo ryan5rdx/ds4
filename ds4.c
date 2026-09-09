@@ -47631,7 +47631,25 @@ static bool glm53_graph_hc_pre(
  *
  * No new code path; the scalar branch is already written and already loops
  * rows. */
-/* MTP2A.  DEFAULT OFF.  The first PHASE-2 arm.
+/* MTP2A.  WITHDRAWN -- it did not test what it was built to test.
+ *
+ * Measured: target_ms 90.36 -> 91.65, i.e. 1.3 ms WORSE, and the result was read
+ * as "the phase-2 premise fails". It does not support that.
+ *
+ * ds4.c:54479 sets use_batch_attn_out_proj = true unconditionally, so the path
+ * this replaced was ALREADY glm_graph_matmul_q8_0_tensor(..., n_tokens) -- a
+ * multi-row matmul. The swap was multi-row -> multi-row, so ~1.0x is the
+ * expected result and no phase-2 question was asked. Phase 2 is "one-row called
+ * twice vs a true two-row kernel", and the attention output projection was never
+ * a one-row-called-twice path.
+ *
+ * What it does show is that the attn_out+hc_pre excess is NOT in the
+ * projection. That merged census key also covers the TP combine, directional
+ * steering and the mHC block -- and MTP1C targets exactly the mHC block, which
+ * remains untested.
+ *
+ * Kept as a no-op with this note so the negative is not mistaken for a phase-2
+ * refutation.
  *
  * MTP1A-E all call the one-row path twice, so they pay its per-call overhead
  * twice: MTP1A's measured result backs out a two-row factor of 2.76x, and +10%
@@ -47649,12 +47667,17 @@ static bool glm53_graph_hc_pre(
  * two-row factor really is ~1.2x here, the same approach is worth writing for
  * the stages that do not already have such a kernel. */
 static bool glm53_mtp2a_attnout_rows_active(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("DS4_GLM_MTP2A_ATTNOUT_ROWS");
-        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    static int warned;
+    const char *e = getenv("DS4_GLM_MTP2A_ATTNOUT_ROWS");
+    if (e && e[0] && e[0] != '0' && !warned) {
+        warned = 1;
+        fprintf(stderr,
+                "ds4: DS4_GLM_MTP2A_ATTNOUT_ROWS is WITHDRAWN and ignored -- the "
+                "path it replaced was already multi-row "
+                "(use_batch_attn_out_proj is unconditionally true), so it "
+                "measured a multi-row-to-multi-row swap, not phase 2\n");
     }
-    return cached != 0;
+    return false;
 }
 
 static bool glm53_mtp1e_indexer_rows_active(void) {
