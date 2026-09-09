@@ -45004,7 +45004,7 @@ static bool glm53_graph_hc_pre_rows(
  *
  * A one-sided DS4_GLM_TP_KDA_SPLIT cannot corrupt output: the split changes the
  * gate schedule, and the TP hello compares gate_slot_mask for equality and
- * refuses the pair at bring-up.  Default off pending rig arm S6. */
+ * refuses the pair at bring-up.  S6c is rig-qualified and defaults to BOTH. */
 typedef struct {
     bool     split;
     uint32_t heads;       /* heads this rank owns */
@@ -67333,8 +67333,8 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     g_tp_block_ctx = tp;
     ds4_gpu_tp_set_big_exchange(ds4_engine_tp_big_exchange);
     /* GLM kept its replicated output head unsplit in v0: the leader computed
-     * full logits and nothing crossed the wire.  S5 opts in per run, because at
-     * -0.34 ms it is worth measuring before it is worth defaulting. */
+     * full logits and nothing crossed the wire.  S5 now defaults on after rig
+     * validation; the environment variable remains an explicit kill switch. */
     e->tp.vocab_split = DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA ||
                         glm53_tp_vocab_split_requested() != 0;
     /* S5 and GLM MTP are mutually exclusive, and the failure is silent rather

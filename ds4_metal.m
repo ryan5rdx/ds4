@@ -2710,8 +2710,8 @@ static id<MTLComputePipelineState> ds4_gpu_hot_pipeline(
 
 /* ROUTER-SIMD: iterative simdgroup top-k instead of a 512-wide bitonic sort.
  * Bit-identical selections and weights -- ds4_glm_router_better is a total
- * order, so the top-k under it is unique and uniquely ordered. Opt-in until
- * the rig confirms. */
+ * order, so the top-k under it is unique and uniquely ordered. Rig-qualified
+ * and default-on, with an explicit control below. */
 static int ds4_gpu_glm_router_select_simd(void) {
     static int initialized;
     static int enabled;
@@ -35572,7 +35572,7 @@ int ds4_gpu_glm53_idxsplit_merge_expand_tensor(
         [enc setBuffer:ab offset:ds4_gpu_tensor_offset(keys_a) atIndex:1];
         [enc setBuffer:bb offset:ds4_gpu_tensor_offset(keys_b) atIndex:2];
         [enc setBuffer:rb offset:ds4_gpu_tensor_offset(raw_selected) atIndex:3];
-        [enc setThreadgroupMemoryLength:2u * top_k * sizeof(uint64_t) atIndex:0];
+        [enc setThreadgroupMemoryLength:DS4_TG16(2u * top_k * sizeof(uint64_t)) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
            threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -47225,7 +47225,7 @@ int ds4_gpu_glm53_matmul_bf16(
                  * without an explicit barrier. */
                 [enc setBuffer:g_bf16_ksplit_buffer offset:0 atIndex:3];
                 [enc setBytes:&bf16_ksplit length:sizeof(bf16_ksplit) atIndex:4];
-                [enc setThreadgroupMemoryLength:(NSUInteger)(nsg * sizeof(float))
+                [enc setThreadgroupMemoryLength:DS4_TG16((NSUInteger)(nsg * sizeof(float)))
                                         atIndex:0];
                 static int announced_wide;
                 if (!announced_wide) {
@@ -47257,7 +47257,7 @@ int ds4_gpu_glm53_matmul_bf16(
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             } else if (bf16_splitk) {
                 /* NR0 = 2 rows per threadgroup; the nsg simdgroups split K. */
-                [enc setThreadgroupMemoryLength:(NSUInteger)(nsg * sizeof(float))
+                [enc setThreadgroupMemoryLength:DS4_TG16((NSUInteger)(nsg * sizeof(float)))
                                         atIndex:0];
                 static int announced;
                 if (!announced) {
@@ -48330,7 +48330,7 @@ int ds4_gpu_glm53_kda_small_mv_merged(
     [enc setBuffer:d_fa   offset:ds4_gpu_tensor_offset(out_fa)   atIndex:5];
     [enc setBuffer:d_beta offset:ds4_gpu_tensor_offset(out_beta) atIndex:6];
     [enc setBuffer:d_ga   offset:ds4_gpu_tensor_offset(out_ga)   atIndex:7];
-    [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+    [enc setThreadgroupMemoryLength:DS4_TG16(mv_dispatch.smem) atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)args.tg0[3], 1, 1)
          threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
@@ -48422,8 +48422,8 @@ int ds4_gpu_glm53_kda_decode(
             model_map, model_size, output_norm_offset, norm_bytes,
             &norm_inner, "KDA output norm");
         /* R3 -- the decode recurrence variant sweep.  See the kernel comment in
-         * metal/glm53_kda.metal.  Two independent levers (rows per simdgroup,
-         * simdgroups per threadgroup), both bit-identical, both opt-in:
+         * metal/glm53_kda.metal.  Two independent runtime-selectable levers
+         * (rows per simdgroup, simdgroups per threadgroup), both bit-identical:
          *
          *   v1     VPT=1  NSG=4   the shipped shape, re-expressed through the
          *                         template -- the null control that has to
@@ -48695,8 +48695,8 @@ int ds4_gpu_glm53_kda_prefill(
             }
         }
         /* K1: four value rows per simdgroup, cutting the q/k/decay re-read.
-         * Default off. Same total work, fewer loads -- see the kernel comment;
-         * this is NOT an occupancy change. */
+         * Same total work, fewer loads -- see the kernel comment; this is NOT
+         * an occupancy change. */
         /* Default ON. Set DS4_METAL_GLM53_KDA_VPT4=0 to disable. */
         const char *kda_vpt4_env = getenv("DS4_METAL_GLM53_KDA_VPT4");
         const int kda_vpt4 = !(kda_vpt4_env && kda_vpt4_env[0] == '0');
