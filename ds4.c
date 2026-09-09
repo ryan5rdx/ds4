@@ -45420,6 +45420,32 @@ static bool glm53_graph_hc_pre(
  *
  * glm53_graph_hc_pre uses the decode-sized g->hc_* scratch; the two calls are
  * ordered on one queue through it, so no fence is added. */
+/* MTP1D.  DEFAULT OFF.
+ *
+ * Take the two-row verifier's qk-low projection down the per-row path that
+ * already exists in this function, calling the DECODE kernel
+ * (ds4_gpu_glm_qk_lowrank_typed_tensor) instead of the batched one.
+ *
+ * The indexed census merges qk_low into kv_path, which reads 5.58 ms in the
+ * verifier against 0.27 ms on the decode substrate. That ratio is flagged
+ * unattributed on its own -- a 0.27 ms denominator is too thin to carry one --
+ * but the two sides genuinely run DIFFERENT KERNELS here, which is exactly the
+ * substrate penalty the other MTP1 arms remove. This arm measures whether the
+ * 5.3 ms is real recoverable work or a measurement artifact; that is a question
+ * only the arm can answer, and the answer decides whether +10% is reachable
+ * from the remaining stages.
+ *
+ * No new code path: the scalar branch below is already written and already
+ * builds the row views. */
+static bool glm53_mtp1d_qklow_rows_active(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_GLM_MTP1D_QKLOW_ROWS");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 static bool glm53_mtp1c_hc_rows_active(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -51806,8 +51832,13 @@ static bool glm_graph_forward_indexed_tokens(
         !glm_graph_indexed_prefill_batch_indexer();
     const bool force_scalar_attn =
         use_all_scalar_kernels || glm_graph_indexed_prefill_scalar_attn();
+    /* MTP1D forces the per-row (decode-kernel) qk-low path for the two-row
+     * verify only; ordinary prefill is untouched. */
+    const bool mtp1d_qklow_rows =
+        glm53_mtp1d_qklow_rows_active() && g->mtp_verify_active && n_tokens == 2u;
     const bool use_batch_qk_low =
-        !force_scalar_attn && glm_graph_indexed_prefill_batch_qk_low();
+        !force_scalar_attn && !mtp1d_qklow_rows &&
+        glm_graph_indexed_prefill_batch_qk_low();
     const bool use_batch_attn_kernel =
         !force_scalar_attn && glm_graph_indexed_prefill_batch_attn_kernel();
     const bool use_split_value_proj =
@@ -52566,6 +52597,15 @@ static bool glm_graph_forward_indexed_tokens(
                                                                    (uint32_t)g->q_nope,
                                                                    DS4_N_KEY_MLA) != 0;
         } else {
+            if (mtp1d_qklow_rows) {
+                static int announced;
+                if (!announced) {
+                    announced = 1;
+                    fprintf(stderr, "ds4: GLM MTP1D ACTIVE -- two-row verify "
+                                    "qk-low through the decode kernel, one call "
+                                    "per row\n");
+                }
+            }
             for (uint32_t t = 0; ok && t < n_tokens; t++) {
                 ds4_gpu_tensor *q_view =
                     glm_graph_tensor_row_view_strided(g->batch_q,
