@@ -10366,16 +10366,17 @@ static uint64_t g_tp_poll_prev_seq;
 #define DS4_TP_PREFETCH_MAX 8u
 #define DS4_TP_PREFETCH_BYTES_PER_US 450000ull  /* ~450 GB/s streaming */
 #define DS4_TP_PREFETCH_MARGIN_US 8.0          /* flush + wire + pickup */
-static double g_tp_exchange_ewma_us[2];        /* per gate kind, always on */
+static double g_tp_exchange_ewma_us[DS4_TP_GATES_PER_LAYER];
 typedef struct { uint64_t offset; uint64_t bytes; } ds4_tp_prefetch_range;
-static ds4_tp_prefetch_range g_tp_prefetch_plan[2][DS4_TP_PREFETCH_MAX]; /* per gate kind */
+static ds4_tp_prefetch_range
+    g_tp_prefetch_plan[DS4_TP_GATES_PER_LAYER][DS4_TP_PREFETCH_MAX];
 /* Gate flag folded into the payload producer (see
  * kernel_dsv4_add2_f32_tp_flag_checked): the producer publishes the checked
  * flag for the sequence number the next gate encode will use, and the gate
  * encode skips its own flag kernel. */
 static uint64_t g_tp_flag_prepublished_seq;
 static id<MTLBuffer> g_tp_fold_ctl;
-static uint32_t g_tp_prefetch_count[2];
+static uint32_t g_tp_prefetch_count[DS4_TP_GATES_PER_LAYER];
 static const void *g_tp_prefetch_map;
 static uint64_t g_tp_prefetch_map_size;
 static id<MTLBuffer> g_tp_prefetch_scratch;
@@ -10425,8 +10426,14 @@ static double g_tp_stat_batch_exchange_ms;   /* exchange callback (peer wait + w
 static double g_tp_stat_batch_release_ms;    /* exchange end -> cpu event signaled */
 static double g_tp_stat_gpu_wait_ms;
 static double g_tp_stat_exchange_ms;
-enum { DS4_GPU_TP_GATE_ATTN = 0, DS4_GPU_TP_GATE_FFN = 1,
-       DS4_GPU_TP_GATES_PER_LAYER = 2 };
+/* The graph, transport slab, GPU flags, and release fences must use exactly
+ * one slot layout.  GLM adds ROUTER and INDEXER slots, so retaining Metal's
+ * old two-gate local enum aliases different layers onto the same fence words. */
+enum {
+    DS4_GPU_TP_GATE_ATTN = DS4_TP_GATE_ATTN,
+    DS4_GPU_TP_GATE_FFN = DS4_TP_GATE_FFN,
+    DS4_GPU_TP_GATES_PER_LAYER = DS4_TP_GATES_PER_LAYER,
+};
 static uint64_t g_tp_stat_gate_count[DS4_GPU_TP_GATES_PER_LAYER];
 static double g_tp_stat_gate_gpu_wait_ms[DS4_GPU_TP_GATES_PER_LAYER];
 static double g_tp_stat_gate_exchange_ms[DS4_GPU_TP_GATES_PER_LAYER];
@@ -10462,7 +10469,7 @@ int ds4_gpu_tp_gate_prefetch_plan(uint32_t gate,
                                   const void *model_map, uint64_t model_size,
                                   const uint64_t *offsets, const uint64_t *bytes,
                                   uint32_t count) {
-    if (gate >= 2u) return 0;
+    if (gate >= DS4_TP_GATES_PER_LAYER) return 0;
     if (!g_tp_gate_prefetch || !g_tp_poll_gates || !model_map) {
         g_tp_prefetch_count[gate] = 0;
         return 1;
@@ -10733,7 +10740,8 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
             g_tp_failed_flag = 1;
         }
         const double t_ex = ds4_gpu_now_ms();
-        if (req.rows == 0 && req.big_bytes == 0 && req.gate < 2u) {
+        if (req.rows == 0 && req.big_bytes == 0 &&
+            req.gate < DS4_TP_GATES_PER_LAYER) {
             /* Sized the gate-time prefetch: how long this rank typically
              * waits for the peer at this gate kind (flag seen -> exchange done). */
             const double ex_us = (t_ex - t1) * 1000.0;

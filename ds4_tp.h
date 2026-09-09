@@ -117,7 +117,8 @@ void ds4_tp_control_unlock(ds4_tp *tp);
 
 /* Gate slab.  The engine allocates one shared GPU-visible block and hands
  * its base VA here; ds4_tp registers it with the NIC (RDMA) and exchanges
- * remote keys.  Layout, all offsets from base, S = n_layer * 2 slots:
+ * remote keys.  Layout, all offsets from base,
+ * S = n_layer * DS4_TP_GATES_PER_LAYER slots:
  *
  *   out vectors   S * vec_bytes   written by local GPU kernels
  *   in  vectors   S * vec_bytes   RDMA/TCP-written with the peer partials

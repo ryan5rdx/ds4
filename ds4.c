@@ -42055,7 +42055,7 @@ typedef struct ds4_glm_gpu_graph {
     /* Tensor parallelism (50/50 expert sharding): tp_world 2 means
      * this rank computes only its contiguous half of the routed experts
      * and exchanges the 24KB routed-FFN partial at one gate per sparse
-     * layer.  Views alias the engine's TP slab slots [layer*2 + FFN]. */
+     * layer.  Views alias the engine's canonical TP slab gate slots. */
     uint32_t tp_world;
     uint32_t tp_rank;
     ds4_gpu_tensor **tp_out;
@@ -54590,7 +54590,8 @@ glm53_attention_done:
             decode_layer_flush_interval != 0 &&
             il < g->layer_end &&
             (g->tp_world != 2 ||
-             ds4_gpu_tp_decode_split_flush_safe()) &&
+             ds4_gpu_tp_decode_split_flush_safe(
+                 (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER)) &&
             (slice_layer_done % decode_layer_flush_interval) == 0) {
             if (decode_flush_profile) {
                 ok = ds4_gpu_flush_commands() != 0;
