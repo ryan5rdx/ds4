@@ -47604,6 +47604,29 @@ static bool glm53_graph_hc_pre(
  *
  * No new code path: the scalar branch below is already written and already
  * builds the row views. */
+/* MTP1E.  DEFAULT OFF.
+ *
+ * Take the two-row verifier's indexer scoring down the per-row scalar path that
+ * already exists here, which calls the same one-row kernels the decode graph
+ * does.
+ *
+ * The indexed census puts indexer_score at 3.94 ms in the verifier against
+ * 0.35 ms on the decode substrate -- 11.6x, and sparse-only, so the dense
+ * census could not see it at all. It is the last stage with a substrate penalty
+ * worth removing: `shared` reads 1.99x, which is simply two rows costing twice
+ * one row, so there is nothing there to recover.
+ *
+ * No new code path; the scalar branch is already written and already loops
+ * rows. */
+static bool glm53_mtp1e_indexer_rows_active(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_GLM_MTP1E_INDEXER_ROWS");
+        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
 static bool glm53_mtp1d_qklow_rows_active(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -54360,10 +54383,22 @@ static bool glm_graph_forward_indexed_tokens(
 
     const bool use_all_scalar_kernels =
         n_tokens == 1u && glm_graph_indexed_prefill_scalar_kernels();
+    /* MTP1E: the two-row verify only; ordinary prefill keeps the batch path. */
+    const bool mtp1e_indexer_rows =
+        glm53_mtp1e_indexer_rows_active() && g->mtp_verify_active && n_tokens == 2u;
     const bool use_scalar_indexer =
         use_all_scalar_kernels ||
+        mtp1e_indexer_rows ||
         glm_graph_indexed_prefill_scalar_indexer() ||
         !glm_graph_indexed_prefill_batch_indexer();
+    if (mtp1e_indexer_rows) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "ds4: GLM MTP1E ACTIVE -- two-row verify indexer "
+                            "scoring through the per-row scalar path\n");
+        }
+    }
     const bool force_scalar_attn =
         use_all_scalar_kernels || glm_graph_indexed_prefill_scalar_attn();
     /* MTP1D forces the per-row (decode-kernel) qk-low path for the two-row
