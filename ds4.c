@@ -47604,11 +47604,24 @@ static bool glm53_graph_hc_pre(
  *
  * No new code path: the scalar branch below is already written and already
  * builds the row views. */
-/* MTP1E.  DEFAULT OFF.
+/* MTP1E.  WITHDRAWN -- the arm is INCORRECT on GLM 5.3 and is now a no-op.
  *
- * Take the two-row verifier's indexer scoring down the per-row scalar path that
- * already exists here, which calls the same one-row kernels the decode graph
- * does.
+ * MTPF-ALL crashed the transport with "GLM decode attention split-K not
+ * available (n_selected 0)" and a worker failure. Root cause: GLM 5.3's indexer
+ * is POOL-4, and the per-row scalar branch is the non-pooled form.
+ *
+ *   scalar branch: scores `visible` RAW positions, selects indexed_selected_count
+ *   batch branch:  score_rows     = n_rows / DS4_GLM53_INDEX_POOL_SIZE
+ *                  selected_for_score = indexer_top_k / DS4_GLM53_INDEX_POOL_SIZE
+ *
+ * The scalar branch never mentions DS4_GLM53_INDEX_POOL_SIZE at all. It is the
+ * GLM 5.2 path, so forcing it on 5.3 hands downstream a selection in the wrong
+ * space -- which is exactly the empty/invalid selection that reached the D4
+ * gate.
+ *
+ * Recovering indexer_score's 3.94 ms would need a POOLED per-row scorer, which
+ * does not exist. Left in place as a no-op with this note so the arm is not
+ * re-attempted from the census alone.
  *
  * The indexed census puts indexer_score at 3.94 ms in the verifier against
  * 0.35 ms on the decode substrate -- 11.6x, and sparse-only, so the dense
@@ -47645,12 +47658,16 @@ static bool glm53_mtp2a_attnout_rows_active(void) {
 }
 
 static bool glm53_mtp1e_indexer_rows_active(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("DS4_GLM_MTP1E_INDEXER_ROWS");
-        cached = (e && e[0] && e[0] != '0') ? 1 : 0;
+    static int warned;
+    const char *e = getenv("DS4_GLM_MTP1E_INDEXER_ROWS");
+    if (e && e[0] && e[0] != '0' && !warned) {
+        warned = 1;
+        fprintf(stderr,
+                "ds4: DS4_GLM_MTP1E_INDEXER_ROWS is WITHDRAWN and ignored -- the "
+                "scalar indexer path is non-pooled and wrong for GLM 5.3 "
+                "(pool-4); it produced the n_selected 0 crash in MTPF-ALL\n");
     }
-    return cached != 0;
+    return false;
 }
 
 static bool glm53_mtp1d_qklow_rows_active(void) {
