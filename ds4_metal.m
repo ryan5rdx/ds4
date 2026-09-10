@@ -2976,67 +2976,12 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_pipeline(
     return pipeline;
 }
 
-/* P1SWZ capability: which mul_mm_id pipelines interpret args.grid_swizzle.
- *
- * ONLY the kernel_mul_mm_id<> template instantiations read that field.  The
- * addr, mpp, pair_swiglu, tail_cull, half_lut, map0 and map_scatter kernels are
- * separate templates that keep the original `work item on tgpig.x` mapping, so
- * swapping the dispatch axes for one of them computes wrong addresses SILENTLY.
- *
- * The encoder that swaps the grid is shared, so the capability has to travel
- * with the PIPELINE and not with the encoder or a global.  Default-deny: a new
- * kernel gets no swizzle until it is added here deliberately, which is the safe
- * direction to fail.  Keep in sync with the `kernel mul_mm_id[_f16_rhs]
- * kernel_mul_mm_id<...>` instantiations in metal/moe.metal. */
-static const char * const DS4_MM_ID_SWIZZLE_OK[] = {
-    "kernel_mul_mm_id_iq2_xxs_cached_f16",
-    "kernel_mul_mm_id_iq2_xxs_cached_f32",
-    "kernel_mul_mm_id_iq2_xxs_f16",
-    "kernel_mul_mm_id_iq2_xxs_f32",
-    "kernel_mul_mm_id_mxfp4_f16",
-    "kernel_mul_mm_id_mxfp4_f32",
-    "kernel_mul_mm_id_q2_K_f16",
-    "kernel_mul_mm_id_q2_K_f32",
-    "kernel_mul_mm_id_q4_K_f16",
-    "kernel_mul_mm_id_q4_K_f32",
-    "kernel_mul_mm_id_q5_K_f16",
-    "kernel_mul_mm_id_q5_K_f32",
-    "kernel_mul_mm_id_q6_K_f16",
-    "kernel_mul_mm_id_q6_K_f32",
-    "kernel_mul_mm_id_q8_0_f16",
-    "kernel_mul_mm_id_q8_0_f32",
-};
-
-static NSMutableSet *g_mm_id_swizzle_ok;   /* boxed pipeline pointers */
-
-static int ds4_gpu_mm_id_name_swizzle_ok(const char *name) {
-    if (!name) return 0;
-    for (size_t i = 0; i < sizeof(DS4_MM_ID_SWIZZLE_OK) /
-                           sizeof(DS4_MM_ID_SWIZZLE_OK[0]); i++) {
-        if (strcmp(name, DS4_MM_ID_SWIZZLE_OK[i]) == 0) return 1;
-    }
-    return 0;
-}
-
-static void ds4_gpu_mm_id_note_swizzle_ok(const char *name,
-                                          id<MTLComputePipelineState> pipeline) {
-    if (!pipeline || !ds4_gpu_mm_id_name_swizzle_ok(name)) return;
-    if (!g_mm_id_swizzle_ok) g_mm_id_swizzle_ok = [NSMutableSet set];
-    [g_mm_id_swizzle_ok addObject:@((uintptr_t)pipeline)];
-}
-
-static int ds4_gpu_mm_id_pipeline_swizzle_ok(id<MTLComputePipelineState> pipeline) {
-    return pipeline && g_mm_id_swizzle_ok &&
-           [g_mm_id_swizzle_ok containsObject:@((uintptr_t)pipeline)];
-}
-
 static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_id_pipeline(
         const char *function_name,
         bool        bc_inp) {
     NSString *key = [NSString stringWithFormat:@"%s_bci=%d",
                      function_name, bc_inp ? 1 : 0];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
-    if (cached) ds4_gpu_mm_id_note_swizzle_ok(function_name, cached);
     if (cached) return cached;
 
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
@@ -3062,7 +3007,6 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_id_pipeline(
     }
 
     [g_pipeline_cache setObject:pipeline forKey:key];
-    ds4_gpu_mm_id_note_swizzle_ok(function_name, pipeline);
     return pipeline;
 }
 
@@ -3705,24 +3649,6 @@ static uint32_t ds4_gpu_glm_flash_attention_max_cache_len(void) {
      * kernel's one-score-per-token threadgroup-memory envelope.
      */
     return 8192u;
-}
-
-/* P1SWZ: put the ROW TILE on grid.x instead of the work item.
- *
- * kernel_mul_mm_id streams a whole 32-row B tile per threadgroup -- 512 KB at
- * the 4096-wide gate/up shapes.  Metal rasterises x-fastest, so with the work
- * item on x the co-resident threadgroups all hold different B tiles and the
- * distinct-B sweep is re-read once per row tile (32x for gate/up, 64x for
- * down).  Swapping the axes makes the co-resident set share one B tile.
- *
- * Default OFF.  The win rests on the x-fastest launch order, which Metal does
- * not contractually specify -- if the scheduler differs this is a no-op or an
- * inversion, so it must be A/B'd rather than modelled.  Bit-identical either
- * way: only which threadgroup claims which tile changes. */
-static int ds4_gpu_mm_id_grid_swizzle(void) {
-    static int cached = -1;
-    if (cached < 0) cached = ds4_gpu_env_bool("DS4_METAL_MM_ID_GRID_SWIZZLE") > 0;
-    return cached;
 }
 
 static int ds4_gpu_mpp_available(void) {
@@ -6899,7 +6825,6 @@ typedef struct {
     /* MOE-TP-SHED: leave an unowned expert's tile unwritten instead of
      * zero-filling it.  Flips together with the ownership-aware sum. */
     int32_t  tp_shed;
-    int32_t  grid_swizzle;   /* P1SWZ, see ds4_gpu_mm_id_grid_swizzle() */
 } ds4_gpu_mul_mm_id_args;
 
 static int ds4_gpu_encode_mul_mv_id(
@@ -36306,19 +36231,7 @@ static int ds4_gpu_encode_mul_mm_id_mapped_tile_resources(
 
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     DS4_SET_PIPE(enc, mm_pipeline);
-    /* P1SWZ: the flag is set HERE, not in ds4_gpu_make_mul_mm_id_args(), and on
-     * a local copy.  kernel_mul_mm_id is reached from more than one encoder and
-     * only this one swaps the dispatch axes; a flag set in the shared builder
-     * would tell those other paths' kernels to read tgpig.y as the work item
-     * while their grid still has it on x, which computes the wrong tiles
-     * silently instead of failing. */
-    ds4_gpu_mul_mm_id_args mm_args_local = *mm_args;
-    /* Capability, not just the flag.  This encoder is shared and swaps the
-     * dispatch axes for whatever pipeline it was handed; only the kernels in
-     * DS4_MM_ID_SWIZZLE_OK read args.grid_swizzle back. */
-    mm_args_local.grid_swizzle = ds4_gpu_mm_id_grid_swizzle() &&
-                                 ds4_gpu_mm_id_pipeline_swizzle_ok(mm_pipeline);
-    [enc setBytes:&mm_args_local length:sizeof(mm_args_local) atIndex:0];
+    [enc setBytes:mm_args length:sizeof(*mm_args) atIndex:0];
     [enc setBuffer:src0 offset:src0_off atIndex:1];
     [enc setBuffer:src1 offset:src1_off atIndex:2];
     [enc setBuffer:g_moe_id_map_buffer offset:0 atIndex:3];
@@ -36337,23 +36250,9 @@ static int ds4_gpu_encode_mul_mm_id_mapped_tile_resources(
     }
     [enc setThreadgroupMemoryLength:DS4_TG16(threadgroup_bytes)
                                  atIndex:0];
-    /* P1SWZ: the kernel reads args.grid_swizzle to decide which axis is which,
-     * so the dispatch and the flag must be set from the same place. */
-    const NSUInteger mm_row_tiles = ((NSUInteger)mm_args->ne0 + 63u) / 64u;
-    const int mm_swz = mm_args_local.grid_swizzle != 0;
-    if (mm_swz) {
-        static int swz_announced = 0;
-        if (!swz_announced) {
-            swz_announced = 1;
-            fprintf(stderr,
-                    "ds4: Metal mul_mm_id GRID SWIZZLE ENGAGED "
-                    "(%lu row tiles on x, %lu work items on y)\n",
-                    (unsigned long)mm_row_tiles, (unsigned long)work_cap);
-        }
-    }
-    [DS4_DISP(enc) dispatchThreadgroups:
-            (mm_swz ? MTLSizeMake(mm_row_tiles, (NSUInteger)work_cap, 1)
-                    : MTLSizeMake((NSUInteger)work_cap, mm_row_tiles, 1))
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)work_cap,
+                                          ((NSUInteger)mm_args->ne0 + 63u) / 64u,
+                                          1)
          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     ds4_gpu_end_compute_encoder(cb, enc);
     return 1;

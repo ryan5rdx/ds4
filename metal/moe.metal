@@ -2755,10 +2755,6 @@ struct ds4_metal_args_mul_mm_id {
      * same slots -- kernel_dsv4_moe_sum8_owned_f32 -- because the rows then
      * hold whatever was already in the buffer.  The two flip together. */
     int32_t  tp_shed;
-    /* P1SWZ: which grid axis carries the work item.  The host and the kernel
-     * must agree, so this rides in the args rather than being two independent
-     * edits that can drift.  See ds4_gpu_mm_id_grid_swizzle(). */
-    int32_t  grid_swizzle;
 };
 
 template<int nr0, typename args_t>
@@ -8146,28 +8142,14 @@ kernel void kernel_mul_mm_id(
     threadgroup S1 * sb = (threadgroup S1 *)(shmem + SA_BYTES);
 
     device const uint32_t * work_count = (device const uint32_t *) work;
-    /* P1SWZ.  Each threadgroup streams its whole B tile -- 32 routed rows x
-     * ne00, i.e. 512 KB at the 4096-wide gate/up shapes -- across the full
-     * contraction.  Metal rasterises the grid x-fastest, so with the WORK ITEM
-     * on x the co-resident threadgroups are consecutive work items, every one
-     * holding a DIFFERENT B tile, and the whole distinct-B sweep is re-fetched
-     * once per row tile: 32x for gate/up (ne0 2048), 64x for down (ne0 4096).
-     *
-     * Putting the ROW TILE on x makes the co-resident set share one work item's
-     * B tile and differ only in which weight rows they read, so B is read about
-     * once rather than once per row tile.
-     *
-     * A pure permutation of independent threadgroups: same tiles, same
-     * accumulation order, bit-identical output.  Only which threadgroup claims
-     * which tile changes. */
-    const uint32_t work_index = args.grid_swizzle ? tgpig.y : tgpig.x;
+    const uint32_t work_index = tgpig.x;
     if (work_index >= work_count[0]) {
         return;
     }
     device const uint2 * work_items = (device const uint2 *)(work + 8);
     const uint2 item = work_items[work_index];
     const int im = (int)item.x;
-    const int r0 = (int)(args.grid_swizzle ? tgpig.x : tgpig.y)*NR0;
+    const int r0 = tgpig.y*NR0;
     const int r1 = (int)item.y;
 
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
