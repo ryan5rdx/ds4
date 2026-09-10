@@ -184,6 +184,151 @@ void kernel_mul_mv_q8_0_f32_impl(
 
 // Decode-time Q8_0 matrix-vector multiply. DS4 uses this for Q8_0 dense
 // projections such as shared experts and output-side small matvecs.
+/* KQ1 -- same-byte-count Q8 SoA.
+ *
+ * The transferable CUDA idea here is separating the quant payload from the
+ * scale metadata, not the conversion trick.  A Q8_0 block is 34 bytes with qs
+ * at offset 2, so a lane reading qs[il*8 .. il*8+7] sits at byte 34*ib+2+8*il
+ * and every other block straddles a 64-byte line.  D1 measured that straddle
+ * from the other side and it cost -30% on Apple8 when attacked by lane
+ * remapping; this attacks the layout instead.
+ *
+ * SoA, identical byte count:
+ *     qs plane     ne01 * ne00        int8, row r at r*ne00      (32 B aligned)
+ *     scale plane  ne01 * nb          half, row r at r*nb
+ *     total        ne01 * nb * (32+2) = the same 34 bytes per block
+ *
+ * Arithmetic, accumulation order and reduction are untouched, so this must be
+ * bit-identical to the AoS kernel on the same values. */
+template<short NR0, typename args_t>
+void kernel_mul_mv_q8_0_f32_soa_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00/QK8_0;
+    const int r0 = tgpig.x*NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+    device const float * y = (device const float *) (src1 + offset1);
+
+    device const int8_t * qs_plane = (device const int8_t *) src0;
+    device const half   * sc_plane =
+        (device const half *) (src0 + (uint64_t)args.ne00 * (uint64_t)args.ne01);
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+    const int ib0 = sgitg*NQ + ix;
+
+    float yl[NQ];
+    device const float * yb = y + ib0*QK8_0 + il*NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        for (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+        for (short row = 0; row < NR0; row++) {
+            device const int8_t * qs =
+                qs_plane + (uint64_t)(r0 + row)*args.ne00 + (uint64_t)ib*QK8_0 + il*NQ;
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+            sumf[row] += sumq * (float)sc_plane[(uint64_t)(r0 + row)*nb + ib];
+        }
+        yb += NSG*NQ*QK8_0;
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+/* KQ1 narrow path -- 16-lane subgroup, one output row per HALF simdgroup.
+ *
+ * At the narrow shape (128 -> 4096) nb is 4, so the shipped narrowk kernel has
+ * ix = tiisg/4 in 0..7 against nb = 4 and HALF THE LANES ARE DEAD.  128
+ * elements is exactly 16 lanes x 8, so a half-simdgroup covers one row with no
+ * dead lanes and the full simdgroup covers two.
+ *
+ * This is NOT R2NK-R8, which Apple8 measured at -0.4%: that widened rows per
+ * simdgroup and collapsed the grid from 2048 threadgroups to 256.  This keeps
+ * two rows per simdgroup, so the grid is unchanged; only the lane mapping
+ * moves.  The reduction is a 4-step shuffle over 16 lanes rather than 5 over
+ * 32, so it is NOT bit-identical to the shipped kernel and needs a tolerance
+ * gate. */
+template<typename args_t>
+void kernel_mul_mv_q8_0_f32_half16_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NQ = 8;
+    constexpr short LANES = 16;
+
+    const int nb = args.ne00/QK8_0;
+    const short sghalf = tiisg / LANES;    /* 0 or 1 */
+    const short lane = tiisg % LANES;      /* 0..15  */
+    const int r0 = tgpig.x*(2*NSG) + sgitg*2 + sghalf;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+    device const float * y = (device const float *) (src1 + offset1);
+
+    const bool live = r0 < args.ne01;
+    const uint64_t offset0 = live
+        ? (uint64_t)r0*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03
+        : 0u;
+    device const block_q8_0 * ax = (device const block_q8_0 *) ((device char *) src0 + offset0);
+
+    float part = 0.f;
+    /* Every lane strides by 16*NQ = 128 elements, so at ne00 = 128 each lane
+     * runs exactly one iteration and none is dead. */
+    for (int e = lane*NQ; e < args.ne00; e += LANES*NQ) {
+        const int ib = e / QK8_0;
+        const short il = (short)((e % QK8_0) / NQ);
+        if (!live || ib >= nb) continue;
+        device const int8_t * qs = ax[ib].qs + il*NQ;
+        float sumq = 0.f;
+        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+            sumq += qs[i] * y[e + i];
+        }
+        part += sumq * (float)ax[ib].d;
+    }
+
+    /* 16-lane tree: four steps, not five.  Lanes 16..31 reduce their own row
+     * independently because the xor offsets never cross bit 4. */
+    FOR_UNROLL (short off = 1; off < LANES; off <<= 1) {
+        part += simd_shuffle_xor(part, (ushort)off);
+    }
+
+    if (lane == 0 && live) {
+        device float * dst_f32 =
+            (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+        dst_f32[r0] = part;
+    }
+}
+
 [[host_name("kernel_mul_mv_q8_0_f32")]]
 kernel void kernel_mul_mv_q8_0_f32(
         constant ds4_metal_args_mul_mv & args,
@@ -196,6 +341,62 @@ kernel void kernel_mul_mv_q8_0_f32(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
+
+/* KQ1: wide row tile NR4 against the shipped NR2. */
+[[host_name("kernel_mul_mv_q8_0_f32_nr4")]]
+kernel void kernel_mul_mv_q8_0_f32_nr4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<4, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+/* KQ1: same-byte-count SoA, shipped row tile. */
+[[host_name("kernel_mul_mv_q8_0_f32_soa")]]
+kernel void kernel_mul_mv_q8_0_f32_soa(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_soa_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+/* KQ1: SoA at NR4. */
+[[host_name("kernel_mul_mv_q8_0_f32_soa_nr4")]]
+kernel void kernel_mul_mv_q8_0_f32_soa_nr4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_soa_impl<4, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+/* KQ1 narrow: one row per half simdgroup. */
+[[host_name("kernel_mul_mv_q8_0_f32_half16")]]
+kernel void kernel_mul_mv_q8_0_f32_half16(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_half16_impl<constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, tgpig, tiisg, sgitg);
+}
+
 
 /* Narrow-k Q8_0 matvec: NR0 output rows per SIMD GROUP, no cross-simdgroup pass.
  *
