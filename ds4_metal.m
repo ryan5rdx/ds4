@@ -3774,6 +3774,25 @@ static int ds4_gpu_device_name_contains(const char *needle) {
     return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
 }
 
+/* DOWN-NSG4 -- the one DM1 candidate past the gate, default OFF pending a 131k
+ * A/B.  Four simdgroups per threadgroup in the routed-MoE decode `down` kernel
+ * instead of two: +5.0% of that chain on Apple8, bit-identical, and the only
+ * arm of eighteen to qualify.  Worth roughly +1.1% of decode end to end.
+ *
+ * Bit-identical because NSG only changes which threadgroup owns which rows;
+ * the per-row accumulation and reduction are untouched.  So this ships on a
+ * cmp with no quality gate -- and on promotion it should flip the default,
+ * not stay a flag. */
+static int ds4_gpu_decmoe_down_nsg4(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_METAL_DECMOE_DOWN_NSG4");
+        cached = (e && e[0] == '1') ? 1 : 0;
+        if (cached) fprintf(stderr, "ds4: Metal DECMOE DOWN-NSG4 ENGAGED\n");
+    }
+    return cached;
+}
+
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
            g_metal_device_name[7] >= '1' &&
@@ -41978,8 +41997,10 @@ int ds4_gpu_glm_routed_moe_one_tensor(
              ds4_gpu_hot_pipeline(g_glm_q2_k_down_f32_pipeline,
                                   "kernel_glm_q2_K_down_f32") :
              down_scalar_q4 ?
-             ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
-                                  "kernel_glm_q4_K_down_f32") :
+             (ds4_gpu_decmoe_down_nsg4()
+              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_f32_nsg4")
+              : ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
+                                     "kernel_glm_q4_K_down_f32")) :
              down_simd_q5 ?
              ds4_gpu_hot_pipeline(g_glm_q5_k_down_f32_pipeline,
                                   "kernel_glm_q5_K_down_f32") :
@@ -42091,7 +42112,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         const NSUInteger pair_threads = 64u;
         const NSUInteger down_x_groups =
             down_scalar_q2 ? (NSUInteger)((out_dim + 7u) / 8u) :
-            down_simd_q4 ? (NSUInteger)((out_dim + 3u) / 4u) :
+            down_simd_q4 ? (NSUInteger)((out_dim + (ds4_gpu_decmoe_down_nsg4() ? 7u : 3u)) /
+                                        (ds4_gpu_decmoe_down_nsg4() ? 8u : 4u)) :
             down_simd_q5 ? (NSUInteger)((out_dim + 3u) / 4u) :
             down_simd_q6 ? (NSUInteger)((out_dim + 3u) / 4u) :
             (NSUInteger)out_dim;
@@ -43181,8 +43203,10 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             ds4_gpu_hot_pipeline(g_glm_q2_k_down_f32_pipeline,
                                  "kernel_glm_q2_K_down_f32") :
             down_scalar_q4 ?
-            ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
-                                 "kernel_glm_q4_K_down_f32") :
+            (ds4_gpu_decmoe_down_nsg4()
+              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_f32_nsg4")
+              : ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
+                                     "kernel_glm_q4_K_down_f32")) :
             down_simd_q5 ?
             ds4_gpu_hot_pipeline(g_glm_q5_k_down_f32_pipeline,
                                  "kernel_glm_q5_K_down_f32") :
@@ -43369,14 +43393,15 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             q4_scalar_pair ? 256u : 64u;
         const NSUInteger down_x_groups =
             down_scalar_q2 ? (NSUInteger)((out_dim + 7u) / 8u) :
-            down_simd_q4 ? (NSUInteger)((out_dim + 3u) / 4u) :
+            down_simd_q4 ? (NSUInteger)((out_dim + (ds4_gpu_decmoe_down_nsg4() ? 7u : 3u)) /
+                                        (ds4_gpu_decmoe_down_nsg4() ? 8u : 4u)) :
             down_simd_q5 ? (NSUInteger)((out_dim + 3u) / 4u) :
             down_simd_q6 ? (NSUInteger)((out_dim + 3u) / 4u) :
             (NSUInteger)out_dim;
         const NSUInteger down_threadgroup_bytes =
             down_simd ? 0u : 256u * sizeof(float);
         const NSUInteger down_threads =
-            down_simd ? 64u : 256u;
+            down_simd ? (ds4_gpu_decmoe_down_nsg4() ? 128u : 64u) : 256u;
         if (use_stream_expert_addr_table &&
             !ds4_gpu_stream_expert_cache_mark_entries_inflight(stream_resources,
                                                                stream_resource_count,

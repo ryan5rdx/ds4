@@ -2148,16 +2148,24 @@ kernel void kernel_glm_q4_K_addr_down_f32(
     }
 }
 
-kernel void kernel_glm_q4_K_down_simd_f32(
+/* DM1 promoted DOWN-NSG4 to a 131k A/B candidate: +5.0% of the routed-MoE
+ * decode chain on Apple8, bit-identical, the only arm of eighteen past the
+ * gate.  Templated on NSG only -- the row tile stays at the shipped value
+ * because row-widening MEASURED WORSE on Apple8 (PAIR8 -6.9%, DOWN4 -4.6%).
+ *
+ * If the 131k A/B confirms it, this should FLIP THE DEFAULT to 4 rather than
+ * stay a flag; the knob exists to measure, not to ship two paths. */
+template <short NSG_T>
+static inline void glm_q4_K_down_simd_nsg_impl(
         constant ds4_metal_glm_routed_moe_args &args,
         device const char *down,
         device const int32_t *selected,
         device const float *mid,
         device float *out,
-        uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    const short NSG = 2;
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = NSG_T;
     const short nr0 = N_R0_Q4_K;
     const int nb = args.mid_dim / QK_K;
     const uint row0 = ((uint)tgpig.x * (uint)NSG + (uint)sgitg) * (uint)nr0;
@@ -2251,6 +2259,32 @@ kernel void kernel_glm_q4_K_down_simd_f32(
             out[(uint64_t)token * args.out_dim + row0 + (uint)row] = sum_all;
         }
     }
+}
+
+
+kernel void kernel_glm_q4_K_down_simd_f32(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *down,
+        device const int32_t *selected,
+        device const float *mid,
+        device float *out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    glm_q4_K_down_simd_nsg_impl<2>(args, down, selected, mid, out, tgpig, tiisg, sgitg);
+}
+
+/* DOWN-NSG4 */
+kernel void kernel_glm_q4_K_down_simd_f32_nsg4(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *down,
+        device const int32_t *selected,
+        device const float *mid,
+        device float *out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    glm_q4_K_down_simd_nsg_impl<4>(args, down, selected, mid, out, tgpig, tiisg, sgitg);
 }
 
 kernel void kernel_glm_q4_K_addr_down_simd_f32(
