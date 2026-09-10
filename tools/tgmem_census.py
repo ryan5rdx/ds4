@@ -54,7 +54,10 @@ KERNEL_RE = re.compile(r"^\s*(?:\[\[host_name\(\"([^\"]+)\"\)\]\]\s*)?kernel\s+v
                        re.M)
 TEMPLATE_HOST_RE = re.compile(r'template\s*\[\[host_name\("([^"]+)"\)\]\]\s*kernel\s+(\w+)\s+(\w+)<')
 
-LEN_RE = re.compile(r"setThreadgroupMemoryLength:\s*([^\n]*?)\s*(?:atIndex|\n)")
+# `atIndex:` is on the NEXT line at most v4-era sites, and call_sites()
+# matches line by line, so an `atIndex|\n` terminator matched neither and
+# the census found 1 site of 160.  End-of-string terminates a split line.
+LEN_RE = re.compile(r"setThreadgroupMemoryLength:\s*([^\n]*?)\s*(?:atIndex|$)")
 PIPE_RE = re.compile(r'"(kernel_[A-Za-z0-9_]+)"')
 
 # `threadgroup T * name = (threadgroup T *)shmem;`  or `... *)(shmem + 4096);`
