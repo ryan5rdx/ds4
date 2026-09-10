@@ -197,6 +197,132 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+/* Narrow-k Q8_0 matvec: NR0 output rows per SIMD GROUP, no cross-simdgroup pass.
+ *
+ * THE DEFECT.  kernel_mul_mv_q8_0_f32_impl partitions K as
+ * `ib0 = sgitg*NQ + ix`, `ix = tiisg/(NW/NQ)` in [0, NQ), stepping by NSG*NQ.
+ * That assumes `nb = ne00/QK8_0 >= NSG*NQ`.  GLM 5.3's KDA f_b and g_b are
+ * 128 -> 4096, so nb = 4: only `sgitg == 0 && ix < 4` ever enters the loop.  Of
+ * the 64 threads in each of 2048 threadgroups, 16 do arithmetic, 16 idle inside
+ * simdgroup 0, and all 32 lanes of simdgroup 1 push an exact zero through both
+ * barriers and the shmem tree in helper_mv_reduce_and_write.  Measured on an
+ * M1 Max that is 39 GB/s -- 4x worse per byte than f_a reading the identical
+ * 557,056 bytes through the same kernel at a wider ne00.
+ *
+ * WHAT CHANGES.  Each SIMD group owns NR0 output rows outright, so the
+ * cross-simdgroup pass, its two barriers and its threadgroup memory disappear.
+ * The shipped per-lane partition and the shipped 32-lane simd_sum are kept per
+ * row, and the NQ activation floats are loaded once and reused across all NR0
+ * rows.  The host sizes the grid as ceil(ne01 / (NR0*NSG)).
+ *
+ * BIT IDENTITY, and it is an argument the probe has to hold to account.  With
+ * nb <= NQ every `sgitg >= 1` in the shipped kernel has `ib0 >= NQ >= nb`, so
+ * its sumf is exactly +0.0f and the deleted cross-simdgroup pass only ever
+ * summed exact zeros into the real value.  The 32-lane vector fed to simd_sum
+ * here is the same vector the shipped kernel feeds it: real partials in the
+ * lanes with `ix < nb`, exact +0.0f elsewhere.  One disclosed corner -- a row
+ * whose true sum is -0.0f reaches +0.0f in the shipped path because the tree
+ * adds it to a zeroed slot, so it is normalised the same way here rather than
+ * left at -0.0f.
+ *
+ * THE LAYOUT CONTRACT IS NOT `nb == 4`.  Treating it as such is what made the
+ * archived /tmp/kdared/dfat8.metal prototype unsafe: it reloaded rows at
+ * `row * nb01` and dropped the `(i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03`
+ * terms the shipped kernel carries, which is correct only when
+ * ne02 == ne03 == r2 == r3 == 1 -- true by accident at the two sites it was
+ * tested on.  Those terms are restored below, so this kernel is generic over the
+ * batch dimensions and the host gate does not have to exclude them.  The guard
+ * is `ix < nb` rather than the prototype's hardcoded `ix < 4`, which silently
+ * dropped blocks at ne00 160/192/224/256.
+ */
+template<short NR0, typename args_t>
+void kernel_mul_mv_q8_0_f32_narrowk_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00/QK8_0;
+
+    const int r0 = tgpig.x*(NR0*NSG) + sgitg*NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    device const float * y = (device const float *) (src1 + offset1);
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+    const bool  live = ix < nb;
+
+    /* Loaded once for all NR0 rows.  Dead lanes hold exact zeros so that the
+     * simd_sum below sees the same vector the shipped reduction saw. */
+    float yl[NQ];
+    if (live) {
+        device const float * yb = y + ix*QK8_0 + il*NQ;
+        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+            yl[i] = yb[i];
+        }
+    } else {
+        FOR_UNROLL (short i = 0; i < NQ; ++i) {
+            yl[i] = 0.0f;
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    for (short row = 0; row < NR0; ++row) {
+        const int rr = r0 + row;
+        if (rr >= args.ne01) break;
+
+        const uint64_t offset0 = (uint64_t)rr*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+        device const block_q8_0 * a = (device const block_q8_0 *) ((device char *) src0 + offset0);
+
+        float sumq = 0.0f;
+        if (live) {
+            device const int8_t * qs = a[ix].qs + il*NQ;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                sumq += qs[i] * yl[i];
+            }
+            sumq *= a[ix].d;
+        }
+
+        const float tot = simd_sum(sumq);
+
+        if (tiisg == 0) {
+            /* Reproduce the shipped tree's zero normalisation: it summed this
+             * value into a +0.0f slot, so a -0.0f total came out +0.0f. */
+            dst_f32[rr] = (tot == 0.0f) ? 0.0f : tot;
+        }
+    }
+}
+
+[[host_name("kernel_mul_mv_q8_0_f32_narrowk")]]
+kernel void kernel_mul_mv_q8_0_f32_narrowk(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void) shmem;   /* bound for signature compatibility; this kernel uses none */
+    kernel_mul_mv_q8_0_f32_narrowk_impl<N_R0_Q8_0_NARROWK, constant ds4_metal_args_mul_mv &>(
+            args, src0, src1, dst, tgpig, tiisg, sgitg);
+}
+
 // Q8_0 matvec whose output is this rank's TP partial in its slab slot: same
 // K walk and reduction tree as kernel_mul_mv_q8_0_f32_impl, plus the checked
 // poll-gate flag published by the last-arriving threadgroup (see

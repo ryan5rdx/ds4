@@ -5608,6 +5608,9 @@ static const char *ds4_gpu_source =
 "#endif\n"
 "#define N_SIMDWIDTH 32\n"
 "#define N_R0_Q8_0 2\n"
+/* Output rows per SIMD GROUP (not per threadgroup) in the narrow-k Q8_0 matvec.
+ * 8 is the measured optimum: R=2 17.3, R=4 8.8, R=8 8.8, R=16 11.6 us. */
+"#define N_R0_Q8_0_NARROWK 8\n"
 "#define N_SG_Q8_0 4\n"
 "#define FC_MUL_MV 600\n"
 "#define FC_MUL_MM 700\n"
@@ -21804,7 +21807,48 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
+            /* R2: the shipped kernel's K partition assumes ne00/QK8_0 >= NSG*NQ.
+             * GLM 5.3's KDA f_b/g_b are 128 -> 4096, i.e. nb = 4, so 16 of 64
+             * threads work and simdgroup 1 pushes exact zeros through the whole
+             * reduction.  kernel_mul_mv_q8_0_f32_narrowk gives each SIMD group
+             * its own rows instead, which deletes the cross-simdgroup pass.
+             *
+             * The gate lives HERE and not in ds4_gpu_make_q8_0_mv_dispatch():
+             * that factory takes void, has 12 callers, and 4 of them bind
+             * NR0 = N_R0_Q8_0 while ignoring args.nr0 -- see the comment on
+             * ds4_gpu_mv_dispatch_pin_nr2 about the upper half of every output
+             * never being written. */
+            /* Gated to EXACTLY the validated GLM shape, not to `nb <= NQ`.
+             * The kernel is generic over nb 1..8 and probe_r2narrowk proves it
+             * bit-identical there, but the only shape with a measured win and a
+             * measured baseline on this model is KDA f_b/g_b at 128 -> 4096.
+             * A broader gate would silently take DeepSeek and shared-expert
+             * matvecs the arm never measured, which is how a kernel that is
+             * right everywhere becomes a regression somewhere. Widen it only
+             * with an arm per shape. */
+            if (in_dim == 128u && out_dim == 4096u &&
+                ds4_gpu_env_bool("DS4_METAL_Q8_MV_NARROWK") > 0) {
+                mv_dispatch.function_name = "kernel_mul_mv_q8_0_f32_narrowk";
+                mv_dispatch.nr0 = 8;                      /* N_R0_Q8_0_NARROWK */
+                mv_dispatch.smem = 0;
+                /* Announce ON SUCCESS ONLY and once per process.  DF2's
+                 * post-mortem: announcing before the predicate scores a
+                 * refusal as engaged, and the harness then VOIDs nothing. */
+                static int announced = 0;
+                if (!announced) {
+                    announced = 1;
+                    fprintf(stderr,
+                            "ds4: Metal Q8_0 narrow-k matvec ENGAGED "
+                            "(in=%llu out=%llu nsg=%d rows/simdgroup=%d)\n",
+                            (unsigned long long)in_dim,
+                            (unsigned long long)out_dim,
+                            (int)mv_dispatch.nsg, (int)mv_dispatch.nr0);
+                }
+            }
             mv_args.nr0 = mv_dispatch.nr0;
+            const int mv_narrowk =
+                strcmp(mv_dispatch.function_name,
+                       "kernel_mul_mv_q8_0_f32_narrowk") == 0;
             id<MTLComputePipelineState> pipeline =
                 ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
             if (!pipeline) return 0;
@@ -21817,7 +21861,16 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
             [enc setThreadgroupMemoryLength:DS4_TG16(mv_dispatch.smem)
                                  atIndex:0];
-            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
+            /* narrow-k gives NR0 rows to each SIMD GROUP, so one threadgroup
+             * covers nr0*nsg rows; the shipped kernel gives NR0 rows to the
+             * whole threadgroup.  Sizing the grid for the wrong one either
+             * leaves the top of the output unwritten or launches ~8x the
+             * threadgroups needed and pays the empty-launch cost the shader-only
+             * prototype could not avoid. */
+            const NSUInteger mv_rows_per_tg =
+                (NSUInteger)mv_dispatch.nr0 *
+                (mv_narrowk ? (NSUInteger)mv_dispatch.nsg : 1u);
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + mv_rows_per_tg - 1u) / mv_rows_per_tg,
                                                   1,
                                                   1)
                  threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
