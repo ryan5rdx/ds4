@@ -2655,6 +2655,21 @@ kernel void kernel_glm_q4_K_down_simd_f32_spec(
     glm_q4_K_down_simd_f32_impl<N_R0_Q4_K, 2, false, DM3_SPEC>(
         args, down, selected, mid, out, tgpig, tiisg, sgitg);
 }
+/* DM1 x DM3 composed: SPEC geometry AND four simdgroups.  DM1 measured
+ * DOWN-NSG4 at +4.1-5.0% and DM2 measured SPEC-BOTH at +6.0%, both exact and
+ * both on `down`; whether they ADD has never been measured. */
+kernel void kernel_glm_q4_K_down_simd_f32_specnsg4(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *down,
+        device const int32_t *selected,
+        device const float *mid,
+        device float *out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    glm_q4_K_down_simd_f32_impl<N_R0_Q4_K, 4, false, DM3_SPEC>(
+        args, down, selected, mid, out, tgpig, tiisg, sgitg);
+}
 
 /* DECMOE-CUDA1 DOWN4: four output rows/SIMD vs the shipped two */
 kernel void kernel_glm_q4_K_down_simd_f32_r4(
