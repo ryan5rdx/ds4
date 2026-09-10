@@ -1117,7 +1117,18 @@ kernel void kernel_glm_q2_K_addr_pair_swiglu2_f32_masked(
  * Prefill's ceiling does not transfer: PR2 measured that at <=10.2% against a
  * mul_mm_id that dequantises per element into a threadgroup tile, whereas this
  * kernel never materialises a dequantised value at all. */
-template <short N_R0, short NSG_T, bool DQSTUB>
+/* DM2 adds SUMYSTUB.  Both CUDA implementations compute the activation group
+ * sums once and reuse them in the asymmetric-quant min correction; this kernel
+ * recomputes sumy in EVERY output-row tile.  At mid_dim 2048 with NSG=2 and
+ * N_R0=4 that is 512 simdgroups each summing the same activation block.
+ *
+ * SUMYSTUB deletes only the eight additions per group and keeps every load, so
+ * it measures the ceiling for reusing them.  Wrong numbers by design.
+ *
+ * If the stub pays, SUMY-EXACT must preserve THIS addition order and lane
+ * distribution -- collapsing the four groups into 128 mathematically equal
+ * full-group sums reassociates the min correction and loses byte identity. */
+template <short N_R0, short NSG_T, bool DQSTUB, bool SUMYSTUB>
 static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
         ds4_metal_glm_routed_moe_args args,
         device const char *gate,
@@ -1180,11 +1191,21 @@ static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
         float yh[16];
         float4 sumy = {0.f, 0.f, 0.f, 0.f};
 
-        for (short i = 0; i < 8; ++i) {
-            yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
-            yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
-            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
-            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        if (SUMYSTUB) {
+            /* loads kept, the eight additions per group deleted */
+            for (short i = 0; i < 8; ++i) {
+                yl[i + 0] = y4[i +   0];
+                yl[i + 8] = y4[i +  32];
+                yh[i + 0] = y4[i + 128];
+                yh[i + 8] = y4[i + 160];
+            }
+        } else {
+            for (short i = 0; i < 8; ++i) {
+                yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+                yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+                yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+                yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+            }
         }
 
         device const uint16_t *scg = (device const uint16_t *)xg[ib].scales + iq;
@@ -1305,7 +1326,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_f32(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR2_K, 2, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR2_K, 2, false, false>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1364,7 +1385,7 @@ kernel void kernel_glm_q4_K_addr_pair_swiglu_f32(
     local.n_total_expert = 1;
     local.gate_expert_bytes = 0;
     local.up_expert_bytes = 0;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false, false>(
         local,
         reinterpret_cast<device const char *>(gate_addr),
         reinterpret_cast<device const char *>(up_addr),
@@ -1427,7 +1448,7 @@ kernel void kernel_glm_q4_K_addr_pair_swiglu_f32_masked(
     local.n_total_expert = 1;
     local.gate_expert_bytes = 0;
     local.up_expert_bytes = 0;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false, false>(
         local,
         reinterpret_cast<device const char *>(gate_addr),
         reinterpret_cast<device const char *>(up_addr),
@@ -1454,7 +1475,34 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 2, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 2, false, false>(
+        args, gate, up, x, weights, mid, scratch,
+        tgpig, slot, token, selected_off,
+        expert - args.tp_expert_base, tiisg, sgitg);
+}
+
+/* DECMOE-CUDA1 PAIR8: eight output rows/SIMD vs the shipped four */
+/* DM2 SUMY-STUB: activation group sums deleted -- CEILING, wrong numbers */
+kernel void kernel_glm_q4_K_pair_swiglu4_f32_sumystub(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *gate,
+        device const char *up,
+        device const float *x,
+        device const int32_t *selected,
+        device const float *weights,
+        device float *mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tgpig.y;
+    const uint token = tgpig.z;
+    if (slot >= args.n_expert_used || token >= args.n_tokens) return;
+    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
+    const int expert = selected[selected_off];
+    if (!ds4_tp_owns_expert(expert, args.n_total_expert,
+                            args.tp_rank, args.tp_world)) return;
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 2, false, true>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1480,7 +1528,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_r8(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<8, 2, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<8, 2, false, false>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1506,7 +1554,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_nsg1(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 1, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 1, false, false>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1532,7 +1580,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_nsg4(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 4, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 4, false, false>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1558,7 +1606,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_r8nsg4(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<8, 4, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<8, 4, false, false>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1584,7 +1632,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_dqstub(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 2, true>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 2, true, false>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1618,7 +1666,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_mapped_f32(
         const uint slot = (uint)id - token * args.n_expert_used;
         if (slot >= args.n_expert_used || token >= args.n_tokens) continue;
         const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
-        glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false>(
+        glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false, false>(
             args, gate, up, x, weights, mid, scratch,
             tgpig, slot, token, selected_off,
             (int)expert - args.tp_expert_base, tiisg, sgitg);
@@ -1649,7 +1697,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_mapped_row_f32(
     const uint slot = (uint)id - token * args.n_expert_used;
     if (slot >= args.n_expert_used || token >= args.n_tokens) return;
     const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false, false>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         (int)expert - args.tp_expert_base, tiisg, sgitg);
