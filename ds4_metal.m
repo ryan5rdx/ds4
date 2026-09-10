@@ -128,6 +128,11 @@ static uint64_t g_timeline_rearms;
 static uint64_t g_timeline_ce_batch;    /* compute_encoder took the batch branch */
 static uint64_t g_timeline_ce_owned;    /* ... fell through to a non-batch CB */
 static uint64_t g_timeline_async;       /* commit_commands_async calls */
+static uint64_t g_timeline_stale_enc;   /* stale/untimelined g_batch_enc dropped */
+/* Which CB g_batch_enc was opened on, and whether it carries a timeline slot.
+ * Without these the encoder is indistinguishable from a live timelined one. */
+static __unsafe_unretained id<MTLCommandBuffer> g_batch_enc_cb;
+static BOOL g_batch_enc_timelined;
 static uint64_t g_timeline_seq;
 static NSMutableDictionary<NSNumber *, NSString *> *g_timeline_pso_names;
 static id<MTLCounterSet> g_timeline_counter_set;
@@ -291,7 +296,7 @@ static void ds4_gpu_timeline_probe(id<MTLDevice> device) {
         @selector(ds4_tl_newComputePipelineStateWithDescriptor:options:reflection:error:));
     fprintf(g_timeline_file, "# ds4 encoder timeline; slide=0x%llx pid=%d\n",
             (unsigned long long)_dyld_get_image_vmaddr_slide(0), (int)getpid());
-    fprintf(g_timeline_file, "# B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns> rearm=<n> ce_batch=<n> ce_owned=<n> async=<n>\n");
+    fprintf(g_timeline_file, "# B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns> rearm=<n> ce_batch=<n> ce_owned=<n> async=<n> stale_enc=<n>\n");
     fprintf(g_timeline_file, "# E <seq> <idx> <start_ns> <end_ns> <dur_us> <gap_us> <caller_unslid> <n_dispatch> <tg> <tpt> <stage> <kernel>\n");
     fprintf(g_timeline_file, "# fields are 1-based: $6=dur_us $7=gap_us $10=tg $11=tpt $12=stage $13=kernel\n");
     fflush(g_timeline_file);
@@ -314,13 +319,14 @@ static void ds4_gpu_timeline_resolve(DS4TimelineBatch *b, id<MTLCommandBuffer> c
     if (!b || !g_timeline_file) return;
     pthread_mutex_lock(&g_timeline_mutex);
     fprintf(g_timeline_file,
-            "B %llu %u %.0f %.0f rearm=%llu ce_batch=%llu ce_owned=%llu async=%llu\n",
+            "B %llu %u %.0f %.0f rearm=%llu ce_batch=%llu ce_owned=%llu async=%llu stale_enc=%llu\n",
             (unsigned long long)b->seq, b->count,
             cb.GPUStartTime * 1e9, cb.GPUEndTime * 1e9,
             (unsigned long long)g_timeline_rearms,
             (unsigned long long)g_timeline_ce_batch,
             (unsigned long long)g_timeline_ce_owned,
-            (unsigned long long)g_timeline_async);
+            (unsigned long long)g_timeline_async,
+            (unsigned long long)g_timeline_stale_enc);
     uint64_t prev_end = 0;
     for (uint32_t i = 0; i < b->count; i++) {
         const uint32_t sb_index = i / (DS4_TIMELINE_SAMPLES_PER_BUFFER / 2);
@@ -1611,14 +1617,43 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
         if (g_timeline_enabled && g_timeline_batch) {
             /* Diagnostic: one timestamped pass per dispatch group. A
              * concurrent section keeps its single encoder. */
+            /* Q1C4.  An encoder that belongs to another command buffer, or
+             * that was opened by the plain path while the capture was
+             * unarmed, records NOTHING -- and when the concurrent flag is set
+             * the guard below never ends it, so it is reused for the rest of
+             * the run.  That is the whole residual defect: Q1C4's counters
+             * showed ce_batch climbing to 154,914 through the dead zone while
+             * rearm stayed at 2 ("already armed") and not one E record was
+             * written.  The arm check passing is exactly what makes it
+             * invisible -- the machinery is confident, and wrong.
+             *
+             * Drop such an encoder REGARDLESS of the concurrent flag.  Ending
+             * a concurrent section early only splits it across two encoders,
+             * and the timeline already gives every dispatch group its own
+             * pass, so this changes nothing that is not already true under the
+             * profiler.  Gated on g_timeline_enabled, so production never sees
+             * it. */
+            if (g_batch_enc && (g_batch_enc_cb != cb || !g_batch_enc_timelined)) {
+                g_timeline_stale_enc++;
+                [g_batch_enc endEncoding];
+                g_batch_enc = nil;
+                g_batch_enc_cb = nil;
+                g_batch_enc_timelined = NO;
+            }
             if (g_batch_enc && !g_batch_encoder_concurrent) {
                 [g_batch_enc endEncoding];
                 g_batch_enc = nil;
+                g_batch_enc_cb = nil;
+                g_batch_enc_timelined = NO;
             }
             if (!g_batch_enc) {
                 g_batch_enc = ds4_gpu_timeline_new_encoder(
                         cb, g_batch_encoder_concurrent,
                         (uintptr_t)__builtin_return_address(0));
+                if (g_batch_enc) {
+                    g_batch_enc_cb = cb;
+                    g_batch_enc_timelined = YES;
+                }
             }
             if (g_batch_enc) return g_batch_enc;
         }
@@ -1626,6 +1661,8 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
             g_batch_enc = g_batch_encoder_concurrent
                 ? [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]
                 : [cb computeCommandEncoder];
+            g_batch_enc_cb = cb;
+            g_batch_enc_timelined = NO;
         }
         return g_batch_enc;
     }
@@ -1657,6 +1694,8 @@ static void ds4_gpu_close_batch_encoder(void) {
     if (!g_batch_enc) return;
     [g_batch_enc endEncoding];
     g_batch_enc = nil;
+    g_batch_enc_cb = nil;
+    g_batch_enc_timelined = NO;
 }
 
 static double g_gpu_busy_accum;
