@@ -122,6 +122,12 @@ static DS4TimelineBatch *g_timeline_batch;
  * encoder path had to re-arm it.  See ds4_gpu_timeline_rearm_if_needed(). */
 static __unsafe_unretained id<MTLCommandBuffer> g_timeline_batch_cb;
 static uint64_t g_timeline_rearms;
+/* Q1C3 diagnostics.  The last fix hooked ds4_gpu_compute_encoder's batch
+ * branch and reported rearm=0 -- which cannot distinguish "the branch ran and
+ * the capture was already armed" from "the branch never ran".  These do. */
+static uint64_t g_timeline_ce_batch;    /* compute_encoder took the batch branch */
+static uint64_t g_timeline_ce_owned;    /* ... fell through to a non-batch CB */
+static uint64_t g_timeline_async;       /* commit_commands_async calls */
 static uint64_t g_timeline_seq;
 static NSMutableDictionary<NSNumber *, NSString *> *g_timeline_pso_names;
 static id<MTLCounterSet> g_timeline_counter_set;
@@ -285,7 +291,7 @@ static void ds4_gpu_timeline_probe(id<MTLDevice> device) {
         @selector(ds4_tl_newComputePipelineStateWithDescriptor:options:reflection:error:));
     fprintf(g_timeline_file, "# ds4 encoder timeline; slide=0x%llx pid=%d\n",
             (unsigned long long)_dyld_get_image_vmaddr_slide(0), (int)getpid());
-    fprintf(g_timeline_file, "# B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns> rearm=<n>\n");
+    fprintf(g_timeline_file, "# B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns> rearm=<n> ce_batch=<n> ce_owned=<n> async=<n>\n");
     fprintf(g_timeline_file, "# E <seq> <idx> <start_ns> <end_ns> <dur_us> <gap_us> <caller_unslid> <n_dispatch> <tg> <tpt> <stage> <kernel>\n");
     fprintf(g_timeline_file, "# fields are 1-based: $6=dur_us $7=gap_us $10=tg $11=tpt $12=stage $13=kernel\n");
     fflush(g_timeline_file);
@@ -307,10 +313,14 @@ static void ds4_gpu_timeline_hook_encoder(id<MTLComputeCommandEncoder> enc) {
 static void ds4_gpu_timeline_resolve(DS4TimelineBatch *b, id<MTLCommandBuffer> cb) {
     if (!b || !g_timeline_file) return;
     pthread_mutex_lock(&g_timeline_mutex);
-    fprintf(g_timeline_file, "B %llu %u %.0f %.0f rearm=%llu\n",
+    fprintf(g_timeline_file,
+            "B %llu %u %.0f %.0f rearm=%llu ce_batch=%llu ce_owned=%llu async=%llu\n",
             (unsigned long long)b->seq, b->count,
             cb.GPUStartTime * 1e9, cb.GPUEndTime * 1e9,
-            (unsigned long long)g_timeline_rearms);
+            (unsigned long long)g_timeline_rearms,
+            (unsigned long long)g_timeline_ce_batch,
+            (unsigned long long)g_timeline_ce_owned,
+            (unsigned long long)g_timeline_async);
     uint64_t prev_end = 0;
     for (uint32_t i = 0; i < b->count; i++) {
         const uint32_t sb_index = i / (DS4_TIMELINE_SAMPLES_PER_BUFFER / 2);
@@ -367,10 +377,11 @@ static void ds4_gpu_timeline_attach(id<MTLCommandBuffer> cb) {
 static id<MTLComputeCommandEncoder> ds4_gpu_timeline_new_encoder(
         id<MTLCommandBuffer> cb, BOOL concurrent, uintptr_t caller) {
     DS4TimelineBatch *b = g_timeline_batch;
-    /* Only the batch command buffer owns the current batch.  Without this a
-     * command buffer from another path could append records to a timeline it
-     * has nothing to do with -- the same class of mistake as the global rec. */
-    if (!b || !cb || cb != g_batch_cb) return nil;
+    /* A command buffer may only append to the batch that was attached to IT.
+     * This used to compare against g_batch_cb, which meant an owned CB -- the
+     * only kind the decode loop gets after commit_commands_async() -- could
+     * never own a capture, so 736 batches recorded zero encoders (Q1C..Q1C3). */
+    if (!b || !cb || cb != g_timeline_batch_cb) return nil;
     const uint32_t per_buffer = DS4_TIMELINE_SAMPLES_PER_BUFFER / 2;
     const uint32_t sb_index = b->count / per_buffer;
     if (sb_index >= [b->samples count]) {
@@ -1576,7 +1587,7 @@ static void ds4_gpu_timeline_attach(id<MTLCommandBuffer> cb);
 
 static void ds4_gpu_timeline_rearm_if_needed(id<MTLCommandBuffer> cb) {
     if (!g_timeline_enabled || !cb) return;
-    if (g_timeline_batch && g_timeline_batch_cb == cb) return;
+    if (g_timeline_batch && g_timeline_batch_cb == cb) return;   /* already armed */
     /* A stale encoder belongs to the previous CB; it must not be handed out. */
     if (g_batch_enc) {
         [g_batch_enc endEncoding];
@@ -1595,6 +1606,7 @@ static void ds4_gpu_timeline_rearm_if_needed(id<MTLCommandBuffer> cb) {
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
+        if (g_timeline_enabled) g_timeline_ce_batch++;
         ds4_gpu_timeline_rearm_if_needed(cb);
         if (g_timeline_enabled && g_timeline_batch) {
             /* Diagnostic: one timestamped pass per dispatch group. A
@@ -1616,6 +1628,21 @@ static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer>
                 : [cb computeCommandEncoder];
         }
         return g_batch_enc;
+    }
+    /* Q1C3: this is the path the decode loop falls into once g_batch_cb is nil,
+     * and it captures nothing.  ds4_gpu_commit_commands_async() commits the
+     * batch CB and leaves the global nil WITHOUT re-attaching -- unlike
+     * ds4_gpu_flush_commands(), which creates a new one and attaches.  After
+     * the first such call every dispatch takes an owned CB, so
+     * `cb == g_batch_cb` is never true again: batches keep attaching (hence B
+     * records) but record zero encoders, and the engine stays healthy because
+     * owned CBs work fine.  Capture them too. */
+    if (g_timeline_enabled) {
+        g_timeline_ce_owned++;
+        ds4_gpu_timeline_rearm_if_needed(cb);
+        id<MTLComputeCommandEncoder> tl = ds4_gpu_timeline_new_encoder(cb, NO,
+                (uintptr_t)__builtin_return_address(0));
+        if (tl) return tl;
     }
     return [cb computeCommandEncoder];
 }
@@ -10683,6 +10710,7 @@ int ds4_gpu_commit_commands_async(void) {
     [cb commit];
     [g_pending_cbs addObject:cb];
     ds4_gpu_stream_expert_cache_note_batch_committed();
+    if (g_timeline_enabled) g_timeline_async++;
     return 1;
 }
 
