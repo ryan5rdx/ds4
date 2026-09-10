@@ -118,6 +118,10 @@ static void ds4_gpu_trace_label_encoder(id<MTLComputeCommandEncoder> enc);
 static FILE *g_timeline_file;
 static pthread_mutex_t g_timeline_mutex = PTHREAD_MUTEX_INITIALIZER;
 static DS4TimelineBatch *g_timeline_batch;
+/* Which command buffer g_timeline_batch was attached to, and how many times the
+ * encoder path had to re-arm it.  See ds4_gpu_timeline_rearm_if_needed(). */
+static __unsafe_unretained id<MTLCommandBuffer> g_timeline_batch_cb;
+static uint64_t g_timeline_rearms;
 static uint64_t g_timeline_seq;
 static NSMutableDictionary<NSNumber *, NSString *> *g_timeline_pso_names;
 static id<MTLCounterSet> g_timeline_counter_set;
@@ -281,7 +285,7 @@ static void ds4_gpu_timeline_probe(id<MTLDevice> device) {
         @selector(ds4_tl_newComputePipelineStateWithDescriptor:options:reflection:error:));
     fprintf(g_timeline_file, "# ds4 encoder timeline; slide=0x%llx pid=%d\n",
             (unsigned long long)_dyld_get_image_vmaddr_slide(0), (int)getpid());
-    fprintf(g_timeline_file, "# B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns>\n");
+    fprintf(g_timeline_file, "# B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns> rearm=<n>\n");
     fprintf(g_timeline_file, "# E <seq> <idx> <start_ns> <end_ns> <dur_us> <gap_us> <caller_unslid> <n_dispatch> <tg> <tpt> <stage> <kernel>\n");
     fprintf(g_timeline_file, "# fields are 1-based: $6=dur_us $7=gap_us $10=tg $11=tpt $12=stage $13=kernel\n");
     fflush(g_timeline_file);
@@ -303,8 +307,10 @@ static void ds4_gpu_timeline_hook_encoder(id<MTLComputeCommandEncoder> enc) {
 static void ds4_gpu_timeline_resolve(DS4TimelineBatch *b, id<MTLCommandBuffer> cb) {
     if (!b || !g_timeline_file) return;
     pthread_mutex_lock(&g_timeline_mutex);
-    fprintf(g_timeline_file, "B %llu %u %.0f %.0f\n", (unsigned long long)b->seq, b->count,
-            cb.GPUStartTime * 1e9, cb.GPUEndTime * 1e9);
+    fprintf(g_timeline_file, "B %llu %u %.0f %.0f rearm=%llu\n",
+            (unsigned long long)b->seq, b->count,
+            cb.GPUStartTime * 1e9, cb.GPUEndTime * 1e9,
+            (unsigned long long)g_timeline_rearms);
     uint64_t prev_end = 0;
     for (uint32_t i = 0; i < b->count; i++) {
         const uint32_t sb_index = i / (DS4_TIMELINE_SAMPLES_PER_BUFFER / 2);
@@ -344,13 +350,17 @@ static void ds4_gpu_timeline_attach(id<MTLCommandBuffer> cb) {
     b->count = 0;
     b->seq = ++g_timeline_seq;
     g_timeline_batch = b;
+    g_timeline_batch_cb = cb;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         ds4_gpu_timeline_resolve(b, done);
         /* Drop the global, but only if it is still this batch -- a newer one
          * may already have replaced it.  The encoders that referenced this
          * batch hold it through their slot, and the block holds it here, so
          * clearing the global cannot free anything still in use. */
-        if (g_timeline_batch == b) g_timeline_batch = nil;
+        if (g_timeline_batch == b) {
+            g_timeline_batch = nil;
+            g_timeline_batch_cb = nil;
+        }
     }];
 }
 
@@ -1541,9 +1551,51 @@ static uint64_t g_dispatch_cbs;
 
 #define DS4_DISP(enc) (g_dispatch_count++, (enc))
 
+/* Re-arm the encoder timeline if the live batch command buffer has no batch
+ * attached to it.
+ *
+ * ds4_gpu_timeline_attach() runs only from ds4_gpu_begin_commands() and
+ * ds4_gpu_flush_commands().  Any path that reaches an encoder on a batch CB by
+ * some other route -- or that lets a completion handler clear g_timeline_batch
+ * while its CB is still current -- silently drops every subsequent dispatch out
+ * of the capture, because ds4_gpu_timeline_new_encoder() returns nil and the
+ * plain encoder below records nothing.
+ *
+ * Q1C and Q1C2 both died that way, deterministically, at the first
+ * position % 4 == 3 (the indexer pool-update cycle): the last non-empty batch
+ * was seq 1475 and the following 736 batches recorded ZERO encoders while the
+ * run continued -- 95.8% of the decode work, and a 9.87 ms gap at the boundary
+ * where the pool-update itself should have been.  Two anatomy runs shipped
+ * nothing because of it.
+ *
+ * Re-arming here rather than hunting the one path keeps the invariant local:
+ * if there is a batch CB and an encoder is wanted, the capture is armed.  The
+ * counter is reported so a run says whether it needed this, instead of quietly
+ * depending on it. */
+static void ds4_gpu_timeline_attach(id<MTLCommandBuffer> cb);
+
+static void ds4_gpu_timeline_rearm_if_needed(id<MTLCommandBuffer> cb) {
+    if (!g_timeline_enabled || !cb) return;
+    if (g_timeline_batch && g_timeline_batch_cb == cb) return;
+    /* A stale encoder belongs to the previous CB; it must not be handed out. */
+    if (g_batch_enc) {
+        [g_batch_enc endEncoding];
+        g_batch_enc = nil;
+    }
+    if (g_timeline_rearms++ == 0) {
+        fprintf(stderr,
+                "ds4: encoder timeline RE-ARMED -- a batch command buffer had no "
+                "capture attached. Without this every later dispatch would have "
+                "recorded zero encoders (the Q1C/Q1C2 defect). Count is reported "
+                "per batch below as 'rearm='.\n");
+    }
+    ds4_gpu_timeline_attach(cb);
+}
+
 static id<MTLComputeCommandEncoder> ds4_gpu_compute_encoder(id<MTLCommandBuffer> cb) {
     if (g_batch_cb && cb == g_batch_cb) {
         g_batch_has_work = YES;
+        ds4_gpu_timeline_rearm_if_needed(cb);
         if (g_timeline_enabled && g_timeline_batch) {
             /* Diagnostic: one timestamped pass per dispatch group. A
              * concurrent section keeps its single encoder. */
