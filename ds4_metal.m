@@ -3815,8 +3815,12 @@ static void ds4_gpu_decmoe_geometry(const char *env,
     const char *e = getenv(env);
     if (e && e[0]) {
         /* suffixes are r<N>, nsg<N>, or r<N>nsg<N> */
-        const char *p = strchr(e, 'r');
-        if (p == e && e[1] >= '0' && e[1] <= '9') nr0 = (uint32_t)atoi(e + 1);
+        for (const char *p = e; *p; p++) {
+            if (*p == 'r' && p[1] >= '0' && p[1] <= '9') {
+                nr0 = (uint32_t)atoi(p + 1);
+                break;
+            }
+        }
         const char *q = strstr(e, "nsg");
         if (q) nsg = (uint32_t)atoi(q + 3);
     }
@@ -3828,9 +3832,22 @@ static void ds4_gpu_decmoe_geometry(const char *env,
 
 static id<MTLComputePipelineState> ds4_gpu_decmoe_pipeline(const char *base,
                                                            const char *env,
-                                                           const char *label) {
+                                                           const char *label,
+                                                           int spec_geometry_ok) {
     const char *suffix = ds4_gpu_decmoe_suffix(env, label);
     if (!suffix[0]) return ds4_gpu_get_pipeline(base);
+    if (strstr(suffix, "spec") && !spec_geometry_ok) {
+        /* A SPEC kernel has the dims, strides and K trip count compiled in.
+         * Binding it at any other geometry would read wrong strides and
+         * silently produce garbage, so refuse loudly instead. */
+        static int warned = 0;
+        if (!warned++) {
+            fprintf(stderr,
+                    "ds4: DECMOE %s SPEC declined -- geometry is not the "
+                    "compiled-in 4096->2048. Running the CONTROL.\n", label);
+        }
+        return ds4_gpu_get_pipeline(base);
+    }
     char name[160];
     snprintf(name, sizeof(name), "%s_%s", base, suffix);
     id<MTLComputePipelineState> p = ds4_gpu_get_pipeline(name);
@@ -42006,6 +42023,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                                              : (expert_mid_dim + 1u) / 2u));
             }
         }
+        /* SPEC kernels compile the dims in; bind them only at that geometry. */
+        const bool dm_spec_ok = (expert_in_dim == 4096u &&
+                                 expert_mid_dim == 2048u && out_dim == 4096u);
         id<MTLComputePipelineState> pair_pipeline =
             (use_stream_split_deferred ?
              (gate_pair_q2 ?
@@ -42038,7 +42058,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
               * scaling it up. */
              (use_pair4 ?
               ds4_gpu_decmoe_pipeline("kernel_glm_q4_K_pair_swiglu4_f32",
-                                      "DS4_METAL_DECMOE_PAIR", "pair") :
+                                      "DS4_METAL_DECMOE_PAIR", "pair",
+                                      dm_spec_ok) :
               ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
                                    "kernel_glm_q4_K_pair_swiglu2_f32")));
         id<MTLComputePipelineState> down_pipeline =
@@ -42053,7 +42074,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                                   "kernel_glm_q2_K_down_f32") :
              down_scalar_q4 ?
              ds4_gpu_decmoe_pipeline("kernel_glm_q4_K_down_simd_f32",
-                                     "DS4_METAL_DECMOE_DOWN", "down") :
+                                     "DS4_METAL_DECMOE_DOWN", "down",
+                                     dm_spec_ok) :
              down_simd_q5 ?
              ds4_gpu_hot_pipeline(g_glm_q5_k_down_f32_pipeline,
                                   "kernel_glm_q5_K_down_f32") :
@@ -43223,6 +43245,9 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             !use_stream_expert_addr_table &&
             !gate_pair_q5 && !q4_scalar_pair &&
             (force_scalar_q4_pair || !enable_q4_pair4);
+        /* SPEC kernels compile the dims in; bind them only at that geometry. */
+        const bool dm_spec_ok = (expert_in_dim == 4096u &&
+                                 expert_mid_dim == 2048u && out_dim == 4096u);
         id<MTLComputePipelineState> pair_pipeline =
             use_stream_expert_addr_table ?
              (gate_pair_q2 ?
@@ -43243,7 +43268,8 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
               ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
                                    "kernel_glm_q4_K_pair_swiglu2_f32") :
               ds4_gpu_decmoe_pipeline("kernel_glm_q4_K_pair_swiglu4_f32",
-                                      "DS4_METAL_DECMOE_PAIR", "pair"));
+                                      "DS4_METAL_DECMOE_PAIR", "pair",
+                                      dm_spec_ok));
         id<MTLComputePipelineState> down_pipeline =
             use_stream_expert_addr_table ?
              (down_scalar_q2 ?
@@ -43256,7 +43282,8 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                                  "kernel_glm_q2_K_down_f32") :
             down_scalar_q4 ?
             ds4_gpu_decmoe_pipeline("kernel_glm_q4_K_down_simd_f32",
-                                     "DS4_METAL_DECMOE_DOWN", "down") :
+                                     "DS4_METAL_DECMOE_DOWN", "down",
+                                     dm_spec_ok) :
             down_simd_q5 ?
             ds4_gpu_hot_pipeline(g_glm_q5_k_down_f32_pipeline,
                                  "kernel_glm_q5_K_down_f32") :
@@ -47937,7 +47964,10 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                        use_tp_mxfp4_static_batch ? 1 : 2,
                                                        false);
         } else if (use_tiny_pair_mv) {
-            id<MTLComputePipelineState> pair_pipeline =
+            /* SPEC kernels compile the dims in; bind them only at that geometry. */
+        const bool dm_spec_ok = (expert_in_dim == 4096u &&
+                                 expert_mid_dim == 2048u && out_dim == 4096u);
+        id<MTLComputePipelineState> pair_pipeline =
                 gate_type == DS4_METAL_TENSOR_IQ2_XXS ?
                     g_moe_mul_mv_id_iq2_xxs_pair_pipeline :
                     g_moe_mul_mv_id_q4_k_pair_pipeline;

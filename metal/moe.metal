@@ -1128,7 +1128,32 @@ kernel void kernel_glm_q2_K_addr_pair_swiglu2_f32_masked(
  * If the stub pays, SUMY-EXACT must preserve THIS addition order and lane
  * distribution -- collapsing the four groups into 128 mathematically equal
  * full-group sums reassociates the min correction and loses byte identity. */
-template <short N_R0, short NSG_T, bool DQSTUB, bool SUMYSTUB>
+/* DM3.  A bitmask rather than three more bools:
+ *     1 SPEC    compile-time in/mid dims, row strides and K-loop trip count
+ *     2 PACKED  aligned uint2 payload loads instead of four scalar uint16
+ *
+ * SPEC is gated ON THE HOST to the exact production geometry (4096->2048),
+ * so a mismatch selects the shipped kernel rather than reading wrong strides.
+ * The K loop is `for (ib = ix; ib < nb; ib += 4)` with nb = 16 and ix in 0..3,
+ * so specialising nb makes it a compile-time trip count of exactly four --
+ * which is the point, and also why an explicit register prefetch is deferred
+ * until this is measured: a fully unrolled four-iteration loop is exactly what
+ * would make one redundant.
+ *
+ * There is NO scale/min hoist to build.  In both pair and down the scale
+ * pointer advances once per output row (`scg += gate_row_bytes/2`), so each row
+ * owns its tuple and no tuple ever serves two rows.  CUDA gets that reuse from
+ * a different weight layout, not from a smarter loop. */
+#define DM3_SPEC   1
+#define DM3_PACKED 2
+#define DM3_PAIR_IN_DIM     4096
+#define DM3_PAIR_MID_DIM    2048
+#define DM3_PAIR_ROW_BYTES  ((DM3_PAIR_IN_DIM / QK_K) * 144)
+#define DM3_DOWN_IN_DIM     2048
+#define DM3_DOWN_OUT_DIM    4096
+#define DM3_DOWN_ROW_BYTES  ((DM3_DOWN_IN_DIM / QK_K) * 144)
+
+template <short N_R0, short NSG_T, bool DQSTUB, bool SUMYSTUB, int DM3>
 static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
         ds4_metal_glm_routed_moe_args args,
         device const char *gate,
@@ -1169,16 +1194,23 @@ static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
     const short it = tiisg % 8;
     const short iq = it / 4;
     const short ir = it % 4;
-    const int nb = args.in_dim / QK_K;
+    const int nb = (DM3 & DM3_SPEC) ? (DM3_PAIR_IN_DIM / QK_K)
+                                    : (int)(args.in_dim / QK_K);
+    const uint  dm3_mid  = (DM3 & DM3_SPEC) ? (uint)DM3_PAIR_MID_DIM : args.mid_dim;
+    const uint64_t dm3_grb = (DM3 & DM3_SPEC) ? (uint64_t)DM3_PAIR_ROW_BYTES
+                                              : args.gate_row_bytes;
+    const uint64_t dm3_urb = (DM3 & DM3_SPEC) ? (uint64_t)DM3_PAIR_ROW_BYTES
+                                              : args.up_row_bytes;
+    const uint  dm3_in   = (DM3 & DM3_SPEC) ? (uint)DM3_PAIR_IN_DIM : args.in_dim;
     const uint64_t expert_gate = (uint64_t)(uint)expert * args.gate_expert_bytes;
     const uint64_t expert_up = (uint64_t)(uint)expert * args.up_expert_bytes;
     device const block_q4_K *xg =
         (device const block_q4_K *)(gate + expert_gate +
-            (uint64_t)row0 * args.gate_row_bytes);
+            (uint64_t)row0 * dm3_grb);
     device const block_q4_K *xu =
         (device const block_q4_K *)(up + expert_up +
-            (uint64_t)row0 * args.up_row_bytes);
-    device const float *y = x + (uint64_t)token * args.in_dim;
+            (uint64_t)row0 * dm3_urb);
+    device const float *y = x + (uint64_t)token * dm3_in;
     device const float *y4 = y + ix * QK_K + 64 * iq + 8 * ir;
 
     float sumg[N_R0] = {0.f};
@@ -1216,7 +1248,7 @@ static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
         device const half *dhu = &xu[ib].d;
 
         for (short row = 0;
-             row < N_R0 && row0 + (uint)row < args.mid_dim;
+             row < N_R0 && row0 + (uint)row < dm3_mid;
              row++) {
             if (DQSTUB) {
                 sc16[0] = scg[0]; sc16[1] = scg[2];
@@ -1228,19 +1260,31 @@ static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
                 sc16[3] = ((scg[4] >> 4) & kmask2) | ((scg[2] & kmask3) >> 2);
             }
 
+            ushort qgv[4], qgw[4];
+            if (DM3 & DM3_PACKED) {
+                /* qs sits at byte 16 of block_q4_K and the lane offset is
+                 * 32*iq + 8*ir bytes, so qg1 is 8-byte aligned and the four
+                 * uint16 the loop reads are exactly one uint2. */
+                const uint2 p1 = *(device const uint2 *)qg1;
+                const uint2 p2 = *(device const uint2 *)(qg1 + 32);
+                qgv[0] = (ushort)(p1.x & 0xFFFFu); qgv[1] = (ushort)(p1.x >> 16);
+                qgv[2] = (ushort)(p1.y & 0xFFFFu); qgv[3] = (ushort)(p1.y >> 16);
+                qgw[0] = (ushort)(p2.x & 0xFFFFu); qgw[1] = (ushort)(p2.x >> 16);
+                qgw[2] = (ushort)(p2.y & 0xFFFFu); qgw[3] = (ushort)(p2.y >> 16);
+            }
             device const uint16_t *qg2 = qg1 + 32;
             float4 acc1g = {0.f, 0.f, 0.f, 0.f};
             float4 acc2g = {0.f, 0.f, 0.f, 0.f};
 
             FOR_UNROLL (short i = 0; i < 4; ++i) {
-                acc1g[0] += yl[2 * i + 0] * (DQSTUB ? qg1[i] : (qg1[i] & 0x000F));
-                acc1g[1] += yl[2 * i + 1] * (DQSTUB ? qg1[i] : (qg1[i] & 0x0F00));
-                acc1g[2] += yl[2 * i + 8] * (DQSTUB ? qg1[i] : (qg1[i] & 0x00F0));
-                acc1g[3] += yl[2 * i + 9] * (DQSTUB ? qg1[i] : (qg1[i] & 0xF000));
-                acc2g[0] += yh[2 * i + 0] * (DQSTUB ? qg2[i] : (qg2[i] & 0x000F));
-                acc2g[1] += yh[2 * i + 1] * (DQSTUB ? qg2[i] : (qg2[i] & 0x0F00));
-                acc2g[2] += yh[2 * i + 8] * (DQSTUB ? qg2[i] : (qg2[i] & 0x00F0));
-                acc2g[3] += yh[2 * i + 9] * (DQSTUB ? qg2[i] : (qg2[i] & 0xF000));
+                acc1g[0] += yl[2 * i + 0] * (DQSTUB ? ((DM3 & DM3_PACKED) ? qgv[i] : qg1[i]) : (((DM3 & DM3_PACKED) ? qgv[i] : qg1[i]) & 0x000F));
+                acc1g[1] += yl[2 * i + 1] * (DQSTUB ? ((DM3 & DM3_PACKED) ? qgv[i] : qg1[i]) : (((DM3 & DM3_PACKED) ? qgv[i] : qg1[i]) & 0x0F00));
+                acc1g[2] += yl[2 * i + 8] * (DQSTUB ? ((DM3 & DM3_PACKED) ? qgv[i] : qg1[i]) : (((DM3 & DM3_PACKED) ? qgv[i] : qg1[i]) & 0x00F0));
+                acc1g[3] += yl[2 * i + 9] * (DQSTUB ? ((DM3 & DM3_PACKED) ? qgv[i] : qg1[i]) : (((DM3 & DM3_PACKED) ? qgv[i] : qg1[i]) & 0xF000));
+                acc2g[0] += yh[2 * i + 0] * (DQSTUB ? ((DM3 & DM3_PACKED) ? qgw[i] : qg2[i]) : (((DM3 & DM3_PACKED) ? qgw[i] : qg2[i]) & 0x000F));
+                acc2g[1] += yh[2 * i + 1] * (DQSTUB ? ((DM3 & DM3_PACKED) ? qgw[i] : qg2[i]) : (((DM3 & DM3_PACKED) ? qgw[i] : qg2[i]) & 0x0F00));
+                acc2g[2] += yh[2 * i + 8] * (DQSTUB ? ((DM3 & DM3_PACKED) ? qgw[i] : qg2[i]) : (((DM3 & DM3_PACKED) ? qgw[i] : qg2[i]) & 0x00F0));
+                acc2g[3] += yh[2 * i + 9] * (DQSTUB ? ((DM3 & DM3_PACKED) ? qgw[i] : qg2[i]) : (((DM3 & DM3_PACKED) ? qgw[i] : qg2[i]) & 0xF000));
             }
 
             sumg[row] += dhg[0] * ((acc1g[0] + 1.f / 256.f * acc1g[1]) * sc8[0] +
@@ -1260,19 +1304,28 @@ static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
                 sc16[3] = ((scu[4] >> 4) & kmask2) | ((scu[2] & kmask3) >> 2);
             }
 
+            ushort quv[4], quw[4];
+            if (DM3 & DM3_PACKED) {
+                const uint2 p1 = *(device const uint2 *)qu1;
+                const uint2 p2 = *(device const uint2 *)(qu1 + 32);
+                quv[0] = (ushort)(p1.x & 0xFFFFu); quv[1] = (ushort)(p1.x >> 16);
+                quv[2] = (ushort)(p1.y & 0xFFFFu); quv[3] = (ushort)(p1.y >> 16);
+                quw[0] = (ushort)(p2.x & 0xFFFFu); quw[1] = (ushort)(p2.x >> 16);
+                quw[2] = (ushort)(p2.y & 0xFFFFu); quw[3] = (ushort)(p2.y >> 16);
+            }
             device const uint16_t *qu2 = qu1 + 32;
             float4 acc1u = {0.f, 0.f, 0.f, 0.f};
             float4 acc2u = {0.f, 0.f, 0.f, 0.f};
 
             FOR_UNROLL (short i = 0; i < 4; ++i) {
-                acc1u[0] += yl[2 * i + 0] * (DQSTUB ? qu1[i] : (qu1[i] & 0x000F));
-                acc1u[1] += yl[2 * i + 1] * (DQSTUB ? qu1[i] : (qu1[i] & 0x0F00));
-                acc1u[2] += yl[2 * i + 8] * (DQSTUB ? qu1[i] : (qu1[i] & 0x00F0));
-                acc1u[3] += yl[2 * i + 9] * (DQSTUB ? qu1[i] : (qu1[i] & 0xF000));
-                acc2u[0] += yh[2 * i + 0] * (DQSTUB ? qu2[i] : (qu2[i] & 0x000F));
-                acc2u[1] += yh[2 * i + 1] * (DQSTUB ? qu2[i] : (qu2[i] & 0x0F00));
-                acc2u[2] += yh[2 * i + 8] * (DQSTUB ? qu2[i] : (qu2[i] & 0x00F0));
-                acc2u[3] += yh[2 * i + 9] * (DQSTUB ? qu2[i] : (qu2[i] & 0xF000));
+                acc1u[0] += yl[2 * i + 0] * (DQSTUB ? ((DM3 & DM3_PACKED) ? quv[i] : qu1[i]) : (((DM3 & DM3_PACKED) ? quv[i] : qu1[i]) & 0x000F));
+                acc1u[1] += yl[2 * i + 1] * (DQSTUB ? ((DM3 & DM3_PACKED) ? quv[i] : qu1[i]) : (((DM3 & DM3_PACKED) ? quv[i] : qu1[i]) & 0x0F00));
+                acc1u[2] += yl[2 * i + 8] * (DQSTUB ? ((DM3 & DM3_PACKED) ? quv[i] : qu1[i]) : (((DM3 & DM3_PACKED) ? quv[i] : qu1[i]) & 0x00F0));
+                acc1u[3] += yl[2 * i + 9] * (DQSTUB ? ((DM3 & DM3_PACKED) ? quv[i] : qu1[i]) : (((DM3 & DM3_PACKED) ? quv[i] : qu1[i]) & 0xF000));
+                acc2u[0] += yh[2 * i + 0] * (DQSTUB ? ((DM3 & DM3_PACKED) ? quw[i] : qu2[i]) : (((DM3 & DM3_PACKED) ? quw[i] : qu2[i]) & 0x000F));
+                acc2u[1] += yh[2 * i + 1] * (DQSTUB ? ((DM3 & DM3_PACKED) ? quw[i] : qu2[i]) : (((DM3 & DM3_PACKED) ? quw[i] : qu2[i]) & 0x0F00));
+                acc2u[2] += yh[2 * i + 8] * (DQSTUB ? ((DM3 & DM3_PACKED) ? quw[i] : qu2[i]) : (((DM3 & DM3_PACKED) ? quw[i] : qu2[i]) & 0x00F0));
+                acc2u[3] += yh[2 * i + 9] * (DQSTUB ? ((DM3 & DM3_PACKED) ? quw[i] : qu2[i]) : (((DM3 & DM3_PACKED) ? quw[i] : qu2[i]) & 0xF000));
             }
 
             sumu[row] += dhu[0] * ((acc1u[0] + 1.f / 256.f * acc1u[1]) * sc8[0] +
@@ -1282,19 +1335,19 @@ static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
                          dhu[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
                                    sumy[2] * sc8[6] + sumy[3] * sc8[7]);
 
-            qg1 += args.gate_row_bytes / 2;
-            scg += args.gate_row_bytes / 2;
-            dhg += args.gate_row_bytes / 2;
-            qu1 += args.up_row_bytes / 2;
-            scu += args.up_row_bytes / 2;
-            dhu += args.up_row_bytes / 2;
+            qg1 += dm3_grb / 2;
+            scg += dm3_grb / 2;
+            dhg += dm3_grb / 2;
+            qu1 += dm3_urb / 2;
+            scu += dm3_urb / 2;
+            dhu += dm3_urb / 2;
         }
 
         y4 += 4 * QK_K;
     }
 
     for (int row = 0;
-         row < N_R0 && row0 + (uint)row < args.mid_dim;
+         row < N_R0 && row0 + (uint)row < dm3_mid;
          ++row) {
         const float g = simd_sum(sumg[row]);
         const float u = simd_sum(sumu[row]);
@@ -1326,7 +1379,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_f32(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR2_K, 2, false, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR2_K, 2, false, false, 0>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1385,7 +1438,7 @@ kernel void kernel_glm_q4_K_addr_pair_swiglu_f32(
     local.n_total_expert = 1;
     local.gate_expert_bytes = 0;
     local.up_expert_bytes = 0;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false, false, 0>(
         local,
         reinterpret_cast<device const char *>(gate_addr),
         reinterpret_cast<device const char *>(up_addr),
@@ -1448,7 +1501,7 @@ kernel void kernel_glm_q4_K_addr_pair_swiglu_f32_masked(
     local.n_total_expert = 1;
     local.gate_expert_bytes = 0;
     local.up_expert_bytes = 0;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false, false, 0>(
         local,
         reinterpret_cast<device const char *>(gate_addr),
         reinterpret_cast<device const char *>(up_addr),
@@ -1475,7 +1528,119 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 2, false, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 2, false, false, 0>(
+        args, gate, up, x, weights, mid, scratch,
+        tgpig, slot, token, selected_off,
+        expert - args.tp_expert_base, tiisg, sgitg);
+}
+
+/* DECMOE-CUDA1 PAIR8: eight output rows/SIMD vs the shipped four */
+/* DM2 SUMY-STUB: activation group sums deleted -- CEILING, wrong numbers */
+/* DM3 SPEC: compile-time dims, strides, K trip count */
+kernel void kernel_glm_q4_K_pair_swiglu4_f32_spec(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *gate,
+        device const char *up,
+        device const float *x,
+        device const int32_t *selected,
+        device const float *weights,
+        device float *mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tgpig.y;
+    const uint token = tgpig.z;
+    if (slot >= args.n_expert_used || token >= args.n_tokens) return;
+    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
+    const int expert = selected[selected_off];
+    if (!ds4_tp_owns_expert(expert, args.n_total_expert,
+                            args.tp_rank, args.tp_world)) return;
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 2, false, false, DM3_SPEC>(
+        args, gate, up, x, weights, mid, scratch,
+        tgpig, slot, token, selected_off,
+        expert - args.tp_expert_base, tiisg, sgitg);
+}
+
+/* DECMOE-CUDA1 PAIR8: eight output rows/SIMD vs the shipped four */
+/* DM2 SUMY-STUB: activation group sums deleted -- CEILING, wrong numbers */
+/* DM3 PACKED: aligned uint2 payload loads */
+kernel void kernel_glm_q4_K_pair_swiglu4_f32_packed(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *gate,
+        device const char *up,
+        device const float *x,
+        device const int32_t *selected,
+        device const float *weights,
+        device float *mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tgpig.y;
+    const uint token = tgpig.z;
+    if (slot >= args.n_expert_used || token >= args.n_tokens) return;
+    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
+    const int expert = selected[selected_off];
+    if (!ds4_tp_owns_expert(expert, args.n_total_expert,
+                            args.tp_rank, args.tp_world)) return;
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 2, false, false, DM3_PACKED>(
+        args, gate, up, x, weights, mid, scratch,
+        tgpig, slot, token, selected_off,
+        expert - args.tp_expert_base, tiisg, sgitg);
+}
+
+/* DECMOE-CUDA1 PAIR8: eight output rows/SIMD vs the shipped four */
+/* DM2 SUMY-STUB: activation group sums deleted -- CEILING, wrong numbers */
+/* DM3 SPEC+PACKED */
+kernel void kernel_glm_q4_K_pair_swiglu4_f32_specpacked(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *gate,
+        device const char *up,
+        device const float *x,
+        device const int32_t *selected,
+        device const float *weights,
+        device float *mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tgpig.y;
+    const uint token = tgpig.z;
+    if (slot >= args.n_expert_used || token >= args.n_tokens) return;
+    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
+    const int expert = selected[selected_off];
+    if (!ds4_tp_owns_expert(expert, args.n_total_expert,
+                            args.tp_rank, args.tp_world)) return;
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 2, false, false, DM3_SPEC|DM3_PACKED>(
+        args, gate, up, x, weights, mid, scratch,
+        tgpig, slot, token, selected_off,
+        expert - args.tp_expert_base, tiisg, sgitg);
+}
+
+/* DECMOE-CUDA1 PAIR8: eight output rows/SIMD vs the shipped four */
+/* DM2 SUMY-STUB: activation group sums deleted -- CEILING, wrong numbers */
+/* DM3 SPEC composed with PAIR8 */
+kernel void kernel_glm_q4_K_pair_swiglu4_f32_specr8(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *gate,
+        device const char *up,
+        device const float *x,
+        device const int32_t *selected,
+        device const float *weights,
+        device float *mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tgpig.y;
+    const uint token = tgpig.z;
+    if (slot >= args.n_expert_used || token >= args.n_tokens) return;
+    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
+    const int expert = selected[selected_off];
+    if (!ds4_tp_owns_expert(expert, args.n_total_expert,
+                            args.tp_rank, args.tp_world)) return;
+    glm_q4_K_pair_swiglu_simd_f32_impl<8, 2, false, false, DM3_SPEC>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1502,7 +1667,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_sumystub(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 2, false, true>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 2, false, true, 0>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1528,7 +1693,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_r8(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<8, 2, false, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<8, 2, false, false, 0>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1554,7 +1719,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_nsg1(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 1, false, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 1, false, false, 0>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1580,7 +1745,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_nsg4(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 4, false, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 4, false, false, 0>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1606,7 +1771,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_r8nsg4(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<8, 4, false, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<8, 4, false, false, 0>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1632,7 +1797,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_dqstub(
     const int expert = selected[selected_off];
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 2, true, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 2, true, false, 0>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
@@ -1666,7 +1831,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_mapped_f32(
         const uint slot = (uint)id - token * args.n_expert_used;
         if (slot >= args.n_expert_used || token >= args.n_tokens) continue;
         const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
-        glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false, false>(
+        glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false, false, 0>(
             args, gate, up, x, weights, mid, scratch,
             tgpig, slot, token, selected_off,
             (int)expert - args.tp_expert_base, tiisg, sgitg);
@@ -1697,7 +1862,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_mapped_row_f32(
     const uint slot = (uint)id - token * args.n_expert_used;
     if (slot >= args.n_expert_used || token >= args.n_tokens) return;
     const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
-    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false, false>(
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 2, false, false, 0>(
         args, gate, up, x, weights, mid, scratch,
         tgpig, slot, token, selected_off,
         (int)expert - args.tp_expert_base, tiisg, sgitg);
@@ -2349,7 +2514,7 @@ kernel void kernel_glm_q4_K_addr_down_f32(
 
 /* DECMOE-CUDA1: same measurement template as the pair kernel.  Every shipped
  * path instantiates <N_R0_Q4_K, 2, false>, which is the previous behaviour. */
-template <short NR0_T, short NSG_T, bool DQSTUB>
+template <short NR0_T, short NSG_T, bool DQSTUB, int DM3>
 static inline void glm_q4_K_down_simd_f32_impl(
         constant ds4_metal_glm_routed_moe_args &args,
         device const char *down,
@@ -2361,7 +2526,11 @@ static inline void glm_q4_K_down_simd_f32_impl(
         ushort sgitg) {
     const short NSG = NSG_T;
     const short nr0 = NR0_T;
-    const int nb = args.mid_dim / QK_K;
+    const int nb = (DM3 & DM3_SPEC) ? (DM3_DOWN_IN_DIM / QK_K)
+                                    : (int)(args.mid_dim / QK_K);
+    const uint dm3_out = (DM3 & DM3_SPEC) ? (uint)DM3_DOWN_OUT_DIM : args.out_dim;
+    const uint64_t dm3_drb = (DM3 & DM3_SPEC) ? (uint64_t)DM3_DOWN_ROW_BYTES
+                                              : args.down_row_bytes;
     const uint row0 = ((uint)tgpig.x * (uint)NSG + (uint)sgitg) * (uint)nr0;
     const uint token = tgpig.y;
     if (row0 >= args.out_dim || token >= args.n_tokens) return;
@@ -2410,7 +2579,7 @@ static inline void glm_q4_K_down_simd_f32_impl(
             device const uint16_t *q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
             device const half *dh = &x[ib].d;
 
-            for (short row = 0; row < nr0 && row0 + (uint)row < args.out_dim; row++) {
+            for (short row = 0; row < nr0 && row0 + (uint)row < dm3_out; row++) {
                 if (DQSTUB) {
                     sc16[0] = sc[0]; sc16[1] = sc[2];
                     sc16[2] = sc[4]; sc16[3] = sc[2];
@@ -2443,16 +2612,16 @@ static inline void glm_q4_K_down_simd_f32_impl(
                              dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
                                       sumy[2] * sc8[6] + sumy[3] * sc8[7]);
 
-                q1 += args.down_row_bytes / 2;
-                sc += args.down_row_bytes / 2;
-                dh += args.down_row_bytes / 2;
+                q1 += dm3_drb / 2;
+                sc += dm3_drb / 2;
+                dh += dm3_drb / 2;
             }
 
             y4 += 4 * QK_K;
         }
     }
 
-    for (short row = 0; row < nr0 && row0 + (uint)row < args.out_dim; row++) {
+    for (short row = 0; row < nr0 && row0 + (uint)row < dm3_out; row++) {
         const float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0u) {
             out[(uint64_t)token * args.out_dim + row0 + (uint)row] = sum_all;
@@ -2469,7 +2638,21 @@ kernel void kernel_glm_q4_K_down_simd_f32(
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    glm_q4_K_down_simd_f32_impl<N_R0_Q4_K, 2, false>(
+    glm_q4_K_down_simd_f32_impl<N_R0_Q4_K, 2, false, 0>(
+        args, down, selected, mid, out, tgpig, tiisg, sgitg);
+}
+
+/* DM3 SPEC (down): compile-time dims, strides, K trip count */
+kernel void kernel_glm_q4_K_down_simd_f32_spec(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *down,
+        device const int32_t *selected,
+        device const float *mid,
+        device float *out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    glm_q4_K_down_simd_f32_impl<N_R0_Q4_K, 2, false, DM3_SPEC>(
         args, down, selected, mid, out, tgpig, tiisg, sgitg);
 }
 
@@ -2483,7 +2666,7 @@ kernel void kernel_glm_q4_K_down_simd_f32_r4(
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    glm_q4_K_down_simd_f32_impl<4, 2, false>(
+    glm_q4_K_down_simd_f32_impl<4, 2, false, 0>(
         args, down, selected, mid, out, tgpig, tiisg, sgitg);
 }
 
@@ -2497,7 +2680,7 @@ kernel void kernel_glm_q4_K_down_simd_f32_nsg1(
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    glm_q4_K_down_simd_f32_impl<N_R0_Q4_K, 1, false>(
+    glm_q4_K_down_simd_f32_impl<N_R0_Q4_K, 1, false, 0>(
         args, down, selected, mid, out, tgpig, tiisg, sgitg);
 }
 
@@ -2511,7 +2694,7 @@ kernel void kernel_glm_q4_K_down_simd_f32_nsg4(
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    glm_q4_K_down_simd_f32_impl<N_R0_Q4_K, 4, false>(
+    glm_q4_K_down_simd_f32_impl<N_R0_Q4_K, 4, false, 0>(
         args, down, selected, mid, out, tgpig, tiisg, sgitg);
 }
 
@@ -2525,7 +2708,7 @@ kernel void kernel_glm_q4_K_down_simd_f32_r4nsg4(
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    glm_q4_K_down_simd_f32_impl<4, 4, false>(
+    glm_q4_K_down_simd_f32_impl<4, 4, false, 0>(
         args, down, selected, mid, out, tgpig, tiisg, sgitg);
 }
 
@@ -2539,7 +2722,7 @@ kernel void kernel_glm_q4_K_down_simd_f32_dqstub(
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    glm_q4_K_down_simd_f32_impl<N_R0_Q4_K, 2, true>(
+    glm_q4_K_down_simd_f32_impl<N_R0_Q4_K, 2, true, 0>(
         args, down, selected, mid, out, tgpig, tiisg, sgitg);
 }
 
