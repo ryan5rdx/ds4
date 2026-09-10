@@ -3774,6 +3774,80 @@ static int ds4_gpu_device_name_contains(const char *needle) {
     return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
 }
 
+/* DECMOE-CUDA1 measurement knobs -- P0 campaign branch, default OFF.
+ *
+ *   DS4_METAL_DECMOE_PAIR = r8 | nsg1 | nsg4 | r8nsg4 | dqstub
+ *   DS4_METAL_DECMOE_DOWN = r4 | nsg1 | nsg4 | r4nsg4 | dqstub
+ *
+ * dqstub produces WRONG NUMBERS on purpose: it keeps every load and deletes
+ * only the Q4 unpack and 6-bit scale/min extraction, to measure the decode
+ * dequant ceiling.  Prefill's ceiling does not transfer -- PR2 measured that
+ * against mul_mm_id, which materialises dequantised values into a threadgroup
+ * tile, while these kernels never materialise one at all.
+ *
+ * Resolution is by NAME, and an unknown or unbuilt suffix falls back to the
+ * shipped kernel, so a typo degrades to the control rather than to nil. */
+static const char *ds4_gpu_decmoe_suffix(const char *env, const char *label) {
+    const char *e = getenv(env);
+    if (!e || !e[0]) return "";
+    static int announced_pair = 0, announced_down = 0;
+    int *flag = (label[0] == 'p') ? &announced_pair : &announced_down;
+    if (!*flag) {
+        *flag = 1;
+        fprintf(stderr, "ds4: Metal DECMOE %s VARIANT ENGAGED (%s)%s\n",
+                label, e,
+                strcmp(e, "dqstub") == 0 ? " -- WRONG NUMBERS, ceiling only" : "");
+    }
+    return e;
+}
+
+/* A DECMOE variant changes rows-per-simdgroup and/or simdgroups-per-threadgroup,
+ * so the DISPATCH GEOMETRY has to move with it.  Leaving the shipped grid in
+ * place is the P1SWZ failure mode -- a flag the shader honours and the host
+ * does not -- and it showed up immediately: PAIR8 on the shipped grid launched
+ * twice the threadgroups it needed and read as -16%, while DOWN4 covered only
+ * half the rows and read as "DIFFERS".  Neither number meant anything. */
+static void ds4_gpu_decmoe_geometry(const char *env,
+                                    uint32_t base_nr0, uint32_t base_nsg,
+                                    uint32_t *rows_per_group,
+                                    uint32_t *threads) {
+    uint32_t nr0 = base_nr0, nsg = base_nsg;
+    const char *e = getenv(env);
+    if (e && e[0]) {
+        /* suffixes are r<N>, nsg<N>, or r<N>nsg<N> */
+        const char *p = strchr(e, 'r');
+        if (p == e && e[1] >= '0' && e[1] <= '9') nr0 = (uint32_t)atoi(e + 1);
+        const char *q = strstr(e, "nsg");
+        if (q) nsg = (uint32_t)atoi(q + 3);
+    }
+    if (nr0 == 0) nr0 = base_nr0;
+    if (nsg == 0) nsg = base_nsg;
+    *rows_per_group = nr0 * nsg;
+    *threads = nsg * 32u;
+}
+
+static id<MTLComputePipelineState> ds4_gpu_decmoe_pipeline(const char *base,
+                                                           const char *env,
+                                                           const char *label) {
+    const char *suffix = ds4_gpu_decmoe_suffix(env, label);
+    if (!suffix[0]) return ds4_gpu_get_pipeline(base);
+    char name[160];
+    snprintf(name, sizeof(name), "%s_%s", base, suffix);
+    id<MTLComputePipelineState> p = ds4_gpu_get_pipeline(name);
+    if (!p) {
+        /* Loud, not silent: a variant that failed to build would otherwise
+         * fall back to the control and read as "no effect". */
+        static int warned = 0;
+        if (!warned++) {
+            fprintf(stderr,
+                    "ds4: DECMOE variant %s DID NOT RESOLVE -- falling back to "
+                    "%s. Any number from this run is the CONTROL.\n", name, base);
+        }
+        return ds4_gpu_get_pipeline(base);
+    }
+    return p;
+}
+
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
            g_metal_device_name[7] >= '1' &&
@@ -41963,8 +42037,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
               * core:bandwidth ratio, so discount the M1 Max delta rather than
               * scaling it up. */
              (use_pair4 ?
-              ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
-                                   "kernel_glm_q4_K_pair_swiglu4_f32") :
+              ds4_gpu_decmoe_pipeline("kernel_glm_q4_K_pair_swiglu4_f32",
+                                      "DS4_METAL_DECMOE_PAIR", "pair") :
               ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
                                    "kernel_glm_q4_K_pair_swiglu2_f32")));
         id<MTLComputePipelineState> down_pipeline =
@@ -41978,8 +42052,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
              ds4_gpu_hot_pipeline(g_glm_q2_k_down_f32_pipeline,
                                   "kernel_glm_q2_K_down_f32") :
              down_scalar_q4 ?
-             ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
-                                  "kernel_glm_q4_K_down_f32") :
+             ds4_gpu_decmoe_pipeline("kernel_glm_q4_K_down_simd_f32",
+                                     "DS4_METAL_DECMOE_DOWN", "down") :
              down_simd_q5 ?
              ds4_gpu_hot_pipeline(g_glm_q5_k_down_f32_pipeline,
                                   "kernel_glm_q5_K_down_f32") :
@@ -43168,8 +43242,8 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
              q4_pair2 ?
               ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
                                    "kernel_glm_q4_K_pair_swiglu2_f32") :
-              ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
-                                   "kernel_glm_q4_K_pair_swiglu4_f32"));
+              ds4_gpu_decmoe_pipeline("kernel_glm_q4_K_pair_swiglu4_f32",
+                                      "DS4_METAL_DECMOE_PAIR", "pair"));
         id<MTLComputePipelineState> down_pipeline =
             use_stream_expert_addr_table ?
              (down_scalar_q2 ?
@@ -43181,8 +43255,8 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             ds4_gpu_hot_pipeline(g_glm_q2_k_down_f32_pipeline,
                                  "kernel_glm_q2_K_down_f32") :
             down_scalar_q4 ?
-            ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
-                                 "kernel_glm_q4_K_down_f32") :
+            ds4_gpu_decmoe_pipeline("kernel_glm_q4_K_down_simd_f32",
+                                     "DS4_METAL_DECMOE_DOWN", "down") :
             down_simd_q5 ?
             ds4_gpu_hot_pipeline(g_glm_q5_k_down_f32_pipeline,
                                  "kernel_glm_q5_K_down_f32") :
@@ -43354,6 +43428,12 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             .down_expert_bytes = down_expert_bytes,
             .down_row_bytes = down_row_bytes,
         };
+        uint32_t dm_pair_rows = 8u, dm_pair_threads = 64u;
+        uint32_t dm_down_rows = 4u, dm_down_threads = 64u;
+        ds4_gpu_decmoe_geometry("DS4_METAL_DECMOE_PAIR", 4u, 2u,
+                                &dm_pair_rows, &dm_pair_threads);
+        ds4_gpu_decmoe_geometry("DS4_METAL_DECMOE_DOWN", 2u, 2u,
+                                &dm_down_rows, &dm_down_threads);
         const NSUInteger pair_x_groups =
             gate_pair_q2 ? (use_stream_expert_addr_table ?
                             (NSUInteger)((expert_mid_dim + 1u) / 2u) :
@@ -43362,21 +43442,21 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             use_stream_expert_addr_table ? (NSUInteger)((expert_mid_dim + 3u) / 4u) :
             q4_scalar_pair ? (NSUInteger)expert_mid_dim :
             q4_pair2 ? (NSUInteger)((expert_mid_dim + 1u) / 2u) :
-            (NSUInteger)((expert_mid_dim + 7u) / 8u);
+            (NSUInteger)((expert_mid_dim + dm_pair_rows - 1u) / dm_pair_rows);
         const NSUInteger pair_threadgroup_bytes =
             q4_scalar_pair ? 512u * sizeof(float) : 0u;
         const NSUInteger pair_threads =
-            q4_scalar_pair ? 256u : 64u;
+            q4_scalar_pair ? 256u : (NSUInteger)dm_pair_threads;
         const NSUInteger down_x_groups =
             down_scalar_q2 ? (NSUInteger)((out_dim + 7u) / 8u) :
-            down_simd_q4 ? (NSUInteger)((out_dim + 3u) / 4u) :
+            down_simd_q4 ? (NSUInteger)((out_dim + dm_down_rows - 1u) / dm_down_rows) :
             down_simd_q5 ? (NSUInteger)((out_dim + 3u) / 4u) :
             down_simd_q6 ? (NSUInteger)((out_dim + 3u) / 4u) :
             (NSUInteger)out_dim;
         const NSUInteger down_threadgroup_bytes =
             down_simd ? 0u : 256u * sizeof(float);
         const NSUInteger down_threads =
-            down_simd ? 64u : 256u;
+            down_simd ? (NSUInteger)dm_down_threads : 256u;
         if (use_stream_expert_addr_table &&
             !ds4_gpu_stream_expert_cache_mark_entries_inflight(stream_resources,
                                                                stream_resource_count,
