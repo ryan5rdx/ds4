@@ -2473,6 +2473,55 @@ void dequantize_q4_K(device const block_q4_K *xb, short il, thread type4x4 &reg)
     }
 }
 
+/* A: mantissa-injection Q4_K dequant.  PROBEREPLAY branch only.
+ *
+ * A half with bit pattern (0x6400 | v) is exactly 1024.0 + v for v in [0,1023],
+ * so ORing a 4-bit nibble into the mantissa and subtracting 1024 replaces the
+ * integer->float convert with one OR and one subtract, two lanes at a time.
+ * The 0xF0 case needs no shift because the shipped code already folds the
+ * factor of 16 into d -- (q & 0xF0) is v*16 and 1024+v*16 is still exact.
+ *
+ * Apple7 measured this FLAT and bit-identical, which is itself a codegen
+ * observation: the compiler had already turned the shipped convert into
+ * something equivalent.  Neither the flatness nor the bit-identity necessarily
+ * transfers to Apple8 -- that is the whole point of PROBEREPLAY. */
+template <typename type4x4>
+void dequantize_q4_K_fastdq(device const block_q4_K *xb, short il, thread type4x4 &reg) {
+    device const uchar *q = xb->qs;
+
+    short is = (il / 4) * 2;
+    q = q + (il / 4) * 32 + 16 * (il & 1);
+    il = il & 3;
+    const uchar2 sc = get_scale_min_k4_just2(is, il / 2, xb->scales);
+    const float d = il < 2 ?
+        (float)xb->d :
+        (float)xb->d * (1.0f / 16.0f);
+    const float min = (float)xb->dmin;
+    const float dl = d * sc[0];
+    const float ml = min * sc[1];
+
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    for (short i = 0; i < 16; i += 2) {
+        const uint w = (uint)(q[i] & mask) | ((uint)(q[i + 1] & mask) << 16);
+        const half2 v = as_type<half2>(w | 0x64006400u) - half2(1024.0h, 1024.0h);
+        reg[i / 4][i % 4]             = dl * (float)v.x - ml;
+        reg[(i + 1) / 4][(i + 1) % 4] = dl * (float)v.y - ml;
+    }
+}
+
+/* A-stub: keeps the weight LOAD, deletes the dequant arithmetic.  Produces
+ * WRONG numbers by design -- it is not a candidate, it is the bound.  The
+ * gap between it and the shipped path is what deleting dequant entirely could
+ * ever be worth (Apple7: 15.6/17.6/16.9% of the kernel). */
+template <typename type4x4>
+void dequantize_q4_K_stub(device const block_q4_K *xb, short il, thread type4x4 &reg) {
+    device const uchar *q = xb->qs + (il / 4) * 32 + 16 * (il & 1);
+    const float d = (float)xb->d;
+    for (int i = 0; i < 16; ++i) {
+        reg[i / 4][i % 4] = d * (float)q[i];
+    }
+}
+
 template <typename type4x4>
 void dequantize_mxfp4(device const block_mxfp4 *xb, short il, thread type4x4 &reg) {
     const float d = ds4_metal_e8m0_to_f32(xb->e);
@@ -9060,6 +9109,8 @@ typedef decltype(kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, hal
 template [[host_name("kernel_mul_mm_id_q8_0_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0,    2,     dequantize_q8_0,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q2_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K,    QK_NL, dequantize_q2_K,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q4_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K,    QK_NL, dequantize_q4_K,    float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_q4_K_f32_stubdq")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K,    QK_NL, dequantize_q4_K_stub,    float, float4x4, float, float2x4>;
+template [[host_name("kernel_mul_mm_id_q4_K_f32_fastdq")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K,    QK_NL, dequantize_q4_K_fastdq,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q5_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K,    QK_NL, dequantize_q5_K,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_q6_K_f32")]]         kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K,    QK_NL, dequantize_q6_K,    float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f32")]]      kernel mul_mm_id kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, float, float4x4, float, float2x4>;
@@ -9067,6 +9118,8 @@ template [[host_name("kernel_mul_mm_id_mxfp4_f32")]]        kernel mul_mm_id ker
 template [[host_name("kernel_mul_mm_id_q8_0_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q8_0,    2,     dequantize_q8_0,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_q2_K_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K,    QK_NL, dequantize_q2_K,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_q4_K_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K,    QK_NL, dequantize_q4_K,    half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_q4_K_f16_stubdq")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K,    QK_NL, dequantize_q4_K_stub,    half, half4x4, half, half2x4>;
+template [[host_name("kernel_mul_mm_id_q4_K_f16_fastdq")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K,    QK_NL, dequantize_q4_K_fastdq,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_q5_K_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q5_K,    QK_NL, dequantize_q5_K,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_q6_K_f16")]]         kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q6_K,    QK_NL, dequantize_q6_K,    half, half4x4, half, half2x4>;
 template [[host_name("kernel_mul_mm_id_iq2_xxs_f16")]]      kernel mul_mm_id_f16_rhs kernel_mul_mm_id<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_iq2_xxs, QK_NL, dequantize_iq2_xxs, half, half4x4, half, half2x4>;

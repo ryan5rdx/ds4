@@ -684,6 +684,7 @@ static id<MTLComputePipelineState> g_glm_indexer_score_one_vpt_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_scores_batch_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_scores_tiled_pipeline;
 static id<MTLComputePipelineState> g_glm_indexer_scores_tiled_f32_pipeline;
+static id<MTLComputePipelineState> g_glm_indexer_scores_tiled_db_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_glm52_pipeline;
 static id<MTLComputePipelineState> g_glm_qk_lowrank_glm52_sg_pipeline;
@@ -3020,7 +3021,11 @@ static const char * const DS4_MM_ID_SWIZZLE_OK[] = {
     "kernel_mul_mm_id_q2_K_f16",
     "kernel_mul_mm_id_q2_K_f32",
     "kernel_mul_mm_id_q4_K_f16",
+    "kernel_mul_mm_id_q4_K_f16_fastdq",
+    "kernel_mul_mm_id_q4_K_f16_stubdq",
     "kernel_mul_mm_id_q4_K_f32",
+    "kernel_mul_mm_id_q4_K_f32_fastdq",
+    "kernel_mul_mm_id_q4_K_f32_stubdq",
     "kernel_mul_mm_id_q5_K_f16",
     "kernel_mul_mm_id_q5_K_f32",
     "kernel_mul_mm_id_q6_K_f16",
@@ -3776,6 +3781,80 @@ static void ds4_gpu_warn_mpp_fallback(void) {
 
 static int ds4_gpu_device_name_contains(const char *needle) {
     return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
+}
+
+/* D1 measurement knob -- PROBEREPLAY branch only, default OFF.
+ *
+ * Routes a Q8_0 attn_v_b value weight to the lane-split project instead of the
+ * per-thread scalar walk.  Apple7 (M1 Max) measured the lane split SLOWER at
+ * every batch factor and it was killed on that; the mechanism was the 34-byte
+ * Q8_0 block with qs at offset 2, which straddles a 64-byte line every other
+ * block.  PROBEREPLAY exists to settle whether that transfers to Apple8.
+ *
+ * Not bit-identical -- the reduction order changes -- so any promotion needs a
+ * quality gate, not a cmp. */
+static int ds4_gpu_glm_vb_lane_split(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_METAL_GLM_VB_LANE_SPLIT");
+        cached = (e && e[0] == '1') ? 1 : 0;
+        if (cached) {
+            fprintf(stderr,
+                    "ds4: Metal glm attn_v_b Q8_0 LANE SPLIT ENGAGED\n");
+        }
+    }
+    return cached;
+}
+
+/* P14b measurement knob -- PROBEREPLAY branch only, default OFF.
+ *
+ * Selects the double-buffered indexer-scores tile kernel.  Bit-identical to the
+ * shipped one; the only question is whether removing two of three per-head
+ * barriers pays.  Apple7 said no. */
+static int ds4_gpu_glm_idx_tiled_db(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_METAL_GLM_IDX_TILED_DB");
+        cached = (e && e[0] == '1') ? 1 : 0;
+        if (cached) {
+            fprintf(stderr,
+                    "ds4: Metal glm indexer_scores TILED DOUBLE-BUFFER ENGAGED\n");
+        }
+    }
+    return cached;
+}
+
+/* A measurement knob -- PROBEREPLAY branch only, default 0 (shipped path).
+ *
+ *   1 = fastdq  mantissa-injection dequant, a real candidate
+ *   2 = stubdq  dequant arithmetic DELETED, wrong numbers on purpose; it exists
+ *               only to bound what removing dequant could ever be worth
+ *
+ * Scoped to the Q4_K cases of the routed-MoE pipeline switches, so unlike the
+ * first cut of P1SWZ the flag cannot reach a pipeline that does not implement
+ * it: a name that was never instantiated simply fails to resolve. */
+static const char *ds4_gpu_q4k_dequant_suffix(void) {
+    static const char *cached = NULL;
+    if (!cached) {
+        const char *e = getenv("DS4_METAL_Q4K_DEQUANT");
+        const int mode = e ? atoi(e) : 0;
+        cached = mode == 1 ? "_fastdq" : (mode == 2 ? "_stubdq" : "");
+        if (mode == 1 || mode == 2) {
+            fprintf(stderr,
+                    "ds4: Metal mul_mm_id Q4_K dequant variant ENGAGED (%s)\n",
+                    mode == 1 ? "fastdq" : "stubdq -- WRONG NUMBERS, bound only");
+        }
+    }
+    return cached;
+}
+
+static id<MTLComputePipelineState> ds4_gpu_q4k_mm_id_pipeline(const char *base) {
+    const char *suffix = ds4_gpu_q4k_dequant_suffix();
+    if (suffix[0] == '\0') return ds4_gpu_get_mul_mm_id_pipeline(base, false);
+    char name[128];
+    snprintf(name, sizeof(name), "%s%s", base, suffix);
+    id<MTLComputePipelineState> p = ds4_gpu_get_mul_mm_id_pipeline(name, false);
+    return p ? p : ds4_gpu_get_mul_mm_id_pipeline(base, false);
 }
 
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
@@ -7838,6 +7917,7 @@ typedef struct {
     float    beta_fast;
     float    beta_slow;
     uint32_t value_type;
+    uint32_t vb_lane_split;
 } ds4_gpu_glm_attention_indexed_decode_split_args;
 
 typedef struct {
@@ -10166,6 +10246,8 @@ int ds4_gpu_init(void) {
             ds4_gpu_get_pipeline("kernel_glm_indexer_scores_tiled");
         g_glm_indexer_scores_tiled_f32_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_indexer_scores_tiled_f32");
+        g_glm_indexer_scores_tiled_db_pipeline =
+            ds4_gpu_get_pipeline("kernel_glm_indexer_scores_tiled_db");
         g_glm_qk_lowrank_pipeline =
             ds4_gpu_get_pipeline("kernel_glm_qk_lowrank_q8_0");
         g_glm_qk_lowrank_glm52_pipeline =
@@ -13919,6 +14001,7 @@ void ds4_gpu_cleanup(void) {
         g_glm_indexer_scores_batch_pipeline = nil;
         g_glm_indexer_scores_tiled_pipeline = nil;
         g_glm_indexer_scores_tiled_f32_pipeline = nil;
+        g_glm_indexer_scores_tiled_db_pipeline = nil;
         g_glm_qk_lowrank_pipeline = nil;
         g_glm_qk_lowrank_glm52_pipeline = nil;
         g_glm_qk_lowrank_glm52_sg_pipeline = nil;
@@ -34722,7 +34805,7 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
     case DS4_METAL_TENSOR_Q4_K:
-        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
+        return ds4_gpu_q4k_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32");
     case DS4_METAL_TENSOR_Q5_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q5_K_f32", false);
     case DS4_METAL_TENSOR_Q6_K:
@@ -34758,7 +34841,7 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t t
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
     case DS4_METAL_TENSOR_Q4_K:
-        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false);
+        return ds4_gpu_q4k_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16");
     case DS4_METAL_TENSOR_Q5_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q5_K_f16", false);
     case DS4_METAL_TENSOR_Q6_K:
@@ -39464,12 +39547,16 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
         const bool use_tiled_f32 = false;
         const bool use_tiled = !force_scalar && n_tokens >= 8u &&
                                n_head == 32u && head_dim == 128u;
+        const bool use_tiled_db = !use_tiled_f32 && ds4_gpu_glm_idx_tiled_db() &&
+                                  g_glm_indexer_scores_tiled_db_pipeline != nil;
         id<MTLComputePipelineState> pipeline =
             use_tiled
                 ? ds4_gpu_hot_pipeline(use_tiled_f32 ? g_glm_indexer_scores_tiled_f32_pipeline
-                                                     : g_glm_indexer_scores_tiled_pipeline,
+                                       : (use_tiled_db ? g_glm_indexer_scores_tiled_db_pipeline
+                                                       : g_glm_indexer_scores_tiled_pipeline),
                                        use_tiled_f32 ? "kernel_glm_indexer_scores_tiled_f32"
-                                                     : "kernel_glm_indexer_scores_tiled")
+                                       : (use_tiled_db ? "kernel_glm_indexer_scores_tiled_db"
+                                                       : "kernel_glm_indexer_scores_tiled"))
                 : ds4_gpu_hot_pipeline(g_glm_indexer_scores_batch_pipeline,
                                        "kernel_glm_indexer_scores_batch");
         if (!pipeline) return 0;
@@ -39511,8 +39598,9 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
                                                 sizeof(float))
                                  atIndex:0];
             } else {
-                [enc setThreadgroupMemoryLength:DS4_TG16((q_shared + k_shared) * sizeof(uint16_t) +
-                                                dot_shared * sizeof(float))
+                const NSUInteger qb = use_tiled_db ? 2u : 1u;
+                [enc setThreadgroupMemoryLength:DS4_TG16((qb * q_shared + k_shared) * sizeof(uint16_t) +
+                                                qb * dot_shared * sizeof(float))
                                  atIndex:0];
             }
             [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_rows + 31u) / 32u,
@@ -40417,6 +40505,7 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
             .beta_fast = beta_fast,
             .beta_slow = beta_slow,
             .value_type = value_weight_type,
+            .vb_lane_split = (uint32_t)ds4_gpu_glm_vb_lane_split(),
         };
         const NSUInteger stage_rows = 16u;
         const NSUInteger kv_vecs = (NSUInteger)kv_lora_dim / 4u;

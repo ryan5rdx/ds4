@@ -375,6 +375,9 @@ struct ds4_metal_args_glm_attention_indexed_decode_split {
     float    beta_fast;
     float    beta_slow;
     uint32_t value_type;
+    /* D1 measurement knob (PROBEREPLAY branch only): 1 routes a Q8_0 value
+     * weight to the lane-split project instead of the scalar fallback. */
+    uint32_t vb_lane_split;
 };
 
 struct ds4_metal_args_glm_attention_indexed_batch {
@@ -1902,6 +1905,36 @@ static inline float glm_quant_dot_row_tg_f32(
 /* Per-lane Q4_K row dot: lane l covers elements (g*32 + l) of every
  * 32-group so the 144-byte superblocks are read with coalesced per-lane
  * bytes; callers simd_sum the result. x lives in threadgroup memory. */
+/* D1: Q8_0 sibling of glm_q4_K_dot_row_lane_f32.  One simdgroup per output
+ * row; lane L takes element L of every 32-element block, so the 32 lanes read
+ * 32 consecutive int8 from each block instead of one thread walking the row.
+ *
+ * The straddle this trades against: a Q8_0 block is 34 bytes with qs at offset
+ * 2, so a block's qs spans [34b+2, 34b+34) and every other block crosses a
+ * 64-byte line.  That is why the scalar path -- which gives each thread a
+ * contiguous, prefetchable row -- won on Apple7.  Whether it still wins on
+ * Apple8 is what PROBEREPLAY measures.
+ *
+ * NOT bit-identical to the scalar path: the reduction order changes from
+ * sequential-per-thread to tree-per-simdgroup.  probe_d1_vblane measured the
+ * lane split CLOSER to a double reference (8.47e-05 vs 2.17e-04), so this
+ * needs a quality gate rather than a cmp. */
+static inline float glm_q8_0_dot_row_lane_f32(
+        device const char *row,
+        threadgroup const float *x,
+        uint n_cols,
+        ushort lane) {
+    float acc = 0.0f;
+    const uint nblocks = n_cols >> 5u;
+    for (uint b = 0; b < nblocks; b++) {
+        device const char *block_base = row + (uint64_t)b * 34u;
+        const float d = (float)(*((device const half *)block_base));
+        device const int8_t *qs = (device const int8_t *)(block_base + 2u);
+        acc += d * (float)qs[lane] * x[(b << 5u) + lane];
+    }
+    return acc;
+}
+
 static inline float glm_q4_K_dot_row_lane_f32(
         device const char *row,
         threadgroup const float *x,
@@ -2311,7 +2344,25 @@ kernel void kernel_glm_indexer_scores_tiled_f32(
     }
 }
 
-kernel void kernel_glm_indexer_scores_tiled(
+/* P14b: double-buffer the per-head q tile and the dot tile.
+ *
+ * The head loop stages qtg, barriers, runs 16 simdgroup_multiply_accumulate,
+ * stores dot, barriers, accumulates, barriers -- three threadgroup barriers per
+ * head across 32 heads.  DB=true stages head h+1's tile while head h computes
+ * and alternates the dot tile, which makes one barrier per head sufficient.
+ *
+ * Bit-identical by construction: same tiles, same mma order, same accumulation.
+ * Only WHERE a tile is staged changes.
+ *
+ * Apple7 measured this flat -- barriers across a 128-thread (4-simdgroup) group
+ * are cheap next to 32 heads x 16 mma, and the 2 KB qtg tile is L2-resident.
+ * PROBEREPLAY exists to settle whether that holds on Apple8, whose two-die
+ * topology and cache hierarchy differ.
+ *
+ * Costs threadgroup memory: qtg 2 KB -> 4 KB and dot 1 KB -> 2 KB, so 11 KB ->
+ * 14 KB. Watch occupancy -- that is the HCMIX-K32 failure mode. */
+template<bool DB>
+static void glm_indexer_scores_tiled_impl(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,
         device const char *weights,
@@ -2330,8 +2381,9 @@ kernel void kernel_glm_indexer_scores_tiled(
     const uint row_base = tgpig.x * TN;
     const uint token_base = tgpig.y * TM;
 
+    constexpr uint QBANKS = DB ? 2u : 1u;
     threadgroup half *qtg = (threadgroup half *)shared;
-    threadgroup half *ktg = qtg + TM*D;
+    threadgroup half *ktg = qtg + QBANKS*TM*D;
     threadgroup float *dot = (threadgroup float *)(ktg + TN*D);
 
     const uint last_token = min(token_base + TM, args.n_tokens);
@@ -2382,9 +2434,8 @@ kernel void kernel_glm_indexer_scores_tiled(
     float acc0 = 0.0f;
     float acc1 = 0.0f;
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint head = 0; head < args.n_head; head++) {
+    if (DB && args.n_head > 0u) {
+        /* prologue: head 0 into bank 0 */
         for (uint i = tid; i < TM*D; i += 128) {
             const uint tr = i / D;
             const uint d = i - tr*D;
@@ -2392,42 +2443,82 @@ kernel void kernel_glm_indexer_scores_tiled(
             half v = half(0.0f);
             if (token < args.n_tokens) {
                 device const float *qrow = (device const float *)(q +
-                    (uint64_t)token * args.q_token_stride +
-                    (uint64_t)head  * args.q_head_stride);
+                    (uint64_t)token * args.q_token_stride);
                 v = half(qrow[d]);
             }
             qtg[i] = v;
         }
+    }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint head = 0; head < args.n_head; head++) {
+        threadgroup half  *qcur = qtg + (DB ? (head & 1u) : 0u) * (TM*D);
+        threadgroup float *dcur = dot + (DB ? (head & 1u) : 0u) * (TM*TN);
+
+        if (DB) {
+            /* stage head+1 into the other bank while this head computes */
+            if (head + 1u < args.n_head) {
+                threadgroup half *qnxt = qtg + (((head + 1u) & 1u)) * (TM*D);
+                for (uint i = tid; i < TM*D; i += 128) {
+                    const uint tr = i / D;
+                    const uint d = i - tr*D;
+                    const uint token = token_base + tr;
+                    half v = half(0.0f);
+                    if (token < args.n_tokens) {
+                        device const float *qrow = (device const float *)(q +
+                            (uint64_t)token * args.q_token_stride +
+                            (uint64_t)(head + 1u) * args.q_head_stride);
+                        v = half(qrow[d]);
+                    }
+                    qnxt[i] = v;
+                }
+            }
+        } else {
+            for (uint i = tid; i < TM*D; i += 128) {
+                const uint tr = i / D;
+                const uint d = i - tr*D;
+                const uint token = token_base + tr;
+                half v = half(0.0f);
+                if (token < args.n_tokens) {
+                    device const float *qrow = (device const float *)(q +
+                        (uint64_t)token * args.q_token_stride +
+                        (uint64_t)head  * args.q_head_stride);
+                    v = half(qrow[d]);
+                }
+                qtg[i] = v;
+            }
+
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
 
         simdgroup_float8x8 mdot = make_filled_simdgroup_matrix<float, 8>(0.0f);
         for (uint db = 0; db < D/TS; db++) {
             simdgroup_half8x8 mq;
             simdgroup_half8x8 mk;
-            simdgroup_load(mq, qtg + db*TS, D, 0, false);
+            simdgroup_load(mq, qcur + db*TS, D, 0, false);
             simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
             simdgroup_multiply_accumulate(mdot, mq, mk, mdot);
         }
 
-        simdgroup_store(mdot, dot + (uint)sg * TS, TN, 0, false);
+        simdgroup_store(mdot, dcur + (uint)sg * TS, TN, 0, false);
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (token0 < args.n_tokens && row0 < args.n_rows) {
             device const float *w = (device const float *)(weights +
                 (uint64_t)token0 * args.weights_token_stride);
-            const float s = dot[token_row0*TN + col0];
+            const float s = dcur[token_row0*TN + col0];
             acc0 += max(s * args.scale, 0.0f) * w[head];
         }
         if (token1 < args.n_tokens && row1 < args.n_rows) {
             device const float *w = (device const float *)(weights +
                 (uint64_t)token1 * args.weights_token_stride);
-            const float s = dot[token_row1*TN + col1];
+            const float s = dcur[token_row1*TN + col1];
             acc1 += max(s * args.scale, 0.0f) * w[head];
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (!DB) threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     if (token0 < args.n_tokens && row0 < args.n_rows) {
@@ -2442,6 +2533,37 @@ kernel void kernel_glm_indexer_scores_tiled(
             (uint64_t)token1 * args.score_token_stride) + row1;
         *dst = row1 < visible ? acc1 : -INFINITY;
     }
+}
+
+
+kernel void kernel_glm_indexer_scores_tiled(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    glm_indexer_scores_tiled_impl<false>(args, q, weights, indexer_key_cache,
+                                         scores, shared, tgpig, tid, lane, sg);
+}
+
+kernel void kernel_glm_indexer_scores_tiled_db(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    glm_indexer_scores_tiled_impl<true>(args, q, weights, indexer_key_cache,
+                                        scores, shared, tgpig, tid, lane, sg);
 }
 
 kernel void kernel_glm_qk_lowrank_q8_0(
@@ -3428,8 +3550,12 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
 
     device float *out =
         (device float *)(heads + (uint64_t)head * args.value_dim * sizeof(float));
-    if (args.value_type == DS4_METAL_GGUF_Q4_K &&
-        (args.kv_lora_dim & 255u) == 0u) {
+    const bool vp_q4k_lane =
+        args.value_type == DS4_METAL_GGUF_Q4_K && (args.kv_lora_dim & 255u) == 0u;
+    const bool vp_q8_lane =
+        args.vb_lane_split != 0u &&
+        args.value_type == DS4_METAL_GGUF_Q8_0 && (args.kv_lora_dim & 31u) == 0u;
+    if (vp_q4k_lane || vp_q8_lane) {
         /* Lane-split Q4_K value project: one simdgroup per output row with
          * coalesced per-lane superblock reads; the per-thread scalar
          * fallback below walks the 144-byte rows one element at a time. */
@@ -3439,9 +3565,11 @@ static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
         for (uint d = vp_sg; d < args.value_dim; d += vp_nsg) {
             device const char *row =
                 value_weight + ((uint64_t)head * args.value_dim + d) * args.value_row_bytes;
-            const float part = glm_q4_K_dot_row_lane_f32(row, lora_sum,
-                                                         args.kv_lora_dim,
-                                                         (ushort)vp_lane);
+            const float part = vp_q8_lane
+                ? glm_q8_0_dot_row_lane_f32(row, lora_sum, args.kv_lora_dim,
+                                            (ushort)vp_lane)
+                : glm_q4_K_dot_row_lane_f32(row, lora_sum, args.kv_lora_dim,
+                                            (ushort)vp_lane);
             const float sum = simd_sum(part);
             if (vp_lane == 0u) {
                 out[d] = sum;
