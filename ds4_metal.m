@@ -11665,7 +11665,8 @@ static bool g_tp_gate_prefetch;
  * arm would otherwise look like a null instead of like a no-op. */
 static uint64_t g_gpf_planned_bytes[DS4_TP_GATES_PER_LAYER];
 static uint64_t g_gpf_touched_bytes[DS4_TP_GATES_PER_LAYER];
-static uint64_t g_gpf_plans[DS4_TP_GATES_PER_LAYER];
+static uint64_t g_gpf_installed[DS4_TP_GATES_PER_LAYER]; /* plans handed in */
+static uint64_t g_gpf_plans[DS4_TP_GATES_PER_LAYER];     /* plans CONSUMED by a gate */
 static uint64_t g_gpf_encodes[DS4_TP_GATES_PER_LAYER];
 static uint64_t g_gpf_elided[DS4_TP_GATES_PER_LAYER];   /* budget was 0 */
 static double   g_gpf_encode_ms[DS4_TP_GATES_PER_LAYER];
@@ -11858,6 +11859,7 @@ int ds4_gpu_tp_gate_prefetch_plan(uint32_t gate,
     g_tp_prefetch_map = model_map;
     g_tp_prefetch_map_size = model_size;
     g_tp_prefetch_count[gate] = n;
+    if (n) g_gpf_installed[gate]++;
     return 1;
 }
 
@@ -11970,7 +11972,8 @@ void ds4_gpu_glm_prefetch_report(void) {
     static const char *names[DS4_TP_GATES_PER_LAYER] =
         { "INDEXER", "ATTN", "ROUTER", "FFN" };
     uint64_t any = 0;
-    for (uint32_t gt = 0; gt < DS4_TP_GATES_PER_LAYER; gt++) any += g_gpf_plans[gt];
+    for (uint32_t gt = 0; gt < DS4_TP_GATES_PER_LAYER; gt++)
+        any += g_gpf_plans[gt] + g_gpf_installed[gt];
     if (!any) return;
     fprintf(stderr,
             "ds4: GPF1 gate prefetch report (split rank %d)\n"
@@ -11978,7 +11981,20 @@ void ds4_gpu_glm_prefetch_report(void) {
             (int)g_tp_split_rank, "gate", "plans", "encodes", "elided",
             "planned MiB", "touched MiB", "wait us", "enc ms");
     for (uint32_t gt = 0; gt < DS4_TP_GATES_PER_LAYER; gt++) {
-        if (!g_gpf_plans[gt]) continue;
+        if (!g_gpf_plans[gt] && !g_gpf_installed[gt]) continue;
+        if (g_gpf_installed[gt] && !g_gpf_plans[gt]) {
+            /* GP1B: the ROUTER mode installed 2688 plans and consumed none, and
+             * the report suppressed itself entirely -- so the arm read as
+             * unexplained overhead rather than as an inert gate.  GLM only
+             * schedules a ROUTER gate when the router split is active
+             * (glm53_layer_tp_gates -> router_gate_fires), so planning into it
+             * otherwise is a no-op.  Say that, do not vanish. */
+            fprintf(stderr,
+                    "  %-8s %8llu installed, %8s CONSUMED -- this gate never "
+                    "fired; the mode is INERT in this schedule, not measured\n",
+                    names[gt], (unsigned long long)g_gpf_installed[gt], "0");
+            continue;
+        }
         fprintf(stderr,
                 "  %-8s %8llu %8llu %8llu %14.2f %14.2f %9.2f %10.3f\n",
                 names[gt],

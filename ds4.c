@@ -56273,7 +56273,14 @@ static bool glm_graph_forward_token(
                                                         model->map, model->size,
                                                         off, byt, 4u);
                 }
-                if ((gpf_mode & 2) && moe) {
+                /* ROUTER mode is INERT unless the router split is active.
+                 * GLM only schedules a ROUTER gate when glm53_layer_tp_gates
+                 * sets router_gate_fires, and in the default decode schedule it
+                 * does not -- GP1B installed 2688 ROUTER plans and consumed
+                 * none.  Planning into an unfired gate cannot help and makes
+                 * the arm look like unexplained overhead, so keep it behind an
+                 * explicit opt-in rather than offering it as a peer of attn. */
+                if ((gpf_mode & 2) && moe && g->tp_router_half) {
                     const uint64_t off[3] = {
                         pw->ffn_gate_shexp->abs_offset,
                         pw->ffn_up_shexp->abs_offset,
