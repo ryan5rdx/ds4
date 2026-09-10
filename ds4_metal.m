@@ -3798,14 +3798,59 @@ static void ds4_gpu_decmoe_down_geometry(int is_q4,
                                          uint32_t *rows_per_group,
                                          uint32_t *threads);
 
-static int ds4_gpu_decmoe_down_nsg4(void) {
+/* Promotion branch selector.  DS4_METAL_DECMOE_MODE picks one of the three
+ * candidates the campaign has measured exact on Apple8:
+ *
+ *   nsg4      DOWN-NSG4 alone.  BANKED: DN3 +1.04% decode @131k, serpentine.
+ *   spec      SPEC on pair and down.  DM2 +6.0%, DM3 +7.0% chain, ~+1.5% decode.
+ *   specnsg4  the compose -- SPEC everywhere AND four simdgroups on down.
+ *             Forecast ~12% chain, ~+2.6% decode, IF the two add.
+ *
+ * DS4_METAL_DECMOE_DOWN_NSG4=1 is kept as an alias for `nsg4` so the banked
+ * DN3 configuration keeps working unchanged.
+ *
+ * SPEC compiles the 4096->2048 dims in, so the host must refuse it at any
+ * other geometry -- the kernel cannot check.  All three are bit-identical, so
+ * they ship on a cmp with no quality gate. */
+static int ds4_gpu_decmoe_mode(void) {   /* 0 none, 1 nsg4, 2 spec, 3 both */
     static int cached = -1;
     if (cached < 0) {
-        const char *e = getenv("DS4_METAL_DECMOE_DOWN_NSG4");
-        cached = (e && e[0] == '1') ? 1 : 0;
-        if (cached) fprintf(stderr, "ds4: Metal DECMOE DOWN-NSG4 ENGAGED\n");
+        const char *e = getenv("DS4_METAL_DECMOE_MODE");
+        const char *legacy = getenv("DS4_METAL_DECMOE_DOWN_NSG4");
+        cached = 0;
+        if (e && e[0]) {
+            if      (strcmp(e, "nsg4")     == 0) cached = 1;
+            else if (strcmp(e, "spec")     == 0) cached = 2;
+            else if (strcmp(e, "specnsg4") == 0) cached = 3;
+            else fprintf(stderr,
+                         "ds4: DS4_METAL_DECMOE_MODE='%s' unknown -- CONTROL\n", e);
+        } else if (legacy && legacy[0] == '1') {
+            cached = 1;
+        }
+        if (cached) {
+            fprintf(stderr, "ds4: Metal DECMOE %s ENGAGED\n",
+                    cached == 1 ? "DOWN-NSG4" :
+                    cached == 2 ? "SPEC" : "SPEC+DOWN-NSG4");
+        }
     }
     return cached;
+}
+
+static int ds4_gpu_decmoe_down_nsg4(void) { return (ds4_gpu_decmoe_mode() & 1) != 0; }
+static int ds4_gpu_decmoe_spec(void)      { return (ds4_gpu_decmoe_mode() & 2) != 0; }
+
+/* SPEC has the dims compiled in; bind it only at that geometry. */
+static int ds4_gpu_decmoe_spec_ok(uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim) {
+    if (!ds4_gpu_decmoe_spec()) return 0;
+    if (in_dim == 4096u && mid_dim == 2048u && out_dim == 4096u) return 1;
+    static int warned = 0;
+    if (!warned++) {
+        fprintf(stderr,
+                "ds4: DECMOE SPEC declined -- geometry %ux%ux%u is not the "
+                "compiled-in 4096x2048x4096. Running the CONTROL.\n",
+                in_dim, mid_dim, out_dim);
+    }
+    return 0;
 }
 
 static void ds4_gpu_decmoe_down_geometry(int is_q4,
@@ -41984,6 +42029,9 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                                              : (expert_mid_dim + 1u) / 2u));
             }
         }
+        /* SPEC compiles the dims in; bind only at that geometry. */
+        const int dm_spec_ok =
+            ds4_gpu_decmoe_spec_ok(expert_in_dim, expert_mid_dim, out_dim);
         id<MTLComputePipelineState> pair_pipeline =
             (use_stream_split_deferred ?
              (gate_pair_q2 ?
@@ -42015,8 +42063,10 @@ int ds4_gpu_glm_routed_moe_one_tensor(
               * core:bandwidth ratio, so discount the M1 Max delta rather than
               * scaling it up. */
              (use_pair4 ?
-              ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
-                                   "kernel_glm_q4_K_pair_swiglu4_f32") :
+              (dm_spec_ok
+              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu4_f32_spec")
+              : ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
+                                     "kernel_glm_q4_K_pair_swiglu4_f32")) :
               ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
                                    "kernel_glm_q4_K_pair_swiglu2_f32")));
         id<MTLComputePipelineState> down_pipeline =
@@ -42031,7 +42081,11 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                                   "kernel_glm_q2_K_down_f32") :
              down_scalar_q4 ?
              (ds4_gpu_decmoe_down_nsg4()
-              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_f32_nsg4")
+              ? ds4_gpu_get_pipeline(dm_spec_ok
+                    ? "kernel_glm_q4_K_down_simd_f32_specnsg4"
+                    : "kernel_glm_q4_K_down_simd_f32_nsg4")
+              : dm_spec_ok
+              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_f32_spec")
               : ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
                                      "kernel_glm_q4_K_down_f32")) :
              down_simd_q5 ?
@@ -43205,6 +43259,9 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             !use_stream_expert_addr_table &&
             !gate_pair_q5 && !q4_scalar_pair &&
             (force_scalar_q4_pair || !enable_q4_pair4);
+        /* SPEC compiles the dims in; bind only at that geometry. */
+        const int dm_spec_ok =
+            ds4_gpu_decmoe_spec_ok(expert_in_dim, expert_mid_dim, out_dim);
         id<MTLComputePipelineState> pair_pipeline =
             use_stream_expert_addr_table ?
              (gate_pair_q2 ?
@@ -43224,8 +43281,10 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
              q4_pair2 ?
               ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
                                    "kernel_glm_q4_K_pair_swiglu2_f32") :
-              ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
-                                   "kernel_glm_q4_K_pair_swiglu4_f32"));
+              (dm_spec_ok
+              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu4_f32_spec")
+              : ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
+                                     "kernel_glm_q4_K_pair_swiglu4_f32")));
         id<MTLComputePipelineState> down_pipeline =
             use_stream_expert_addr_table ?
              (down_scalar_q2 ?
@@ -43238,7 +43297,11 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                                  "kernel_glm_q2_K_down_f32") :
             down_scalar_q4 ?
             (ds4_gpu_decmoe_down_nsg4()
-              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_f32_nsg4")
+              ? ds4_gpu_get_pipeline(dm_spec_ok
+                    ? "kernel_glm_q4_K_down_simd_f32_specnsg4"
+                    : "kernel_glm_q4_K_down_simd_f32_nsg4")
+              : dm_spec_ok
+              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_f32_spec")
               : ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
                                      "kernel_glm_q4_K_down_f32")) :
             down_simd_q5 ?
@@ -47917,7 +47980,10 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                        use_tp_mxfp4_static_batch ? 1 : 2,
                                                        false);
         } else if (use_tiny_pair_mv) {
-            id<MTLComputePipelineState> pair_pipeline =
+            /* SPEC compiles the dims in; bind only at that geometry. */
+        const int dm_spec_ok =
+            ds4_gpu_decmoe_spec_ok(expert_in_dim, expert_mid_dim, out_dim);
+        id<MTLComputePipelineState> pair_pipeline =
                 gate_type == DS4_METAL_TENSOR_IQ2_XXS ?
                     g_moe_mul_mv_id_iq2_xxs_pair_pipeline :
                     g_moe_mul_mv_id_q4_k_pair_pipeline;
