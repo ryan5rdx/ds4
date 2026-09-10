@@ -102,13 +102,49 @@ def accessor_values():
     return out
 
 
+SIZEOF_BYTES = {
+    "char": 1, "uint8_t": 1, "int8_t": 1,
+    "half": 2, "short": 2, "ushort": 2, "uint16_t": 2, "int16_t": 2,
+    "float": 4, "int": 4, "uint": 4, "uint32_t": 4, "int32_t": 4,
+    "half2": 4, "float2": 8, "half4": 8, "uint2": 8,
+    "uint64_t": 8, "int64_t": 8, "double": 8,
+    "float4": 16, "uint4": 16, "half4x4": 32, "float4x4": 64,
+}
+
+TG16_OPEN_RE = re.compile(r"\bDS4_TG16\s*\(")
+
+
+def _tg16_inner(expr):
+    """Text inside a `DS4_TG16(...)`, matched with balanced parentheses.
+
+    ds4_metal.m:66 defines DS4_TG16 as the central 16-byte round-up, and 152 of
+    the 153 binding sites go through it.  A regex that stops at the first `)`
+    cannot read `DS4_TG16(656u * sizeof(float))` or
+    `DS4_TG16(2048u * sizeof(uint64_t) + 96u)`, so before this the census
+    resolved a bound for ZERO kernels and still exited 0 -- the guard against the
+    8fcd61d bug class was checking nothing.  Returns None when there is no
+    DS4_TG16 or its parentheses do not close.
+    """
+    m = TG16_OPEN_RE.search(expr)
+    if not m:
+        return None
+    depth, start, i = 1, m.end(), m.end()
+    while i < len(expr):
+        if expr[i] == "(":
+            depth += 1
+        elif expr[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return expr[start:i]
+        i += 1
+    return None
+
+
 def _const_eval_raw(expr):
     """Evaluate a byte-count expression if it is made only of literals."""
     e = expr.strip().rstrip("]").strip()
-    e = re.sub(r"\bsizeof\(uint16_t\)", "2", e)
-    e = re.sub(r"\bsizeof\(float\)", "4", e)
-    e = re.sub(r"\bsizeof\(uint32_t\)", "4", e)
-    e = re.sub(r"\bsizeof\(half\)", "2", e)
+    for tname, tbytes in SIZEOF_BYTES.items():
+        e = re.sub(r"\bsizeof\(%s\)" % re.escape(tname), str(tbytes), e)
     e = re.sub(r"(\d+)[uU]\b", r"\1", e)
     e = e.replace("(NSUInteger)", "")
     if not re.fullmatch(r"[\d\s\+\*\(\)/-]+", e):
@@ -125,6 +161,12 @@ _ACCESSORS = None
 def const_eval(expr):
     """Constant byte count, resolving a known accessor call if that is all it is."""
     global _ACCESSORS
+    inner = _tg16_inner(expr)
+    if inner is not None:
+        v = const_eval(inner)
+        # Re-apply the macro's round-up.  It can only raise the bound, so a
+        # census that uses the rounded value stays conservative.
+        return None if v is None else ((v + 15) & ~15)
     v = _const_eval_raw(expr)
     if v is not None:
         return v
@@ -299,6 +341,20 @@ def main():
 
     print("\nthreadgroup-memory census: %d kernel(s) with a constant bound checked, "
           "%d site(s) unresolved" % (checked, len(unresolved)))
+
+    # A census that resolves nothing is indistinguishable from a clean one unless
+    # it says so.  That is exactly what happened when DS4_TG16 was introduced:
+    # 0 checked / 133 unresolved, exit 0, for an unknown number of releases.  Any
+    # future wrapper that blinds the parser must break the build, not pass it.
+    if checked == 0:
+        print("\nFATAL: the census resolved a constant bound for ZERO kernels.")
+        print("It cannot have checked anything, so its exit status is meaningless.")
+        print("Something now wraps or computes the length expressions -- teach")
+        print("const_eval() to see through it (as _tg16_inner does for DS4_TG16)")
+        print("or the 8fcd61d bug class is unguarded. Re-run with --verbose to")
+        print("see what the unresolved sites look like.")
+        return 1
+
     if reported:
         print("\n%d KERNEL(S) BOUND BELOW WHAT THEY INDEX:" % len(reported))
         for name, low, need, where, exact, lines in reported:
