@@ -136,6 +136,40 @@ static uint64_t g_timeline_stale_enc;   /* stale/untimelined g_batch_enc dropped
  * one in particular fails to stderr on a rank whose log is not archived, and
  * MTLCounterSampleBuffer is a finite device resource that a 9.5 ms stall could
  * plausibly exhaust by piling up uncompleted batches. */
+/* Q1C6 fix.  MTLCounterSampleBuffer is a finite device resource and the
+ * instrument allocated one per batch and relied on the batch object's dealloc
+ * to give it back.  Something retains the batch -- Q1C6-DISC measured
+ * newCounterSampleBufferWithDescriptor failing permanently from batch 1478 on,
+ * after ~1477 batches had each taken one -- so the buffers were never returned
+ * and 95.8% of the decode recorded nothing.
+ *
+ * probe_sbufpool measures the cap on an M1 Max at THIRTY-TWO simultaneous
+ * buffers, fully reclaimable, with a single recirculated buffer surviving 41x
+ * that.  So the resource is not merely finite, it is tiny -- 32 co-resident
+ * batches is enough to exhaust it, which is exactly what a 9.5 ms stall does.
+ *
+ * The fix is therefore two parts, and BOTH are needed:
+ *
+ *   1. A free list.  Buffers go back once ds4_gpu_timeline_resolve() has read
+ *      them -- the point after which their contents are dead -- instead of
+ *      waiting on the batch object's dealloc.  Steady state allocates zero.
+ *
+ *   2. A hard budget below the device cap.  A free list alone still dies in a
+ *      stall: the pool is empty precisely because the buffers are pinned in
+ *      uncompleted batches, so it would allocate, and exhaust, exactly as
+ *      before.  Past the budget we decline to capture and count it instead.
+ *      Coverage degrades for the duration of the stall and then RECOVERS,
+ *      which is the whole difference from the current behaviour -- today one
+ *      stall kills capture permanently for the remaining 95.8% of the run.
+ *
+ * Verification, free and on every B record: g_tl_sbuf_new must stay <= the
+ * budget, and g_tl_sbuf_starved must return to a flat line after any stall.
+ * If nil_sbuf is ever non-zero again the budget is set too high. */
+#define DS4_TIMELINE_SBUF_BUDGET 16u
+static NSMutableArray<id<MTLCounterSampleBuffer>> *g_timeline_sbuf_pool;
+static uint64_t g_tl_sbuf_new;    /* buffers actually created on the device */
+static uint64_t g_tl_sbuf_reuse;  /* buffers taken from the free list */
+static uint64_t g_tl_sbuf_starved; /* declined: budget spent, pool empty */
 static uint64_t g_tl_nil_batch;   /* no batch, or CB mismatch */
 static uint64_t g_tl_nil_sbuf;    /* newCounterSampleBufferWithDescriptor failed */
 static uint64_t g_tl_nil_enc;     /* computeCommandEncoderWithDescriptor failed */
@@ -307,7 +341,7 @@ static void ds4_gpu_timeline_probe(id<MTLDevice> device) {
         @selector(ds4_tl_newComputePipelineStateWithDescriptor:options:reflection:error:));
     fprintf(g_timeline_file, "# ds4 encoder timeline; slide=0x%llx pid=%d\n",
             (unsigned long long)_dyld_get_image_vmaddr_slide(0), (int)getpid());
-    fprintf(g_timeline_file, "# B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns> rearm=<n> ce_batch=<n> ce_owned=<n> async=<n> stale_enc=<n> tl_ok=<n> nil_batch=<n> nil_sbuf=<n> nil_enc=<n> sbufs=<n>\n");
+    fprintf(g_timeline_file, "# B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns> rearm=<n> ce_batch=<n> ce_owned=<n> async=<n> stale_enc=<n> tl_ok=<n> nil_batch=<n> nil_sbuf=<n> nil_enc=<n> sbufs=<n> sbuf_new=<n> sbuf_reuse=<n> sbuf_starved=<n>\n");
     fprintf(g_timeline_file, "# E <seq> <idx> <start_ns> <end_ns> <dur_us> <gap_us> <caller_unslid> <n_dispatch> <tg> <tpt> <stage> <kernel>\n");
     fprintf(g_timeline_file, "# fields are 1-based: $6=dur_us $7=gap_us $10=tg $11=tpt $12=stage $13=kernel\n");
     fflush(g_timeline_file);
@@ -331,7 +365,7 @@ static void ds4_gpu_timeline_resolve(DS4TimelineBatch *b, id<MTLCommandBuffer> c
     pthread_mutex_lock(&g_timeline_mutex);
     fprintf(g_timeline_file,
             "B %llu %u %.0f %.0f rearm=%llu ce_batch=%llu ce_owned=%llu async=%llu stale_enc=%llu"
-            " tl_ok=%llu nil_batch=%llu nil_sbuf=%llu nil_enc=%llu sbufs=%lu\n",
+            " tl_ok=%llu nil_batch=%llu nil_sbuf=%llu nil_enc=%llu sbufs=%lu sbuf_new=%llu sbuf_reuse=%llu sbuf_starved=%llu\n",
             (unsigned long long)b->seq, b->count,
             cb.GPUStartTime * 1e9, cb.GPUEndTime * 1e9,
             (unsigned long long)g_timeline_rearms,
@@ -343,7 +377,10 @@ static void ds4_gpu_timeline_resolve(DS4TimelineBatch *b, id<MTLCommandBuffer> c
             (unsigned long long)g_tl_nil_batch,
             (unsigned long long)g_tl_nil_sbuf,
             (unsigned long long)g_tl_nil_enc,
-            (unsigned long)[b->samples count]);
+            (unsigned long)[b->samples count],
+            (unsigned long long)g_tl_sbuf_new,
+            (unsigned long long)g_tl_sbuf_reuse,
+            (unsigned long long)g_tl_sbuf_starved);
     uint64_t prev_end = 0;
     for (uint32_t i = 0; i < b->count; i++) {
         const uint32_t sb_index = i / (DS4_TIMELINE_SAMPLES_PER_BUFFER / 2);
@@ -386,6 +423,21 @@ static void ds4_gpu_timeline_attach(id<MTLCommandBuffer> cb) {
     g_timeline_batch_cb = cb;
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
         ds4_gpu_timeline_resolve(b, done);
+        /* resolve() has copied every timestamp out, so the buffers are dead
+         * data now.  Hand them to the free list explicitly instead of waiting
+         * for b to dealloc -- that wait is what exhausted the device pool. */
+        if ([b->samples count] > 0) {
+            pthread_mutex_lock(&g_timeline_mutex);
+            if (!g_timeline_sbuf_pool) g_timeline_sbuf_pool = [NSMutableArray array];
+            /* Bounded so a pathological burst cannot pin memory forever; the
+             * steady-state need is one or two. */
+            for (id<MTLCounterSampleBuffer> sb in b->samples) {
+                if ([g_timeline_sbuf_pool count] >= 64u) break;
+                [g_timeline_sbuf_pool addObject:sb];
+            }
+            pthread_mutex_unlock(&g_timeline_mutex);
+            [b->samples removeAllObjects];
+        }
         /* Drop the global, but only if it is still this batch -- a newer one
          * may already have replaced it.  The encoders that referenced this
          * batch hold it through their slot, and the block holds it here, so
@@ -408,20 +460,38 @@ static id<MTLComputeCommandEncoder> ds4_gpu_timeline_new_encoder(
     const uint32_t per_buffer = DS4_TIMELINE_SAMPLES_PER_BUFFER / 2;
     const uint32_t sb_index = b->count / per_buffer;
     if (sb_index >= [b->samples count]) {
-        MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
-        d.counterSet = g_timeline_counter_set;
-        d.storageMode = MTLStorageModeShared;
-        d.sampleCount = DS4_TIMELINE_SAMPLES_PER_BUFFER;
-        NSError *error = nil;
-        id<MTLCounterSampleBuffer> sb = [g_device newCounterSampleBufferWithDescriptor:d error:&error];
-        if (!sb) {
-            /* Rate-limited: at ~109 dispatches per batch an unbounded print
-             * would itself perturb the run and drown the log. */
-            if (g_tl_nil_sbuf++ == 0) {
-                fprintf(stderr, "ds4: timeline sample buffer failed (FIRST): %s\n",
-                        [[error localizedDescription] UTF8String]);
-            }
+        id<MTLCounterSampleBuffer> sb = nil;
+        pthread_mutex_lock(&g_timeline_mutex);
+        if ([g_timeline_sbuf_pool count] > 0) {
+            sb = [g_timeline_sbuf_pool lastObject];
+            [g_timeline_sbuf_pool removeLastObject];
+            g_tl_sbuf_reuse++;
+        }
+        pthread_mutex_unlock(&g_timeline_mutex);
+        if (!sb && g_tl_sbuf_new >= DS4_TIMELINE_SBUF_BUDGET) {
+            /* Budget spent and nothing free: decline this encoder rather than
+             * ask the device for a 33rd buffer.  Self-healing -- the next
+             * completion puts one back. */
+            g_tl_sbuf_starved++;
             return nil;
+        }
+        if (!sb) {
+            MTLCounterSampleBufferDescriptor *d = [MTLCounterSampleBufferDescriptor new];
+            d.counterSet = g_timeline_counter_set;
+            d.storageMode = MTLStorageModeShared;
+            d.sampleCount = DS4_TIMELINE_SAMPLES_PER_BUFFER;
+            NSError *error = nil;
+            sb = [g_device newCounterSampleBufferWithDescriptor:d error:&error];
+            if (!sb) {
+                /* Rate-limited: at ~109 dispatches per batch an unbounded print
+                 * would itself perturb the run and drown the log. */
+                if (g_tl_nil_sbuf++ == 0) {
+                    fprintf(stderr, "ds4: timeline sample buffer failed (FIRST): %s\n",
+                            [[error localizedDescription] UTF8String]);
+                }
+                return nil;
+            }
+            g_tl_sbuf_new++;
         }
         [b->samples addObject:sb];
     }
