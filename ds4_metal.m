@@ -3774,6 +3774,49 @@ static int ds4_gpu_device_name_contains(const char *needle) {
     return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
 }
 
+/* PMM1 measurement knob, default OFF.  DS4_METAL_PMM1_TILE selects a
+ * routed-MoE PREFILL mul_mm_id variant:
+ *
+ *   cull        final-tile SIMDgroup culling (CULL_TAIL_SIMDGROUPS)
+ *   pad1/2/4/8  threadgroup tile pitch 64+N.  Threadgroup memory is banked
+ *               ~32 x 4 B, so a pitch of exactly 64 puts tile i and tile i+2
+ *               on the same banks; a small pad walks that off.
+ *   cullpad4    both
+ *
+ * Both are bit-identical by construction -- culling only skips MMA for
+ * simdgroups whose rows are past the tail, and padding only moves WHERE a
+ * staged value lives.  A DIFFERS is a defect, not a tolerance question.
+ *
+ * Scoped to the Q4_K cases, so the flag cannot reach a pipeline that does not
+ * implement it, and an unresolvable name falls back LOUDLY rather than
+ * silently becoming the control. */
+static const char *ds4_gpu_pmm1_suffix(void) {
+    static const char *cached = NULL;
+    if (!cached) {
+        const char *e = getenv("DS4_METAL_PMM1_TILE");
+        cached = (e && e[0]) ? e : "";
+        if (cached[0]) fprintf(stderr, "ds4: Metal PMM1 TILE ENGAGED (%s)\n", cached);
+    }
+    return cached;
+}
+
+static id<MTLComputePipelineState> ds4_gpu_pmm1_pipeline(const char *base) {
+    const char *suffix = ds4_gpu_pmm1_suffix();
+    char name[160];
+    snprintf(name, sizeof(name), "%s_%s", base, suffix);
+    id<MTLComputePipelineState> p = ds4_gpu_get_mul_mm_id_pipeline(name, false);
+    if (!p) {
+        static int warned = 0;
+        if (!warned++) {
+            fprintf(stderr,
+                    "ds4: PMM1 variant %s DID NOT RESOLVE -- falling back to %s. "
+                    "Any number from this run is the CONTROL.\n", name, base);
+        }
+        return ds4_gpu_get_mul_mm_id_pipeline(base, false);
+    }
+    return p;
+}
+
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
            g_metal_device_name[7] >= '1' &&
@@ -34717,6 +34760,7 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
     case DS4_METAL_TENSOR_Q4_K:
+        if (ds4_gpu_pmm1_suffix()[0]) return ds4_gpu_pmm1_pipeline("kernel_mul_mm_id_q4_K_f32");
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
     case DS4_METAL_TENSOR_Q5_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q5_K_f32", false);
@@ -34753,6 +34797,7 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t t
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
     case DS4_METAL_TENSOR_Q4_K:
+        if (ds4_gpu_pmm1_suffix()[0]) return ds4_gpu_pmm1_pipeline("kernel_mul_mm_id_q4_K_f16");
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false);
     case DS4_METAL_TENSOR_Q5_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q5_K_f16", false);
