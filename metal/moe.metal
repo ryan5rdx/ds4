@@ -8631,6 +8631,33 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
 
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
     const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
+
+    /* P2SW-TP8: expert ownership, BEFORE any weight dereference.
+     *
+     * This kernel previously had none, which is why the host pinned it to
+     * g_tp_split_world != 2 with the comment "pair-swiglu mm kernel lacks
+     * expert ownership".  Two separate things were missing and both are
+     * required -- the guard, and the rank-local index translation below.
+     *
+     * The zero fill and the tp_shed early-out mirror kernel_mul_mm_id exactly,
+     * including its disclosed corner: skipping is bit-identical to filling
+     * except for -0.0f, which the fill turns into +0.0f and the skip leaves at
+     * -0.0f.  The downstream sum is kernel_dsv4_moe_sum8_owned_f32 in that
+     * mode, and it skips precisely these slots. */
+    if (!ds4_tp_owns_expert(im, args.ne02, args.tp_rank, args.tp_world)) {
+        if (args.tp_shed) return;
+        for (short j = sgitg; j < nr1; j += 4) {
+            const int idj = ids_i32[im*args.ne21 + r1 + j];
+            const short ide = idj % args.ne20;
+            const short idt = idj / args.ne20;
+            device half *D = (device half *)(dst_mid +
+                ((uint64_t)idt*args.ne1 + (uint64_t)ide)*act.mid_row_stride) + r0;
+            for (int i = tiisg; i < nr0; i += 32) {
+                D[i] = (half)0.0f;
+            }
+        }
+        return;
+    }
     // SIMDgroups 0/1 own routed rows 0..15 and SIMDgroups 2/3 own rows
     // 16..31. Keep every thread in staging and at every threadgroup barrier,
     // but let the second row-half skip MMA on short final expert tiles.
@@ -8649,7 +8676,12 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
     const short i12 = (id / args.ne20);
     const short i13 = 0;
 
-    const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
+    /* RANK-LOCAL, not global.  Each rank holds only its half of the experts
+     * under TP2, so indexing with the global id walks off this rank's slab.
+     * kernel_mul_mm_id has always done this; this kernel did not, and it is
+     * the second half of why it was pinned to world 1. */
+    const uint64_t offset0 =
+        (uint64_t)(im - args.tp_expert_base)*args.nb02 + i13*args.nb03;
     const short    offset1 = il0/nl;
 
     device const block_q * xg =

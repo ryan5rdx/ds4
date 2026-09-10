@@ -3774,6 +3774,33 @@ static int ds4_gpu_device_name_contains(const char *needle) {
     return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
 }
 
+/* P2SW-TP8, default OFF.  Relaxes the two restrictions that kept the fused
+ * gate/up/SwiGLU mm kernel off GLM:
+ *
+ *   g_tp_split_world != 2   the in-tree comment said "pair-swiglu mm kernel
+ *                           lacks expert ownership", and it was right twice
+ *                           over -- no ds4_tp_owns_expert guard, and expert
+ *                           weights indexed with the GLOBAL id rather than
+ *                           (im - tp_expert_base). Both are fixed in the
+ *                           kernel now, mirroring kernel_mul_mm_id including
+ *                           its tp_shed early-out.
+ *   n_expert == 6           ds4f's top-6. GLM routes top-8; nothing in the
+ *                           kernel depends on the value.
+ *
+ * Default off because enabling it is new behaviour for this model, not a
+ * tuning change: it replaces two dispatches (gate, up) plus a separate SwiGLU
+ * with one, and deletes the gate scratch traffic. That is measured, not
+ * assumed. */
+static int ds4_gpu_p2sw_tp8(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_METAL_P2SW_TP8");
+        cached = (e && e[0] == '1') ? 1 : 0;
+        if (cached) fprintf(stderr, "ds4: Metal P2SW-TP8 ENGAGED\n");
+    }
+    return cached;
+}
+
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
            g_metal_device_name[7] >= '1' &&
@@ -42552,7 +42579,65 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                            selectedbuf,
                                            ds4_gpu_tensor_offset(selected));
         DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("map");
-        if (ok) {
+        /* P2SW-TP8: one fused dispatch in place of gate + up + activation.
+         *
+         * The premise in the campaign plan does not hold for GLM. The
+         * world-1/top-6 restrictions gate ds4_gpu_routed_moe_batch_tensor --
+         * the DeepSeek encoder. This GLM grouped path never had a fused branch
+         * at all: it issues gate and up as two separate mul_mm_id dispatches
+         * and then a third kernel for SwiGLU. So the work is a PORT, not a
+         * relaxation.
+         *
+         * What the fused kernel deletes: the whole gate scratch round trip.
+         * Gate and up each write expert_mid_dim floats per routed row to
+         * g_moe_gate_scratch_buffer, and the activation kernel reads both back.
+         * Fused, the mid is produced in registers and written once as half.
+         *
+         * Requires the ownership guard and rank-local expert index added to
+         * kernel_mul_mm_id_pair_swiglu_f16 on this branch -- without them this
+         * would read another rank's slab. */
+        const bool p2sw_fused =
+            ds4_gpu_p2sw_tp8() && mid_f16 && !g_quality_mode &&
+            gate_type == DS4_METAL_TENSOR_Q4_K &&
+            up_type == DS4_METAL_TENSOR_Q4_K;
+        id<MTLComputePipelineState> p2sw_pipeline =
+            p2sw_fused ? ds4_gpu_get_pipeline("kernel_mul_mm_id_q4_K_pair_swiglu_f16")
+                       : nil;
+        if (p2sw_fused && !p2sw_pipeline) {
+            static int warned = 0;
+            if (!warned++) {
+                fprintf(stderr, "ds4: P2SW-TP8 pipeline missing -- running the "
+                                "CONTROL (separate gate/up/activation)\n");
+            }
+        }
+        if (ok && p2sw_pipeline) {
+            ds4_gpu_dsv4_moe_swiglu_weight_args act_args = {
+                .width = expert_mid_dim,
+                .rows = pair_rows,
+                .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                .up_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(uint16_t),
+                .weight_stride = sizeof(float),
+                .write_clamped = 0,
+                .clamp_value = swiglu_clamp,
+            };
+            ok = ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(cb,
+                                                              p2sw_pipeline,
+                                                              false,
+                                                              &gate_args,
+                                                              &act_args,
+                                                              gatebuf,
+                                                              (NSUInteger)gate_inner,
+                                                              upbuf,
+                                                              (NSUInteger)up_inner,
+                                                              xbuf,
+                                                              ds4_gpu_tensor_offset(x),
+                                                              midbuf,
+                                                              ds4_gpu_tensor_offset(mid),
+                                                              weightsbuf,
+                                                              ds4_gpu_tensor_offset(weights));
+            DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("gate_up_fused");
+        } else if (ok) {
             ok = ds4_gpu_encode_mul_mm_id_mapped_tile(cb,
                                                        gate_pipeline,
                                                        &gate_args,
@@ -42565,7 +42650,7 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                        mm_id_threadgroup_bytes);
         }
         DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("gate");
-        if (ok) {
+        if (ok && !p2sw_pipeline) {
             ok = ds4_gpu_encode_mul_mm_id_mapped_tile(cb,
                                                        up_pipeline,
                                                        &up_args,
@@ -42578,7 +42663,7 @@ static int ds4_gpu_glm_routed_moe_batch_grouped_tensor(
                                                        mm_id_threadgroup_bytes);
         }
         DS4_METAL_PROFILE_GLM_GROUPED_MOE_STAGE("up");
-        if (ok) {
+        if (ok && !p2sw_pipeline) {
             ok = ds4_gpu_encode_moe_swiglu_weight(cb,
                                                    g_moe_gate_scratch_buffer,
                                                    0,
@@ -47011,9 +47096,11 @@ int ds4_gpu_routed_moe_batch_tensor(
             use_mm_id &&
             !(gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
               (ds4_gpu_routed_mm_mpp_mask() & 3) == 3) &&
-            g_tp_split_world != 2 &&    /* pair-swiglu mm kernel lacks expert ownership */
+            /* P2SW-TP8 relaxes both of these; the kernel now carries the
+             * ownership guard and the rank-local expert index it lacked. */
+            (g_tp_split_world != 2 || ds4_gpu_p2sw_tp8()) &&
             request_mid_f16 &&
-            n_expert == 6 &&
+            (n_expert == 6 || (n_expert == 8 && ds4_gpu_p2sw_tp8())) &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
               down_type == DS4_METAL_TENSOR_Q2_K) ||
              (gate_type == DS4_METAL_TENSOR_Q4_K &&
