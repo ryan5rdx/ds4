@@ -403,6 +403,8 @@ int ds4_gpu_tp_gate_prefetch_plan(uint32_t gate,
                                   const void *model_map, uint64_t model_size,
                                   const uint64_t *offsets, const uint64_t *bytes,
                                   uint32_t count);
+/* GPF1: dump planned vs TOUCHED bytes, gate-wait EWMA and encode cost. */
+void ds4_gpu_glm_prefetch_report(void);
 /* The coordinator-only DSpark support model does not participate in TP.
  * Suspend ownership only while encoding it; base-model verification remains
  * split across both ranks. */

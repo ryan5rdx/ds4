@@ -1595,7 +1595,9 @@ void ds4_gpu_dsa_lora_census(const char *when) {
             g_dsa_lora_disp_unknown ? "  <-- UNPHASED, census is not evidence" : "");
 }
 
+void ds4_gpu_glm_prefetch_report(void);
 static void ds4_gpu_dsa_lora_census_atexit(void) {
+    ds4_gpu_glm_prefetch_report();
     ds4_gpu_dsa_lora_census("process exit");
 }
 
@@ -11656,6 +11658,17 @@ static const void *g_tp_prefetch_map;
 static uint64_t g_tp_prefetch_map_size;
 static id<MTLBuffer> g_tp_prefetch_scratch;
 static bool g_tp_gate_prefetch;
+/* GPF1 instrumentation.  The engine has existed since the DeepSeek work and
+ * GLM simply never populated a plan, so the first thing any GLM arm needs is
+ * proof that bytes were actually TOUCHED -- not merely planned.  The budget is
+ * cut from the measured gate wait, so a plan can be entirely elided and the
+ * arm would otherwise look like a null instead of like a no-op. */
+static uint64_t g_gpf_planned_bytes[DS4_TP_GATES_PER_LAYER];
+static uint64_t g_gpf_touched_bytes[DS4_TP_GATES_PER_LAYER];
+static uint64_t g_gpf_plans[DS4_TP_GATES_PER_LAYER];
+static uint64_t g_gpf_encodes[DS4_TP_GATES_PER_LAYER];
+static uint64_t g_gpf_elided[DS4_TP_GATES_PER_LAYER];   /* budget was 0 */
+static double   g_gpf_encode_ms[DS4_TP_GATES_PER_LAYER];
 static uint64_t g_tp_stat_poll_lines;      /* sum of poll hit lines (profile) */
 static uint64_t g_tp_stat_poll_max_line;
 static uint64_t g_tp_stat_poll_count;
@@ -11853,7 +11866,7 @@ static uint64_t ds4_gpu_buffer_address(id<MTLBuffer> buffer, NSUInteger inner);
 
 /* One dispatch of kernel_touch_u8_stride_table over up to DS4_TP_PREFETCH_MAX
  * model ranges (priority order, cut at `budget` bytes), 128 B per thread. */
-static void ds4_gpu_encode_touch_table(id<MTLComputeCommandEncoder> enc,
+static uint64_t ds4_gpu_encode_touch_table(id<MTLComputeCommandEncoder> enc,
                                        id<MTLComputePipelineState> touch,
                                        const ds4_tp_prefetch_range *plan,
                                        uint32_t n,
@@ -11864,6 +11877,7 @@ static void ds4_gpu_encode_touch_table(id<MTLComputeCommandEncoder> enc,
     id<MTLResource> views[DS4_TP_PREFETCH_MAX];
     uint32_t count = 0;
     uint64_t total_lines = 0;
+    uint64_t issued_bytes = 0;
     for (uint32_t i = 0; i < n && budget != 0u; i++) {
         uint64_t inner = 0;
         uint64_t bytes = plan[i].bytes;
@@ -11881,9 +11895,10 @@ static void ds4_gpu_encode_touch_table(id<MTLComputeCommandEncoder> enc,
         lines[count] = (uint32_t)range_lines;
         views[count] = src;
         total_lines += range_lines;
+        issued_bytes += bytes;
         count++;
     }
-    if (count == 0u) return;
+    if (count == 0u) return 0;
     [enc setComputePipelineState:touch];
     [enc useResources:views count:count usage:MTLResourceUsageRead];
     [enc setBytes:addr length:sizeof(addr) atIndex:0];
@@ -11892,12 +11907,18 @@ static void ds4_gpu_encode_touch_table(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:g_tp_prefetch_scratch offset:0 atIndex:3];
     [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)((total_lines + 255u) / 256u), 1, 1)
          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    return issued_bytes;
 }
 
 static int ds4_gpu_tp_encode_gate_prefetch(uint32_t gate) {
     const uint32_t n = g_tp_prefetch_count[gate];
     g_tp_prefetch_count[gate] = 0;
     if (n == 0 || !g_batch_cb) return 1;
+    if (gate < DS4_TP_GATES_PER_LAYER) {
+        g_gpf_plans[gate]++;
+        for (uint32_t i = 0; i < n; i++)
+            g_gpf_planned_bytes[gate] += g_tp_prefetch_plan[gate][i].bytes;
+    }
     if (!g_tp_prefetch_scratch) {
         g_tp_prefetch_scratch =
             [g_device newBufferWithLength:(NSUInteger)(1u << 20)
@@ -11924,11 +11945,54 @@ static int ds4_gpu_tp_encode_gate_prefetch(uint32_t gate) {
         ? (uint64_t)((wait_us - margin_us) * bytes_per_us)
         : 0u;
     if (wait_us == 0.0) budget = 4u << 20;
-    if (budget == 0u) return 1;
+    if (budget == 0u) {
+        if (gate < DS4_TP_GATES_PER_LAYER) g_gpf_elided[gate]++;
+        return 1;
+    }
+    const double enc_t0 = ds4_gpu_now_ms();
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
-    ds4_gpu_encode_touch_table(enc, touch, g_tp_prefetch_plan[gate], n, budget);
+    const uint64_t issued =
+        ds4_gpu_encode_touch_table(enc, touch, g_tp_prefetch_plan[gate], n, budget);
     ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+    if (gate < DS4_TP_GATES_PER_LAYER) {
+        g_gpf_touched_bytes[gate] += issued;
+        g_gpf_encodes[gate]++;
+        g_gpf_encode_ms[gate] += ds4_gpu_now_ms() - enc_t0;
+    }
     return 1;
+}
+
+/* GPF1 report.  Called at session teardown and by the harness through
+ * DS4_GLM_TP_PREFETCH_REPORT=1.  The two numbers that decide an arm are
+ * TOUCHED (not planned) and whether the following stage got faster; a plan
+ * whose touched bytes are zero is a no-op, not a null. */
+void ds4_gpu_glm_prefetch_report(void) {
+    static const char *names[DS4_TP_GATES_PER_LAYER] =
+        { "INDEXER", "ATTN", "ROUTER", "FFN" };
+    uint64_t any = 0;
+    for (uint32_t gt = 0; gt < DS4_TP_GATES_PER_LAYER; gt++) any += g_gpf_plans[gt];
+    if (!any) return;
+    fprintf(stderr,
+            "ds4: GPF1 gate prefetch report (split rank %d)\n"
+            "  %-8s %8s %8s %8s %14s %14s %9s %10s\n",
+            (int)g_tp_split_rank, "gate", "plans", "encodes", "elided",
+            "planned MiB", "touched MiB", "wait us", "enc ms");
+    for (uint32_t gt = 0; gt < DS4_TP_GATES_PER_LAYER; gt++) {
+        if (!g_gpf_plans[gt]) continue;
+        fprintf(stderr,
+                "  %-8s %8llu %8llu %8llu %14.2f %14.2f %9.2f %10.3f\n",
+                names[gt],
+                (unsigned long long)g_gpf_plans[gt],
+                (unsigned long long)g_gpf_encodes[gt],
+                (unsigned long long)g_gpf_elided[gt],
+                (double)g_gpf_planned_bytes[gt] / (1024.0 * 1024.0),
+                (double)g_gpf_touched_bytes[gt] / (1024.0 * 1024.0),
+                g_tp_exchange_ewma_us[gt],
+                g_gpf_encode_ms[gt]);
+    }
+    fprintf(stderr, "  poll iterations: %llu (max line %llu)\n",
+            (unsigned long long)g_tp_stat_poll_count,
+            (unsigned long long)g_tp_stat_poll_max_line);
 }
 
 static uint32_t ds4_gpu_tp_keepalive_tgs_from_env(void) {

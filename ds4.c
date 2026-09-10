@@ -56214,6 +56214,102 @@ static bool glm_graph_forward_token(
             if (!ok) break;
         }
         glm_ft_fail_il = il;
+#if defined(__APPLE__)
+        /* GPF1 -- gate-time weight prefetch for GLM.  Default OFF.
+         *
+         * The Metal prefetch engine has existed since the DeepSeek work: it
+         * takes a per-gate range plan, cuts it at a budget derived from THIS
+         * rank's measured wait at THAT gate, and streams the ranges with a
+         * touch kernel while the poll spins.  GLM never populated a plan, so
+         * on this model the engine has always been dead code.
+         *
+         * What can legitimately be prefetched is only what is known before the
+         * gate releases.  The routed experts are NOT: they are chosen by the
+         * router, which runs after the attention gate.  So every plan here is
+         * a FIXED weight -- router, shared expert, next layer's attention.
+         *
+         *   attn    at the ATTN gate, this layer's router + shared expert
+         *   router  at the ROUTER gate, the shared expert (routed still unknown)
+         *   ffn     at the FFN gate, the NEXT layer's fixed attention weights
+         *   all     compose the three
+         *
+         * Reject an arm that merely moves time between buckets, or that
+         * lengthens gate release -- the prefetch shares the encoder with the
+         * poll and a plan larger than the wait steals from the release path. */
+        if (g->tp_world == 2) {
+            static int gpf_mode = -1;   /* 0 none, 1 attn, 2 router, 4 ffn */
+            if (gpf_mode < 0) {
+                const char *e = getenv("DS4_GLM_TP_PREFETCH");
+                gpf_mode = 0;
+                if (e && *e) {
+                    if (strstr(e, "all"))    gpf_mode = 1 | 2 | 4;
+                    else {
+                        if (strstr(e, "attn"))   gpf_mode |= 1;
+                        if (strstr(e, "router")) gpf_mode |= 2;
+                        if (strstr(e, "ffn"))    gpf_mode |= 4;
+                    }
+                    fprintf(stderr,
+                            "ds4: GLM TP GATE PREFETCH ENGAGED (%s, mode %d)\n",
+                            e, gpf_mode);
+                }
+            }
+            if (gpf_mode) {
+                const ds4_layer_weights *pw = &weights->layer[il];
+                const bool moe = pw->ffn_gate_inp && pw->ffn_gate_shexp &&
+                                 pw->ffn_up_shexp && pw->ffn_down_shexp;
+                if ((gpf_mode & 1) && moe) {
+                    /* router first: it is the very next consumer after release */
+                    const uint64_t off[4] = {
+                        pw->ffn_gate_inp->abs_offset,
+                        pw->ffn_gate_shexp->abs_offset,
+                        pw->ffn_up_shexp->abs_offset,
+                        pw->ffn_down_shexp->abs_offset,
+                    };
+                    const uint64_t byt[4] = {
+                        pw->ffn_gate_inp->bytes, pw->ffn_gate_shexp->bytes,
+                        pw->ffn_up_shexp->bytes, pw->ffn_down_shexp->bytes,
+                    };
+                    (void)ds4_gpu_tp_gate_prefetch_plan(DS4_TP_GATE_ATTN,
+                                                        model->map, model->size,
+                                                        off, byt, 4u);
+                }
+                if ((gpf_mode & 2) && moe) {
+                    const uint64_t off[3] = {
+                        pw->ffn_gate_shexp->abs_offset,
+                        pw->ffn_up_shexp->abs_offset,
+                        pw->ffn_down_shexp->abs_offset,
+                    };
+                    const uint64_t byt[3] = {
+                        pw->ffn_gate_shexp->bytes, pw->ffn_up_shexp->bytes,
+                        pw->ffn_down_shexp->bytes,
+                    };
+                    (void)ds4_gpu_tp_gate_prefetch_plan(DS4_TP_GATE_ROUTER,
+                                                        model->map, model->size,
+                                                        off, byt, 3u);
+                }
+                if ((gpf_mode & 4) && il + 1u <= g->layer_end) {
+                    const ds4_layer_weights *nw = &weights->layer[il + 1u];
+                    uint64_t off[5], byt[5];
+                    uint32_t nn = 0;
+                    const ds4_tensor *cand[5] = {
+                        nw->attn_norm, nw->attn_q_a, nw->attn_kv_a_mqa,
+                        nw->hc_attn_fn, nw->attn_q_b,
+                    };
+                    for (uint32_t c = 0; c < 5u; c++) {
+                        if (!cand[c] || cand[c]->bytes == 0u) continue;
+                        off[nn] = cand[c]->abs_offset;
+                        byt[nn] = cand[c]->bytes;
+                        nn++;
+                    }
+                    if (nn) {
+                        (void)ds4_gpu_tp_gate_prefetch_plan(DS4_TP_GATE_FFN,
+                                                            model->map, model->size,
+                                                            off, byt, nn);
+                    }
+                }
+            }
+        }
+#endif
         const uint32_t slice_layer_done = il - g->layer_start + 1u;
         /* IDX-SPLIT's gate is OWED BY THE LAYER, not by the branch that happens
          * to want it.  The schedule reserves an INDEXER slot on every DSA layer
