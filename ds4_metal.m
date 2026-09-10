@@ -3774,6 +3774,23 @@ static int ds4_gpu_device_name_contains(const char *needle) {
     return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
 }
 
+/* ROUTER-REG8 measurement knob, default OFF.  Selects the register-top-8 +
+ * tournament selector in place of the shipped eight-full-scans one.
+ *
+ * Byte-identical is the bar, not "equivalent": the ordering predicate and the
+ * normalisation summation order are copied verbatim, so a DIFFERS is a defect.
+ * Promotion needs >=25% on the selector kernel, and the end-to-end ceiling is
+ * under ~1% of decode -- so this is cheap to test and easy to over-value. */
+static int ds4_gpu_router_reg8(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_METAL_ROUTER_REG8");
+        cached = (e && e[0] == '1') ? 1 : 0;
+        if (cached) fprintf(stderr, "ds4: Metal ROUTER-REG8 ENGAGED\n");
+    }
+    return cached;
+}
+
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
            g_metal_device_name[7] >= '1' &&
@@ -41364,7 +41381,9 @@ int ds4_gpu_glm_router_select_tensor(
         const int router_simd = ds4_gpu_glm_router_select_simd();
         id<MTLComputePipelineState> pipeline =
             router_simd
-                ? ds4_gpu_get_pipeline("kernel_glm_router_select_one_simd")
+                ? ds4_gpu_get_pipeline(ds4_gpu_router_reg8()
+                                       ? "kernel_glm_router_select_one_simd_reg8"
+                                       : "kernel_glm_router_select_one_simd")
                 : ds4_gpu_hot_pipeline(g_glm_router_select_one_pipeline,
                                        "kernel_glm_router_select_one");
         if (!pipeline) return 0;
@@ -41468,7 +41487,9 @@ int ds4_gpu_glm_router_select_batch_tensor(
         const int router_simd = ds4_gpu_glm_router_select_simd();
         id<MTLComputePipelineState> pipeline =
             router_simd
-                ? ds4_gpu_get_pipeline("kernel_glm_router_select_one_simd")
+                ? ds4_gpu_get_pipeline(ds4_gpu_router_reg8()
+                                       ? "kernel_glm_router_select_one_simd_reg8"
+                                       : "kernel_glm_router_select_one_simd")
                 : ds4_gpu_hot_pipeline(g_glm_router_select_one_pipeline,
                                        "kernel_glm_router_select_one");
         if (!pipeline) return 0;
