@@ -6518,6 +6518,46 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     const uint64_t default_nsg = ds4_gpu_tp_world_is_two() ? 2u : 4u;
     const int16_t nsg =
         (int16_t)ds4_gpu_env_u64("DS4_METAL_Q8_MV_NSG", default_nsg, 1u, 8u);
+    /* KQ1 wide arms.  DS4_METAL_KDAQ8_WIDE = nr4 | soa | soa_nr4, default off.
+     *
+     * nr0 moves WITH function_name here, which is the whole reason this factory
+     * is the right hook: the grid is sized out_dim/(nr0*nsg), and a kernel whose
+     * row count disagrees with the grid leaves the upper half of the output
+     * unwritten -- the exact trap ds4_gpu_mv_dispatch_pin_nr2 exists to close.
+     *
+     * soa expects the weight tensor in the same-byte-count SoA layout: an
+     * ne01*ne00 int8 qs plane followed by an ne01*nb half scale plane.  It is
+     * NOT a drop-in for a model-loaded AoS tensor, so it is reachable only from
+     * probe_kdaq8, which builds both layouts itself. */
+    const char *wide = getenv("DS4_METAL_KDAQ8_WIDE");
+    if (wide && wide[0]) {
+        static int announced = 0;
+        const char *fn = NULL;
+        int32_t rows = 2;
+        if      (strcmp(wide, "nr4")     == 0) { fn = "kernel_mul_mv_q8_0_f32_nr4";     rows = 4; }
+        else if (strcmp(wide, "soa")     == 0) { fn = "kernel_mul_mv_q8_0_f32_soa";     rows = 2; }
+        else if (strcmp(wide, "soa_nr4") == 0) { fn = "kernel_mul_mv_q8_0_f32_soa_nr4"; rows = 4; }
+        if (fn) {
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: Metal KDAQ8 WIDE ENGAGED (%s, nsg=%d rows/simdgroup=%d)\n",
+                        wide, (int)nsg, (int)rows);
+            }
+            return (ds4_gpu_mv_dispatch) {
+                .function_name = fn,
+                .nsg = nsg,
+                .nr0 = rows,
+                .smem = 32u * (NSUInteger)rows * sizeof(float),
+            };
+        }
+        static int warned = 0;
+        if (!warned++) {
+            fprintf(stderr,
+                    "ds4: DS4_METAL_KDAQ8_WIDE='%s' unknown -- running the CONTROL\n",
+                    wide);
+        }
+    }
     return (ds4_gpu_mv_dispatch) {
         .function_name = "kernel_mul_mv_q8_0_f32",
         .nsg = nsg,
@@ -22037,7 +22077,31 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
              * matvecs the arm never measured, which is how a kernel that is
              * right everywhere becomes a regression somewhere. Widen it only
              * with an arm per shape. */
+            /* KQ1 narrow arm.  Same validated shape as narrowk, different
+             * lane mapping: one output row per HALF simdgroup, so 128 elements
+             * is exactly 16 lanes x 8 and no lane is dead.  nr0 stays 2, so the
+             * grid stays at 2048 threadgroups -- this is deliberately not
+             * R2NK-R8, which collapsed it to 256 and measured -0.4% on Apple8.
+             *
+             * Its reduction is 4 shuffle steps over 16 lanes rather than 5 over
+             * 32, so it is NOT bit-identical and needs a tolerance gate. */
             if (in_dim == 128u && out_dim == 4096u &&
+                getenv("DS4_METAL_KDAQ8_NARROW") &&
+                strcmp(getenv("DS4_METAL_KDAQ8_NARROW"), "half16") == 0) {
+                mv_dispatch.function_name = "kernel_mul_mv_q8_0_f32_half16";
+                mv_dispatch.nr0 = 2;
+                mv_dispatch.smem = 0;
+                static int announced16 = 0;
+                if (!announced16) {
+                    announced16 = 1;
+                    fprintf(stderr,
+                            "ds4: Metal KDAQ8 NARROW half16 ENGAGED "
+                            "(in=%llu out=%llu nsg=%d rows/simdgroup=%d)\n",
+                            (unsigned long long)in_dim,
+                            (unsigned long long)out_dim,
+                            (int)mv_dispatch.nsg, (int)mv_dispatch.nr0);
+                }
+            } else if (in_dim == 128u && out_dim == 4096u &&
                 ds4_gpu_env_bool("DS4_METAL_Q8_MV_NARROWK") > 0) {
                 mv_dispatch.function_name = "kernel_mul_mv_q8_0_f32_narrowk";
                 mv_dispatch.nr0 = 8;                      /* N_R0_Q8_0_NARROWK */
