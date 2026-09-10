@@ -47453,6 +47453,12 @@ static bool glm53_graph_kda_attention(
         !g->layer_kda_recurrent_state[il]) {
         return false;
     }
+    /* The decode caller reaches this with a `goto glm53_attention_done` that
+     * jumps over twelve DS4_GLM_PROFILE_DECODE_STAGE boundaries, so without a
+     * tag here the whole KDA block -- 34 of 45 layers, ten dispatches each --
+     * inherits whatever `attn_norm` left behind and disappears into the DSA
+     * rows of any rollup.  Tag on entry; the FFN's own boundary retakes it. */
+    ds4_gpu_trace_tag_layer(il, "kda_attention");
     const glm53_kda_lane lane = glm53_kda_lane_decode(g);
     const uint32_t projection = lane.projection;
     /* Per-head weights shift to this rank's head range; kda_f_a / kda_g_a are
@@ -56176,7 +56182,25 @@ static bool glm_graph_forward_token(
      * track which branch produced the list rather than giving up the template
      * everywhere. */
     bool last_indexer_selected_dense = false;
+/* Two instruments, one boundary list.
+ *
+ * The stage-profile half submits and waits, so it can only ever be on for a
+ * profiling run.  The trace tag is free -- ds4_gpu_trace_tag_layer() self-gates
+ * on ds4_gpu_stage_tag_wanted() -- and the encoder timeline needs it on a run
+ * where the profiler is deliberately OFF, because a boundary that waits turns
+ * GPU occupancy into a wall-clock envelope containing peer skew.  That is the
+ * error Q1 made and Q1B corrected.
+ *
+ * Tagging here rather than at 17 new call sites means the two instruments
+ * cannot drift apart, and a stage added later gets both for free.
+ *
+ * Q1C is why this exists: ds4_gpu_trace_phase("dec") was set but NO decode
+ * boundary ever touched g_trace_tag, so every one of the 4,107 captured decode
+ * records carried `dec/L44/shared_expert` -- whatever prefill's last layer
+ * happened to leave behind.  There was no per-stage decode attribution at all,
+ * and nothing in the run said so. */
 #define DS4_GLM_PROFILE_DECODE_STAGE(part_, name_) do { \
+        ds4_gpu_trace_tag_layer((il), (name_)); \
         if (ok && decode_stage_profile) { \
             ok = metal_graph_layer_stage_profile_boundary((part_), (name_), il, pos, 1, &decode_stage_t0); \
         } \
