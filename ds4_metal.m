@@ -3783,6 +3783,21 @@ static int ds4_gpu_device_name_contains(const char *needle) {
  * the per-row accumulation and reduction are untouched.  So this ships on a
  * cmp with no quality gate -- and on promotion it should flip the default,
  * not stay a flag. */
+/* Grid rows-per-threadgroup and thread count for the routed-MoE down kernel,
+ * derived TOGETHER.  DN1 failed bit-identity because one of the two dispatch
+ * sites got the widened grid and kept the 64-thread launch: the grid then
+ * assumed four simdgroups while two were launched, and half the output rows
+ * were never written.  That produced a +5.4-6.3% "win" -- five times the
+ * forecast -- which is what doing half the work looks like.
+ *
+ * The two sites spell the surrounding predicate differently
+ * ("down_simd ? 64u" vs "(down_scalar_q2 || down_simd) ? 64u"), which is how a
+ * textual edit hit one and not the other.  Returning both numbers from one
+ * place removes the possibility. */
+static void ds4_gpu_decmoe_down_geometry(int is_q4,
+                                         uint32_t *rows_per_group,
+                                         uint32_t *threads);
+
 static int ds4_gpu_decmoe_down_nsg4(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -3791,6 +3806,24 @@ static int ds4_gpu_decmoe_down_nsg4(void) {
         if (cached) fprintf(stderr, "ds4: Metal DECMOE DOWN-NSG4 ENGAGED\n");
     }
     return cached;
+}
+
+static void ds4_gpu_decmoe_down_geometry(int is_q4,
+                                         uint32_t *rows_per_group,
+                                         uint32_t *threads) {
+    /* ONLY the Q4_K down kernel is templated on NSG.  down_simd also covers
+     * Q5_K and Q6_K, whose kernels hardcode NSG = 2 and whose grid is sized
+     * (out_dim+3)/4 accordingly.  Widening the LAUNCH for those while leaving
+     * their grid and their internal NSG at 2 makes sgitg 2 and 3 compute
+     * row0 = (tgpig.x*2 + sgitg)*nr0, which collides with the next
+     * threadgroup's rows -- overlapping writes, wrong output.
+     *
+     * That is what DN1 hit: +5.4-6.3%, five times the forecast, and greedy
+     * output that differed on the full engine while the decode probe (Q4_K
+     * only) stayed bit-identical. */
+    const int n4 = is_q4 && ds4_gpu_decmoe_down_nsg4();
+    *rows_per_group = n4 ? 8u : 4u;   /* NSG * nr0, nr0 = 2 */
+    *threads        = n4 ? 128u : 64u;
 }
 
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
@@ -42110,17 +42143,18 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             (NSUInteger)((expert_mid_dim + 1u) / 2u);
         const NSUInteger pair_threadgroup_bytes = 0u;
         const NSUInteger pair_threads = 64u;
+        uint32_t dm_down_rpg = 4u, dm_down_thr = 64u;
+        ds4_gpu_decmoe_down_geometry(down_simd_q4, &dm_down_rpg, &dm_down_thr);
         const NSUInteger down_x_groups =
             down_scalar_q2 ? (NSUInteger)((out_dim + 7u) / 8u) :
-            down_simd_q4 ? (NSUInteger)((out_dim + (ds4_gpu_decmoe_down_nsg4() ? 7u : 3u)) /
-                                        (ds4_gpu_decmoe_down_nsg4() ? 8u : 4u)) :
+            down_simd_q4 ? (NSUInteger)((out_dim + dm_down_rpg - 1u) / dm_down_rpg) :
             down_simd_q5 ? (NSUInteger)((out_dim + 3u) / 4u) :
             down_simd_q6 ? (NSUInteger)((out_dim + 3u) / 4u) :
             (NSUInteger)out_dim;
         const NSUInteger down_threadgroup_bytes =
             (down_scalar_q2 || down_simd) ? 0u : 256u * sizeof(float);
         const NSUInteger down_threads =
-            (down_scalar_q2 || down_simd) ? 64u : 256u;
+            down_scalar_q2 ? 64u : (down_simd ? (NSUInteger)dm_down_thr : 256u);
         if (use_stream_expert_addr_table &&
             !ds4_gpu_stream_expert_cache_mark_entries_inflight(
                     stream_entries,
@@ -43391,17 +43425,18 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             q4_scalar_pair ? 512u * sizeof(float) : 0u;
         const NSUInteger pair_threads =
             q4_scalar_pair ? 256u : 64u;
+        uint32_t dm_down_rpg = 4u, dm_down_thr = 64u;
+        ds4_gpu_decmoe_down_geometry(down_simd_q4, &dm_down_rpg, &dm_down_thr);
         const NSUInteger down_x_groups =
             down_scalar_q2 ? (NSUInteger)((out_dim + 7u) / 8u) :
-            down_simd_q4 ? (NSUInteger)((out_dim + (ds4_gpu_decmoe_down_nsg4() ? 7u : 3u)) /
-                                        (ds4_gpu_decmoe_down_nsg4() ? 8u : 4u)) :
+            down_simd_q4 ? (NSUInteger)((out_dim + dm_down_rpg - 1u) / dm_down_rpg) :
             down_simd_q5 ? (NSUInteger)((out_dim + 3u) / 4u) :
             down_simd_q6 ? (NSUInteger)((out_dim + 3u) / 4u) :
             (NSUInteger)out_dim;
         const NSUInteger down_threadgroup_bytes =
             down_simd ? 0u : 256u * sizeof(float);
         const NSUInteger down_threads =
-            down_simd ? (ds4_gpu_decmoe_down_nsg4() ? 128u : 64u) : 256u;
+            down_simd ? (NSUInteger)dm_down_thr : 256u;
         if (use_stream_expert_addr_table &&
             !ds4_gpu_stream_expert_cache_mark_entries_inflight(stream_resources,
                                                                stream_resource_count,
