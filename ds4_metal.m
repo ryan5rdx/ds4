@@ -129,6 +129,17 @@ static uint64_t g_timeline_ce_batch;    /* compute_encoder took the batch branch
 static uint64_t g_timeline_ce_owned;    /* ... fell through to a non-batch CB */
 static uint64_t g_timeline_async;       /* commit_commands_async calls */
 static uint64_t g_timeline_stale_enc;   /* stale/untimelined g_batch_enc dropped */
+/* Q1C5 discriminator.  Five arm-level fixes have all reported healthy while
+ * zero E records were written, which localises the defect INSIDE
+ * ds4_gpu_timeline_new_encoder.  It has three nil paths and they are
+ * indistinguishable from outside, so count them separately -- the sample-buffer
+ * one in particular fails to stderr on a rank whose log is not archived, and
+ * MTLCounterSampleBuffer is a finite device resource that a 9.5 ms stall could
+ * plausibly exhaust by piling up uncompleted batches. */
+static uint64_t g_tl_nil_batch;   /* no batch, or CB mismatch */
+static uint64_t g_tl_nil_sbuf;    /* newCounterSampleBufferWithDescriptor failed */
+static uint64_t g_tl_nil_enc;     /* computeCommandEncoderWithDescriptor failed */
+static uint64_t g_tl_ok;          /* returned a timestamped encoder */
 /* Which CB g_batch_enc was opened on, and whether it carries a timeline slot.
  * Without these the encoder is indistinguishable from a live timelined one. */
 static __unsafe_unretained id<MTLCommandBuffer> g_batch_enc_cb;
@@ -296,7 +307,7 @@ static void ds4_gpu_timeline_probe(id<MTLDevice> device) {
         @selector(ds4_tl_newComputePipelineStateWithDescriptor:options:reflection:error:));
     fprintf(g_timeline_file, "# ds4 encoder timeline; slide=0x%llx pid=%d\n",
             (unsigned long long)_dyld_get_image_vmaddr_slide(0), (int)getpid());
-    fprintf(g_timeline_file, "# B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns> rearm=<n> ce_batch=<n> ce_owned=<n> async=<n> stale_enc=<n>\n");
+    fprintf(g_timeline_file, "# B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns> rearm=<n> ce_batch=<n> ce_owned=<n> async=<n> stale_enc=<n> tl_ok=<n> nil_batch=<n> nil_sbuf=<n> nil_enc=<n> sbufs=<n>\n");
     fprintf(g_timeline_file, "# E <seq> <idx> <start_ns> <end_ns> <dur_us> <gap_us> <caller_unslid> <n_dispatch> <tg> <tpt> <stage> <kernel>\n");
     fprintf(g_timeline_file, "# fields are 1-based: $6=dur_us $7=gap_us $10=tg $11=tpt $12=stage $13=kernel\n");
     fflush(g_timeline_file);
@@ -319,14 +330,20 @@ static void ds4_gpu_timeline_resolve(DS4TimelineBatch *b, id<MTLCommandBuffer> c
     if (!b || !g_timeline_file) return;
     pthread_mutex_lock(&g_timeline_mutex);
     fprintf(g_timeline_file,
-            "B %llu %u %.0f %.0f rearm=%llu ce_batch=%llu ce_owned=%llu async=%llu stale_enc=%llu\n",
+            "B %llu %u %.0f %.0f rearm=%llu ce_batch=%llu ce_owned=%llu async=%llu stale_enc=%llu"
+            " tl_ok=%llu nil_batch=%llu nil_sbuf=%llu nil_enc=%llu sbufs=%lu\n",
             (unsigned long long)b->seq, b->count,
             cb.GPUStartTime * 1e9, cb.GPUEndTime * 1e9,
             (unsigned long long)g_timeline_rearms,
             (unsigned long long)g_timeline_ce_batch,
             (unsigned long long)g_timeline_ce_owned,
             (unsigned long long)g_timeline_async,
-            (unsigned long long)g_timeline_stale_enc);
+            (unsigned long long)g_timeline_stale_enc,
+            (unsigned long long)g_tl_ok,
+            (unsigned long long)g_tl_nil_batch,
+            (unsigned long long)g_tl_nil_sbuf,
+            (unsigned long long)g_tl_nil_enc,
+            (unsigned long)[b->samples count]);
     uint64_t prev_end = 0;
     for (uint32_t i = 0; i < b->count; i++) {
         const uint32_t sb_index = i / (DS4_TIMELINE_SAMPLES_PER_BUFFER / 2);
@@ -387,7 +404,7 @@ static id<MTLComputeCommandEncoder> ds4_gpu_timeline_new_encoder(
      * This used to compare against g_batch_cb, which meant an owned CB -- the
      * only kind the decode loop gets after commit_commands_async() -- could
      * never own a capture, so 736 batches recorded zero encoders (Q1C..Q1C3). */
-    if (!b || !cb || cb != g_timeline_batch_cb) return nil;
+    if (!b || !cb || cb != g_timeline_batch_cb) { g_tl_nil_batch++; return nil; }
     const uint32_t per_buffer = DS4_TIMELINE_SAMPLES_PER_BUFFER / 2;
     const uint32_t sb_index = b->count / per_buffer;
     if (sb_index >= [b->samples count]) {
@@ -398,8 +415,12 @@ static id<MTLComputeCommandEncoder> ds4_gpu_timeline_new_encoder(
         NSError *error = nil;
         id<MTLCounterSampleBuffer> sb = [g_device newCounterSampleBufferWithDescriptor:d error:&error];
         if (!sb) {
-            fprintf(stderr, "ds4: timeline sample buffer failed: %s\n",
-                    [[error localizedDescription] UTF8String]);
+            /* Rate-limited: at ~109 dispatches per batch an unbounded print
+             * would itself perturb the run and drown the log. */
+            if (g_tl_nil_sbuf++ == 0) {
+                fprintf(stderr, "ds4: timeline sample buffer failed (FIRST): %s\n",
+                        [[error localizedDescription] UTF8String]);
+            }
             return nil;
         }
         [b->samples addObject:sb];
@@ -416,7 +437,8 @@ static id<MTLComputeCommandEncoder> ds4_gpu_timeline_new_encoder(
     att.startOfEncoderSampleIndex = slot;
     att.endOfEncoderSampleIndex = slot + 1u;
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDescriptor:pd];
-    if (!enc) return nil;
+    if (!enc) { g_tl_nil_enc++; return nil; }
+    g_tl_ok++;
     const uint32_t rec_index = b->count++;
     ds4_timeline_rec *rec = &b->recs[rec_index];
     memset(rec, 0, sizeof(*rec));
