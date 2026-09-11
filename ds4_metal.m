@@ -2859,6 +2859,17 @@ static int ds4_gpu_device_name_contains(const char *needle) {
  * fall back for bisection. */
 /* Final-tile SIMDgroup culling on the routed-MoE prefill GEMM. Bit-identical;
  * set DS4_METAL_DISABLE_MM_ID_CULL=1 to fall back for bisection. */
+/* Register top-k router selector. Bit-identical to the scan-based one;
+ * set DS4_METAL_DISABLE_ROUTER_REG8=1 to fall back for bisection. */
+static int ds4_gpu_router_reg8_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_METAL_DISABLE_ROUTER_REG8") == NULL ? 1 : 0;
+        if (!cached) fprintf(stderr, "ds4: register router selector disabled by env\n");
+    }
+    return cached;
+}
+
 static int ds4_gpu_mm_id_cull_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -38640,7 +38651,9 @@ int ds4_gpu_glm_router_select_tensor(
         const int router_simd = ds4_gpu_glm_router_select_simd();
         id<MTLComputePipelineState> pipeline =
             router_simd
-                ? ds4_gpu_get_pipeline("kernel_glm_router_select_one_simd")
+                ? ds4_gpu_get_pipeline(ds4_gpu_router_reg8_enabled()
+                                       ? "kernel_glm_router_select_one_simd_reg8"
+                                       : "kernel_glm_router_select_one_simd")
                 : ds4_gpu_hot_pipeline(g_glm_router_select_one_pipeline,
                                        "kernel_glm_router_select_one");
         if (!pipeline) return 0;
@@ -38743,7 +38756,9 @@ int ds4_gpu_glm_router_select_batch_tensor(
         const int router_simd = ds4_gpu_glm_router_select_simd();
         id<MTLComputePipelineState> pipeline =
             router_simd
-                ? ds4_gpu_get_pipeline("kernel_glm_router_select_one_simd")
+                ? ds4_gpu_get_pipeline(ds4_gpu_router_reg8_enabled()
+                                       ? "kernel_glm_router_select_one_simd_reg8"
+                                       : "kernel_glm_router_select_one_simd")
                 : ds4_gpu_hot_pipeline(g_glm_router_select_one_pipeline,
                                        "kernel_glm_router_select_one");
         if (!pipeline) return 0;
