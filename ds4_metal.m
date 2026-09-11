@@ -39321,6 +39321,44 @@ static uint32_t glm_indexer_score_vpt_configured(void) {
     return (uint32_t)cached;
 }
 
+/* ROWTILE -- BANKED 2026-09-11, default ON at R=4.
+ *
+ * The shipped kernel_glm_indexer_score_one_direct runs ONE key row per
+ * threadgroup and pays 16 threadgroup barriers per row (8 head-groups x 2),
+ * re-reads every head's Q from device memory, and reduces serially on thread 0
+ * while 127 threads idle. ROWTILE stages a whole tile of rows behind a single
+ * barrier pair and finishes one lane per row.
+ *
+ * GLMSCORER on Apple8, 11-layer DSA chain, f16 cache, IDX-SPLIT row ranges:
+ * 1.2121 -> 0.9733 ms at 131k (-19.7%) and 2.7391 -> 2.1041 at 310k (-23.2%),
+ * bit-identical on every case with every local and global top-512 hash
+ * matching. ~0.24 ms/token is about +0.85% decode end to end.
+ *
+ * R=4 rather than 8: Apple7 preferred 8 and Apple8 prefers 4 (0.9733 vs
+ * 0.9933). Exactness was identical on both, which is the standing rule in one
+ * line -- the dev box decides exactness, the rig decides timing.
+ *
+ * DS4_METAL_GLM_INDEXER_ROWTILE=0 restores the shipped direct kernel and is
+ * the explicit control; =N overrides the tile height for a sweep. Value-gated
+ * and self-naming for the same reason DS4_METAL_IDXPORT is. */
+#define GLM_ROWTILE_DEFAULT 4u
+
+static uint32_t glm_indexer_score_rowtile(void) {
+    static int cached = -2;
+    if (cached == -2) {
+        const char *e = getenv("DS4_METAL_GLM_INDEXER_ROWTILE");
+        cached = (e && e[0]) ? atoi(e) : (int)GLM_ROWTILE_DEFAULT;
+        if (cached < 0 || cached > 32) cached = (int)GLM_ROWTILE_DEFAULT;
+        if (cached == 1) cached = 0;      /* R=1 is the direct kernel */
+        if (!cached) {
+            fprintf(stderr, "ds4: Metal GLM indexer ROWTILE DISABLED by env\n");
+        } else if (cached != (int)GLM_ROWTILE_DEFAULT) {
+            fprintf(stderr, "ds4: Metal GLM indexer ROWTILE%d (non-default)\n", cached);
+        }
+    }
+    return (uint32_t)cached;
+}
+
 static uint32_t glm_indexer_score_rows_per_tg(uint32_t n_rows) {
     const uint32_t want = glm_indexer_score_vpt_configured();
     if (want <= 1u) return 1u;
@@ -39408,11 +39446,22 @@ int ds4_gpu_glm_indexer_score_one_base_tensor(
                                      "kernel_glm_indexer_score_one_direct");
             if (!direct_pipeline) return 0;
 
-            const uint32_t rows_per_tg = glm_indexer_score_rows_per_tg(n_rows);
+            const uint32_t rowtile = glm_indexer_score_rowtile();
+            const uint32_t rows_per_tg = rowtile ? rowtile
+                                                 : glm_indexer_score_rows_per_tg(n_rows);
             id<MTLComputePipelineState> use_pipeline = direct_pipeline;
             NSUInteger tg_count = (NSUInteger)n_rows;
             NSUInteger tg_mem = (128u + 4u) * sizeof(float);
-            if (rows_per_tg > 1u) {
+            if (rowtile > 1u) {
+                id<MTLComputePipelineState> rt_pipeline =
+                    ds4_gpu_get_pipeline("kernel_glm_indexer_score_one_rowtile");
+                if (rt_pipeline) {
+                    args.rows_per_tg = rowtile;
+                    use_pipeline = rt_pipeline;
+                    tg_count = (NSUInteger)((n_rows + rowtile - 1u) / rowtile);
+                    tg_mem = (NSUInteger)rowtile * (128u + 32u) * sizeof(float);
+                }
+            } else if (rows_per_tg > 1u) {
                 id<MTLComputePipelineState> vpt_pipeline =
                     ds4_gpu_hot_pipeline(g_glm_indexer_score_one_vpt_pipeline,
                                          "kernel_glm_indexer_score_one_vpt");
