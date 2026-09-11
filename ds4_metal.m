@@ -3774,6 +3774,22 @@ static int ds4_gpu_device_name_contains(const char *needle) {
     return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
 }
 
+/* IDXPORT-KREG measurement knob, default OFF.  Hoists the GLM prefill scorer's
+ * K tiles into registers across the 32-head loop.
+ *
+ * ktg is staged once and never rewritten, so the shipped kernel re-issues the
+ * same 16 simdgroup_loads on every head -- 496 redundant threadgroup reads per
+ * threadgroup. Byte-identical: same matrices, same mma order. */
+static int ds4_gpu_idxport_kreg(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_METAL_IDXPORT_KREG");
+        cached = (e && e[0] == '1') ? 1 : 0;
+        if (cached) fprintf(stderr, "ds4: Metal IDXPORT KREG ENGAGED\n");
+    }
+    return cached;
+}
+
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
            g_metal_device_name[7] >= '1' &&
@@ -39435,10 +39451,12 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
                                n_head == 32u && head_dim == 128u;
         id<MTLComputePipelineState> pipeline =
             use_tiled
-                ? ds4_gpu_hot_pipeline(use_tiled_f32 ? g_glm_indexer_scores_tiled_f32_pipeline
-                                                     : g_glm_indexer_scores_tiled_pipeline,
-                                       use_tiled_f32 ? "kernel_glm_indexer_scores_tiled_f32"
-                                                     : "kernel_glm_indexer_scores_tiled")
+                ? ((!use_tiled_f32 && ds4_gpu_idxport_kreg())
+                   ? ds4_gpu_get_pipeline("kernel_glm_indexer_scores_tiled_kreg")
+                   : ds4_gpu_hot_pipeline(use_tiled_f32 ? g_glm_indexer_scores_tiled_f32_pipeline
+                                                        : g_glm_indexer_scores_tiled_pipeline,
+                                          use_tiled_f32 ? "kernel_glm_indexer_scores_tiled_f32"
+                                                        : "kernel_glm_indexer_scores_tiled"))
                 : ds4_gpu_hot_pipeline(g_glm_indexer_scores_batch_pipeline,
                                        "kernel_glm_indexer_scores_batch");
         if (!pipeline) return 0;

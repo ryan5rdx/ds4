@@ -2311,17 +2311,32 @@ kernel void kernel_glm_indexer_scores_tiled_f32(
     }
 }
 
-kernel void kernel_glm_indexer_scores_tiled(
+/* GLM prefill scorer.  KREG hoists the K matrices into registers across the
+ * head loop.
+ *
+ * ktg is staged ONCE before the loop and never written again, yet every one of
+ * the 32 heads re-issues the same 16 simdgroup_loads against it -- 496
+ * redundant threadgroup reads per threadgroup. The 16 matrices cost 2 halves
+ * per lane each, 32 halves per lane in total, which is cheap to hold.
+ *
+ * Q staging is NOT redundant and is deliberately left alone: each head reads a
+ * different slice (head * q_head_stride), so "pack Q once" would need a device
+ * f16 prepass, not a loop hoist.
+ *
+ * Byte-identical by construction: same matrices, same mma order, same
+ * accumulation -- only WHEN the K tiles are fetched changes. */
+template<bool KREG>
+static inline void glm_indexer_scores_tiled_kreg_impl(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,
         device const char *weights,
         device const char *indexer_key_cache,
         device char *scores,
-        threadgroup float *shared [[threadgroup(0)]],
-        uint2  tgpig [[threadgroup_position_in_grid]],
-        ushort tid   [[thread_index_in_threadgroup]],
-        ushort lane  [[thread_index_in_simdgroup]],
-        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+        threadgroup float *shared,
+        uint2  tgpig,
+        ushort tid,
+        ushort lane,
+        ushort sg) {
     constexpr uint TM = 8;
     constexpr uint TN = 32;
     constexpr uint TS = 8;
@@ -2384,6 +2399,15 @@ kernel void kernel_glm_indexer_scores_tiled(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    /* ktg is complete and immutable from here, so the K tiles can be fetched
+     * once instead of once per head. */
+    simdgroup_half8x8 mk_reg[D/TS];
+    if (KREG) {
+        FOR_UNROLL (uint db = 0; db < D/TS; db++) {
+            simdgroup_load(mk_reg[db], ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+        }
+    }
+
     for (uint head = 0; head < args.n_head; head++) {
         for (uint i = tid; i < TM*D; i += 128) {
             const uint tr = i / D;
@@ -2402,12 +2426,16 @@ kernel void kernel_glm_indexer_scores_tiled(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         simdgroup_float8x8 mdot = make_filled_simdgroup_matrix<float, 8>(0.0f);
-        for (uint db = 0; db < D/TS; db++) {
+        FOR_UNROLL (uint db = 0; db < D/TS; db++) {
             simdgroup_half8x8 mq;
-            simdgroup_half8x8 mk;
             simdgroup_load(mq, qtg + db*TS, D, 0, false);
-            simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
-            simdgroup_multiply_accumulate(mdot, mq, mk, mdot);
+            if (KREG) {
+                simdgroup_multiply_accumulate(mdot, mq, mk_reg[db], mdot);
+            } else {
+                simdgroup_half8x8 mk;
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+                simdgroup_multiply_accumulate(mdot, mq, mk, mdot);
+            }
         }
 
         simdgroup_store(mdot, dot + (uint)sg * TS, TN, 0, false);
@@ -2442,6 +2470,38 @@ kernel void kernel_glm_indexer_scores_tiled(
             (uint64_t)token1 * args.score_token_stride) + row1;
         *dst = row1 < visible ? acc1 : -INFINITY;
     }
+}
+
+
+kernel void kernel_glm_indexer_scores_tiled(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    glm_indexer_scores_tiled_kreg_impl<false>(args, q, weights, indexer_key_cache,
+                                              scores, shared, tgpig, tid, lane, sg);
+}
+
+/* IDXPORT KREG: K tiles hoisted into registers across the 32-head loop. */
+kernel void kernel_glm_indexer_scores_tiled_kreg(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    glm_indexer_scores_tiled_kreg_impl<true>(args, q, weights, indexer_key_cache,
+                                             scores, shared, tgpig, tid, lane, sg);
 }
 
 kernel void kernel_glm_qk_lowrank_q8_0(
