@@ -72,6 +72,166 @@ static float bf16_to_f32(uint16_t value) {
     return bits.f;
 }
 
+/* IEEE-754 binary16 encode, normals only. Callers below keep magnitudes in
+ * [0.5, 1.0), so the subnormal and overflow edges are unreachable. */
+static uint16_t f32_to_f16_normal(float value) {
+    union { float f; uint32_t u; } bits = { .f = value };
+    const uint32_t sign = (bits.u >> 16) & 0x8000u;
+    const int32_t exp = (int32_t)((bits.u >> 23) & 0xffu) - 127 + 15;
+    const uint32_t mant = bits.u & 0x7fffffu;
+    require_ok(exp > 0 && exp < 0x1f, "binary16 encode input is a normal");
+    const uint32_t dropped = mant & 0x1fffu;
+    uint16_t out = (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+    /* round-to-nearest-even; a mantissa carry propagates into the exponent */
+    if (dropped > 0x1000u || (dropped == 0x1000u && (out & 1u))) out++;
+    return out;
+}
+
+/* The tiled kernel stages Q and the key cache into threadgroup `half` before
+ * the simdgroup matmul, so every input below is placed on a grid that binary16
+ * represents exactly: m/8192 for |m| <= 1000 needs 10 significant bits. The
+ * reference can then be checked tightly instead of against an f16 error bar,
+ * and a mismatch means the kernel rather than rounding. Signs are mixed, which
+ * matters -- see the ReLU in the reference. */
+static float tiled_scorer_q(uint32_t token, uint32_t head, uint32_t dim) {
+    uint32_t x = token * 2654435761u ^ head * 2246822519u ^ dim * 3266489917u;
+    x ^= x >> 15; x *= 2246822519u; x ^= x >> 13;
+    return (float)((int32_t)(x % 2001u) - 1000) / 8192.0f; /* (-0.13, 0.13) */
+}
+
+static float tiled_scorer_weight(uint32_t token, uint32_t head) {
+    uint32_t x = token * 374761393u ^ head * 668265263u;
+    x ^= x >> 13; x *= 1274126177u; x ^= x >> 16;
+    return (float)((int32_t)(x % 1001u) - 500) / 1024.0f;  /* (-0.49, 0.49) */
+}
+
+/* A 1/128 grid in [0.5, 1.0), exact in binary16 (resolution there is 1/2048),
+ * so the f16 and f32 cache arms share one reference. */
+static float tiled_scorer_cache(uint32_t row, uint32_t dim) {
+    uint32_t x = row * 2246822519u ^ dim * 2654435761u;
+    x ^= x >> 15; x *= 3266489917u; x ^= x >> 13;
+    const float magnitude = 0.5f + (float)(x % 64u) / 128.0f;
+    return (x & 0x10000u) ? -magnitude : magnitude;
+}
+
+/* The tiled indexer scorer is gated on `n_tokens >= 8 && n_head == 32 &&
+ * head_dim == 128` (ds4_metal.m). The grouped case in main() runs 5 tokens and
+ * 2 heads, so it only ever reaches the scalar batch kernel -- leaving the
+ * tiled kernel, and the DS4_METAL_IDXPORT=unroll|kreg variants selected inside
+ * that same branch, with no numeric coverage. This covers the production
+ * shape.
+ *
+ * An exhaustive check is O(rows * tokens * 32 * 128), which is ~1.7e10
+ * multiply-accumulates at the 4096-token decision shape, so large shapes
+ * verify values on a stride sample. The causal mask is checked in full
+ * regardless, since that costs nothing. */
+static void check_tiled_indexer_scores(uint32_t rows, uint32_t tokens,
+                                       uint32_t pos0, bool cache_f16,
+                                       uint32_t token_stride,
+                                       uint32_t row_stride) {
+    enum { TH = 32, TD = 128, TPOOL = 4 };
+    const float scale = 0.0884f;
+
+    require_ok((uint64_t)(pos0 + tokens) / TPOOL <= rows,
+               "tiled scorer shape is representable");
+
+    float *q = malloc((size_t)tokens * TH * TD * sizeof(float));
+    float *weights = malloc((size_t)tokens * TH * sizeof(float));
+    float *cache = malloc((size_t)rows * TD * sizeof(float));
+    uint16_t *cache_h = malloc((size_t)rows * TD * sizeof(uint16_t));
+    float *out = malloc((size_t)rows * tokens * sizeof(float));
+    require_ok(q && weights && cache && cache_h && out,
+               "tiled scorer host allocation");
+
+    for (uint32_t t = 0; t < tokens; t++) {
+        for (uint32_t h = 0; h < TH; h++) {
+            weights[t * TH + h] = tiled_scorer_weight(t, h);
+            for (uint32_t d = 0; d < TD; d++) {
+                q[((uint64_t)t * TH + h) * TD + d] = tiled_scorer_q(t, h, d);
+            }
+        }
+    }
+    for (uint32_t r = 0; r < rows; r++) {
+        for (uint32_t d = 0; d < TD; d++) {
+            const float v = tiled_scorer_cache(r, d);
+            cache[r * TD + d] = v;
+            cache_h[r * TD + d] = f32_to_f16_normal(v);
+        }
+    }
+
+    const size_t cache_bytes =
+        (size_t)rows * TD * (cache_f16 ? sizeof(uint16_t) : sizeof(float));
+    ds4_gpu_tensor *q_gpu =
+        ds4_gpu_tensor_alloc((uint64_t)tokens * TH * TD * sizeof(float));
+    ds4_gpu_tensor *weights_gpu =
+        ds4_gpu_tensor_alloc((uint64_t)tokens * TH * sizeof(float));
+    ds4_gpu_tensor *cache_gpu = ds4_gpu_tensor_alloc(cache_bytes);
+    ds4_gpu_tensor *out_gpu =
+        ds4_gpu_tensor_alloc((uint64_t)rows * tokens * sizeof(float));
+    require_ok(q_gpu && weights_gpu && cache_gpu && out_gpu,
+               "tiled scorer tensor allocation");
+    require_ok(ds4_gpu_tensor_write(q_gpu, 0, q,
+                                    (size_t)tokens * TH * TD * sizeof(float)),
+               "tiled scorer Q write");
+    require_ok(ds4_gpu_tensor_write(weights_gpu, 0, weights,
+                                    (size_t)tokens * TH * sizeof(float)),
+               "tiled scorer weights write");
+    require_ok(ds4_gpu_tensor_write(cache_gpu, 0,
+                                    cache_f16 ? (const void *)cache_h
+                                              : (const void *)cache,
+                                    cache_bytes),
+               "tiled scorer cache write");
+    require_ok(ds4_gpu_glm53_indexer_scores_batch_tensor(
+                   out_gpu, q_gpu, weights_gpu, cache_gpu, rows, tokens, pos0,
+                   TPOOL, TH, TD, scale, cache_f16),
+               "tiled indexer scores");
+    require_ok(ds4_gpu_tensor_read(out_gpu, 0, out,
+                                   (size_t)rows * tokens * sizeof(float)),
+               "tiled scorer output read");
+
+    uint64_t checked = 0;
+    for (uint32_t t = 0; t < tokens; t++) {
+        const uint32_t visible = (pos0 + t + 1u) / TPOOL;
+        for (uint32_t r = 0; r < rows; r++) {
+            const float actual = out[(uint64_t)t * rows + r];
+            if (r >= visible) {
+                if (!isinf(actual) || actual >= 0.0f) {
+                    fprintf(stderr,
+                            "tiled scorer row %u token %u should be hidden, "
+                            "got %.9g\n", r, t, actual);
+                    exit(1);
+                }
+                continue;
+            }
+            if (t % token_stride != 0u || r % row_stride != 0u) continue;
+            /* Both the tiled and the scalar kernel rectify each head's scaled
+             * dot before weighting: sum_h max(scale*dot, 0) * w[h]. The 5-token
+             * case above builds Q and the cache entirely from positive values,
+             * so every dot is positive there and the ReLU is invisible to it. */
+            float expected = 0.0f;
+            for (uint32_t h = 0; h < TH; h++) {
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < TD; d++) {
+                    dot += q[((uint64_t)t * TH + h) * TD + d] * cache[r * TD + d];
+                }
+                expected += fmaxf(dot * scale, 0.0f) * weights[t * TH + h];
+            }
+            require_close("GLM-5.3 tiled indexer score", actual, expected,
+                          2e-5f);
+            checked++;
+        }
+    }
+    /* A stride that lands only on masked cells would make this case pass
+     * without comparing anything. */
+    require_ok(checked > 0, "tiled scorer compared at least one visible score");
+
+    ds4_gpu_tensor_free(out_gpu);
+    ds4_gpu_tensor_free(cache_gpu);
+    ds4_gpu_tensor_free(weights_gpu);
+    ds4_gpu_tensor_free(q_gpu);
+    free(out); free(cache_h); free(cache); free(weights); free(q);
+}
+
 int main(void) {
     enum {
         D = 128,
@@ -755,11 +915,16 @@ int main(void) {
         for (uint32_t h = 0; h < HEADS; h++) {
             score_weights[t * HEADS + h] =
                 0.25f + 0.1f * (float)t - 0.05f * (float)h;
+            /* Odd heads are negated so their dot lands below zero. The scorer
+             * rectifies each head before weighting; with the all-positive Q
+             * this case used to build, every dot was positive and the ReLU was
+             * indistinguishable from its absence. */
+            const float head_sign = (h & 1u) ? -1.0f : 1.0f;
             for (uint32_t d = 0; d < D; d++) {
-                score_q[((uint64_t)t * HEADS + h) * D + d] =
-                    0.01f * (float)(t + 1u) +
-                    0.02f * (float)h +
-                    0.0001f * (float)d;
+                score_q[((uint64_t)t * HEADS + h) * D + d] = head_sign *
+                    (0.01f * (float)(t + 1u) +
+                     0.02f * (float)h +
+                     0.0001f * (float)d);
             }
         }
     }
@@ -814,16 +979,26 @@ int main(void) {
                     dot += score_q[((uint64_t)t * HEADS + h) * D + d] *
                            score_cache[row * D + d];
                 }
-                expected_score += score_weights[t * HEADS + h] * dot;
+                expected_score += fmaxf(dot * score_scale, 0.0f) *
+                                  score_weights[t * HEADS + h];
             }
             require_close("GLM-5.3 grouped indexer score", actual_score,
-                          expected_score * score_scale, 2e-5f);
+                          expected_score, 2e-5f);
         }
     }
     ds4_gpu_tensor_free(scores_gpu);
     ds4_gpu_tensor_free(score_cache_gpu);
     ds4_gpu_tensor_free(score_weights_gpu);
     ds4_gpu_tensor_free(score_q_gpu);
+
+    /* Tiled scorer at the production shape. The case above runs 5 tokens and 2
+     * heads and so never crosses the tiled gate. Under DS4_METAL_IDXPORT the
+     * mode is read once per process, so covering all three arms means running
+     * this binary three times -- see harness-idxport.sh. */
+    check_tiled_indexer_scores(3, 8, 0, true, 1, 1);       /* gate boundary */
+    check_tiled_indexer_scores(5, 12, 6, true, 1, 1);      /* pos0 > 0, masked */
+    check_tiled_indexer_scores(5, 12, 6, false, 1, 1);     /* f32 cache arm */
+    check_tiled_indexer_scores(1024, 4096, 0, true, 149, 37); /* decision shape */
 
     enum { SELECTED_POOLS = 512, INDEX_TOPK = 2048, SELECT_ROWS = 5,
            SELECT_WIDTH = 2051 };
