@@ -3774,6 +3774,45 @@ static int ds4_gpu_device_name_contains(const char *needle) {
     return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
 }
 
+/* SPEC -- routed-MoE decode pair+down compile-time specialization. DEFAULT ON.
+ *
+ * Confirmed +1.97% decode @131k over two serpentine reps (DMM2) after +1.90%
+ * on an independent run (DMM1), bit-identical both times. Supersedes DOWN-NSG4
+ * (+1.04%, DN3): more gain and no change to the down kernel's dispatch
+ * geometry, which is where the DN1 defect lived. The compose with DOWN-NSG4
+ * was measured twice and adds nothing (DMM1 +1.81, DMM2 +1.70).
+ *
+ * Bit-identical, so it ships on a cmp with no quality gate.
+ *
+ * Individually reversible per the banked-wins rule: DS4_METAL_DISABLE_DECMOE_SPEC=1.
+ * A CONTROL ARM MUST SET THAT EXPLICITLY -- on this branch an omitted knob is
+ * ON, and the campaign has lost three probes to exactly that. */
+static int ds4_gpu_decmoe_spec_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_METAL_DISABLE_DECMOE_SPEC") == NULL ? 1 : 0;
+        if (!cached) {
+            fprintf(stderr, "ds4: Metal DECMOE SPEC DISABLED by env\n");
+        }
+    }
+    return cached;
+}
+
+/* SPEC compiles the dims in and the kernel cannot check them, so bind it only
+ * at the geometry it was compiled for. */
+static int ds4_gpu_decmoe_spec_ok(uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim) {
+    if (!ds4_gpu_decmoe_spec_enabled()) return 0;
+    if (in_dim == 4096u && mid_dim == 2048u && out_dim == 4096u) return 1;
+    static int warned = 0;
+    if (!warned++) {
+        fprintf(stderr,
+                "ds4: DECMOE SPEC not bound -- geometry %ux%ux%u is not the "
+                "compiled-in 4096x2048x4096; using the generic kernels.\n",
+                in_dim, mid_dim, out_dim);
+    }
+    return 0;
+}
+
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
            g_metal_device_name[7] >= '1' &&
@@ -41932,6 +41971,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                                              : (expert_mid_dim + 1u) / 2u));
             }
         }
+        const int dm_spec_ok =
+            ds4_gpu_decmoe_spec_ok(expert_in_dim, expert_mid_dim, out_dim);
         id<MTLComputePipelineState> pair_pipeline =
             (use_stream_split_deferred ?
              (gate_pair_q2 ?
@@ -41963,8 +42004,10 @@ int ds4_gpu_glm_routed_moe_one_tensor(
               * core:bandwidth ratio, so discount the M1 Max delta rather than
               * scaling it up. */
              (use_pair4 ?
-              ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
-                                   "kernel_glm_q4_K_pair_swiglu4_f32") :
+              (dm_spec_ok
+              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu4_f32_spec")
+              : ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
+                                     "kernel_glm_q4_K_pair_swiglu4_f32")) :
               ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
                                    "kernel_glm_q4_K_pair_swiglu2_f32")));
         id<MTLComputePipelineState> down_pipeline =
@@ -41978,8 +42021,10 @@ int ds4_gpu_glm_routed_moe_one_tensor(
              ds4_gpu_hot_pipeline(g_glm_q2_k_down_f32_pipeline,
                                   "kernel_glm_q2_K_down_f32") :
              down_scalar_q4 ?
-             ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
-                                  "kernel_glm_q4_K_down_f32") :
+             (dm_spec_ok
+              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_f32_spec")
+              : ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
+                                     "kernel_glm_q4_K_down_f32")) :
              down_simd_q5 ?
              ds4_gpu_hot_pipeline(g_glm_q5_k_down_f32_pipeline,
                                   "kernel_glm_q5_K_down_f32") :
@@ -43149,6 +43194,8 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             !use_stream_expert_addr_table &&
             !gate_pair_q5 && !q4_scalar_pair &&
             (force_scalar_q4_pair || !enable_q4_pair4);
+        const int dm_spec_ok =
+            ds4_gpu_decmoe_spec_ok(expert_in_dim, expert_mid_dim, out_dim);
         id<MTLComputePipelineState> pair_pipeline =
             use_stream_expert_addr_table ?
              (gate_pair_q2 ?
@@ -43168,8 +43215,10 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
              q4_pair2 ?
               ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
                                    "kernel_glm_q4_K_pair_swiglu2_f32") :
-              ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
-                                   "kernel_glm_q4_K_pair_swiglu4_f32"));
+              (dm_spec_ok
+              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu4_f32_spec")
+              : ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
+                                     "kernel_glm_q4_K_pair_swiglu4_f32")));
         id<MTLComputePipelineState> down_pipeline =
             use_stream_expert_addr_table ?
              (down_scalar_q2 ?
@@ -43181,8 +43230,10 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
             ds4_gpu_hot_pipeline(g_glm_q2_k_down_f32_pipeline,
                                  "kernel_glm_q2_K_down_f32") :
             down_scalar_q4 ?
-            ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
-                                 "kernel_glm_q4_K_down_f32") :
+            (dm_spec_ok
+              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_f32_spec")
+              : ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
+                                     "kernel_glm_q4_K_down_f32")) :
             down_simd_q5 ?
             ds4_gpu_hot_pipeline(g_glm_q5_k_down_f32_pipeline,
                                  "kernel_glm_q5_K_down_f32") :
@@ -47857,7 +47908,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                                                        use_tp_mxfp4_static_batch ? 1 : 2,
                                                        false);
         } else if (use_tiny_pair_mv) {
-            id<MTLComputePipelineState> pair_pipeline =
+            const int dm_spec_ok =
+            ds4_gpu_decmoe_spec_ok(expert_in_dim, expert_mid_dim, out_dim);
+        id<MTLComputePipelineState> pair_pipeline =
                 gate_type == DS4_METAL_TENSOR_IQ2_XXS ?
                     g_moe_mul_mv_id_iq2_xxs_pair_pipeline :
                     g_moe_mul_mv_id_q4_k_pair_pipeline;
