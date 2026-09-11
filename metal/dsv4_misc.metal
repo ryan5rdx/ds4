@@ -2311,17 +2311,42 @@ kernel void kernel_glm_indexer_scores_tiled_f32(
     }
 }
 
-kernel void kernel_glm_indexer_scores_tiled(
+/* GLM prefill scorer.
+ *
+ *   IDX_KREG      shipped: depth loop unrolled, K tiles held in registers
+ *   IDX_ORIGINAL  the pre-2026-09-10 loop, kept only so the win is reversible
+ *
+ * ktg is staged once before the 32-head loop and never rewritten, yet the
+ * original re-issued the same 16 simdgroup_loads on every head -- 496 redundant
+ * threadgroup reads per threadgroup. Hoisting them into 16 simdgroup_half8x8
+ * (32 halves per lane, held across the loop) beats the register pressure:
+ * IDX1 measured **+2.73% prefill end-to-end @131k**, above its own +1.90%
+ * upper-bound forecast.
+ *
+ * A third arm, unrolling the depth loop without hoisting, measured +1.16% and
+ * is subsumed -- KREG unrolls too. It is not kept.
+ *
+ * Both are byte-identical: same matrices, same mma order.
+ *
+ * The first version of this experiment forced FOR_UNROLL in BOTH arms, so its
+ * control already carried an optimisation the parent does not; that A/B
+ * measured KREG against unroll and credited the unroll's gain to KREG. Hence
+ * IDX_ORIGINAL is the shipped loop byte for byte, not a near-miss of it. */
+#define IDX_ORIGINAL 0
+#define IDX_KREG     1
+
+template<int MODE>
+static inline void glm_indexer_scores_tiled_mode_impl(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,
         device const char *weights,
         device const char *indexer_key_cache,
         device char *scores,
-        threadgroup float *shared [[threadgroup(0)]],
-        uint2  tgpig [[threadgroup_position_in_grid]],
-        ushort tid   [[thread_index_in_threadgroup]],
-        ushort lane  [[thread_index_in_simdgroup]],
-        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+        threadgroup float *shared,
+        uint2  tgpig,
+        ushort tid,
+        ushort lane,
+        ushort sg) {
     constexpr uint TM = 8;
     constexpr uint TN = 32;
     constexpr uint TS = 8;
@@ -2384,6 +2409,13 @@ kernel void kernel_glm_indexer_scores_tiled(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    simdgroup_half8x8 mk_reg[D/TS];
+    if (MODE == IDX_KREG) {
+        FOR_UNROLL (uint db = 0; db < D/TS; db++) {
+            simdgroup_load(mk_reg[db], ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+        }
+    }
+
     for (uint head = 0; head < args.n_head; head++) {
         for (uint i = tid; i < TM*D; i += 128) {
             const uint tr = i / D;
@@ -2402,12 +2434,21 @@ kernel void kernel_glm_indexer_scores_tiled(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         simdgroup_float8x8 mdot = make_filled_simdgroup_matrix<float, 8>(0.0f);
-        for (uint db = 0; db < D/TS; db++) {
-            simdgroup_half8x8 mq;
-            simdgroup_half8x8 mk;
-            simdgroup_load(mq, qtg + db*TS, D, 0, false);
-            simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
-            simdgroup_multiply_accumulate(mdot, mq, mk, mdot);
+        if (MODE == IDX_ORIGINAL) {
+            /* the pre-bank loop, unchanged */
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mq;
+                simdgroup_half8x8 mk;
+                simdgroup_load(mq, qtg + db*TS, D, 0, false);
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+                simdgroup_multiply_accumulate(mdot, mq, mk, mdot);
+            }
+        } else {
+            FOR_UNROLL (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mq;
+                simdgroup_load(mq, qtg + db*TS, D, 0, false);
+                simdgroup_multiply_accumulate(mdot, mq, mk_reg[db], mdot);
+            }
         }
 
         simdgroup_store(mdot, dot + (uint)sg * TS, TN, 0, false);
@@ -2442,6 +2483,37 @@ kernel void kernel_glm_indexer_scores_tiled(
             (uint64_t)token1 * args.score_token_stride) + row1;
         *dst = row1 < visible ? acc1 : -INFINITY;
     }
+}
+
+kernel void kernel_glm_indexer_scores_tiled(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    glm_indexer_scores_tiled_mode_impl<IDX_KREG>(args, q, weights, indexer_key_cache,
+                                           scores, shared, tgpig, tid, lane, sg);
+}
+
+/* Reversibility only: DS4_METAL_IDXPORT=original restores the pre-bank loop. */
+kernel void kernel_glm_indexer_scores_tiled_original(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    glm_indexer_scores_tiled_mode_impl<IDX_ORIGINAL>(args, q, weights, indexer_key_cache,
+                                           scores, shared, tgpig, tid, lane, sg);
 }
 
 kernel void kernel_glm_qk_lowrank_q8_0(
