@@ -382,6 +382,12 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         uint32_t prefill_chunk,
         bool ssd_streaming);
 bool ds4_log_is_tty(FILE *fp);
+
+/* TOP1 eligibility census (Phase A). Counters only; enabled by DS4_TOP1_CENSUS.
+ * request_greedy: 1 request-wide greedy, 0 temporary/forced, -1 unknown. */
+void ds4_top1_census_sample(float temperature, int top_k, int request_greedy);
+void ds4_top1_census_full_read(int which);   /* 0 copy_logits, 1 logprobs, 2 persist */
+void ds4_top1_census_mode(int request_greedy);
 void ds4_log(FILE *fp, ds4_log_type type, const char *fmt, ...);
 int ds4_engine_generate_argmax(ds4_engine *e, const ds4_tokens *prompt,
                                int n_predict, int ctx_size,

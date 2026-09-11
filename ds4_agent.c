@@ -9524,6 +9524,9 @@ static bool agent_stream_wants_greedy_sampling(const agent_stream_renderer *sr) 
 
 static int worker_sample_with_mode(agent_worker *w, const agent_config *cfg,
                                    bool greedy, uint64_t *rng) {
+    /* Distinguish a request that asked for greedy from one forced into it for
+     * tool syntax; the callee only sees the substituted temperature. */
+    if (greedy) ds4_top1_census_mode(cfg->gen.temperature <= 0.0f ? 1 : 0);
     return ds4_session_sample(w->session,
                               greedy ? 0.0f : cfg->gen.temperature,
                               0,

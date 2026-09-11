@@ -61808,6 +61808,7 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
 }
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    ds4_top1_census_full_read(2);
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -74210,6 +74211,162 @@ int ds4_session_argmax_ignoring_eos(ds4_session *s,
     return best;
 }
 
+
+/* =========================================================================
+ * TOP1 eligibility census -- Phase A of distributed greedy argmax.
+ * =========================================================================
+ *
+ * COUNTERS ONLY. Nothing here changes what is sampled, sent, or saved.
+ *
+ * The question this exists to answer is whether shipping {value, id} instead
+ * of a 310 KiB logits half is worth building at all. The realistic transport
+ * ceiling is ~0.15 ms/token, not the full 0.394-0.405 ms recv: only 0.15-0.18
+ * of that is payload and the rest is waiting for the peer to arrive, which
+ * eight bytes cannot remove. That ceiling then gets multiplied by the share of
+ * tokens that could actually have been top-1-only -- and server defaults are
+ * temperature 1 with min-p 0.05, so if explicit greedy use is rare the weighted
+ * value falls below 0.05 ms/token and the project is not worth its risk.
+ *
+ * Eligibility is decided per sampling event and can be revoked retroactively:
+ * a full-vector reader (logprobs, copy_logits, save) may run AFTER the sample
+ * that produced the logits it reads, so a step is only eligible once the next
+ * sample closes it with no full read having intervened.
+ *
+ * Effective greedy is exactly `temperature <= 0.0f` -- sample_top_p_min_p
+ * short-circuits to sample_argmax there and ignores top_k/top_p/min_p, so no
+ * other parameter can make a step greedy or stop it being greedy. top_k == 1
+ * is deterministic too but takes the sorted path; it is counted separately
+ * rather than folded in, because it is a different code path.
+ */
+typedef struct {
+    uint64_t samples;              /* sampling events seen */
+    uint64_t greedy;               /* temperature <= 0 */
+    uint64_t greedy_requestwide;   /* the request itself asked for greedy */
+    uint64_t greedy_temporary;     /* forced greedy inside a sampled request */
+    uint64_t topk1;                /* deterministic but not via the temp<=0 path */
+    uint64_t eligible;             /* greedy AND no full-vector read that step */
+    uint64_t revoked_by_full_read; /* greedy but a full reader intervened */
+    uint64_t not_greedy;
+    uint64_t read_copy_logits;
+    uint64_t read_top_logprobs;
+    uint64_t read_persist;
+    uint64_t persist_ops;          /* full-logit snapshot/save operations */
+    uint64_t greedy_to_sampled;    /* tool-syntax greedy handing back to sampling */
+    uint64_t run_cur;              /* consecutive eligible steps */
+    uint64_t run_max;
+    int      step_open;            /* a sample is awaiting close-out */
+    int      step_greedy;
+    int      step_full_read;
+    int      last_was_greedy;
+} ds4_top1_census;
+
+static ds4_top1_census g_top1;
+static pthread_mutex_t g_top1_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_top1_enabled = -1;
+
+static int ds4_top1_census_on(void) {
+    if (g_top1_enabled < 0) {
+        g_top1_enabled = getenv("DS4_TOP1_CENSUS") != NULL;
+    }
+    return g_top1_enabled;
+}
+
+/* Close the previous step now that we know nothing else read its logits. */
+static void ds4_top1_close_step_locked(void) {
+    if (!g_top1.step_open) return;
+    if (g_top1.step_greedy && !g_top1.step_full_read) {
+        g_top1.eligible++;
+        if (++g_top1.run_cur > g_top1.run_max) g_top1.run_max = g_top1.run_cur;
+    } else {
+        if (g_top1.step_greedy) g_top1.revoked_by_full_read++;
+        g_top1.run_cur = 0;
+    }
+    g_top1.step_open = 0;
+}
+
+static void ds4_top1_census_report(void);
+
+void ds4_top1_census_sample(float temperature, int top_k, int request_greedy) {
+    if (!ds4_top1_census_on()) return;
+    pthread_mutex_lock(&g_top1_lock);
+    if (!g_top1.samples) atexit(ds4_top1_census_report);
+    ds4_top1_close_step_locked();
+    const int greedy = temperature <= 0.0f;
+    g_top1.samples++;
+    if (greedy) {
+        g_top1.greedy++;
+        (void)request_greedy;   /* attributed via ds4_top1_census_mode */
+    } else {
+        g_top1.not_greedy++;
+        if (top_k == 1) g_top1.topk1++;
+        if (g_top1.last_was_greedy) g_top1.greedy_to_sampled++;
+    }
+    g_top1.last_was_greedy = greedy;
+    g_top1.step_open = 1;
+    g_top1.step_greedy = greedy;
+    g_top1.step_full_read = 0;
+    pthread_mutex_unlock(&g_top1_lock);
+}
+
+/* Attribution only. ds4_session_sample sees the temperature AFTER a forced
+ * greedy has substituted 0.0f, so it cannot tell a request that asked for
+ * greedy from one that was pushed into it for tool syntax. The agent knows,
+ * and reports it here without touching the sample or eligibility tallies --
+ * these are an independent breakdown of the same events, not extra ones. */
+void ds4_top1_census_mode(int request_greedy) {
+    if (!ds4_top1_census_on()) return;
+    pthread_mutex_lock(&g_top1_lock);
+    if (request_greedy > 0) g_top1.greedy_requestwide++;
+    else                    g_top1.greedy_temporary++;
+    pthread_mutex_unlock(&g_top1_lock);
+}
+
+/* Any consumer that needs the whole vector revokes the current step. */
+void ds4_top1_census_full_read(int which) {
+    if (!ds4_top1_census_on()) return;
+    pthread_mutex_lock(&g_top1_lock);
+    switch (which) {
+        case 0: g_top1.read_copy_logits++;  break;
+        case 1: g_top1.read_top_logprobs++; break;
+        default: g_top1.read_persist++; g_top1.persist_ops++; break;
+    }
+    g_top1.step_full_read = 1;
+    pthread_mutex_unlock(&g_top1_lock);
+}
+
+static void ds4_top1_census_report(void) {
+    if (!ds4_top1_census_on()) return;
+    pthread_mutex_lock(&g_top1_lock);
+    ds4_top1_close_step_locked();
+    const uint64_t n = g_top1.samples;
+    if (n == 0) { pthread_mutex_unlock(&g_top1_lock); return; }
+    const double pct = 100.0 * (double)g_top1.eligible / (double)n;
+    fprintf(stderr,
+        "ds4: TOP1 census: %llu samples, %llu eligible (%.1f%%), longest run %llu\n"
+        "ds4:   greedy %llu (agent path: request-wide %llu, temporary %llu),"
+        " not greedy %llu"
+        " (top_k==1 %llu)\n"
+        "ds4:   revoked by a full read %llu; reads: copy_logits %llu,"
+        " top_logprobs %llu, persist %llu\n"
+        "ds4:   full-logit save operations %llu; greedy->sampled transitions %llu\n"
+        "ds4:   KILL GATE: below ~50%% eligible this is not worth building"
+        " unless the deployment runs temperature 0 explicitly.\n",
+        (unsigned long long)n, (unsigned long long)g_top1.eligible, pct,
+        (unsigned long long)g_top1.run_max,
+        (unsigned long long)g_top1.greedy,
+        (unsigned long long)g_top1.greedy_requestwide,
+        (unsigned long long)g_top1.greedy_temporary,
+        (unsigned long long)g_top1.not_greedy,
+        (unsigned long long)g_top1.topk1,
+        (unsigned long long)g_top1.revoked_by_full_read,
+        (unsigned long long)g_top1.read_copy_logits,
+        (unsigned long long)g_top1.read_top_logprobs,
+        (unsigned long long)g_top1.read_persist,
+        (unsigned long long)g_top1.persist_ops,
+        (unsigned long long)g_top1.greedy_to_sampled);
+    pthread_mutex_unlock(&g_top1_lock);
+}
+
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!logits || n_vocab <= 0) return 0;
@@ -74222,12 +74379,14 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 }
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    ds4_top1_census_sample(temperature, top_k, -1);
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
+    ds4_top1_census_full_read(1);
     if (!s || !out || k <= 0) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
@@ -74287,6 +74446,7 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 }
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
+    ds4_top1_census_full_read(0);
     if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
     return (int)DS4_N_VOCAB;
