@@ -282,6 +282,7 @@ struct ds4_metal_args_glm_indexer_score_one {
      * the cache the same way but carry args_glm_indexer_scores_batch and are
      * prefill; 2c is decode-only and they are deliberately untouched. */
     uint32_t row_base;
+    uint     rows_per_tg;  /* key rows per threadgroup; 0/1 = untiled */
 };
 
 struct ds4_metal_args_glm_indexer_scores_batch {
@@ -2028,6 +2029,90 @@ kernel void kernel_glm_indexer_score_one_direct(
 
     if (tid == 0) {
         scores[row] = acc;
+    }
+}
+
+/* ROWTILE -- NK key rows per 128-thread threadgroup, for the GLM decode scorer.
+ *
+ * The shipped kernel_glm_indexer_score_one_direct runs ONE row per threadgroup
+ * and pays, per row, 16 threadgroup barriers (8 head-groups x 2), a fresh
+ * device read of every head's Q slice, and a serial 4-add reduction on thread 0
+ * while 127 threads idle. kernel_glm_indexer_score_one_vpt already hoists Q and
+ * the weights into registers and amortises them over rows_per_tg rows, but it
+ * still stages K and synchronises ONCE PER ROW -- 2R barriers for R rows.
+ *
+ * This stages every row's key up front so the whole tile costs two barriers
+ * regardless of R, and finishes with one lane per row rather than one lane per
+ * threadgroup.
+ *
+ * BIT-IDENTITY IS THE POINT, so nothing about the arithmetic moves: the same
+ * f16->f32 cache promotion, the same dot(float4) per lane, the same simd_sum,
+ * the same max(s*scale,0)*w, and the same ASCENDING head order 0..31 in the
+ * final accumulation -- which is the order the direct kernel reaches by summing
+ * psum[0..3] for head0 = 0,4,...,28. Same order over the same f32 values is
+ * what makes this exact rather than merely close.
+ *
+ * Threadgroup cost is NK*(128+32) floats: 2560 B at NK=4, 5120 B at NK=8, so
+ * residency stays healthy at both. */
+kernel void kernel_glm_indexer_score_one_rowtile(
+        constant ds4_metal_args_glm_indexer_score_one & args,
+        device const char *q,
+        device const float *weights,
+        device const char *indexer_key_cache,
+        device float *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint tg [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort lane [[thread_index_in_simdgroup]],
+        ushort sg [[simdgroup_index_in_threadgroup]]) {
+    if (args.n_head != 32u || args.head_dim != 128u) return;
+
+    const uint NK = args.rows_per_tg == 0u ? 1u : args.rows_per_tg;
+    const uint row0 = tg * NK;
+    if (row0 >= args.n_rows) return;
+    const uint nrow = min(NK, args.n_rows - row0);
+
+    threadgroup float *ktg  = shared;              /* [NK][128] */
+    threadgroup float *psum = ktg + NK * 128u;     /* [NK][32]  */
+
+    /* This lane's float4 slice of each of the 8 heads this simdgroup owns
+     * (sg, sg+4, ... sg+28), read once and reused for every row in the tile. */
+    float4 qreg[8];
+    float  wreg[8];
+    for (uint i = 0; i < 8u; i++) {
+        const uint head = i * 4u + (uint)sg;
+        device const float4 *q4 =
+            (device const float4 *)(q + (uint64_t)head * 128u * sizeof(float));
+        qreg[i] = q4[lane];
+        wreg[i] = weights[head];
+    }
+
+    /* Every row staged before the single barrier. */
+    for (uint i = tid; i < nrow * 128u; i += 128u) {
+        const uint r = i / 128u;
+        const uint d = i - r * 128u;
+        ktg[i] = glm_cache_load_f32_or_f16(indexer_key_cache,
+                     ((uint64_t)args.row_base + row0 + r) * 128u + d,
+                     args.cache_f16);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint r = 0; r < nrow; r++) {
+        threadgroup const float4 *k4 = (threadgroup const float4 *)(ktg + r * 128u);
+        const float4 kv = k4[lane];
+        for (uint i = 0; i < 8u; i++) {
+            const float sv = simd_sum(dot(qreg[i], kv));
+            if (lane == 0) {
+                psum[r * 32u + i * 4u + (uint)sg] = max(sv * args.scale, 0.0f) * wreg[i];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < nrow) {
+        float acc = 0.0f;
+        for (uint h = 0; h < 32u; h++) acc += psum[tid * 32u + h];
+        scores[row0 + tid] = acc;
     }
 }
 

@@ -6731,6 +6731,7 @@ typedef struct {
     uint32_t cache_f16;
     float    scale;
     uint32_t row_base;   /* IDX-SPLIT-DEC; 0 reproduces the full scan */
+    uint32_t rows_per_tg; /* key rows per threadgroup; 0/1 = the untiled kernel */
 } ds4_gpu_glm_indexer_score_one_args;
 
 typedef struct {
@@ -36588,6 +36589,23 @@ int ds4_gpu_glm_indexer_rope_tail_tensor(
 /* IDX-SPLIT-DEC scores pooled rows [row_base, row_base + n_rows) into
  * scores[0, n_rows).  Every pre-existing caller goes through the wrapper below
  * with row_base = 0, which is the full scan unchanged. */
+/* Key rows per threadgroup in the decode indexer scorer. The tiled kernel is
+ * bit-identical to the one-row form -- same f16->f32 cache promotion, same
+ * per-lane dot, same simd_sum, same rectify-and-weight, and the same ascending
+ * head order in the final accumulation -- so this is a scheduling change only.
+ * DS4_METAL_GLM_INDEXER_ROWTILE=0 restores the untiled kernel for bisection. */
+#define GLM_ROWTILE_DEFAULT 4u
+static uint32_t glm_indexer_score_rowtile(void) {
+    static int cached = -2;
+    if (cached == -2) {
+        const char *e = getenv("DS4_METAL_GLM_INDEXER_ROWTILE");
+        cached = (e && e[0]) ? atoi(e) : (int)GLM_ROWTILE_DEFAULT;
+        if (cached < 0 || cached > 32) cached = (int)GLM_ROWTILE_DEFAULT;
+        if (cached == 1) cached = 0;
+    }
+    return (uint32_t)cached;
+}
+
 int ds4_gpu_glm_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -36656,9 +36674,16 @@ int ds4_gpu_glm_indexer_score_one_base_tensor(
         };
 
         if (n_head == 32u && head_dim == 128u) {
-            id<MTLComputePipelineState> direct_pipeline =
-                ds4_gpu_hot_pipeline(g_glm_indexer_score_one_direct_pipeline,
-                                     "kernel_glm_indexer_score_one_direct");
+            /* One key row per threadgroup costs 16 threadgroup barriers per row
+             * and re-reads every head's Q from device memory. The tiled kernel
+             * puts GLM_ROWTILE_DEFAULT rows behind a single barrier pair and
+             * reuses one register-resident copy of Q across them. */
+            const uint32_t rowtile = glm_indexer_score_rowtile();
+            if (rowtile) args.rows_per_tg = rowtile;
+            id<MTLComputePipelineState> direct_pipeline = rowtile
+                ? ds4_gpu_get_pipeline("kernel_glm_indexer_score_one_rowtile")
+                : ds4_gpu_hot_pipeline(g_glm_indexer_score_one_direct_pipeline,
+                                       "kernel_glm_indexer_score_one_direct");
             if (!direct_pipeline) return 0;
 
             int owned = 0;
@@ -36672,8 +36697,12 @@ int ds4_gpu_glm_indexer_score_one_base_tensor(
             [enc setBuffer:weightsbuf offset:ds4_gpu_tensor_offset(weights) atIndex:2];
             [enc setBuffer:cachebuf offset:ds4_gpu_tensor_offset(indexer_key_cache) atIndex:3];
             [enc setBuffer:scoresbuf offset:ds4_gpu_tensor_offset(scores) atIndex:4];
-            [enc setThreadgroupMemoryLength:DS4_TG16((128u + 4u) * sizeof(float)) atIndex:0];
-            [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)n_rows, 1, 1)
+            [enc setThreadgroupMemoryLength:DS4_TG16(rowtile
+                    ? (NSUInteger)rowtile * (128u + 32u) * sizeof(float)
+                    : (128u + 4u) * sizeof(float)) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(rowtile
+                    ? (((NSUInteger)n_rows + rowtile - 1u) / rowtile)
+                    : (NSUInteger)n_rows, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
             ds4_gpu_end_compute_encoder(cb, enc);
 
