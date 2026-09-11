@@ -2289,6 +2289,17 @@ kernel void kernel_glm_indexer_scores_tiled(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    /* This simdgroup's slice of the key cache is staged once and never
+     * rewritten, so load it into registers before the head loop rather than
+     * re-issuing the same D/TS simdgroup_loads for every head. At the model's
+     * 32 heads and D=128 that removes 496 redundant threadgroup reads per
+     * threadgroup. The cost is D/TS simdgroup_half8x8 held live across the
+     * loop, which the measurement below says is comfortably paid for. */
+    simdgroup_half8x8 mk_reg[D/TS];
+    FOR_UNROLL (uint db = 0; db < D/TS; db++) {
+        simdgroup_load(mk_reg[db], ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+    }
+
     for (uint head = 0; head < args.n_head; head++) {
         for (uint i = tid; i < TM*D; i += 128) {
             const uint tr = i / D;
@@ -2307,12 +2318,10 @@ kernel void kernel_glm_indexer_scores_tiled(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         simdgroup_float8x8 mdot = make_filled_simdgroup_matrix<float, 8>(0.0f);
-        for (uint db = 0; db < D/TS; db++) {
+        FOR_UNROLL (uint db = 0; db < D/TS; db++) {
             simdgroup_half8x8 mq;
-            simdgroup_half8x8 mk;
             simdgroup_load(mq, qtg + db*TS, D, 0, false);
-            simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
-            simdgroup_multiply_accumulate(mdot, mq, mk, mdot);
+            simdgroup_multiply_accumulate(mdot, mq, mk_reg[db], mdot);
         }
 
         simdgroup_store(mdot, dot + (uint)sg * TS, TN, 0, false);
