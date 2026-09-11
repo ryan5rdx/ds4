@@ -3813,6 +3813,38 @@ static int ds4_gpu_decmoe_spec_ok(uint32_t in_dim, uint32_t mid_dim, uint32_t ou
     return 0;
 }
 
+/* CULL -- final-tile SIMDgroup culling on the routed-MoE PREFILL GEMM.
+ * DEFAULT ON. PM1: +3.5% of the stage on Apple8, bit-identical, worth ~+1.2%
+ * prefill (3.5% of a stage that is 33.3% of prefill; the PM1 write-up said
+ * +0.37% by applying that 33.3% twice).
+ * Reverse with DS4_METAL_DISABLE_MM_ID_CULL=1. */
+static int ds4_gpu_mm_id_cull_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_METAL_DISABLE_MM_ID_CULL") == NULL ? 1 : 0;
+        if (!cached) fprintf(stderr, "ds4: Metal MM_ID CULL DISABLED by env\n");
+    }
+    return cached;
+}
+
+/* ROUTER-REG8 -- register top-8 + bitonic tournament in place of eight full
+ * scans. DEFAULT ON. RR1: +19.6% at decode cadence on Apple8 and byte-identical
+ * on all nine ordering cases, including allsame, negzero and the used=12
+ * fallback to the shipped scan.
+ *
+ * Small by SHARE, not by ratio: the router is 4.0% of ffn_norm which is 44.6%
+ * of decode active, so the whole stage is 1.78% and this is ~+0.35%. Shipped
+ * because it is exact and free to carry, not because it is large.
+ * Reverse with DS4_METAL_DISABLE_ROUTER_REG8=1. */
+static int ds4_gpu_router_reg8_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_METAL_DISABLE_ROUTER_REG8") == NULL ? 1 : 0;
+        if (!cached) fprintf(stderr, "ds4: Metal ROUTER-REG8 DISABLED by env\n");
+    }
+    return cached;
+}
+
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
            g_metal_device_name[7] >= '1' &&
@@ -34756,7 +34788,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
     case DS4_METAL_TENSOR_Q4_K:
-        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
+        return ds4_gpu_get_mul_mm_id_pipeline(
+            ds4_gpu_mm_id_cull_enabled() ? "kernel_mul_mm_id_q4_K_f32_cull" : "kernel_mul_mm_id_q4_K_f32", false);
     case DS4_METAL_TENSOR_Q5_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q5_K_f32", false);
     case DS4_METAL_TENSOR_Q6_K:
@@ -34792,7 +34825,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t t
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
     case DS4_METAL_TENSOR_Q4_K:
-        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false);
+        return ds4_gpu_get_mul_mm_id_pipeline(
+            ds4_gpu_mm_id_cull_enabled() ? "kernel_mul_mm_id_q4_K_f16_cull" : "kernel_mul_mm_id_q4_K_f16", false);
     case DS4_METAL_TENSOR_Q5_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q5_K_f16", false);
     case DS4_METAL_TENSOR_Q6_K:
@@ -41403,7 +41437,9 @@ int ds4_gpu_glm_router_select_tensor(
         const int router_simd = ds4_gpu_glm_router_select_simd();
         id<MTLComputePipelineState> pipeline =
             router_simd
-                ? ds4_gpu_get_pipeline("kernel_glm_router_select_one_simd")
+                ? ds4_gpu_get_pipeline(ds4_gpu_router_reg8_enabled()
+                                       ? "kernel_glm_router_select_one_simd_reg8"
+                                       : "kernel_glm_router_select_one_simd")
                 : ds4_gpu_hot_pipeline(g_glm_router_select_one_pipeline,
                                        "kernel_glm_router_select_one");
         if (!pipeline) return 0;
@@ -41507,7 +41543,9 @@ int ds4_gpu_glm_router_select_batch_tensor(
         const int router_simd = ds4_gpu_glm_router_select_simd();
         id<MTLComputePipelineState> pipeline =
             router_simd
-                ? ds4_gpu_get_pipeline("kernel_glm_router_select_one_simd")
+                ? ds4_gpu_get_pipeline(ds4_gpu_router_reg8_enabled()
+                                       ? "kernel_glm_router_select_one_simd_reg8"
+                                       : "kernel_glm_router_select_one_simd")
                 : ds4_gpu_hot_pipeline(g_glm_router_select_one_pipeline,
                                        "kernel_glm_router_select_one");
         if (!pipeline) return 0;
