@@ -2311,22 +2311,30 @@ kernel void kernel_glm_indexer_scores_tiled_f32(
     }
 }
 
-/* GLM prefill scorer.  KREG hoists the K matrices into registers across the
- * head loop.
+/* GLM prefill scorer, three same-build arms so the control is the real parent.
  *
- * ktg is staged ONCE before the loop and never written again, yet every one of
- * the 32 heads re-issues the same 16 simdgroup_loads against it -- 496
- * redundant threadgroup reads per threadgroup. The 16 matrices cost 2 halves
- * per lane each, 32 halves per lane in total, which is cheap to hold.
+ *   IDX_ORIGINAL  the shipped loop, byte for byte
+ *   IDX_UNROLL    only the depth loop forced to unroll
+ *   IDX_KREG      forced unroll AND the K tiles held in registers
  *
- * Q staging is NOT redundant and is deliberately left alone: each head reads a
- * different slice (head * q_head_stride), so "pack Q once" would need a device
- * f16 prepass, not a loop hoist.
+ * The first version of this experiment converted the depth loop to FOR_UNROLL
+ * for BOTH arms, so its "off" arm already carried an optimisation the parent
+ * does not. That made the A/B measure KREG against unroll rather than against
+ * the shipped kernel, and attributed the unroll's gain to KREG.
  *
- * Byte-identical by construction: same matrices, same mma order, same
- * accumulation -- only WHEN the K tiles are fetched changes. */
-template<bool KREG>
-static inline void glm_indexer_scores_tiled_kreg_impl(
+ * The redundancy KREG targets is real either way: ktg is staged once before the
+ * 32-head loop and never rewritten, yet every head re-issues the same 16
+ * simdgroup_loads. Whether removing them beats the register pressure -- 16
+ * simdgroup_half8x8 is 32 halves per lane held across the loop -- is what the
+ * three arms exist to separate.
+ *
+ * All three are byte-identical: same matrices, same mma order. */
+#define IDX_ORIGINAL 0
+#define IDX_UNROLL   1
+#define IDX_KREG     2
+
+template<int MODE>
+static inline void glm_indexer_scores_tiled_mode_impl(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,
         device const char *weights,
@@ -2399,10 +2407,8 @@ static inline void glm_indexer_scores_tiled_kreg_impl(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    /* ktg is complete and immutable from here, so the K tiles can be fetched
-     * once instead of once per head. */
     simdgroup_half8x8 mk_reg[D/TS];
-    if (KREG) {
+    if (MODE == IDX_KREG) {
         FOR_UNROLL (uint db = 0; db < D/TS; db++) {
             simdgroup_load(mk_reg[db], ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
         }
@@ -2426,15 +2432,28 @@ static inline void glm_indexer_scores_tiled_kreg_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         simdgroup_float8x8 mdot = make_filled_simdgroup_matrix<float, 8>(0.0f);
-        FOR_UNROLL (uint db = 0; db < D/TS; db++) {
-            simdgroup_half8x8 mq;
-            simdgroup_load(mq, qtg + db*TS, D, 0, false);
-            if (KREG) {
-                simdgroup_multiply_accumulate(mdot, mq, mk_reg[db], mdot);
-            } else {
+        if (MODE == IDX_ORIGINAL) {
+            /* the shipped loop, unchanged */
+            for (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mq;
                 simdgroup_half8x8 mk;
+                simdgroup_load(mq, qtg + db*TS, D, 0, false);
                 simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
                 simdgroup_multiply_accumulate(mdot, mq, mk, mdot);
+            }
+        } else if (MODE == IDX_UNROLL) {
+            FOR_UNROLL (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mq;
+                simdgroup_half8x8 mk;
+                simdgroup_load(mq, qtg + db*TS, D, 0, false);
+                simdgroup_load(mk, ktg + ((uint)sg * TS) * D + db*TS, D, 0, true);
+                simdgroup_multiply_accumulate(mdot, mq, mk, mdot);
+            }
+        } else {
+            FOR_UNROLL (uint db = 0; db < D/TS; db++) {
+                simdgroup_half8x8 mq;
+                simdgroup_load(mq, qtg + db*TS, D, 0, false);
+                simdgroup_multiply_accumulate(mdot, mq, mk_reg[db], mdot);
             }
         }
 
@@ -2472,7 +2491,6 @@ static inline void glm_indexer_scores_tiled_kreg_impl(
     }
 }
 
-
 kernel void kernel_glm_indexer_scores_tiled(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,
@@ -2484,11 +2502,25 @@ kernel void kernel_glm_indexer_scores_tiled(
         ushort tid   [[thread_index_in_threadgroup]],
         ushort lane  [[thread_index_in_simdgroup]],
         ushort sg    [[simdgroup_index_in_threadgroup]]) {
-    glm_indexer_scores_tiled_kreg_impl<false>(args, q, weights, indexer_key_cache,
-                                              scores, shared, tgpig, tid, lane, sg);
+    glm_indexer_scores_tiled_mode_impl<IDX_ORIGINAL>(args, q, weights, indexer_key_cache,
+                                           scores, shared, tgpig, tid, lane, sg);
 }
 
-/* IDXPORT KREG: K tiles hoisted into registers across the 32-head loop. */
+kernel void kernel_glm_indexer_scores_tiled_unroll(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    glm_indexer_scores_tiled_mode_impl<IDX_UNROLL>(args, q, weights, indexer_key_cache,
+                                           scores, shared, tgpig, tid, lane, sg);
+}
+
 kernel void kernel_glm_indexer_scores_tiled_kreg(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,
@@ -2500,8 +2532,8 @@ kernel void kernel_glm_indexer_scores_tiled_kreg(
         ushort tid   [[thread_index_in_threadgroup]],
         ushort lane  [[thread_index_in_simdgroup]],
         ushort sg    [[simdgroup_index_in_threadgroup]]) {
-    glm_indexer_scores_tiled_kreg_impl<true>(args, q, weights, indexer_key_cache,
-                                             scores, shared, tgpig, tid, lane, sg);
+    glm_indexer_scores_tiled_mode_impl<IDX_KREG>(args, q, weights, indexer_key_cache,
+                                           scores, shared, tgpig, tid, lane, sg);
 }
 
 kernel void kernel_glm_qk_lowrank_q8_0(

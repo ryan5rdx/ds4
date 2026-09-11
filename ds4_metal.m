@@ -3780,12 +3780,25 @@ static int ds4_gpu_device_name_contains(const char *needle) {
  * ktg is staged once and never rewritten, so the shipped kernel re-issues the
  * same 16 simdgroup_loads on every head -- 496 redundant threadgroup reads per
  * threadgroup. Byte-identical: same matrices, same mma order. */
-static int ds4_gpu_idxport_kreg(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char *e = getenv("DS4_METAL_IDXPORT_KREG");
-        cached = (e && e[0] == '1') ? 1 : 0;
-        if (cached) fprintf(stderr, "ds4: Metal IDXPORT KREG ENGAGED\n");
+/* DS4_METAL_IDXPORT = unroll | kreg.  Unset selects the SHIPPED kernel, which
+ * is the true parent -- the previous version forced the depth loop to unroll in
+ * both arms, so its control already carried an optimisation and the A/B
+ * attributed the unroll's gain to KREG. Each arm announces separately. */
+static const char *ds4_gpu_idxport_mode(void) {
+    static const char *cached = NULL;
+    if (!cached) {
+        const char *e = getenv("DS4_METAL_IDXPORT");
+        cached = (e && e[0]) ? e : "";
+        if (cached[0]) {
+            if (strcmp(cached, "unroll") && strcmp(cached, "kreg")) {
+                fprintf(stderr,
+                        "ds4: DS4_METAL_IDXPORT='%s' unknown -- running the "
+                        "ORIGINAL scorer\n", cached);
+                cached = "";
+            } else {
+                fprintf(stderr, "ds4: Metal IDXPORT %s ENGAGED\n", cached);
+            }
+        }
     }
     return cached;
 }
@@ -39451,8 +39464,11 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
                                n_head == 32u && head_dim == 128u;
         id<MTLComputePipelineState> pipeline =
             use_tiled
-                ? ((!use_tiled_f32 && ds4_gpu_idxport_kreg())
-                   ? ds4_gpu_get_pipeline("kernel_glm_indexer_scores_tiled_kreg")
+                ? ((!use_tiled_f32 && ds4_gpu_idxport_mode()[0])
+                   ? ds4_gpu_get_pipeline(
+                         strcmp(ds4_gpu_idxport_mode(), "kreg") == 0
+                             ? "kernel_glm_indexer_scores_tiled_kreg"
+                             : "kernel_glm_indexer_scores_tiled_unroll")
                    : ds4_gpu_hot_pipeline(use_tiled_f32 ? g_glm_indexer_scores_tiled_f32_pipeline
                                                         : g_glm_indexer_scores_tiled_pipeline,
                                           use_tiled_f32 ? "kernel_glm_indexer_scores_tiled_f32"
