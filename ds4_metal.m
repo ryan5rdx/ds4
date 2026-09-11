@@ -3790,7 +3790,14 @@ static const char *ds4_gpu_idxport_mode(void) {
         const char *e = getenv("DS4_METAL_IDXPORT");
         cached = (e && e[0]) ? e : "";
         if (cached[0]) {
-            if (strcmp(cached, "unroll") && strcmp(cached, "kreg")) {
+            if (strcmp(cached, "original") == 0) {
+                /* Explicit control. A value-gated knob makes `VAR=` a valid
+                 * "off", but that idiom means the OPPOSITE on the tree's
+                 * presence-gated DS4_METAL_DISABLE_* knobs and has already
+                 * invalidated one arm. Naming the control removes the
+                 * ambiguity for anyone reading the harness. */
+                cached = "";
+            } else if (strcmp(cached, "unroll") && strcmp(cached, "kreg")) {
                 fprintf(stderr,
                         "ds4: DS4_METAL_IDXPORT='%s' unknown -- running the "
                         "ORIGINAL scorer\n", cached);
