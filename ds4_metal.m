@@ -50352,10 +50352,28 @@ int ds4_gpu_glm53_matmul_bf16(
          * shapes. */
         const int bf16_splitk_shape =
             out_dim <= 64u && in_dim >= 4096u && (in_dim % 32u) == 0u;
+        /* D7: the 4096 -> 128 decode matvec, which Q1C7 caught at 22 calls per
+         * token (two in each of the 11 DSA layers) and 0.290 ms/token on the
+         * 16-threadgroup row kernel. out_dim 128 sits just past the B1 gate, so
+         * it never split.
+         *
+         * A SEPARATE predicate, not a relaxation of the one above. Widening
+         * `out_dim <= 64` to 128 would also hand this shape to HCMIX-WIDE,
+         * whose K-slice knob defaults to 4 -- the arm would silently measure
+         * W4 while reporting B1, and the banked HCMIX default would change
+         * behaviour on a shape its quality gate never covered.
+         *
+         * Default OFF, and its own K knob defaults to 0 so W2/W4 stay opt-in. */
+        const int bf16_d7_shape =
+            in_dim == 4096u && out_dim == 128u && n_rows == 1u;
+        const char *bf16_d7_env = getenv("DS4_METAL_GLM53_BF16_128_SPLITK");
+        const int bf16_d7 =
+            bf16_d7_shape && bf16_d7_env && bf16_d7_env[0] == '1';
         const int bf16_splitk =
             /* Default ON; DS4_METAL_GLM53_BF16_MV_SPLITK=0 disables. */
-            !(bf16_splitk_env && bf16_splitk_env[0] == '0') &&
-            bf16_splitk_shape;
+            (!(bf16_splitk_env && bf16_splitk_env[0] == '0') &&
+             bf16_splitk_shape) ||
+            bf16_d7;
         /* HCMIX-WIDE: a third grid axis over the contraction.  B1 took hc_mix
          * from 3 to 12 threadgroups by splitting K across simdgroups; this
          * splits it across threadgroups too, 12 -> 12*KSPLIT.  Two dispatches
@@ -50374,7 +50392,12 @@ int ds4_gpu_glm53_matmul_bf16(
          * 4 is the smaller reduction-order perturbation of the two tied values
          * and is the one the quality gate covers. */
         const uint32_t bf16_ksplit = bf16_splitk_shape ?
-            (uint32_t)ds4_gpu_env_u64("DS4_METAL_GLM53_BF16_MV_KSPLIT", 4u, 0u, 32u) : 0u;
+            (uint32_t)ds4_gpu_env_u64("DS4_METAL_GLM53_BF16_MV_KSPLIT", 4u, 0u, 32u) :
+            /* D7 gets its OWN K knob defaulting to 0, so the banked HCMIX K=4
+             * cannot reach this shape by accident. 2 or 4 selects W2/W4. */
+            (bf16_d7 ?
+                (uint32_t)ds4_gpu_env_u64("DS4_METAL_GLM53_BF16_128_KSPLIT", 0u, 0u, 32u)
+              : 0u);
         const int bf16_wide = bf16_ksplit >= 2u;
         const bool bc_inp = (in_dim % 32u) != 0u;
         const bool bc_out = (out_dim % 64u) != 0u || (n_rows % 32u) != 0u;
