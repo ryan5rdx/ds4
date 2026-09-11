@@ -20972,6 +20972,27 @@ static void ds4_gpu_use_q4_expert_table_resources(
     }
 }
 
+/* GLMLLT -- route GLM 5.3's 32-head decode scorer through the lightning
+ * indexer. OPT-IN, measurement only: DS4_METAL_GLM_LLT=1.
+ *
+ * GLM runs a 32-head indexer, so it fell past the n_head==64 gate below and
+ * onto the generic fallback: a mul_mv writing an [n_comp][32] f32 scratch and
+ * a weighted sum that reads it back. At 131k (32768 pooled rows) that is
+ * ~4 MiB of round-tripped intermediate per layer per token, against an LLT
+ * path that keeps K in registers and never materialises per-head scores.
+ *
+ * Not default-on: the promotion gate is >=15% on the scorer or >=0.5%
+ * projected end-to-end, and neither is measured yet. */
+static int ds4_gpu_glm_llt_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_METAL_GLM_LLT");
+        cached = (e && e[0] == '1') ? 1 : 0;
+        if (cached) fprintf(stderr, "ds4: Metal GLM-LLT 32-head scorer ENGAGED\n");
+    }
+    return cached;
+}
+
 int ds4_gpu_indexer_score_one_tensor(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -21005,7 +21026,12 @@ int ds4_gpu_indexer_score_one_tensor(
             return 0;
         }
 
-        if (n_head == 64 && head_dim == 128) {
+        /* GLM's 32-head scorer joins this path only when GLMLLT is on; with
+         * it off GLM keeps the generic fallback below, unchanged. The 64-head
+         * behaviour is untouched either way. */
+        const bool glm_llt = n_head == 32u && head_dim == 128u &&
+                             ds4_gpu_glm_llt_enabled();
+        if ((n_head == 64 && head_dim == 128) || glm_llt) {
             /* Lightning-indexer organization for the decode scorer (upstream
              * #782, decode half only).  One 256-thread threadgroup owns 64
              * compressed rows, staged once and transposed into per-simdgroup
@@ -21023,7 +21049,10 @@ int ds4_gpu_indexer_score_one_tensor(
              * is where our sweep degrades.  DS4_METAL_DISABLE_INDEXER_LLT is
              * the A/B rollback; read per call so a variant bench can toggle it
              * inside one process. */
-            const bool score_llt =
+            /* kernel_dsv4_indexer_score_one_direct is 64-head only, so a
+             * GLM call must never land on it -- disabling LLT for GLM means
+             * not entering this branch at all, which the gate above handles. */
+            const bool score_llt = glm_llt ||
                 getenv("DS4_METAL_DISABLE_INDEXER_LLT") == NULL;
             /* Tight shared-memory alias for the low-latency scorer: the staged
              * K rows and the score scratch have disjoint lifetimes, so allocate
@@ -21036,9 +21065,11 @@ int ds4_gpu_indexer_score_one_tensor(
             const char *tight_env = getenv("DS4_METAL_INDEXER_LLT_TIGHT");
             const bool score_tight = !(tight_env && tight_env[0] == '0');
             id<MTLComputePipelineState> direct_pipeline = score_llt
-                ? ds4_gpu_get_pipeline(score_tight
-                        ? "kernel_dsv4_indexer_scores_llt_tight"
-                        : "kernel_dsv4_indexer_scores_llt")
+                ? ds4_gpu_get_pipeline(glm_llt
+                        ? "kernel_dsv4_indexer_scores_llt_tight_h32"
+                        : (score_tight
+                            ? "kernel_dsv4_indexer_scores_llt_tight"
+                            : "kernel_dsv4_indexer_scores_llt"))
                 : ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_direct_pipeline,
                                         "kernel_dsv4_indexer_score_one_direct");
             if (!direct_pipeline) return 0;

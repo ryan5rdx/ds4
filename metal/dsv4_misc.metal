@@ -7703,7 +7703,7 @@ kernel void kernel_dsv4_indexer_scores_tiled(
  * matrix steps over depth 128 in ascending order, relu then w*scale per
  * head in ascending head order, and ds4's causal (-inf) epilogue for
  * multi-token (prefill) calls / all-rows pass-through for decode. */
-template <int NBPTG, int T_NSG, bool TIGHT_SMEM = false>
+template <int NBPTG, int T_NSG, bool TIGHT_SMEM = false, int T_NH = 64>
 kernel void kernel_dsv4_indexer_scores_llt_impl(
         constant ds4_metal_args_dsv4_indexer_scores_fused & args,
         device const char *q,
@@ -7716,7 +7716,7 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr uint DK     = 128;   // indexer key depth
-    constexpr uint NH     = 64;    // indexer heads
+    constexpr uint NH     = T_NH;  // indexer heads: 64 DeepSeek, 32 GLM
     constexpr uint NHPTG  = 8;     // heads per tile
     constexpr uint NKPSG  = 8;     // keys per simdgroup
     constexpr uint NSG    = T_NSG; // simdgroups per threadgroup
@@ -7724,6 +7724,11 @@ kernel void kernel_dsv4_indexer_scores_llt_impl(
     constexpr uint NTG    = 32*NSG;      // threads per threadgroup
     constexpr uint DK8    = DK/8;
 
+    /* Head count is the ONLY model-dependent quantity here. The K staging,
+     * the transposed mk registers, sq/sw/sqk and the shared-memory layout are
+     * all per-head-TILE, so a different NH only changes how many tiles the
+     * loop below runs -- 8 at 64 heads, 4 at 32. */
+    static_assert(NH % NHPTG == 0, "head count must tile evenly by NHPTG");
     if (args.n_head != NH || args.head_dim != DK) return;
     const bool causal = args.n_tokens > 1u;
 
@@ -7843,6 +7848,13 @@ template [[host_name("kernel_dsv4_indexer_scores_llt")]]   kernel kernel_dsv4_ll
 /* Same NK=64 shape, sq/sw/sqk aliased over the dead sk staging buffer.
  * 16384 B instead of 20512 -> 2 threadgroups resident per 32 KiB core. */
 template [[host_name("kernel_dsv4_indexer_scores_llt_tight")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 8, true>;
+/* GLM 5.3 Flash runs a 32-head indexer, so it fell past the n_head==64 gate
+ * and onto the generic two-dispatch fallback: a mul_mv into an [n_comp][32]
+ * f32 scratch, then a weighted sum that re-reads it. At 131k that intermediate
+ * is ~4 MiB written and read back per layer per token. This instantiation lets
+ * the 32-head scorer take the same single-kernel path, with the head-tile loop
+ * running 4 tiles instead of 8. */
+template [[host_name("kernel_dsv4_indexer_scores_llt_tight_h32")]] kernel kernel_dsv4_llt_t kernel_dsv4_indexer_scores_llt_impl<8, 8, true, 32>;
 
 #ifdef DS4_METAL_HAS_TENSOR
 // Retained full-512 prefill indexer score path.  This is the part of sparse
