@@ -3774,6 +3774,25 @@ static int ds4_gpu_device_name_contains(const char *needle) {
     return g_metal_device_name[0] != '\0' && strstr(g_metal_device_name, needle) != NULL;
 }
 
+/* TKR1 measurement knob, default OFF.  Selects the radix-select pass-1 top-k
+ * in place of the two bitonic-2048 sorts.
+ *
+ * BYTE IDENTITY IS THE BAR, and it is achievable rather than approximate:
+ * ds4_topk_pack_key folds the index into the low 32 bits as (0xffffffff - idx),
+ * so a plain unsigned compare on the ulong is exactly (score desc, index asc)
+ * and every key in a slice is distinct.  A distinct-key top-K boundary is
+ * unambiguous, so radix selection returns the same 512 keys in the same order
+ * the bitonic path produces -- not merely an equivalent set. */
+static int ds4_gpu_tkr1_radix(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_METAL_TKR1_RADIX");
+        cached = (e && e[0] == '1') ? 1 : 0;
+        if (cached) fprintf(stderr, "ds4: Metal TKR1 RADIX pass-1 ENGAGED\n");
+    }
+    return cached;
+}
+
 int ds4_gpu_device_is_pre_m5_apple_silicon(void) {
     return strncmp(g_metal_device_name, "Apple M", 7) == 0 &&
            g_metal_device_name[7] >= '1' &&
@@ -21418,8 +21437,14 @@ int ds4_gpu_indexer_topk_tensor(
                             "ds4: metal indexer topk using tiled (%u slices of "
                             "~%u rows)\n", tiles, n_comp / tiles);
                 }
+                /* TKR1 only replaces the top_k == 512 case; the radix
+                 * final path is specialised on that width and falls back
+                 * otherwise rather than silently taking the bitonic branch
+                 * under a name that says radix. */
                 id<MTLComputePipelineState> p1 =
-                    ds4_gpu_get_pipeline("kernel_dsv4_indexer_topk_tile_p1");
+                    ds4_gpu_get_pipeline((ds4_gpu_tkr1_radix() && top_k == 512u)
+                        ? "kernel_dsv4_indexer_topk_tile_p1_radix"
+                        : "kernel_dsv4_indexer_topk_tile_p1");
                 id<MTLComputePipelineState> p2 =
                     ds4_gpu_get_pipeline("kernel_dsv4_indexer_topk_tile_p2");
                 if (!p1 || !p2) return 0;

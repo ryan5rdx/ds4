@@ -345,6 +345,136 @@ static inline ulong ds4_topk_pack_key(float v, uint32_t idx) {
     return ((ulong)ordered << 32) | (ulong)(0xffffffffu - idx);
 }
 
+/* ---------------------------------------------------------------------------
+ * TKR1: exact radix selection for the pass-1 top-k problem.
+ *
+ * WHY RADIX IS EXACT HERE, and why it is simpler than the CUDA equivalents.
+ * ds4_topk_pack_key folds the index into the low 32 bits as (0xffffffff - idx),
+ * so a plain unsigned compare on the ulong IS (score desc, index asc) -- the
+ * order the merge path already consumes -- and every key in a slice is DISTINCT
+ * because indices are.  A distinct-key top-K boundary is unambiguous: there is
+ * no tie group straddling it, so no tie-breaking rule is needed at selection
+ * time.  The ordering contract does that work up front.
+ *
+ * WHAT IT REPLACES.  ds4_topk_stream_core sorts the whole 2048-entry buffer
+ * with ds4_topk_bitonic_desc_2048 -- 11 stages x up to 11 substeps = 66
+ * compare-exchange passes over 2048 elements at 4 elements per thread -- and it
+ * does that BOTH periodically (only to recover buf[top_k-1] as the threshold)
+ * and once at the end.
+ *
+ * The periodic call does not need a sort at all: radix select returns the K-th
+ * largest key directly, which IS the threshold.  Only the final call needs the
+ * survivors ordered, and that is a bitonic over 512, not 2048.
+ *
+ * NOT H100'S k>64 FALLBACK, deliberately: that needs ~39 KiB of threadgroup
+ * memory at k=512.  This needs a 256-entry histogram, 1 KiB.
+ * ------------------------------------------------------------------------- */
+
+/* Exact K-th largest of N distinct keys, MSB-first 8 bits at a time.
+ * Returns the key itself; every element >= it is in the top K, and because the
+ * keys are distinct there are exactly K of them. */
+static inline ulong ds4_topk_radix_kth(
+        threadgroup const ulong  *buf,
+        threadgroup atomic_uint  *hist,
+        threadgroup ulong        *scratch,
+        uint N, uint K, ushort tid) {
+    ulong prefix = 0ul;
+    uint  remaining = K;
+
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        for (uint i = tid; i < 256u; i += 512u) {
+            atomic_store_explicit(&hist[i], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Bits strictly above the current digit are already pinned. */
+        const ulong mask = (shift == 56) ? 0ul : (~0ul << (uint)(shift + 8));
+        for (uint i = tid; i < N; i += 512u) {
+            const ulong k = buf[i];
+            if ((k & mask) == prefix) {
+                atomic_fetch_add_explicit(
+                    &hist[(uint)((k >> (uint)shift) & 0xffu)], 1u,
+                    memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Walk buckets high to low; the bucket that crosses `remaining` holds
+         * the K-th largest.  256 iterations on one thread is far cheaper than
+         * a barrier-synchronised scan over 2048 elements. */
+        if (tid == 0) {
+            uint acc = 0u;
+            uint digit = 0u;
+            uint before = 0u;
+            for (int d = 255; d >= 0; d--) {
+                const uint c = atomic_load_explicit(&hist[(uint)d],
+                                                    memory_order_relaxed);
+                if (acc + c >= remaining) { digit = (uint)d; before = acc; break; }
+                acc += c;
+            }
+            scratch[0] = ((ulong)digit << (uint)shift);
+            scratch[1] = (ulong)before;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        prefix |= scratch[0];
+        remaining -= (uint)scratch[1];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return prefix;
+}
+
+/* Keep every key >= thr, packed into buf[0..K), rest zeroed.  Order within the
+ * kept set is arbitrary -- callers that need it ordered sort afterwards, and
+ * the periodic caller does not need it at all. */
+static inline void ds4_topk_radix_compact(
+        threadgroup ulong       *buf,
+        threadgroup atomic_uint *cursor,
+        uint N, uint K, ulong thr, ushort tid) {
+    if (tid == 0) atomic_store_explicit(cursor, 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* Read the survivors out before overwriting: a key can move to a slot that
+     * another thread has not read yet. */
+    ulong mine[4];
+    uint  n_mine = 0u;
+    for (uint i = tid; i < N; i += 512u) {
+        const ulong k = buf[i];
+        if (k >= thr && n_mine < 4u) mine[n_mine++] = k;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = 0; j < n_mine; j++) {
+        const uint slot = atomic_fetch_add_explicit(cursor, 1u,
+                                                    memory_order_relaxed);
+        if (slot < K) buf[slot] = mine[j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint i = tid + K; i < N; i += 512u) buf[i] = 0ul;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+/* Descending bitonic over exactly K = 512 -- 9 stages instead of 11, and one
+ * element per thread instead of four. */
+static inline void ds4_topk_bitonic_desc_512(
+        threadgroup ulong *buf,
+        ushort tid) {
+    for (uint k = 2; k <= 512u; k <<= 1) {
+        for (uint j = k >> 1; j > 0; j >>= 1) {
+            const uint i = (uint)tid;
+            const uint ixj = i ^ j;
+            if (ixj > i) {
+                const bool descending = (i & k) == 0u;
+                const ulong a = buf[i];
+                const ulong b = buf[ixj];
+                if ((a < b) == descending) { buf[i] = b; buf[ixj] = a; }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
 static inline void ds4_topk_bitonic_desc_2048(
         threadgroup ulong *buf,
         ushort tid) {
@@ -372,6 +502,9 @@ static inline void ds4_topk_bitonic_desc_2048(
  * it cannot belong to the final set.  Keys pack (score, index) into one word
  * under a (score desc, index asc) total order, so ties resolve deterministically
  * and the emitted list does not depend on compaction order. */
+/* TKR1 selects the radix path at instantiation; every shipped caller passes
+ * false, which is byte-for-byte the previous behaviour. */
+template<bool RADIX>
 static inline void ds4_topk_stream_core(
         device const char *src,
         uint64_t           row_stride,
@@ -390,6 +523,13 @@ static inline void ds4_topk_stream_core(
     threadgroup uint  *cnt = (threadgroup uint *)(buf + CAP);
     threadgroup ulong *thr_tg = (threadgroup ulong *)(buf + CAP + 1);
     threadgroup uint  *sg_counts = (threadgroup uint *)(buf + CAP + 2); // [16]
+    /* TKR1 scratch, past the existing block: a 256-entry histogram, a cursor
+     * and two ulongs.  1 KiB and change -- the H100 k>64 path this replaces
+     * would want ~39 KiB at k=512. */
+    threadgroup atomic_uint *rx_hist =
+        (threadgroup atomic_uint *)(buf + CAP + 2 + 8);
+    threadgroup atomic_uint *rx_cursor = rx_hist + 256;
+    threadgroup ulong *rx_scratch = (threadgroup ulong *)(rx_cursor + 2);
 
     device const float *frow = (device const float *)(src + row_stride * row);
 
@@ -442,10 +582,19 @@ static inline void ds4_topk_stream_core(
                 if (j >= have) buf[j] = 0ul;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            ds4_topk_bitonic_desc_2048(buf, tid);
-            if (tid == 0) {
-                thr_tg[0] = buf[top_k - 1u];
-                cnt[0] = top_k;
+            if (RADIX) {
+                /* This call never needed a sort -- it only wants the threshold,
+                 * and radix select returns the K-th largest key directly. */
+                const ulong kth = ds4_topk_radix_kth(buf, rx_hist, rx_scratch,
+                                                     CAP, top_k, tid);
+                ds4_topk_radix_compact(buf, rx_cursor, CAP, top_k, kth, tid);
+                if (tid == 0) { thr_tg[0] = kth; cnt[0] = top_k; }
+            } else {
+                ds4_topk_bitonic_desc_2048(buf, tid);
+                if (tid == 0) {
+                    thr_tg[0] = buf[top_k - 1u];
+                    cnt[0] = top_k;
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
@@ -456,7 +605,15 @@ static inline void ds4_topk_stream_core(
         if (j >= have) buf[j] = 0ul;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    ds4_topk_bitonic_desc_2048(buf, tid);
+    if (RADIX && top_k == 512u) {
+        /* Only this call needs the survivors ORDERED, and only over top_k. */
+        const ulong kth = ds4_topk_radix_kth(buf, rx_hist, rx_scratch,
+                                             CAP, top_k, tid);
+        ds4_topk_radix_compact(buf, rx_cursor, CAP, top_k, kth, tid);
+        ds4_topk_bitonic_desc_512(buf, tid);
+    } else {
+        ds4_topk_bitonic_desc_2048(buf, tid);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -554,16 +711,16 @@ static inline void ds4_topk_stream_core_keys(
 }
 
 /* Pass 1: one threadgroup per slice.  args.ne01 carries the slice count. */
-[[max_total_threads_per_threadgroup(512)]]
-kernel void kernel_dsv4_indexer_topk_tile_p1(
+template<bool TKR1_RADIX>
+static inline void ds4_indexer_topk_tile_p1_impl(
         constant ds4_metal_args_argsort & args,
         device const char * src0,
         device      ulong * cand,
-        threadgroup ulong * buf [[threadgroup(0)]],
-        uint3   tgpig[[threadgroup_position_in_grid]],
-        ushort  tid  [[thread_index_in_threadgroup]],
-        ushort  lane [[thread_index_in_simdgroup]],
-        ushort  sgid [[simdgroup_index_in_threadgroup]]) {
+        threadgroup ulong * buf,
+        uint3   tgpig,
+        ushort  tid,
+        ushort  lane,
+        ushort  sgid) {
     const uint n_comp = (uint)args.ne00;
     const uint top_k  = (uint)args.top_k;
     const uint tiles  = (uint)args.ne01;
@@ -577,7 +734,7 @@ kernel void kernel_dsv4_indexer_topk_tile_p1(
     const uint count = base + (t < rem ? 1u : 0u);
 
     /* row is always 0 here: this path exists for the one-row decode shape. */
-    ds4_topk_stream_core(src0, args.nb01, 0u, begin, count, top_k, t,
+    ds4_topk_stream_core<TKR1_RADIX>(src0, args.nb01, 0u, begin, count, top_k, t,
                          buf, tid, lane, sgid);
 
     /* Raw keys, not indices -- pass 2 needs the score to merge on.  A slice
@@ -588,6 +745,34 @@ kernel void kernel_dsv4_indexer_topk_tile_p1(
     for (uint j = tid; j < top_k; j += 512u) {
         out[j] = buf[j];
     }
+}
+
+
+[[max_total_threads_per_threadgroup(512)]]
+kernel void kernel_dsv4_indexer_topk_tile_p1(
+        constant ds4_metal_args_argsort & args,
+        device const char * src0,
+        device      ulong * cand,
+        threadgroup ulong * buf [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tid  [[thread_index_in_threadgroup]],
+        ushort  lane [[thread_index_in_simdgroup]],
+        ushort  sgid [[simdgroup_index_in_threadgroup]]) {
+    ds4_indexer_topk_tile_p1_impl<false>(args, src0, cand, buf, tgpig, tid, lane, sgid);
+}
+
+/* TKR1: exact radix selection in place of the two bitonic-2048 sorts. */
+[[max_total_threads_per_threadgroup(512)]]
+kernel void kernel_dsv4_indexer_topk_tile_p1_radix(
+        constant ds4_metal_args_argsort & args,
+        device const char * src0,
+        device      ulong * cand,
+        threadgroup ulong * buf [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tid  [[thread_index_in_threadgroup]],
+        ushort  lane [[thread_index_in_simdgroup]],
+        ushort  sgid [[simdgroup_index_in_threadgroup]]) {
+    ds4_indexer_topk_tile_p1_impl<true>(args, src0, cand, buf, tgpig, tid, lane, sgid);
 }
 
 /* Pass 2: single threadgroup over tiles*top_k candidates. */
@@ -624,7 +809,7 @@ kernel void kernel_dsv4_indexer_topk_stream512(
     const uint top_k  = (uint)args.top_k;
     const uint t      = tgpig.x;
 
-    ds4_topk_stream_core(src0, args.nb01, t, 0u, n_comp, top_k, t,
+    ds4_topk_stream_core<false>(src0, args.nb01, t, 0u, n_comp, top_k, t,
                                 buf, tid, lane, sgid);
 
     device int32_t *out = dst + (ulong)t * args.top_k;
