@@ -2857,6 +2857,17 @@ static int ds4_gpu_device_name_contains(const char *needle) {
  * Bit-identical to the generic path -- same arithmetic, same accumulation
  * order -- so it needs no quality gate. Set DS4_METAL_DISABLE_DECMOE_SPEC=1 to
  * fall back for bisection. */
+/* Final-tile SIMDgroup culling on the routed-MoE prefill GEMM. Bit-identical;
+ * set DS4_METAL_DISABLE_MM_ID_CULL=1 to fall back for bisection. */
+static int ds4_gpu_mm_id_cull_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("DS4_METAL_DISABLE_MM_ID_CULL") == NULL ? 1 : 0;
+        if (!cached) fprintf(stderr, "ds4: routed-MoE prefill tail culling disabled by env\n");
+    }
+    return cached;
+}
+
 static int ds4_gpu_decmoe_spec_ok(uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim) {
     static int disabled = -1;
     if (disabled < 0) {
@@ -32184,7 +32195,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
     case DS4_METAL_TENSOR_Q4_K:
-        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f32", false);
+        return ds4_gpu_get_mul_mm_id_pipeline(
+            ds4_gpu_mm_id_cull_enabled() ? "kernel_mul_mm_id_q4_K_f32_cull" : "kernel_mul_mm_id_q4_K_f32", false);
     case DS4_METAL_TENSOR_Q5_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q5_K_f32", false);
     case DS4_METAL_TENSOR_Q6_K:
@@ -32220,7 +32232,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t t
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
     case DS4_METAL_TENSOR_Q4_K:
-        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false);
+        return ds4_gpu_get_mul_mm_id_pipeline(
+            ds4_gpu_mm_id_cull_enabled() ? "kernel_mul_mm_id_q4_K_f16_cull" : "kernel_mul_mm_id_q4_K_f16", false);
     case DS4_METAL_TENSOR_Q5_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q5_K_f16", false);
     case DS4_METAL_TENSOR_Q6_K:
