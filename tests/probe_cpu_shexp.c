@@ -52,6 +52,7 @@
 #include <pthread.h>
 #include <sys/sysctl.h>
 #include <pthread/qos.h>
+#include <unistd.h>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -62,10 +63,19 @@
 #define N_FF_FULL 2048u          /* the down matrix is stored at FULL width */
 #define QK        32u
 #define BLK_BYTES 34u            /* fp16 scale + 32 int8 */
+#define CLAMP     10.0f          /* DS4_SHAPE_GLM53.swiglu_clamp_exp */
 
 static uint32_t g_layers  = 42;
 static uint32_t g_iters   = 200;
 static int      g_check   = 0;
+/* Long-lived contention mode. The sweep is a benchmark; this is a LOAD, and it
+ * has to outlive a decode run rather than finish during its setup -- the first
+ * harness cut launched 100k iterations and then spent 19 seconds starting the
+ * worker and loading the model, by which time the load was over and the
+ * "concurrent" measurement had nothing running beside it. */
+static double   g_duration = 0.0;      /* seconds; 0 = not a load run */
+static double   g_duty     = 1.0;      /* 1.0 = continuous stress */
+static const char *g_stopfile = NULL;
 
 typedef struct { uint8_t *gate, *up, *down; } layer_w;
 
@@ -95,30 +105,72 @@ static uint16_t f16e(float f) {
 }
 
 /* ------------------------------------------------------------ arm: pairq8
- * Transcribed from ds4.c dot_q8_0_row_pair. Both rows share the activation,
- * so the int8 loads of xq are amortised across gate and up. */
+ * Transcribed VERBATIM from ds4.c's dot_q8_0_row_pair and dot_q8_0_row. The
+ * first cut paraphrased: it reduced every block with vaddvq_s32 instead of
+ * accumulating float32x4 lanes across block PAIRS and reducing once, and it
+ * had no single-row kernel at all -- `down` called the paired one with the
+ * same row twice and threw half the result away, roughly 4.2M wasted MACs per
+ * layer, about a third extra arithmetic across the whole MLP. Both made the
+ * 156 us figure pessimistic by an unknown amount, which is the worst kind.
+ * --check verifies both against a scalar reference. */
 static inline void dot_pair_q8(const uint8_t *r0, const uint8_t *r1,
                                const int8_t *xq, const float *xd,
                                uint64_t blocks, float *o0, float *o1) {
-    float s0 = 0.0f, s1 = 0.0f;
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    for (uint64_t b = 0; b < blocks; ++b) {
-        uint16_t h0, h1;
-        memcpy(&h0, r0 + b * BLK_BYTES, 2);
-        memcpy(&h1, r1 + b * BLK_BYTES, 2);
-        const int8x16_t x0 = vld1q_s8(xq + b * QK);
-        const int8x16_t x1 = vld1q_s8(xq + b * QK + 16);
+    float32x4_t a00 = vdupq_n_f32(0.0f), a01 = vdupq_n_f32(0.0f);
+    float32x4_t a10 = vdupq_n_f32(0.0f), a11 = vdupq_n_f32(0.0f);
+    uint64_t b = 0;
+    for (; b + 1 < blocks; b += 2) {
+        uint16_t s00, s01, s10, s11;
+        memcpy(&s00, r0 + b * BLK_BYTES, 2);
+        memcpy(&s01, r0 + (b + 1) * BLK_BYTES, 2);
+        memcpy(&s10, r1 + b * BLK_BYTES, 2);
+        memcpy(&s11, r1 + (b + 1) * BLK_BYTES, 2);
+        const int8_t *xq0 = xq + b * QK, *xq1 = xq + (b + 1) * QK;
+        const int8x16_t xv00 = vld1q_s8(xq0),      xv01 = vld1q_s8(xq0 + 16);
+        const int8x16_t xv10 = vld1q_s8(xq1),      xv11 = vld1q_s8(xq1 + 16);
+        const int8_t *q00 = (const int8_t *)(r0 + b * BLK_BYTES + 2);
+        const int8_t *q01 = (const int8_t *)(r0 + (b + 1) * BLK_BYTES + 2);
+        const int8_t *q10 = (const int8_t *)(r1 + b * BLK_BYTES + 2);
+        const int8_t *q11 = (const int8_t *)(r1 + (b + 1) * BLK_BYTES + 2);
+        int32x4_t d00 = vdupq_n_s32(0);
+        d00 = vdotq_s32(d00, vld1q_s8(q00),      xv00);
+        d00 = vdotq_s32(d00, vld1q_s8(q00 + 16), xv01);
+        int32x4_t d01 = vdupq_n_s32(0);
+        d01 = vdotq_s32(d01, vld1q_s8(q01),      xv10);
+        d01 = vdotq_s32(d01, vld1q_s8(q01 + 16), xv11);
+        int32x4_t d10 = vdupq_n_s32(0);
+        d10 = vdotq_s32(d10, vld1q_s8(q10),      xv00);
+        d10 = vdotq_s32(d10, vld1q_s8(q10 + 16), xv01);
+        int32x4_t d11 = vdupq_n_s32(0);
+        d11 = vdotq_s32(d11, vld1q_s8(q11),      xv10);
+        d11 = vdotq_s32(d11, vld1q_s8(q11 + 16), xv11);
+        a00 = vfmaq_n_f32(a00, vcvtq_f32_s32(d00), f16d(s00) * xd[b]);
+        a01 = vfmaq_n_f32(a01, vcvtq_f32_s32(d01), f16d(s01) * xd[b + 1]);
+        a10 = vfmaq_n_f32(a10, vcvtq_f32_s32(d10), f16d(s10) * xd[b]);
+        a11 = vfmaq_n_f32(a11, vcvtq_f32_s32(d11), f16d(s11) * xd[b + 1]);
+    }
+    if (b < blocks) {
+        uint16_t s0, s1;
+        memcpy(&s0, r0 + b * BLK_BYTES, 2);
+        memcpy(&s1, r1 + b * BLK_BYTES, 2);
+        const int8_t *xqb = xq + b * QK;
+        const int8x16_t xv0 = vld1q_s8(xqb), xv1 = vld1q_s8(xqb + 16);
         const int8_t *q0 = (const int8_t *)(r0 + b * BLK_BYTES + 2);
         const int8_t *q1 = (const int8_t *)(r1 + b * BLK_BYTES + 2);
-        int32x4_t d0 = vdupq_n_s32(0), d1 = vdupq_n_s32(0);
-        d0 = vdotq_s32(d0, vld1q_s8(q0),      x0);
-        d0 = vdotq_s32(d0, vld1q_s8(q0 + 16), x1);
-        d1 = vdotq_s32(d1, vld1q_s8(q1),      x0);
-        d1 = vdotq_s32(d1, vld1q_s8(q1 + 16), x1);
-        s0 += f16d(h0) * xd[b] * (float)vaddvq_s32(d0);
-        s1 += f16d(h1) * xd[b] * (float)vaddvq_s32(d1);
+        int32x4_t d0 = vdupq_n_s32(0);
+        d0 = vdotq_s32(d0, vld1q_s8(q0),      xv0);
+        d0 = vdotq_s32(d0, vld1q_s8(q0 + 16), xv1);
+        int32x4_t d1 = vdupq_n_s32(0);
+        d1 = vdotq_s32(d1, vld1q_s8(q1),      xv0);
+        d1 = vdotq_s32(d1, vld1q_s8(q1 + 16), xv1);
+        a00 = vfmaq_n_f32(a00, vcvtq_f32_s32(d0), f16d(s0) * xd[b]);
+        a10 = vfmaq_n_f32(a10, vcvtq_f32_s32(d1), f16d(s1) * xd[b]);
     }
+    *o0 = vaddvq_f32(vaddq_f32(a00, a01));
+    *o1 = vaddvq_f32(vaddq_f32(a10, a11));
 #else
+    float s0 = 0.0f, s1 = 0.0f;
     for (uint64_t b = 0; b < blocks; ++b) {
         uint16_t h0, h1;
         memcpy(&h0, r0 + b * BLK_BYTES, 2);
@@ -132,8 +184,56 @@ static inline void dot_pair_q8(const uint8_t *r0, const uint8_t *r1,
         s0 += f16d(h0) * xd[b] * (float)a0;
         s1 += f16d(h1) * xd[b] * (float)a1;
     }
-#endif
     *o0 = s0; *o1 = s1;
+#endif
+}
+
+/* The SINGLE-row kernel production uses for `down`. Its absence was the
+ * expensive omission: calling the paired kernel with one row twice does two
+ * dots and discards one. */
+static inline float dot_row_q8(const uint8_t *r, const int8_t *xq,
+                               const float *xd, uint64_t blocks) {
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
+    float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+    uint64_t b = 0;
+    for (; b + 1 < blocks; b += 2) {
+        uint16_t s0, s1;
+        memcpy(&s0, r + b * BLK_BYTES, 2);
+        memcpy(&s1, r + (b + 1) * BLK_BYTES, 2);
+        const int8_t *q0 = (const int8_t *)(r + b * BLK_BYTES + 2);
+        const int8_t *q1 = (const int8_t *)(r + (b + 1) * BLK_BYTES + 2);
+        const int8_t *x0 = xq + b * QK, *x1 = xq + (b + 1) * QK;
+        int32x4_t d0 = vdupq_n_s32(0);
+        d0 = vdotq_s32(d0, vld1q_s8(q0),      vld1q_s8(x0));
+        d0 = vdotq_s32(d0, vld1q_s8(q0 + 16), vld1q_s8(x0 + 16));
+        int32x4_t d1 = vdupq_n_s32(0);
+        d1 = vdotq_s32(d1, vld1q_s8(q1),      vld1q_s8(x1));
+        d1 = vdotq_s32(d1, vld1q_s8(q1 + 16), vld1q_s8(x1 + 16));
+        a0 = vfmaq_n_f32(a0, vcvtq_f32_s32(d0), f16d(s0) * xd[b]);
+        a1 = vfmaq_n_f32(a1, vcvtq_f32_s32(d1), f16d(s1) * xd[b + 1]);
+    }
+    if (b < blocks) {
+        uint16_t sb;
+        memcpy(&sb, r + b * BLK_BYTES, 2);
+        const int8_t *q = (const int8_t *)(r + b * BLK_BYTES + 2);
+        const int8_t *x = xq + b * QK;
+        int32x4_t d = vdupq_n_s32(0);
+        d = vdotq_s32(d, vld1q_s8(q),      vld1q_s8(x));
+        d = vdotq_s32(d, vld1q_s8(q + 16), vld1q_s8(x + 16));
+        a0 = vfmaq_n_f32(a0, vcvtq_f32_s32(d), f16d(sb) * xd[b]);
+    }
+    return vaddvq_f32(vaddq_f32(a0, a1));
+#else
+    float acc = 0.0f;
+    for (uint64_t b = 0; b < blocks; ++b) {
+        uint16_t h; memcpy(&h, r + b * BLK_BYTES, 2);
+        const int8_t *q = (const int8_t *)(r + b * BLK_BYTES + 2);
+        int a = 0;
+        for (uint32_t j = 0; j < QK; ++j) a += (int)q[j] * (int)xq[b * QK + j];
+        acc += f16d(h) * xd[b] * (float)a;
+    }
+    return acc;
+#endif
 }
 
 /* ------------------------------------------------------------- arm: q8f32
@@ -192,17 +292,39 @@ static inline void dot_pair_q8_f32(const uint8_t *r0, const uint8_t *r1,
     *o0 = s0; *o1 = s1;
 }
 
-static inline float dot_q8_f32(const uint8_t *r, const float *x, uint64_t blocks) {
-    float s0, s1;
-    dot_pair_q8_f32(r, r, x, blocks, &s0, &s1);
-    return s0;
+/* q8f32 has no production counterpart, so its single-row form is the paired
+ * one with the second accumulator dropped rather than computed. */
+static inline float dot_row_q8_f32(const uint8_t *r, const float *x,
+                                   uint64_t blocks) {
+    float s = 0.0f;
+#if defined(__ARM_NEON)
+    for (uint64_t b = 0; b < blocks; ++b) {
+        uint16_t h; memcpy(&h, r + b * BLK_BYTES, 2);
+        const int8_t *q = (const int8_t *)(r + b * BLK_BYTES + 2);
+        const float *xp = x + b * QK;
+        float32x4_t a = vdupq_n_f32(0.0f);
+        for (uint32_t j = 0; j < QK; j += 16) {
+            const int8x16_t v = vld1q_s8(q + j);
+            const int16x8_t lo = vmovl_s8(vget_low_s8(v)), hi = vmovl_s8(vget_high_s8(v));
+            a = vfmaq_f32(a, vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo))),  vld1q_f32(xp + j));
+            a = vfmaq_f32(a, vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo))), vld1q_f32(xp + j + 4));
+            a = vfmaq_f32(a, vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi))),  vld1q_f32(xp + j + 8));
+            a = vfmaq_f32(a, vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi))), vld1q_f32(xp + j + 12));
+        }
+        s += f16d(h) * vaddvq_f32(a);
+    }
+#else
+    for (uint64_t b = 0; b < blocks; ++b) {
+        uint16_t h; memcpy(&h, r + b * BLK_BYTES, 2);
+        const int8_t *q = (const int8_t *)(r + b * BLK_BYTES + 2);
+        float a = 0.0f;
+        for (uint32_t j = 0; j < QK; ++j) a += (float)q[j] * x[b * QK + j];
+        s += f16d(h) * a;
+    }
+#endif
+    return s;
 }
-static inline float dot_q8(const uint8_t *r, const int8_t *xq, const float *xd,
-                           uint64_t blocks) {
-    float s0, s1;
-    dot_pair_q8(r, r, xq, xd, blocks, &s0, &s1);
-    return s0;
-}
+
 
 /* ------------------------------------------------------------ thread pool
  * Spawn-per-call is out of the question at 67 us a stage: pthread_create alone
@@ -312,6 +434,12 @@ static void stage_gate_up(void *vud, uint32_t r0, uint32_t r1) {
         else
             dot_pair_q8(c->L->gate + r * rb, c->L->up + r * rb, c->xq, c->xd,
                         blocks, &g, &u);
+        /* Production clamps both before the SwiGLU (matvec_q8_k_mid_worker).
+         * Two compares and two selects per row is not much, but leaving it out
+         * makes the kernel cheaper than the one being proposed. */
+        if (g > CLAMP) g = CLAMP;
+        if (u > CLAMP) u = CLAMP;
+        if (u < -CLAMP) u = -CLAMP;
         c->mid[r] = silu_f(g) * u;
     }
 }
@@ -320,8 +448,8 @@ static void stage_down(void *vud, uint32_t r0, uint32_t r1) {
     const uint64_t blocks = N_LANE / QK;
     for (uint32_t r = r0; r < r1; ++r) {
         const uint8_t *row = c->L->down + (uint64_t)r * DN_FULL_RB + g_lane_off_bytes;
-        c->out[r] = c->f32_path ? dot_q8_f32(row, c->midx, blocks)
-                                : dot_q8(row, c->midq, c->midd, blocks);
+        c->out[r] = c->f32_path ? dot_row_q8_f32(row, c->midx, blocks)
+                                : dot_row_q8(row, c->midq, c->midd, blocks);
     }
 }
 
@@ -352,6 +480,10 @@ int main(int argc, char **argv) {
     uint32_t threads[12] = {8, 12, 14, 15, 16, 20, 24}; uint32_t n_threads = 7;
     int rank = 0;
     const char *only_qos = NULL, *only_part = NULL;
+    /* Tile 64 over 1024 gate/up rows is only 16 tiles, so a 20- or 24-thread
+     * arm cannot put every worker to work and the dynamic partition looks bad
+     * for a reason that has nothing to do with E-cores. */
+    uint32_t tiles[4] = {16, 32, 64}; uint32_t n_tiles = 3;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--layers")  && i + 1 < argc) g_layers = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--iters") && i + 1 < argc) g_iters = (uint32_t)atoi(argv[++i]);
@@ -361,6 +493,14 @@ int main(int argc, char **argv) {
          * not sweep while a decode is trying to be measured next to it. */
         else if (!strcmp(argv[i], "--qos")  && i + 1 < argc) only_qos  = argv[++i];
         else if (!strcmp(argv[i], "--part") && i + 1 < argc) only_part = argv[++i];
+        else if (!strcmp(argv[i], "--duration") && i + 1 < argc) g_duration = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--duty") && i + 1 < argc) g_duty = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--stop") && i + 1 < argc) g_stopfile = argv[++i];
+        else if (!strcmp(argv[i], "--tiles") && i + 1 < argc) {
+            n_tiles = 0;
+            for (char *t = strtok(argv[++i], ","); t && n_tiles < 4; t = strtok(NULL, ","))
+                tiles[n_tiles++] = (uint32_t)atoi(t);
+        }
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
             n_threads = 0;
             for (char *t = strtok(argv[++i], ","); t && n_threads < 8; t = strtok(NULL, ","))
@@ -438,8 +578,8 @@ int main(int argc, char **argv) {
                 ref  += (double)f16d(h) * a;
                 refq += (double)f16d(h) * (double)xd[b] * aq;
             }
-            const float gf = dot_q8_f32(row, x, blocks);
-            const float gp = dot_q8(row, xq, xd, blocks);
+            const float gf = dot_row_q8_f32(row, x, blocks);
+            const float gp = dot_row_q8(row, xq, xd, blocks);
             worst_f32  = fmax(worst_f32,  fabs((double)gf - ref));
             worst_pair = fmax(worst_pair, fabs((double)gp - refq));
             ref_mag = fmax(ref_mag, fabs(ref));
@@ -454,9 +594,54 @@ int main(int argc, char **argv) {
     struct { const char *name; qos_class_t q; } qoss[2] = {
         { "ui", QOS_CLASS_USER_INTERACTIVE }, { "ud", QOS_CLASS_USER_INITIATED },
     };
-    printf("%-8s %-4s %-5s %-7s %9s %9s %9s %11s %9s\n",
-           "arm", "qos", "part", "threads", "p50_us", "p95_us", "rot42_us",
-           "tok_ms", "GB/s");
+    if (g_duration > 0.0) {
+        /* One configuration, held for a wall-clock duration, at a duty cycle.
+         * Production pacing is 42 x 149 us = 6.26 ms of CPU per 28.19 ms token,
+         * about 22%; duty 1.0 is a deliberate upper-bound stress and is
+         * labelled as such rather than quoted as the answer. */
+        pool_start(threads[0], only_part && !strcmp(only_part, "dyn"),
+                   tiles[0], (only_qos && !strcmp(only_qos, "ud"))
+                             ? QOS_CLASS_USER_INITIATED : QOS_CLASS_USER_INTERACTIVE);
+        stage_ctx c = {0};
+        c.x = x; c.xq = xq; c.xd = xd; c.mid = mid; c.midx = mid;
+        c.midq = midq; c.midd = midd; c.out = out; c.f32_path = 0;
+        const double t_end = now_us() + g_duration * 1e6;
+        double *samp = malloc(200000 * sizeof(double));
+        uint32_t n = 0; uint64_t rots = 0;
+        while (now_us() < t_end) {
+            if (g_stopfile && access(g_stopfile, F_OK) == 0) break;
+            const double r0 = now_us();
+            for (uint32_t l = 0; l < g_layers; ++l) {
+                c.L = &W[l];
+                const double t0 = now_us();
+                quantize_q8_0(x, N_EMBD, xq, xd);
+                pool_run(stage_gate_up, &c, N_LANE);
+                quantize_q8_0(mid, N_LANE, midq, midd);
+                pool_run(stage_down, &c, N_EMBD);
+                if (n < 200000) samp[n++] = now_us() - t0;
+            }
+            rots++;
+            const double busy = now_us() - r0;
+            if (g_duty > 0.0 && g_duty < 1.0) {
+                const double idle = busy * (1.0 / g_duty - 1.0);
+                struct timespec ts = { (time_t)(idle / 1e6),
+                                       (long)((idle - (long)(idle / 1e6) * 1e6) * 1e3) };
+                nanosleep(&ts, NULL);
+            }
+        }
+        pool_stop();
+        qsort(samp, n, sizeof(double), cmp_d);
+        printf("load\tthreads\tduty\trotations\tlayers\tp50_us\tp95_us\n");
+        printf("load\t%u\t%.2f\t%llu\t%u\t%.1f\t%.1f\n", threads[0], g_duty,
+               (unsigned long long)rots, n,
+               n ? samp[n / 2] : 0.0, n ? samp[(n * 95) / 100] : 0.0);
+        free(samp);
+        return 0;
+    }
+
+    printf("%-8s %-4s %-5s %-5s %-7s %9s %9s %9s %9s %9s\n",
+           "arm", "qos", "part", "tile", "threads", "p50_us", "p95_us",
+           "rot42_us", "rot_med", "GB/s");
     int green = 0, marginal = 0;
     int ncpu = 0, nperf = 0;
     size_t sz = sizeof(ncpu);
@@ -488,14 +673,21 @@ int main(int argc, char **argv) {
         if (only_qos && strcmp(only_qos, qoss[qi].name)) continue;
         for (int dyn = 0; dyn < 2; ++dyn) {
         if (only_part && strcmp(only_part, dyn ? "dyn" : "eq")) continue;
-        pool_start(threads[ti], dyn, 64u, qoss[qi].q);
+        for (uint32_t tk = 0; tk < (dyn ? n_tiles : 1u); ++tk) {
+        pool_start(threads[ti], dyn, tiles[tk], qoss[qi].q);
         for (int arm = 0; arm < 2; ++arm) {
             stage_ctx c = {0};
             c.x = x; c.xq = xq; c.xd = xd; c.mid = mid; c.midx = mid;
             c.midq = midq; c.midd = midd;
             c.out = out; c.f32_path = (arm == 1);
             double *samp = malloc(g_iters * sizeof(double));
-            double rot = 0.0;
+            /* One cold pass is a single sample of the thing that actually
+             * matters, and it is the noisiest. Collect EVERY full rotation and
+             * report the median alongside, because a configuration is chosen
+             * on 42-layer totals and tails, not on the best single layer. */
+            const uint32_t n_rot = g_iters / g_layers;
+            double *rots = calloc(n_rot ? n_rot : 1u, sizeof(double));
+            double rot = 0.0, cur = 0.0;
             for (uint32_t it = 0; it < g_iters; ++it) {
                 const uint32_t l = it % g_layers;     /* rotate: cold weights */
                 c.L = &W[l];
@@ -506,18 +698,31 @@ int main(int argc, char **argv) {
                 pool_run(stage_down, &c, N_EMBD);
                 const double dt = now_us() - t0;
                 samp[it] = dt;
-                if (it >= g_iters - g_layers) rot += dt;   /* one full cold pass */
+                cur += dt;
+                if ((it + 1u) % g_layers == 0u) {
+                    const uint32_t ri = it / g_layers;
+                    if (ri < n_rot) rots[ri] = cur;
+                    cur = 0.0;
+                }
+                if (it >= g_iters - g_layers) rot += dt;   /* the last cold pass */
             }
             qsort(samp, g_iters, sizeof(double), cmp_d);
             const double p50 = samp[g_iters / 2], p95 = samp[(g_iters * 95) / 100];
-            printf("%-8s %-4s %-5s %-7u %9.1f %9.1f %9.1f %11.2f %9.1f\n",
+            double rot_med = 0.0;
+            if (n_rot) {
+                qsort(rots, n_rot, sizeof(double), cmp_d);
+                rot_med = rots[n_rot / 2];
+            }
+            printf("%-8s %-4s %-5s %-5u %-7u %9.1f %9.1f %9.1f %9.1f %9.1f\n",
                    arm ? "q8f32" : "pairq8", qoss[qi].name,
-                   dyn ? "dyn" : "eq", threads[ti], p50, p95, rot,
-                   p50 * 42.0 / 1000.0, per_layer / (p50 * 1e-6) / 1e9);
+                   dyn ? "dyn" : "eq", dyn ? tiles[tk] : 0u, threads[ti],
+                   p50, p95, rot, rot_med,
+                   per_layer / (p50 * 1e-6) / 1e9);
             if (p50 <= 150.0) green = 1; else if (p50 < 200.0) marginal = 1;
-            free(samp);
+            free(samp); free(rots);
         }
         pool_stop();
+        }
         }
         }
     }
