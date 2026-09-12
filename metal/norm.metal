@@ -62,7 +62,12 @@ kernel void kernel_rms_norm_fuse_impl(
          * front so the final simd_sum sees 0 above the live simdgroups; the
          * ternary below supplies that for free. BIT-IDENTICAL: the 32-lane
          * vector entering the final simd_sum is unchanged. */
-        const ushort nsg = ntg.x / 32u;
+        /* CEILING division. ntg.x need not be a multiple of 32: the public
+         * RMSNorm API takes any width divisible by four, so n=192 dispatches 48
+         * threads -- two simdgroups, of which truncation would count one and
+         * silently drop the second's partial. n=96 dispatches 24 and truncates
+         * to ZERO, making the ternary never true and the whole sum collapse. */
+        const ushort nsg = (ntg.x + N_SIMDWIDTH - 1u) / N_SIMDWIDTH;
         if (tiisg == 0) {
             shmem_f32[sgitg] = sumf;
         }

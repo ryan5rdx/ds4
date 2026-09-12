@@ -4347,6 +4347,17 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_pipeline(
     [constants setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
     const BOOL mv_compact = (ds4_gpu_compact_reduce_mask() & 1) ? YES : NO;
     [constants setConstantValue:&mv_compact type:MTLDataTypeBool atIndex:602];
+    /* Announce where the constant is BOUND TO A PIPELINE, not where the env was
+     * parsed. An env-parse announce proves only that a string was read: it
+     * cannot show the constant reached a pipeline, nor that an affected kernel
+     * ran. This fires once, from the path a dispatch takes to get its PSO. */
+    if (mv_compact) {
+        static int announced_mv;
+        if (!announced_mv) {
+            announced_mv = 1;
+            fprintf(stderr, "ds4: COMPACT MV pipeline bound\n");
+        }
+    }
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
@@ -4387,6 +4398,17 @@ static id<MTLComputePipelineState> ds4_gpu_new_mul_mv_tg_multiple_pipeline(
     [constants setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
     const BOOL mv_compact = (ds4_gpu_compact_reduce_mask() & 1) ? YES : NO;
     [constants setConstantValue:&mv_compact type:MTLDataTypeBool atIndex:602];
+    /* Announce where the constant is BOUND TO A PIPELINE, not where the env was
+     * parsed. An env-parse announce proves only that a string was read: it
+     * cannot show the constant reached a pipeline, nor that an affected kernel
+     * ran. This fires once, from the path a dispatch takes to get its PSO. */
+    if (mv_compact) {
+        static int announced_mv;
+        if (!announced_mv) {
+            announced_mv = 1;
+            fprintf(stderr, "ds4: COMPACT MV pipeline bound\n");
+        }
+    }
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
@@ -4630,6 +4652,17 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_ext_pipeline(
     [constants setConstantValue:&nsg   type:MTLDataTypeShort atIndex:600];
     const BOOL mv_compact = (ds4_gpu_compact_reduce_mask() & 1) ? YES : NO;
     [constants setConstantValue:&mv_compact type:MTLDataTypeBool atIndex:602];
+    /* Announce where the constant is BOUND TO A PIPELINE, not where the env was
+     * parsed. An env-parse announce proves only that a string was read: it
+     * cannot show the constant reached a pipeline, nor that an affected kernel
+     * ran. This fires once, from the path a dispatch takes to get its PSO. */
+    if (mv_compact) {
+        static int announced_mv;
+        if (!announced_mv) {
+            announced_mv = 1;
+            fprintf(stderr, "ds4: COMPACT MV pipeline bound\n");
+        }
+    }
     [constants setConstantValue:&nxpsg type:MTLDataTypeShort atIndex:601];
 
     NSError *error = nil;
@@ -25119,6 +25152,13 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         if (!cb) return 0;
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        if (ds4_gpu_compact_reduce_mask() & 2) {
+            static int announced_norm;
+            if (!announced_norm) {
+                announced_norm = 1;
+                fprintf(stderr, "ds4: COMPACT NORM dispatched\n");
+            }
+        }
         DS4_SET_PIPE(enc, g_rms_norm_pipeline);
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
