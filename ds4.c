@@ -51246,12 +51246,47 @@ static bool glm_graph_encode_ffn_batch(
      * Metal command buffer and a Core ML prediction, only completion. */
     const int ane_sidecar = ok && !shared_done && ds4_ane_mode() != DS4_ANE_OFF &&
                             ds4_ane_init((uint32_t)DS4_N_LAYER, n_tokens);
+    uint32_t ane_seq = 0;
     if (ane_sidecar) {
-        ok = glm_graph_prefill_stage_sync_boundary();
-        if (ok && ds4_ane_mode() >= DS4_ANE_BRIDGE) {
-            ds4_gpu_ane_pack(g->batch_ffn_norm, (uint32_t)DS4_N_EMBD, n_tokens);
+        /* TWO fences, and both are load-bearing.
+         *
+         * The first makes batch_ffn_norm readable. Folding it into the pack's
+         * own submission does not work: the batch encoder may be
+         * MTLDispatchTypeConcurrent, under which encoder order is NOT
+         * ordering, so a pack appended behind the norm could still read it
+         * before it was written.
+         *
+         * The second makes the PACKED SURFACE readable, and its absence was a
+         * race. ds4_gpu_finish_command_buffer() returns immediately when the
+         * command buffer is not owned, so a pack appended to the open batch
+         * buffer is encoded and never committed -- Core ML then read whatever
+         * the staging surface held from the previous layer. Every shadow
+         * number taken before this is invalid, and optimistically so: the ANE
+         * was racing ahead of work that had not happened.
+         *
+         * This is the SAFE path, not the only one: ds4 already has a
+         * system-coherent release-word fence, and ANE-FAST-HANDOFF exists to
+         * price the same handoff on it. Read the cost measured here as the
+         * public-API ceiling. */
+        if (ds4_ane_mode() == DS4_ANE_FAST) {
+            /* No command-buffer round trip at all. Encoder boundaries order
+             * the pack against the norm and the publish against the pack --
+             * the same primitive ds4's own fast-sync gates use -- and the
+             * rendezvous is a system-coherent word instead of completion. */
+            ane_seq = ds4_ane_next_seq();
+            ds4_gpu_ane_order_boundary();
+            ok = ds4_gpu_ane_pack(g->batch_ffn_norm, (uint32_t)DS4_N_EMBD,
+                                  n_tokens) != 0;
+            if (ok) ok = ds4_gpu_ane_publish_ready(ane_seq) != 0;
+            if (ok) ds4_ane_begin_layer(il);
+        } else {
+            ok = glm_graph_prefill_stage_sync_boundary();
+            if (ok && ds4_ane_mode() >= DS4_ANE_BRIDGE) {
+                ds4_gpu_ane_pack(g->batch_ffn_norm, (uint32_t)DS4_N_EMBD, n_tokens);
+                ok = glm_graph_prefill_stage_sync_boundary();
+            }
+            if (ok) ds4_ane_begin_layer(il);
         }
-        if (ok) ds4_ane_begin_layer(il);
     }
     if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) { /* ablate: keep the gate */ } else
     ds4_gpu_trace_tag_layer(il, "routed_moe");
@@ -51366,6 +51401,12 @@ static bool glm_graph_encode_ffn_batch(
     }
     if (ok && !shared_done) DS4_GLM_ENCODE_FFN_BATCH_SHARED();
     if (ane_sidecar) {
+        if (ds4_ane_mode() == DS4_ANE_FAST) {
+            /* The GPU waits, not this thread. It reaches the fence having
+             * already run routed-MoE, so a prediction that finished during
+             * that window costs nothing here. */
+            ok = ok && ds4_gpu_ane_fence_done(ane_seq) != 0;
+        }
         ds4_ane_wait(il);
         if (ds4_ane_mode() >= DS4_ANE_BRIDGE) {
             /* NULL destination = the bridge's own scratch. The GPU stays

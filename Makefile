@@ -489,6 +489,11 @@ ds4_ane.o: ds4_ane.m ds4_ane.h
 tests/probe_ane: tests/probe_ane.c ds4_metal.o ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/probe_ane.c ds4_metal.o $(METAL_LDLIBS)
 
+# 10k-iteration poison test for the FAST rendezvous. Every failure mode there
+# is a stale read, and a stale read produces a complete, plausible tensor.
+tests/probe_ane_handoff: tests/probe_ane_handoff.c ds4_metal.o ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/probe_ane_handoff.c ds4_metal.o $(METAL_LDLIBS)
+
 tests/test_glm53_kda.o: tests/test_glm53_kda.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_glm53_kda.c
 

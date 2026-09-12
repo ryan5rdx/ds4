@@ -51,6 +51,15 @@ enum {
     DS4_ANE_PROBE  = 1,
     DS4_ANE_BRIDGE = 2,
     DS4_ANE_SHADOW = 3,
+    /* Same work as SHADOW, rendezvoused on ds4's system-coherent release words
+     * instead of on command-buffer completion. The safe path costs two full
+     * round trips per layer -- 2688 over a 131k prefill -- and the earlier
+     * claim that this was "unavoidable" was too strong: it is the public-API
+     * path, and ds4 already owns a cheaper one. Here the GPU publishes READY
+     * after the pack, the sidecar thread spins on it and runs Core ML while
+     * the GPU is inside routed-MoE, stores DONE on completion, and a GPU fence
+     * spins on DONE before the unpack. Nothing is committed in between. */
+    DS4_ANE_FAST   = 4,
 };
 
 /* Parsed once from the environment. 0 when unset or when this build has no
@@ -79,6 +88,11 @@ void ds4_ane_report(void);
 
 /* Reset the accumulated counters (used by the per-chunk reporting path). */
 void ds4_ane_reset(void);
+
+/* FAST only: the per-layer sequence rendezvous. begin_layer publishes nothing
+ * itself -- ds4.c encodes the GPU publish -- so the caller needs the sequence
+ * number it must hand to ds4_gpu_ane_publish_ready/ds4_gpu_ane_fence_done. */
+uint32_t ds4_ane_next_seq(void);
 
 #ifdef __cplusplus
 }

@@ -66,6 +66,17 @@ int  ds4_gpu_ane_unpack(ds4_gpu_tensor *dst, uint32_t dim, uint32_t n_tok,
                         int accumulate);
 int  ds4_gpu_ane_compare(const ds4_gpu_tensor *gpu_ref, uint32_t dim,
                          uint32_t n_tok, double *max_abs, double *rel_rms);
+
+/* Fast handoff. The safe path costs two command-buffer round trips per layer
+ * and 42 x 32 is 2688 of them; these rendezvous on ds4's system-coherent
+ * release words instead, using DEDICATED sidecar sequence words rather than TP
+ * gate slots -- a ~15 ms ANE wait dropped into a space sized for ~500 us
+ * exchanges would surface as a TP hang, not as anything pointing here. */
+void ds4_gpu_ane_order_boundary(void);
+int  ds4_gpu_ane_publish_ready(uint32_t seq);
+int  ds4_gpu_ane_fence_done(uint32_t seq);
+volatile uint32_t *ds4_gpu_ane_sync_words(void);
+int  ds4_gpu_ane_sync_timed_out(void);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 
 /* GPU-side fill of a sub-range, in elements. Unlike ds4_gpu_tensor_fill_f32

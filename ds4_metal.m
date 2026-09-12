@@ -52273,6 +52273,31 @@ static void *g_ane_in_ptr, *g_ane_out_ptr;
  * guard and silently skipped -- the bridge would have measured half of
  * itself and reported success. */
 static ds4_gpu_tensor *g_ane_scratch;
+
+/* ---- fast handoff: dedicated sidecar sequence words -----------------------
+ *
+ * The safe path costs two full command-buffer round trips per layer, and 42
+ * layers x 32 chunks is 2688 of them. ds4 already owns a cheaper rendezvous:
+ * the system-coherent release word the TP fast-sync gates spin on. Same
+ * primitives here -- kernel_dsv4_tp_flag_set_coherent to publish, and
+ * kernel_dsv4_tp_fence_wait to spin -- so nothing about the mechanism is new.
+ *
+ * The words are DEDICATED, deliberately. Borrowing a TP gate slot would put a
+ * ~15 ms ANE wait into a sequence space sized for ~500 us exchanges, and the
+ * two would interleave: a sidecar publish landing in a gate slot is
+ * indistinguishable from that gate's own arrival, and the corruption would
+ * appear as a TP hang under load rather than as anything pointing here.
+ *
+ * The iteration budget is separate for the same reason. A TP exchange waits
+ * hundreds of microseconds; a shared-expert prediction is ~15 ms. Reusing the
+ * gate's budget would time out every layer. */
+#define DS4_ANE_SYNC_READY 0u
+#define DS4_ANE_SYNC_DONE  1u
+static id<MTLBuffer> g_ane_sync_buffer;
+static volatile uint32_t *g_ane_sync_words;
+static id<MTLBuffer> g_ane_sync_timeout_buffer;
+static id<MTLBuffer> g_ane_sync_stats_buffer;
+static uint32_t g_ane_fence_max_iters;
 static uint32_t g_ane_dim, g_ane_ntok;
 
 typedef struct {
@@ -52339,6 +52364,8 @@ static id<MTLBuffer> ds4_gpu_ane_surface(size_t bytes, IOSurfaceRef *surf_out,
 }
 
 void ds4_gpu_ane_stage_free(void) {
+    g_ane_sync_buffer = nil; g_ane_sync_words = NULL;
+    g_ane_sync_timeout_buffer = nil; g_ane_sync_stats_buffer = nil;
     if (g_ane_scratch) { ds4_gpu_tensor_free(g_ane_scratch); g_ane_scratch = NULL; }
     g_ane_in_buf = nil; g_ane_out_buf = nil; g_ane_cmp_buf = nil;
     if (g_ane_in_surface)  { CFRelease(g_ane_in_surface);  g_ane_in_surface = NULL; }
@@ -52366,7 +52393,26 @@ int ds4_gpu_ane_stage_alloc(uint32_t dim, uint32_t n_tok,
         g_ane_cmp_buf = [g_device newBufferWithLength:3 * sizeof(uint32_t)
                                               options:MTLResourceStorageModeShared];
         g_ane_scratch = ds4_gpu_tensor_alloc((uint64_t)dim * n_tok * sizeof(float));
-        if (!g_ane_in_buf || !g_ane_out_buf || !g_ane_cmp_buf || !g_ane_scratch) {
+        g_ane_sync_buffer = [g_device newBufferWithLength:4 * sizeof(uint32_t)
+                                                  options:MTLResourceStorageModeShared];
+        g_ane_sync_timeout_buffer = [g_device newBufferWithLength:sizeof(uint32_t)
+                                                          options:MTLResourceStorageModeShared];
+        g_ane_sync_stats_buffer = [g_device newBufferWithLength:
+                                       DS4_TP_FENCE_SPIN_WORDS * sizeof(uint32_t)
+                                                        options:MTLResourceStorageModeShared];
+        if (g_ane_sync_buffer) {
+            memset(g_ane_sync_buffer.contents, 0, 4 * sizeof(uint32_t));
+            g_ane_sync_words = (volatile uint32_t *)g_ane_sync_buffer.contents;
+        }
+        if (g_ane_sync_timeout_buffer) memset(g_ane_sync_timeout_buffer.contents, 0, sizeof(uint32_t));
+        if (g_ane_sync_stats_buffer)
+            memset(g_ane_sync_stats_buffer.contents, 0, DS4_TP_FENCE_SPIN_WORDS * sizeof(uint32_t));
+        /* ~15 ms of spin, not the gate's ~500 us. Dedicated budget, dedicated
+         * words: see the comment at the declarations. */
+        g_ane_fence_max_iters = (uint32_t)ds4_gpu_env_u64(
+                "DS4_ANE_FENCE_MAX_ITERS", 2000000000ull, 1000ull, 4000000000ull);
+        if (!g_ane_in_buf || !g_ane_out_buf || !g_ane_cmp_buf || !g_ane_scratch ||
+            !g_ane_sync_buffer || !g_ane_sync_timeout_buffer || !g_ane_sync_stats_buffer) {
             ds4_gpu_ane_stage_free();
             return 0;
         }
@@ -52458,3 +52504,79 @@ int ds4_gpu_ane_compare(const ds4_gpu_tensor *gpu_ref, uint32_t dim, uint32_t n_
     }
     return 1;
 }
+
+/* The two sequence words, for the sidecar thread to spin on and store into.
+ * Returns NULL until the staging is allocated. */
+volatile uint32_t *ds4_gpu_ane_sync_words(void) { return g_ane_sync_words; }
+
+int ds4_gpu_ane_sync_timed_out(void) {
+    if (!g_ane_sync_timeout_buffer) return 0;
+    return *(volatile uint32_t *)g_ane_sync_timeout_buffer.contents != 0u;
+}
+
+/* Publish READY=seq from the GPU, after the pack. The CPU cannot know the pack
+ * has RUN without either a completion wait -- which is the cost being avoided
+ * -- or a store the GPU itself makes visible at system scope. */
+int ds4_gpu_ane_publish_ready(uint32_t seq) {
+    if (!g_ane_sync_buffer) return 0;
+    @autoreleasepool {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputePipelineState> pipe =
+                ds4_gpu_get_pipeline("kernel_dsv4_tp_flag_set_coherent");
+        if (!pipe) return 0;
+        /* Close first: the batch encoder may be MTLDispatchTypeConcurrent, in
+         * which case dispatch order inside one encoder is not ordering, and a
+         * publish that overtook the pack would hand the ANE a stale surface --
+         * exactly the race the safe path's second fence exists to prevent. */
+        ds4_gpu_close_batch_encoder();
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        DS4_SET_PIPE(enc, pipe);
+        [enc setBuffer:g_ane_sync_buffer
+                offset:DS4_ANE_SYNC_READY * sizeof(uint32_t) atIndex:0];
+        [enc setBytes:&seq length:sizeof(seq) atIndex:1];
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                      threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        ds4_gpu_close_batch_encoder();
+        if (owned) return ds4_gpu_finish_command_buffer(cb, owned, "ANE publish");
+    }
+    return 1;
+}
+
+/* Spin the GPU on DONE==seq. Encoded before the unpack, after the routed-MoE
+ * dispatch, so the GPU reaches it having already done the work the ANE was
+ * overlapping with. */
+int ds4_gpu_ane_fence_done(uint32_t seq) {
+    if (!g_ane_sync_buffer || !g_ane_sync_timeout_buffer) return 0;
+    @autoreleasepool {
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputePipelineState> pipe =
+                ds4_gpu_get_pipeline("kernel_dsv4_tp_fence_wait");
+        if (!pipe) return 0;
+        ds4_gpu_close_batch_encoder();
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        DS4_SET_PIPE(enc, pipe);
+        [enc setBuffer:g_ane_sync_buffer
+                offset:DS4_ANE_SYNC_DONE * sizeof(uint32_t) atIndex:0];
+        [enc setBytes:&seq length:sizeof(seq) atIndex:1];
+        [enc setBytes:&g_ane_fence_max_iters length:sizeof(g_ane_fence_max_iters) atIndex:2];
+        [enc setBuffer:g_ane_sync_timeout_buffer offset:0 atIndex:3];
+        [enc setBuffer:g_ane_sync_stats_buffer offset:0 atIndex:4];
+        const uint32_t profile = 0u;
+        [enc setBytes:&profile length:sizeof(profile) atIndex:5];
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                      threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+        ds4_gpu_close_batch_encoder();
+        if (owned) return ds4_gpu_finish_command_buffer(cb, owned, "ANE fence");
+    }
+    return 1;
+}
+
+/* Encoder-boundary ordering for the pack, so the fast path can keep everything
+ * in one command buffer instead of committing to get ordering. */
+void ds4_gpu_ane_order_boundary(void) { ds4_gpu_close_batch_encoder(); }
