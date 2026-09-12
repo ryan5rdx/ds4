@@ -37,6 +37,7 @@ static volatile uint32_t *g_w;
 static void *g_in, *g_out;
 static volatile int g_stop;
 static volatile uint32_t g_served;
+static uint32_t g_ahead;   /* handoffs served by the run-ahead pass */
 
 /* Stands in for the sidecar thread: wait for READY, transform in -> out,
  * release DONE. */
@@ -74,10 +75,52 @@ int main(void) {
     if (!src || !dst) { puts("VOID: tensors"); return 1; }
     float *sp = ds4_gpu_tensor_contents(src), *dp = ds4_gpu_tensor_contents(dst);
 
+    uint32_t seq = 0;
     pthread_t th;
     if (pthread_create(&th, NULL, producer, NULL) != 0) { puts("VOID: thread"); return 1; }
 
-    uint32_t stale = 0, wrong = 0, seq = 0;
+    /* PASS 1: all 42 handoffs encoded before ONE completion.
+     *
+     * This is the case the per-iteration loop below cannot reach, and it is
+     * the case that found the single-slot bug: the host encodes far ahead of
+     * what the GPU has executed, so with one (seq, model) slot layer N+1's
+     * request overwrote layer N's before the sidecar saw READY(N). A ring plus
+     * in-order drain is what makes this correct, and correctness here rests on
+     * the GPU being unable to pack N+1 before it has fenced on DONE(N) --
+     * encoder boundaries, program order, one command buffer. */
+    {
+        const uint32_t L = 42;
+        g_ahead = L;
+        ds4_gpu_begin_commands();
+        for (uint32_t l = 0; l < L; ++l) {
+            for (uint32_t i = 0; i < DIM * NTOK; ++i) sp[i] = (float)l * 0.5f - 8.0f;
+            seq++;
+            ds4_gpu_ane_order_boundary();
+            if (!ds4_gpu_ane_pack(src, DIM, NTOK))      { puts("VOID: pack/ahead");    return 1; }
+            if (!ds4_gpu_ane_publish_ready(seq))        { puts("VOID: publish/ahead"); return 1; }
+            if (!ds4_gpu_ane_fence_done(seq))           { puts("VOID: fence/ahead");   return 1; }
+            if (!ds4_gpu_ane_unpack(dst, DIM, NTOK, 0)) { puts("VOID: unpack/ahead");  return 1; }
+        }
+        ds4_gpu_end_commands();
+        /* Only the LAST layer's output survives in dst, but every layer had to
+         * be served in order for the GPU to have got there at all: a missed
+         * request stalls its fence until timeout. */
+        int bad = 0;
+        const float want = (float)(L - 1u) * 0.5f - 8.0f + 1.0f;
+        for (uint32_t i = 0; i < DIM * NTOK; ++i)
+            if (fabsf(dp[i] - want) > 1e-3f) bad++;
+        printf("run-ahead pass: %u handoffs encoded before one completion, "
+               "served %u, %s\n", L, g_served,
+               (bad || ds4_gpu_ane_sync_timed_out()) ? "FAIL" : "ok");
+        if (bad || ds4_gpu_ane_sync_timed_out()) {
+            printf("  %d/%u wrong, timeout=%d -- a request was dropped or "
+                   "reordered\n", bad, DIM * NTOK, ds4_gpu_ane_sync_timed_out());
+            g_stop = 1; pthread_join(th, NULL);
+            return 1;
+        }
+    }
+
+    uint32_t stale = 0, wrong = 0;
     for (uint32_t it = 0; it < ITERS; ++it) {
         /* A nonce that is exact in f16 and changes every iteration, so a
          * result carried over from the previous one is unmistakable. */
@@ -113,13 +156,14 @@ int main(void) {
     }
     g_stop = 1; pthread_join(th, NULL);
 
-    printf("iterations      %u\n", ITERS);
-    printf("producer served %u\n", g_served);
+    printf("\niterations      %u\n", ITERS);
+    printf("producer served %u (%u run-ahead + %u loop)\n",
+           g_served, g_ahead, ITERS);
     printf("wrong results   %u\n", wrong);
     printf("  of which stale (previous iteration's value) %u\n", stale);
     printf("fence timeouts  %d\n", ds4_gpu_ane_sync_timed_out());
-    const int ok = !wrong && g_served == ITERS;
-    printf("\n%s\n", ok ? "PASS: fast handoff is race-free over 10k iterations"
+    const int ok = !wrong && g_served == ITERS + g_ahead;
+    printf("\n%s\n", ok ? "PASS: race-free over 10k iterations AND 42-deep run-ahead"
                         : "FAIL: the handoff drops or reorders");
     return ok ? 0 : 1;
 }

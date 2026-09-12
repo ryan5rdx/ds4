@@ -51,6 +51,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <sys/sysctl.h>
+#include <pthread/qos.h>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -58,6 +59,7 @@
 
 #define N_EMBD    4096u
 #define N_LANE    1024u          /* n_ff_exp 2048 halved per rank under S2 */
+#define N_FF_FULL 2048u          /* the down matrix is stored at FULL width */
 #define QK        32u
 #define BLK_BYTES 34u            /* fp16 scale + 32 int8 */
 
@@ -66,6 +68,15 @@ static uint32_t g_iters   = 200;
 static int      g_check   = 0;
 
 typedef struct { uint8_t *gate, *up, *down; } layer_w;
+
+/* down is [n_embd][n_ff_exp] at FULL 2048 width; a rank reads a contiguous
+ * 1024-lane slice out of each row. Packing that slice contiguously -- as the
+ * first cut did -- turns a strided read into a streaming one and touches half
+ * as many DRAM pages, which is exactly the sort of flattering the window
+ * cannot afford. Rows are DN_FULL_RB apart and DN_RB wide. */
+#define DN_FULL_RB ((uint64_t)(N_FF_FULL / QK) * BLK_BYTES)   /* 2176 */
+#define DN_RB      ((uint64_t)(N_LANE / QK) * BLK_BYTES)      /* 1088 */
+static uint64_t g_lane_off_bytes;   /* rank 1 starts half way along the row */
 
 static double now_us(void) {
     struct timespec ts;
@@ -87,7 +98,7 @@ static uint16_t f16e(float f) {
  * Transcribed from ds4.c dot_q8_0_row_pair. Both rows share the activation,
  * so the int8 loads of xq are amortised across gate and up. */
 static inline void dot_pair_q8(const uint8_t *r0, const uint8_t *r1,
-                               const int8_t *xq, float xscale,
+                               const int8_t *xq, const float *xd,
                                uint64_t blocks, float *o0, float *o1) {
     float s0 = 0.0f, s1 = 0.0f;
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
@@ -104,8 +115,8 @@ static inline void dot_pair_q8(const uint8_t *r0, const uint8_t *r1,
         d0 = vdotq_s32(d0, vld1q_s8(q0 + 16), x1);
         d1 = vdotq_s32(d1, vld1q_s8(q1),      x0);
         d1 = vdotq_s32(d1, vld1q_s8(q1 + 16), x1);
-        s0 += f16d(h0) * xscale * (float)vaddvq_s32(d0);
-        s1 += f16d(h1) * xscale * (float)vaddvq_s32(d1);
+        s0 += f16d(h0) * xd[b] * (float)vaddvq_s32(d0);
+        s1 += f16d(h1) * xd[b] * (float)vaddvq_s32(d1);
     }
 #else
     for (uint64_t b = 0; b < blocks; ++b) {
@@ -118,8 +129,8 @@ static inline void dot_pair_q8(const uint8_t *r0, const uint8_t *r1,
             a0 += (int)((const int8_t *)(r0 + b * BLK_BYTES + 2))[j] * xv;
             a1 += (int)((const int8_t *)(r1 + b * BLK_BYTES + 2))[j] * xv;
         }
-        s0 += f16d(h0) * xscale * (float)a0;
-        s1 += f16d(h1) * xscale * (float)a1;
+        s0 += f16d(h0) * xd[b] * (float)a0;
+        s1 += f16d(h1) * xd[b] * (float)a1;
     }
 #endif
     *o0 = s0; *o1 = s1;
@@ -186,10 +197,10 @@ static inline float dot_q8_f32(const uint8_t *r, const float *x, uint64_t blocks
     dot_pair_q8_f32(r, r, x, blocks, &s0, &s1);
     return s0;
 }
-static inline float dot_q8(const uint8_t *r, const int8_t *xq, float xscale,
+static inline float dot_q8(const uint8_t *r, const int8_t *xq, const float *xd,
                            uint64_t blocks) {
     float s0, s1;
-    dot_pair_q8(r, r, xq, xscale, blocks, &s0, &s1);
+    dot_pair_q8(r, r, xq, xd, blocks, &s0, &s1);
     return s0;
 }
 
@@ -205,28 +216,61 @@ typedef struct {
     work_fn   fn;
     void     *ud;
     uint32_t  rows;
+    int       dynamic;                  /* 0 = equal partition, 1 = row tiles */
+    volatile uint32_t next;             /* dynamic: the tile cursor */
+    uint32_t  tile;
+    qos_class_t qos;
 } pool;
 static pool g_pool;
 
+static void pool_do(uint32_t id) {
+    if (!g_pool.dynamic) {
+        const uint32_t per = (g_pool.rows + g_pool.n - 1u) / g_pool.n;
+        uint32_t r0 = id * per, r1 = r0 + per;
+        if (r1 > g_pool.rows) r1 = g_pool.rows;
+        if (r0 < r1) g_pool.fn(g_pool.ud, r0, r1);
+        return;
+    }
+    /* Dynamic tiles. An equal partition finishes at the speed of its slowest
+     * worker, so one E-core paces everyone; small tiles let a slow core take
+     * fewer of them instead. Costs one atomic per tile. */
+    for (;;) {
+        const uint32_t r0 = __atomic_fetch_add(&g_pool.next, g_pool.tile,
+                                               __ATOMIC_ACQ_REL);
+        if (r0 >= g_pool.rows) return;
+        uint32_t r1 = r0 + g_pool.tile;
+        if (r1 > g_pool.rows) r1 = g_pool.rows;
+        g_pool.fn(g_pool.ud, r0, r1);
+    }
+}
+
 static void *pool_worker(void *vid) {
     const uint32_t id = (uint32_t)(uintptr_t)vid;
+    /* macOS has no reliable P-core pinning -- THREAD_AFFINITY_POLICY is a
+     * cache-affinity hint, not a binding -- so QoS is the only lever. It biases
+     * placement rather than guaranteeing it, which is why the E-core arms below
+     * are negative controls and not assumptions. */
+    pthread_set_qos_class_self_np(g_pool.qos, 0);
     uint32_t seen = 0;
     for (;;) {
         while (__atomic_load_n(&g_pool.gen, __ATOMIC_ACQUIRE) == seen) {
             if (__atomic_load_n(&g_pool.stop, __ATOMIC_ACQUIRE)) return NULL;
         }
         seen = __atomic_load_n(&g_pool.gen, __ATOMIC_ACQUIRE);
-        const uint32_t per = (g_pool.rows + g_pool.n - 1u) / g_pool.n;
-        uint32_t r0 = id * per, r1 = r0 + per;
-        if (r1 > g_pool.rows) r1 = g_pool.rows;
-        if (r0 < r1) g_pool.fn(g_pool.ud, r0, r1);
+        pool_do(id);
         __atomic_add_fetch(&g_pool.done, 1u, __ATOMIC_RELEASE);
     }
 }
-static void pool_start(uint32_t n) {
+static void pool_start(uint32_t n, int dynamic, uint32_t tile, qos_class_t q) {
     g_pool.n = n; g_pool.gen = 0; g_pool.done = 0; g_pool.stop = 0;
+    g_pool.dynamic = dynamic; g_pool.tile = tile ? tile : 64u; g_pool.qos = q;
+    pthread_set_qos_class_self_np(q, 0);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_set_qos_class_np(&attr, q, 0);
     for (uint32_t i = 1; i < n; ++i)
-        pthread_create(&g_pool.th[i], NULL, pool_worker, (void *)(uintptr_t)i);
+        pthread_create(&g_pool.th[i], &attr, pool_worker, (void *)(uintptr_t)i);
+    pthread_attr_destroy(&attr);
 }
 static void pool_stop(void) {
     __atomic_store_n(&g_pool.stop, 1u, __ATOMIC_RELEASE);
@@ -234,11 +278,10 @@ static void pool_stop(void) {
 }
 static void pool_run(work_fn fn, void *ud, uint32_t rows) {
     g_pool.fn = fn; g_pool.ud = ud; g_pool.rows = rows;
+    __atomic_store_n(&g_pool.next, 0u, __ATOMIC_RELEASE);
     __atomic_store_n(&g_pool.done, 0u, __ATOMIC_RELEASE);
     __atomic_add_fetch(&g_pool.gen, 1u, __ATOMIC_RELEASE);
-    const uint32_t per = (rows + g_pool.n - 1u) / g_pool.n;
-    uint32_t r1 = per; if (r1 > rows) r1 = rows;
-    if (r1 > 0) fn(ud, 0, r1);                       /* thread 0 is this one */
+    pool_do(0);                                      /* thread 0 is this one */
     while (__atomic_load_n(&g_pool.done, __ATOMIC_ACQUIRE) < g_pool.n - 1u) { }
 }
 
@@ -247,11 +290,11 @@ typedef struct {
     const layer_w *L;
     const float   *x;          /* f32 activation, N_EMBD */
     const int8_t  *xq;         /* int8 activation, N_EMBD */
-    float          xscale;
+    const float   *xd;          /* per-block activation scales */
     float         *mid;        /* N_LANE */
     const float   *midx;       /* f32 mid for the down stage */
     const int8_t  *midq;
-    float          midscale;
+    const float   *midd;
     float         *out;        /* N_EMBD */
     int            f32_path;
 } stage_ctx;
@@ -267,7 +310,7 @@ static void stage_gate_up(void *vud, uint32_t r0, uint32_t r1) {
         if (c->f32_path)
             dot_pair_q8_f32(c->L->gate + r * rb, c->L->up + r * rb, c->x, blocks, &g, &u);
         else
-            dot_pair_q8(c->L->gate + r * rb, c->L->up + r * rb, c->xq, c->xscale,
+            dot_pair_q8(c->L->gate + r * rb, c->L->up + r * rb, c->xq, c->xd,
                         blocks, &g, &u);
         c->mid[r] = silu_f(g) * u;
     }
@@ -275,28 +318,49 @@ static void stage_gate_up(void *vud, uint32_t r0, uint32_t r1) {
 static void stage_down(void *vud, uint32_t r0, uint32_t r1) {
     stage_ctx *c = vud;
     const uint64_t blocks = N_LANE / QK;
-    const uint64_t rb = blocks * BLK_BYTES;
-    for (uint32_t r = r0; r < r1; ++r)
-        c->out[r] = c->f32_path
-            ? dot_q8_f32(c->L->down + r * rb, c->midx, blocks)
-            : dot_q8(c->L->down + r * rb, c->midq, c->midscale, blocks);
+    for (uint32_t r = r0; r < r1; ++r) {
+        const uint8_t *row = c->L->down + (uint64_t)r * DN_FULL_RB + g_lane_off_bytes;
+        c->out[r] = c->f32_path ? dot_q8_f32(row, c->midx, blocks)
+                                : dot_q8(row, c->midq, c->midd, blocks);
+    }
 }
 
-static void quantize_q8(const float *x, uint32_t n, int8_t *q, float *scale) {
-    float amax = 0.0f;
-    for (uint32_t i = 0; i < n; ++i) { const float a = fabsf(x[i]); if (a > amax) amax = a; }
-    const float d = amax / 127.0f;
-    *scale = d;
-    const float id = d > 0.0f ? 1.0f / d : 0.0f;
-    for (uint32_t i = 0; i < n; ++i) q[i] = (int8_t)lrintf(x[i] * id);
+/* Q8_0 quantizes PER BLOCK OF 32, not once for the whole vector. The first cut
+ * used a single scale, which understates both the work (one amax pass and one
+ * reciprocal per block, not per vector) and the accuracy, and would have made
+ * the 115 us figure not production-faithful. */
+static void quantize_q8_0(const float *x, uint32_t n, int8_t *q, float *xd) {
+    for (uint32_t b = 0; b < n / QK; ++b) {
+        float amax = 0.0f;
+        for (uint32_t j = 0; j < QK; ++j) {
+            const float a = fabsf(x[b * QK + j]); if (a > amax) amax = a;
+        }
+        const float d = amax / 127.0f;
+        xd[b] = d;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+        for (uint32_t j = 0; j < QK; ++j)
+            q[b * QK + j] = (int8_t)lrintf(x[b * QK + j] * id);
+    }
 }
 
 int main(int argc, char **argv) {
-    uint32_t threads[8] = {12, 16, 24}; uint32_t n_threads = 3;
+    /* P-oriented candidates first, then 20/24 as deliberate E-core negative
+     * controls. An M2 Ultra is 16 P + 8 E, so 12-16 is the real range and the
+     * last two exist to be shown worse. Production will also want 1-2 P-cores
+     * left for the TP service and the Metal driver threads, so 12-14 beating 16
+     * would not be a surprise even if 16 wins standalone. */
+    uint32_t threads[12] = {8, 12, 14, 15, 16, 20, 24}; uint32_t n_threads = 7;
+    int rank = 0;
+    const char *only_qos = NULL, *only_part = NULL;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--layers")  && i + 1 < argc) g_layers = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--iters") && i + 1 < argc) g_iters = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--check")) g_check = 1;
+        else if (!strcmp(argv[i], "--rank") && i + 1 < argc) rank = atoi(argv[++i]);
+        /* Pin one configuration -- the contention arm has to run the winner,
+         * not sweep while a decode is trying to be measured next to it. */
+        else if (!strcmp(argv[i], "--qos")  && i + 1 < argc) only_qos  = argv[++i];
+        else if (!strcmp(argv[i], "--part") && i + 1 < argc) only_part = argv[++i];
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
             n_threads = 0;
             for (char *t = strtok(argv[++i], ","); t && n_threads < 8; t = strtok(NULL, ","))
@@ -305,28 +369,32 @@ int main(int argc, char **argv) {
     }
 
     const uint64_t gu_rb = (N_EMBD / QK) * BLK_BYTES;   /* 4352 */
-    const uint64_t dn_rb = (N_LANE / QK) * BLK_BYTES;   /* 1088 */
-    const uint64_t per_layer = N_LANE * gu_rb * 2u + N_EMBD * dn_rb;
+    const uint64_t per_layer = N_LANE * gu_rb * 2u + N_EMBD * DN_RB;
+    g_lane_off_bytes = rank ? DN_RB : 0u;
 
     printf("CPU decode shared-expert sidecar probe\n");
     printf("  shapes  gate/up %ux%u  down %ux%u   (S2: rank-local lane slice)\n",
            N_EMBD, N_LANE, N_LANE, N_EMBD);
     printf("  weights %.2f MB/layer, %.2f MB over %u layers\n",
            per_layer / 1e6, per_layer * g_layers / 1e6, g_layers);
-    printf("  window  149 us/layer -> needs %.1f GB/s\n\n", per_layer / 149e-6 / 1e9);
+    printf("  window  149 us/layer -> needs %.1f GB/s\n", per_layer / 149e-6 / 1e9);
+    printf("  down is a STRIDED slice: %llu B read out of every %llu B row, "
+           "rank %d offset %llu\n\n",
+           (unsigned long long)DN_RB, (unsigned long long)DN_FULL_RB,
+           rank, (unsigned long long)g_lane_off_bytes);
 
     layer_w *W = calloc(g_layers, sizeof(*W));
     for (uint32_t l = 0; l < g_layers; ++l) {
         W[l].gate = malloc(N_LANE * gu_rb);
         W[l].up   = malloc(N_LANE * gu_rb);
-        W[l].down = malloc(N_EMBD * dn_rb);
+        W[l].down = malloc(N_EMBD * DN_FULL_RB);
         if (!W[l].gate || !W[l].up || !W[l].down) { puts("VOID: alloc"); return 1; }
         /* Distinct per layer so the rotation is a real rotation and not 42
          * views of one resident matrix -- the mistake ANE-CAP made. */
         uint32_t s = 12345u + l;
         uint8_t *bufs[3] = { W[l].gate, W[l].up, W[l].down };
-        uint64_t sizes[3] = { N_LANE * gu_rb, N_LANE * gu_rb, N_EMBD * dn_rb };
-        uint64_t rbs[3] = { gu_rb, gu_rb, dn_rb };
+        uint64_t sizes[3] = { N_LANE * gu_rb, N_LANE * gu_rb, N_EMBD * DN_FULL_RB };
+        uint64_t rbs[3] = { gu_rb, gu_rb, DN_FULL_RB };
         for (int k = 0; k < 3; ++k) {
             for (uint64_t off = 0; off < sizes[k]; off += rbs[k])
                 for (uint64_t b = 0; b < rbs[k] / BLK_BYTES; ++b) {
@@ -345,13 +413,15 @@ int main(int argc, char **argv) {
     float *mid = malloc(N_LANE * sizeof(float));
     float *out = malloc(N_EMBD * sizeof(float));
     int8_t *xq = malloc(N_EMBD), *midq = malloc(N_LANE);
+    float *xd = malloc((N_EMBD / QK) * sizeof(float));
+    float *midd = malloc((N_LANE / QK) * sizeof(float));
     for (uint32_t i = 0; i < N_EMBD; ++i) x[i] = sinf((float)i * 0.01f) * 0.7f;
 
     if (g_check) {
         /* Both arms against a scalar reference. The pairq8 kernel is a
          * TRANSCRIPTION of a static function in ds4.c, so "it looks right" is
          * not evidence; and q8f32 is new. */
-        float xs; quantize_q8(x, N_EMBD, xq, &xs);
+        quantize_q8_0(x, N_EMBD, xq, xd);
         const uint64_t blocks = N_EMBD / QK;
         double worst_pair = 0.0, worst_f32 = 0.0, ref_mag = 0.0;
         for (uint32_t r = 0; r < 64; ++r) {
@@ -366,10 +436,10 @@ int main(int argc, char **argv) {
                     aq += (double)q[j] * (double)xq[b * QK + j];
                 }
                 ref  += (double)f16d(h) * a;
-                refq += (double)f16d(h) * xs * aq;
+                refq += (double)f16d(h) * (double)xd[b] * aq;
             }
             const float gf = dot_q8_f32(row, x, blocks);
-            const float gp = dot_q8(row, xq, xs, blocks);
+            const float gp = dot_q8(row, xq, xd, blocks);
             worst_f32  = fmax(worst_f32,  fabs((double)gf - ref));
             worst_pair = fmax(worst_pair, fabs((double)gp - refq));
             ref_mag = fmax(ref_mag, fabs(ref));
@@ -381,8 +451,12 @@ int main(int argc, char **argv) {
         if (worst_f32 > 1e-2 || worst_pair > 1e-2) { puts("FAIL: kernel mismatch"); return 1; }
     }
 
-    printf("%-8s %-7s %9s %9s %9s %11s %9s\n",
-           "arm", "threads", "p50_us", "p95_us", "rot42_us", "tok_ms", "GB/s");
+    struct { const char *name; qos_class_t q; } qoss[2] = {
+        { "ui", QOS_CLASS_USER_INTERACTIVE }, { "ud", QOS_CLASS_USER_INITIATED },
+    };
+    printf("%-8s %-4s %-5s %-7s %9s %9s %9s %11s %9s\n",
+           "arm", "qos", "part", "threads", "p50_us", "p95_us", "rot42_us",
+           "tok_ms", "GB/s");
     int green = 0, marginal = 0;
     int ncpu = 0, nperf = 0;
     size_t sz = sizeof(ncpu);
@@ -405,14 +479,20 @@ int main(int argc, char **argv) {
             continue;
         }
         if (nperf && (int)threads[ti] > nperf) {
-            printf("# note: %u threads exceeds %d performance cores -- expect the\n",
+            printf("# %u threads exceeds %d performance cores: NEGATIVE CONTROL.\n",
                    threads[ti], nperf);
-            printf("#       barrier to be paced by E-core stragglers\n");
+            printf("#   Equal partition should degrade (one E-core paces all);\n");
+            printf("#   dynamic tiles are the arm that lets them contribute.\n");
         }
-        pool_start(threads[ti]);
+        for (int qi = 0; qi < 2; ++qi) {
+        if (only_qos && strcmp(only_qos, qoss[qi].name)) continue;
+        for (int dyn = 0; dyn < 2; ++dyn) {
+        if (only_part && strcmp(only_part, dyn ? "dyn" : "eq")) continue;
+        pool_start(threads[ti], dyn, 64u, qoss[qi].q);
         for (int arm = 0; arm < 2; ++arm) {
             stage_ctx c = {0};
-            c.x = x; c.xq = xq; c.mid = mid; c.midx = mid; c.midq = midq;
+            c.x = x; c.xq = xq; c.xd = xd; c.mid = mid; c.midx = mid;
+            c.midq = midq; c.midd = midd;
             c.out = out; c.f32_path = (arm == 1);
             double *samp = malloc(g_iters * sizeof(double));
             double rot = 0.0;
@@ -420,9 +500,9 @@ int main(int argc, char **argv) {
                 const uint32_t l = it % g_layers;     /* rotate: cold weights */
                 c.L = &W[l];
                 const double t0 = now_us();
-                if (!c.f32_path) quantize_q8(x, N_EMBD, xq, &c.xscale);
+                if (!c.f32_path) quantize_q8_0(x, N_EMBD, xq, xd);
                 pool_run(stage_gate_up, &c, N_LANE);
-                if (!c.f32_path) quantize_q8(mid, N_LANE, midq, &c.midscale);
+                if (!c.f32_path) quantize_q8_0(mid, N_LANE, midq, midd);
                 pool_run(stage_down, &c, N_EMBD);
                 const double dt = now_us() - t0;
                 samp[it] = dt;
@@ -430,13 +510,16 @@ int main(int argc, char **argv) {
             }
             qsort(samp, g_iters, sizeof(double), cmp_d);
             const double p50 = samp[g_iters / 2], p95 = samp[(g_iters * 95) / 100];
-            printf("%-8s %-7u %9.1f %9.1f %9.1f %11.2f %9.1f\n",
-                   arm ? "q8f32" : "pairq8", threads[ti], p50, p95, rot,
+            printf("%-8s %-4s %-5s %-7u %9.1f %9.1f %9.1f %11.2f %9.1f\n",
+                   arm ? "q8f32" : "pairq8", qoss[qi].name,
+                   dyn ? "dyn" : "eq", threads[ti], p50, p95, rot,
                    p50 * 42.0 / 1000.0, per_layer / (p50 * 1e-6) / 1e9);
             if (p50 <= 150.0) green = 1; else if (p50 < 200.0) marginal = 1;
             free(samp);
         }
         pool_stop();
+        }
+        }
     }
 
     printf("\ngate: <=150 us/layer green, 150-185 marginal, >=200 kills it\n");

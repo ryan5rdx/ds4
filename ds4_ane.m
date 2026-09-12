@@ -35,15 +35,32 @@ static dispatch_queue_t g_queue;
 static dispatch_semaphore_t g_done[DS4_ANE_MAX_LAYERS];
 static int       g_started[DS4_ANE_MAX_LAYERS];
 static uint32_t  g_seq;
-static uint32_t  g_fast_seq_wanted;
 static int       g_fast_stop;
-/* __unsafe_unretained: ARC forbids atomics on object pointers, and a retain
- * here would be redundant anyway -- g_models owns the model for the whole run.
- * Ordering comes from the release-store of g_fast_seq_wanted immediately
- * after, which is what the reader acquires on. */
-static __unsafe_unretained MLModel *g_fast_model;
 static pthread_t g_fast_thread;
 static int       g_fast_running;
+
+/* REQUEST RING.
+ *
+ * The first cut had ONE (seq, model) slot, and the host encodes far ahead of
+ * what the GPU has executed -- that is the entire point of FAST, since nothing
+ * blocks the encoding thread. So layer N+1's request overwrote layer N's
+ * before the sidecar had seen READY(N): the sidecar would then wait for
+ * READY(N+1) while the GPU published READY(N), and the GPU's fence on DONE(N)
+ * would spin to timeout and consume a stale surface. The 10k test never caught
+ * it because it waits for completion every iteration, so the host was never
+ * more than one layer ahead.
+ *
+ * Draining IN ORDER is correct, and the reason is worth stating: within a
+ * command buffer the GPU cannot pack layer N+1 before it has fenced on DONE(N)
+ * -- pack, publish, fence and unpack are separated by encoder boundaries and
+ * execute in program order. So a single staging surface is safe, and the only
+ * thing that had to be queued was the host's INTENT. */
+#define DS4_ANE_RING 128u
+typedef struct { uint32_t seq; __unsafe_unretained MLModel *model; } ane_req;
+static ane_req   g_ring[DS4_ANE_RING];
+static volatile uint64_t g_ring_head, g_ring_tail;
+static dispatch_semaphore_t g_ring_sem;
+static uint64_t  g_backpressure;
 
 /* Counters. Reported per run rather than per layer: a per-layer print at 42
  * layers x 32 chunks would itself perturb what it measures. */
@@ -82,9 +99,11 @@ static void *ds4_ane_sidecar_thread(void *ud);
 static void ds4_ane_teardown(void) {
     if (g_fast_running) {
         __atomic_store_n(&g_fast_stop, 1, __ATOMIC_RELEASE);
+        if (g_ring_sem) dispatch_semaphore_signal(g_ring_sem);
         pthread_join(g_fast_thread, NULL);
         g_fast_running = 0;
     }
+    g_ring_sem = nil;
     for (uint32_t i = 0; i < DS4_ANE_MAX_LAYERS; ++i) {
         g_models[i] = nil;
         g_done[i] = nil;
@@ -185,13 +204,20 @@ int ds4_ane_init(uint32_t n_layers, uint32_t n_tokens) {
         g_queue = dispatch_queue_create("ds4.ane.shexp", DISPATCH_QUEUE_SERIAL);
         if (ds4_ane_mode() == DS4_ANE_FAST && !g_fast_running) {
             __atomic_store_n(&g_fast_stop, 0, __ATOMIC_RELEASE);
-            if (pthread_create(&g_fast_thread, NULL, ds4_ane_sidecar_thread, NULL) == 0) {
+            g_ring_head = g_ring_tail = 0; g_backpressure = 0;
+            g_ring_sem = dispatch_semaphore_create(0);
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+            if (pthread_create(&g_fast_thread, &attr, ds4_ane_sidecar_thread, NULL) == 0) {
                 g_fast_running = 1;
             } else {
                 fprintf(stderr, "ds4: ANE sidecar thread failed to start\n");
+                pthread_attr_destroy(&attr);
                 ds4_ane_teardown();
                 return 0;
             }
+            pthread_attr_destroy(&attr);
         }
         for (uint32_t i = 0; i < n_layers; ++i) g_done[i] = dispatch_semaphore_create(0);
     }
@@ -207,19 +233,31 @@ uint32_t ds4_ane_next_seq(void) { return ++g_seq; }
  * add a wakeup latency of the same order as the thing being saved. */
 static void *ds4_ane_sidecar_thread(void *ud) {
     (void)ud;
+    /* USER_INTERACTIVE: this thread gates the GPU -- a fence is spinning on its
+     * result -- so letting the scheduler treat it as background work would
+     * stall the GPU at E-core latency. */
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     volatile uint32_t *w = ds4_gpu_ane_sync_words();
     if (!w) return NULL;
     for (;;) {
-        uint32_t seq = __atomic_load_n(&g_fast_seq_wanted, __ATOMIC_ACQUIRE);
-        if (seq == 0u) {
+        /* Block rather than spin when there is nothing queued. The first cut
+         * burned a core continuously whenever the sidecar was idle, which on a
+         * machine whose CPU is also running the TP service is not free. */
+        if (dispatch_semaphore_wait(g_ring_sem,
+                dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC)) != 0) {
             if (__atomic_load_n(&g_fast_stop, __ATOMIC_ACQUIRE)) return NULL;
             continue;
         }
-        /* Wait for the GPU to say the staging surface holds THIS layer. */
-        while (__atomic_load_n(&w[0], __ATOMIC_ACQUIRE) != seq) {
+        if (__atomic_load_n(&g_fast_stop, __ATOMIC_ACQUIRE)) return NULL;
+        const uint64_t t = __atomic_load_n(&g_ring_tail, __ATOMIC_ACQUIRE);
+        const ane_req req = g_ring[t % DS4_ANE_RING];
+        const uint32_t seq = req.seq;
+        /* >= not ==: the GPU publishes monotonically and may already be past
+         * this seq by the time we look. Equality would hang on a skipped one. */
+        while ((int32_t)(__atomic_load_n(&w[0], __ATOMIC_ACQUIRE) - seq) < 0) {
             if (__atomic_load_n(&g_fast_stop, __ATOMIC_ACQUIRE)) return NULL;
         }
-        MLModel *m = g_fast_model;   /* published by the seq release-store */
+        MLModel *m = req.model;
         const double t0 = ds4_ane_now_ns();
         if (m) {
             @autoreleasepool {
@@ -241,7 +279,7 @@ static void *ds4_ane_sidecar_thread(void *ud) {
         /* Release-store: everything Core ML wrote to the output surface must be
          * visible to the GPU before it sees DONE. */
         __atomic_store_n(&w[1], seq, __ATOMIC_RELEASE);
-        __atomic_store_n(&g_fast_seq_wanted, 0u, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_ring_tail, t + 1u, __ATOMIC_RELEASE);
     }
 }
 
@@ -252,10 +290,19 @@ int ds4_ane_begin_layer(uint32_t il) {
     if (!m) { g_skipped++; return 0; }
 
     if (ds4_ane_mode() == DS4_ANE_FAST) {
-        /* Hand the model to the sidecar thread and arm it. It will not touch
-         * the staging surface until the GPU publishes READY for this seq. */
-        g_fast_model = m;
-        __atomic_store_n(&g_fast_seq_wanted, g_seq, __ATOMIC_RELEASE);
+        /* Enqueue. Backpressure rather than overwrite: the ring holds 128 and
+         * a chunk is 42 layers, so this should never spin -- if it does, the
+         * host has run further ahead than the design assumed, and that is
+         * worth knowing rather than silently dropping a request. */
+        uint64_t h = __atomic_load_n(&g_ring_head, __ATOMIC_ACQUIRE);
+        while (h - __atomic_load_n(&g_ring_tail, __ATOMIC_ACQUIRE) >= DS4_ANE_RING) {
+            g_backpressure++;
+            if (__atomic_load_n(&g_fast_stop, __ATOMIC_ACQUIRE)) return 0;
+        }
+        g_ring[h % DS4_ANE_RING].seq = g_seq;
+        g_ring[h % DS4_ANE_RING].model = m;
+        __atomic_store_n(&g_ring_head, h + 1u, __ATOMIC_RELEASE);
+        dispatch_semaphore_signal(g_ring_sem);
         g_started[il] = 1;
         return 1;
     }
@@ -318,6 +365,11 @@ void ds4_ane_report(void) {
             (unsigned long long)g_engaged, (unsigned long long)g_skipped,
             (unsigned long long)g_failed, g_ns_predict / 1.0e6,
             g_engaged ? g_ns_predict / 1.0e6 / (double)g_engaged : 0.0);
+    if (ds4_ane_mode() == DS4_ANE_FAST && g_backpressure) {
+        fprintf(stderr, "ds4: ANE ring backpressure %llu spins -- the host ran "
+                        "further ahead than %u layers\n",
+                (unsigned long long)g_backpressure, DS4_ANE_RING);
+    }
     if (ds4_ane_mode() == DS4_ANE_FAST && ds4_gpu_ane_sync_timed_out()) {
         fprintf(stderr, "ds4: ANE FAST fence TIMED OUT -- the GPU gave up "
                         "waiting on DONE, so at least one layer consumed a "
