@@ -50415,9 +50415,24 @@ int ds4_gpu_glm53_matmul_bf16(
          * Default OFF, and its own K knob defaults to 0 so W2/W4 stay opt-in. */
         const int bf16_d7_shape =
             in_dim == 4096u && out_dim == 128u && n_rows == 1u;
+        /* BANKED 2026-09-11, DEFAULT ON for this shape. D7R: kernel 1.734x
+         * (0.2301 -> 0.1327 ms on the 22-call chain), quality gate
+         * BIT-IDENTICAL (avg_nll delta 0.000000000, 100/100 ties), greedy
+         * output byte-identical, +0.30% decode @131k and +0.20% @2k at four
+         * reps with prefill flat.
+         *
+         * DS4_METAL_GLM53_BF16_128_SPLITK=0 restores the row walk. An omitted
+         * knob is ON, so a control arm must write the 0 explicitly. */
         const char *bf16_d7_env = getenv("DS4_METAL_GLM53_BF16_128_SPLITK");
         const int bf16_d7 =
-            bf16_d7_shape && bf16_d7_env && bf16_d7_env[0] == '1';
+            bf16_d7_shape && !(bf16_d7_env && bf16_d7_env[0] == '0');
+        if (bf16_d7_shape && !bf16_d7) {
+            static int announced_d7_off;
+            if (!announced_d7_off) {
+                announced_d7_off = 1;
+                fprintf(stderr, "ds4: GLM53 BF16 4096->128 split-K DISABLED by env\n");
+            }
+        }
         const int bf16_splitk =
             /* Default ON; DS4_METAL_GLM53_BF16_MV_SPLITK=0 disables. */
             (!(bf16_splitk_env && bf16_splitk_env[0] == '0') &&
