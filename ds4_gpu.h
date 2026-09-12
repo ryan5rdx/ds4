@@ -3534,3 +3534,16 @@ void ds4_gpu_decode_graphs_invalidate(void);
 #endif
 
 #endif
+
+/* Banked-feature engagement counters. A promotion that silently reverts an
+ * already-banked hunk passes every correctness test, because those check that
+ * kernels are right, not that the banked ones ran. See ds4_gpu_banked_reset. */
+enum {
+    DS4_BANKED_IDXPORT_KREG = 0,
+    DS4_BANKED_ROWTILE,
+    DS4_BANKED_D7_SPLITK,
+    DS4_BANKED_COMPACT_MV,
+    DS4_BANKED_COUNT
+};
+void     ds4_gpu_banked_reset(void);
+uint32_t ds4_gpu_banked_count(int which);

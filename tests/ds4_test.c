@@ -4785,6 +4785,46 @@ static void test_metal_rms_norm_partial_simdgroup(void) {
     }
 }
 
+
+/* Every banked feature must actually ENGAGE, not merely still compile.
+ *
+ * Three promotions have silently reverted an already-banked hunk -- ROWTILE's
+ * removed KREG, and COMPACT's removed D7 -- and every one passed this suite,
+ * because the suite checks that kernels are CORRECT and a missing feature
+ * leaves the shipped kernel behind, which is also correct. This dispatches one
+ * representative shape per banked path and asserts the counter fired.
+ */
+static void test_metal_banked_features_engage(void) {
+    /* NO reset. COMPACT-MV rides ds4_gpu_get_mul_mv_pipeline, which this test
+     * never calls -- its D7 dispatch goes through ds4_gpu_get_pipeline. The
+     * earlier tests in this group do plenty of matvecs, so the cumulative
+     * count is the evidence; resetting here would erase it and fail a healthy
+     * build. D7's counter is unambiguous either way: nothing else in the suite
+     * uses the 4096->128 n_rows==1 shape. */
+
+    /* D7: the narrow 4096->128 bf16 decode matvec. */
+    {
+        const uint32_t in_dim = 4096u, out_dim = 128u;
+        const size_t wn = (size_t)in_dim * out_dim;
+        uint16_t *w = xmalloc(wn * sizeof(uint16_t));
+        for (size_t i = 0; i < wn; i++) w[i] = 0x3800u;
+        float *x = xmalloc((size_t)in_dim * sizeof(float));
+        for (uint32_t i = 0; i < in_dim; i++) x[i] = 0.001f * (float)(i % 11u);
+        ds4_gpu_tensor *xt = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
+        ds4_gpu_tensor *ot = ds4_gpu_tensor_alloc((uint64_t)out_dim * sizeof(float));
+        TEST_ASSERT(xt && ot);
+        TEST_ASSERT(ds4_gpu_tensor_write(xt, 0, x, (size_t)in_dim * sizeof(float)));
+        TEST_ASSERT(ds4_gpu_set_model_map(w, wn * sizeof(uint16_t)));
+        TEST_ASSERT(ds4_gpu_glm53_matmul_bf16(ot, w, wn * sizeof(uint16_t), 0,
+                                              in_dim, out_dim, xt, 1));
+        ds4_gpu_tensor_free(ot); ds4_gpu_tensor_free(xt); free(x); free(w);
+    }
+    TEST_ASSERT(ds4_gpu_banked_count(DS4_BANKED_D7_SPLITK) > 0);
+
+    /* COMPACT-MV: cumulative over every matvec this group already ran. */
+    TEST_ASSERT(ds4_gpu_banked_count(DS4_BANKED_COMPACT_MV) > 0);
+}
+
 static void test_metal_kernel_group(void) {
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
@@ -4811,6 +4851,7 @@ static void test_metal_kernel_group(void) {
     test_metal_router_simd_finalize_exact();
     test_metal_router_weights_batch_exact();
     test_metal_rms_norm_partial_simdgroup();
+    test_metal_banked_features_engage();
 #endif
 }
 

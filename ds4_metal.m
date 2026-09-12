@@ -54,6 +54,29 @@ enum {
 static id<MTLDevice> g_device;
 static id<MTLCommandQueue> g_queue;
 static id<MTLLibrary> g_library;
+
+/* BANKED-FEATURE ENGAGEMENT COUNTERS.
+ *
+ * Three separate times a promotion has silently deleted an already-banked
+ * feature: ROWTILE's promotion removed KREG, the v5 port nearly repeated it,
+ * and COMPACT's promotion removed D7. Every one was the same mechanism -- a
+ * wholesale `git checkout <branch> -- <file>` from a branch cut before the
+ * other feature landed -- and every one passed --metal-kernels, because the
+ * suite tests that kernels are CORRECT, not that the banked ones RAN.
+ *
+ * These counters close that gap. Each banked path bumps its own on the way
+ * through, and a test dispatches the representative shapes and asserts every
+ * one fired. A reverted hunk then fails the suite instead of shipping. */
+static uint32_t g_banked_engaged[DS4_BANKED_COUNT];
+
+void ds4_gpu_banked_reset(void) {
+    memset(g_banked_engaged, 0, sizeof g_banked_engaged);
+}
+uint32_t ds4_gpu_banked_count(int which) {
+    return (which >= 0 && which < DS4_BANKED_COUNT) ? g_banked_engaged[which] : 0u;
+}
+#define DS4_BANKED_HIT(w) do { g_banked_engaged[(w)]++; } while (0)
+
 static id<MTLCommandBuffer> g_batch_cb;
 static id<MTLComputeCommandEncoder> g_batch_enc;
 static BOOL g_batch_encoder_concurrent;
@@ -3875,6 +3898,7 @@ static bool ds4_gpu_idxport_kreg(void) {
             cached = 1;
         }
     }
+    if (cached) DS4_BANKED_HIT(DS4_BANKED_IDXPORT_KREG);
     return cached != 0;
 }
 
@@ -4326,6 +4350,11 @@ static int ds4_gpu_compact_reduce_mask(void) {
 static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_pipeline(
         const char *function_name,
         int16_t     nsg) {
+    /* Counted per REQUEST, not per creation: pipelines are created once and
+     * served from a cache thereafter, so a counter on the creation path reads
+     * zero for every caller after the first and the engagement test would
+     * fail on a perfectly healthy build. */
+    if (ds4_gpu_compact_reduce_mask() & 1) DS4_BANKED_HIT(DS4_BANKED_COMPACT_MV);
     uint16_t fast_name_len = 0;
     uint64_t fast_hash = 0;
     const bool fast_key_valid =
@@ -39528,6 +39557,7 @@ int ds4_gpu_glm_indexer_score_one_base_tensor(
             if (!direct_pipeline) return 0;
 
             const uint32_t rowtile = glm_indexer_score_rowtile();
+            if (rowtile > 1u) DS4_BANKED_HIT(DS4_BANKED_ROWTILE);
             const uint32_t rows_per_tg = rowtile ? rowtile
                                                  : glm_indexer_score_rows_per_tg(n_rows);
             id<MTLComputePipelineState> use_pipeline = direct_pipeline;
@@ -50482,10 +50512,44 @@ int ds4_gpu_glm53_matmul_bf16(
          * shapes. */
         const int bf16_splitk_shape =
             out_dim <= 64u && in_dim >= 4096u && (in_dim % 32u) == 0u;
+        /* D7: the 4096 -> 128 decode matvec, which Q1C7 caught at 22 calls per
+         * token (two in each of the 11 DSA layers) and 0.290 ms/token on the
+         * 16-threadgroup row kernel. out_dim 128 sits just past the B1 gate, so
+         * it never split.
+         *
+         * A SEPARATE predicate, not a relaxation of the one above. Widening
+         * `out_dim <= 64` to 128 would also hand this shape to HCMIX-WIDE,
+         * whose K-slice knob defaults to 4 -- the arm would silently measure
+         * W4 while reporting B1, and the banked HCMIX default would change
+         * behaviour on a shape its quality gate never covered.
+         *
+         * Default OFF, and its own K knob defaults to 0 so W2/W4 stay opt-in. */
+        const int bf16_d7_shape =
+            in_dim == 4096u && out_dim == 128u && n_rows == 1u;
+        /* BANKED 2026-09-11, DEFAULT ON for this shape. D7R: kernel 1.734x
+         * (0.2301 -> 0.1327 ms on the 22-call chain), quality gate
+         * BIT-IDENTICAL (avg_nll delta 0.000000000, 100/100 ties), greedy
+         * output byte-identical, +0.30% decode @131k and +0.20% @2k at four
+         * reps with prefill flat.
+         *
+         * DS4_METAL_GLM53_BF16_128_SPLITK=0 restores the row walk. An omitted
+         * knob is ON, so a control arm must write the 0 explicitly. */
+        const char *bf16_d7_env = getenv("DS4_METAL_GLM53_BF16_128_SPLITK");
+        const int bf16_d7 =
+            bf16_d7_shape && !(bf16_d7_env && bf16_d7_env[0] == '0');
+        if (bf16_d7) DS4_BANKED_HIT(DS4_BANKED_D7_SPLITK);
+        if (bf16_d7_shape && !bf16_d7) {
+            static int announced_d7_off;
+            if (!announced_d7_off) {
+                announced_d7_off = 1;
+                fprintf(stderr, "ds4: GLM53 BF16 4096->128 split-K DISABLED by env\n");
+            }
+        }
         const int bf16_splitk =
             /* Default ON; DS4_METAL_GLM53_BF16_MV_SPLITK=0 disables. */
-            !(bf16_splitk_env && bf16_splitk_env[0] == '0') &&
-            bf16_splitk_shape;
+            (!(bf16_splitk_env && bf16_splitk_env[0] == '0') &&
+             bf16_splitk_shape) ||
+            bf16_d7;
         /* HCMIX-WIDE: a third grid axis over the contraction.  B1 took hc_mix
          * from 3 to 12 threadgroups by splitting K across simdgroups; this
          * splits it across threadgroups too, 12 -> 12*KSPLIT.  Two dispatches
@@ -50504,7 +50568,13 @@ int ds4_gpu_glm53_matmul_bf16(
          * 4 is the smaller reduction-order perturbation of the two tied values
          * and is the one the quality gate covers. */
         const uint32_t bf16_ksplit = bf16_splitk_shape ?
-            (uint32_t)ds4_gpu_env_u64("DS4_METAL_GLM53_BF16_MV_KSPLIT", 4u, 0u, 32u) : 0u;
+            (uint32_t)ds4_gpu_env_u64("DS4_METAL_GLM53_BF16_MV_KSPLIT", 4u, 0u, 32u) :
+            /* D7 gets its OWN K knob defaulting to 0, so the banked HCMIX K=4
+             * cannot reach this shape by accident. 2 or 4 selects W2/W4. */
+            (bf16_d7 ?
+                (uint32_t)ds4_gpu_env_u64("DS4_METAL_GLM53_BF16_128_KSPLIT", 0u, 0u, 32u)
+              : 0u);
+
         const int bf16_wide = bf16_ksplit >= 2u;
         const bool bc_inp = (in_dim % 32u) != 0u;
         const bool bc_out = (out_dim % 64u) != 0u || (n_rows % 32u) != 0u;
