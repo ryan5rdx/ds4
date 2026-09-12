@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <IOSurface/IOSurface.h>
 #include <execinfo.h>
 
 #include <stdint.h>
@@ -6123,6 +6124,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_NORM_SOURCE",       @"metal/norm.metal"],
         @[@"DS4_METAL_BIN_SOURCE",        @"metal/bin.metal"],
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
+        @[@"DS4_METAL_ANE_BRIDGE_SOURCE", @"metal/ane_bridge.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -52239,4 +52241,220 @@ int ds4_gpu_glm53_kda_prefill(
 
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
     (void)enabled;
+}
+
+/* ======================= ANE shared-expert staging ========================
+ *
+ * Core ML and Metal have to look at the same bytes for the sidecar to be worth
+ * anything, and the layouts disagree: ds4 keeps activations [tok][dim] in f32,
+ * a conv graph wants (1, dim, 1, n_tok) in f16. So the staging is a pair of
+ * IOSurface-backed buffers -- IOSurface because that is the allocation both
+ * engines can map without a copy, and the rig's `gpuio` mode verified the
+ * round trip end to end (16 distinct Metal-written inputs, 16 distinct
+ * Metal-read checksums).
+ *
+ * All of this lives here rather than in ds4_ane.m so that exactly one
+ * translation unit owns the MTLDevice, the command buffer, and the pipeline
+ * cache. ds4_ane.m gets base pointers and never touches Metal.
+ *
+ * Pipelines are built lazily on first use: with the sidecar off -- which is the
+ * default and will be the common case for a long time -- this costs nothing,
+ * and a missing kernel degrades to "no sidecar" instead of failing startup.
+ */
+static id<MTLComputePipelineState> g_ane_pack_pipeline;
+static id<MTLComputePipelineState> g_ane_unpack_pipeline;
+static id<MTLComputePipelineState> g_ane_cmp_pipeline;
+static IOSurfaceRef g_ane_in_surface, g_ane_out_surface;
+static id<MTLBuffer> g_ane_in_buf, g_ane_out_buf, g_ane_cmp_buf;
+static void *g_ane_in_ptr, *g_ane_out_ptr;
+/* Unpack destination. The obvious candidate, batch_shared_mid, is
+ * n_tok x n_ff_exp (2048) while the shared-expert OUTPUT is n_tok x
+ * n_embd (4096), so unpacking there would have been caught by the size
+ * guard and silently skipped -- the bridge would have measured half of
+ * itself and reported success. */
+static ds4_gpu_tensor *g_ane_scratch;
+static uint32_t g_ane_dim, g_ane_ntok;
+
+typedef struct {
+    uint32_t dim;
+    uint32_t n_tok;
+    uint32_t accumulate;
+} ds4_ane_bridge_args;
+
+static int ds4_gpu_ane_pipelines(void) {
+    if (g_ane_pack_pipeline && g_ane_unpack_pipeline && g_ane_cmp_pipeline) return 1;
+    if (!g_library) return 0;
+    NSError *error = nil;
+    struct { const char *name; __strong id<MTLComputePipelineState> *slot; } want[] = {
+        { "kernel_ds4_ane_pack_f32_to_f16",   &g_ane_pack_pipeline   },
+        { "kernel_ds4_ane_unpack_f16_to_f32", &g_ane_unpack_pipeline },
+        { "kernel_ds4_ane_compare",           &g_ane_cmp_pipeline    },
+    };
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); ++i) {
+        if (*want[i].slot) continue;
+        id<MTLFunction> fn = [g_library newFunctionWithName:
+                [NSString stringWithUTF8String:want[i].name]];
+        if (!fn) {
+            fprintf(stderr, "ds4: ANE bridge kernel %s not found\n", want[i].name);
+            return 0;
+        }
+        error = nil;
+        *want[i].slot = ds4_gpu_new_pipeline(fn, &error);
+        if (!*want[i].slot) {
+            fprintf(stderr, "ds4: ANE bridge pipeline %s failed: %s\n", want[i].name,
+                    [[error localizedDescription] UTF8String]);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static id<MTLBuffer> ds4_gpu_ane_surface(size_t bytes, IOSurfaceRef *surf_out,
+                                         void **base_out) {
+    const size_t bpr = (bytes + 4095u) & ~(size_t)4095u;
+    NSDictionary *props = @{
+        (id)kIOSurfaceWidth:            @(bytes / 2),
+        (id)kIOSurfaceHeight:           @1,
+        (id)kIOSurfaceBytesPerElement:  @2,
+        (id)kIOSurfaceBytesPerRow:      @(bpr),
+        (id)kIOSurfaceAllocSize:        @(bpr),
+        (id)kIOSurfacePixelFormat:      @(0x4C303136),   /* 'L016' */
+    };
+    IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    if (!s) return nil;
+    /* Lock only long enough to take the address. Holding the lock pins a
+     * CPU-cached mapping against the very GPU/ANE sharing this exists for. */
+    IOSurfaceLock(s, 0, NULL);
+    void *base = IOSurfaceGetBaseAddress(s);
+    IOSurfaceUnlock(s, 0, NULL);
+    if (!base) { CFRelease(s); return nil; }
+    id<MTLBuffer> buf = [g_device newBufferWithBytesNoCopy:base
+                                                    length:bpr
+                                                   options:MTLResourceStorageModeShared
+                                               deallocator:nil];
+    if (!buf) { CFRelease(s); return nil; }
+    *base_out = base;
+    *surf_out = s;
+    return buf;
+}
+
+void ds4_gpu_ane_stage_free(void) {
+    if (g_ane_scratch) { ds4_gpu_tensor_free(g_ane_scratch); g_ane_scratch = NULL; }
+    g_ane_in_buf = nil; g_ane_out_buf = nil; g_ane_cmp_buf = nil;
+    if (g_ane_in_surface)  { CFRelease(g_ane_in_surface);  g_ane_in_surface = NULL; }
+    if (g_ane_out_surface) { CFRelease(g_ane_out_surface); g_ane_out_surface = NULL; }
+    g_ane_in_ptr = NULL; g_ane_out_ptr = NULL;
+    g_ane_dim = 0; g_ane_ntok = 0;
+}
+
+int ds4_gpu_ane_stage_alloc(uint32_t dim, uint32_t n_tok,
+                            void **in_ptr, void **out_ptr) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (dim == 0 || n_tok == 0) return 0;
+    if (g_ane_dim == dim && g_ane_ntok == n_tok && g_ane_in_ptr && g_ane_out_ptr) {
+        if (in_ptr)  *in_ptr  = g_ane_in_ptr;
+        if (out_ptr) *out_ptr = g_ane_out_ptr;
+        return 1;
+    }
+    ds4_gpu_ane_stage_free();
+    if (!ds4_gpu_ane_pipelines()) return 0;
+
+    @autoreleasepool {
+        const size_t bytes = (size_t)dim * n_tok * sizeof(uint16_t);
+        g_ane_in_buf  = ds4_gpu_ane_surface(bytes, &g_ane_in_surface,  &g_ane_in_ptr);
+        g_ane_out_buf = ds4_gpu_ane_surface(bytes, &g_ane_out_surface, &g_ane_out_ptr);
+        g_ane_cmp_buf = [g_device newBufferWithLength:3 * sizeof(uint32_t)
+                                              options:MTLResourceStorageModeShared];
+        g_ane_scratch = ds4_gpu_tensor_alloc((uint64_t)dim * n_tok * sizeof(float));
+        if (!g_ane_in_buf || !g_ane_out_buf || !g_ane_cmp_buf || !g_ane_scratch) {
+            ds4_gpu_ane_stage_free();
+            return 0;
+        }
+    }
+    g_ane_dim = dim; g_ane_ntok = n_tok;
+    if (in_ptr)  *in_ptr  = g_ane_in_ptr;
+    if (out_ptr) *out_ptr = g_ane_out_ptr;
+    return 1;
+}
+
+static int ds4_gpu_ane_bridge_dispatch(id<MTLComputePipelineState> pipe,
+                                       id<MTLBuffer> b0, uint64_t o0,
+                                       id<MTLBuffer> b1, uint64_t o1,
+                                       id<MTLBuffer> b3,
+                                       ds4_ane_bridge_args args,
+                                       const char *label) {
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    DS4_SET_PIPE(enc, pipe);
+    [enc setBuffer:b0 offset:o0 atIndex:0];
+    [enc setBuffer:b1 offset:o1 atIndex:1];
+    [enc setBytes:&args length:sizeof(args) atIndex:2];
+    if (b3) [enc setBuffer:b3 offset:0 atIndex:3];
+    NSUInteger tx = pipe.threadExecutionWidth;
+    if (tx == 0u) tx = 32u;
+    NSUInteger ty = pipe.maxTotalThreadsPerThreadgroup / tx;
+    if (ty == 0u) ty = 1u;
+    if (ty > 8u) ty = 8u;
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((args.dim + tx - 1u) / tx,
+                                                    (args.n_tok + ty - 1u) / ty, 1)
+                  threadsPerThreadgroup:MTLSizeMake(tx, ty, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, label);
+}
+
+int ds4_gpu_ane_pack(const ds4_gpu_tensor *src, uint32_t dim, uint32_t n_tok) {
+    if (!g_ane_in_buf || !src || dim != g_ane_dim || n_tok != g_ane_ntok) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> sb = ds4_gpu_tensor_buffer(src);
+        if (!sb || ds4_gpu_tensor_bytes(src) <
+                (uint64_t)dim * n_tok * sizeof(float)) return 0;
+        ds4_ane_bridge_args a = { dim, n_tok, 0 };
+        return ds4_gpu_ane_bridge_dispatch(g_ane_pack_pipeline,
+                                           sb, ds4_gpu_tensor_offset(src),
+                                           g_ane_in_buf, 0, nil, a, "ANE pack");
+    }
+}
+
+/* dst == NULL unpacks into the internal scratch: that is what the BRIDGE and
+ * SHADOW modes want, since the GPU stays authoritative and the ANE result must
+ * not reach anything load-bearing. */
+int ds4_gpu_ane_unpack(ds4_gpu_tensor *dst, uint32_t dim, uint32_t n_tok,
+                       int accumulate) {
+    if (!dst) dst = g_ane_scratch;
+    if (!g_ane_out_buf || !dst || dim != g_ane_dim || n_tok != g_ane_ntok) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> db = ds4_gpu_tensor_buffer(dst);
+        if (!db || ds4_gpu_tensor_bytes(dst) <
+                (uint64_t)dim * n_tok * sizeof(float)) return 0;
+        ds4_ane_bridge_args a = { dim, n_tok, accumulate ? 1u : 0u };
+        return ds4_gpu_ane_bridge_dispatch(g_ane_unpack_pipeline,
+                                           g_ane_out_buf, 0,
+                                           db, ds4_gpu_tensor_offset(dst),
+                                           nil, a, "ANE unpack");
+    }
+}
+
+int ds4_gpu_ane_compare(const ds4_gpu_tensor *gpu_ref, uint32_t dim, uint32_t n_tok,
+                        double *max_abs, double *rel_rms) {
+    if (!g_ane_out_buf || !g_ane_cmp_buf || !gpu_ref) return 0;
+    if (dim != g_ane_dim || n_tok != g_ane_ntok) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> rb = ds4_gpu_tensor_buffer(gpu_ref);
+        if (!rb) return 0;
+        memset(g_ane_cmp_buf.contents, 0, 3 * sizeof(uint32_t));
+        ds4_ane_bridge_args a = { dim, n_tok, 0 };
+        if (!ds4_gpu_ane_bridge_dispatch(g_ane_cmp_pipeline,
+                                         g_ane_out_buf, 0,
+                                         rb, ds4_gpu_tensor_offset(gpu_ref),
+                                         g_ane_cmp_buf, a, "ANE compare")) return 0;
+        /* The comparison result is only meaningful once the GPU has run it. */
+        if (ds4_gpu_end_commands() == 0) return 0;
+        if (ds4_gpu_begin_commands() == 0) return 0;
+        const uint32_t *o = (const uint32_t *)g_ane_cmp_buf.contents;
+        if (max_abs) *max_abs = (double)o[0] / 1.0e6;
+        if (rel_rms) *rel_rms = o[2] ? sqrt((double)o[1] / (double)o[2]) : 0.0;
+    }
+    return 1;
 }

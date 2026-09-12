@@ -50,6 +50,22 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
+
+/* ANE shared-expert staging (see ds4_ane.h).
+ *
+ * Core ML and Metal have to read the same bytes, and the layouts disagree:
+ * ds4 keeps activations [tok][dim] in f32, a conv graph wants
+ * (1, dim, 1, n_tok) in f16. These own the IOSurface-backed pair both engines
+ * map, and the transpose/narrowing between them. All Metal stays in
+ * ds4_metal.m; ds4_ane.m only ever sees the two base pointers. */
+int  ds4_gpu_ane_stage_alloc(uint32_t dim, uint32_t n_tok,
+                             void **in_ptr, void **out_ptr);
+void ds4_gpu_ane_stage_free(void);
+int  ds4_gpu_ane_pack(const ds4_gpu_tensor *src, uint32_t dim, uint32_t n_tok);
+int  ds4_gpu_ane_unpack(ds4_gpu_tensor *dst, uint32_t dim, uint32_t n_tok,
+                        int accumulate);
+int  ds4_gpu_ane_compare(const ds4_gpu_tensor *gpu_ref, uint32_t dim,
+                         uint32_t n_tok, double *max_abs, double *rel_rms);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 
 /* GPU-side fill of a sub-range, in elements. Unlike ds4_gpu_tensor_fill_f32

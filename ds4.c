@@ -59,6 +59,7 @@ static ds4_tp *g_tp_block_ctx;
  * is included unconditionally for the same reason (engine helpers call
  * the packer in multi-tier mode, but the headers are tiny and C-safe). */
 #include "ds4_layer_pack.h"
+#include "ds4_ane.h"
 #include "ds4_gpu_mgpu.h"
 
 #define DS4_CUDA_TP_PEER_TMP_BYTES \
@@ -51233,6 +51234,25 @@ static bool glm_graph_encode_ffn_batch(
         if (!finish_ok) rocm_batch_selected_async_started = false;
     }
 #endif
+    /* ANE shared-expert sidecar. Launched HERE, before the routed-MoE
+     * dispatch, because the entire premise is that the two run at the same
+     * time: the shared expert is ~417 ms of a ~10.5 s chunk and is only worth
+     * moving if it disappears underneath the ~2.8 s routed-MoE window rather
+     * than being added to it.
+     *
+     * The flush is unavoidable and is the thing PROBE exists to price. The ANE
+     * reads batch_ffn_norm through shared memory, so the GPU work producing it
+     * has to have landed first -- there is no ordering primitive between a
+     * Metal command buffer and a Core ML prediction, only completion. */
+    const int ane_sidecar = ok && !shared_done && ds4_ane_mode() != DS4_ANE_OFF &&
+                            ds4_ane_init((uint32_t)DS4_N_LAYER, n_tokens);
+    if (ane_sidecar) {
+        ok = glm_graph_prefill_stage_sync_boundary();
+        if (ok && ds4_ane_mode() >= DS4_ANE_BRIDGE) {
+            ds4_gpu_ane_pack(g->batch_ffn_norm, (uint32_t)DS4_N_EMBD, n_tokens);
+        }
+        if (ok) ds4_ane_begin_layer(il);
+    }
     if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) { /* ablate: keep the gate */ } else
     ds4_gpu_trace_tag_layer(il, "routed_moe");
     if (ok) ok = glm_graph_routed_moe_batch_dispatch(
@@ -51345,6 +51365,28 @@ static bool glm_graph_encode_ffn_batch(
                                       pos0);
     }
     if (ok && !shared_done) DS4_GLM_ENCODE_FFN_BATCH_SHARED();
+    if (ane_sidecar) {
+        ds4_ane_wait(il);
+        if (ds4_ane_mode() >= DS4_ANE_BRIDGE) {
+            /* NULL destination = the bridge's own scratch. The GPU stays
+             * authoritative in every mode this file supports and the sidecar's
+             * weights are synthetic, so the result must not reach anything
+             * load-bearing -- that would produce fluent, wrong text. */
+            ds4_gpu_ane_unpack(NULL, (uint32_t)DS4_N_EMBD, n_tokens, 0);
+        }
+        /* One divergence sample per chunk. Comparing every layer would add 42
+         * flushes to price a number that does not vary much across them. */
+        if (il == 0 && ds4_ane_mode() >= DS4_ANE_SHADOW) {
+            double max_abs = 0.0, rel_rms = 0.0;
+            if (ds4_gpu_ane_compare(g->batch_attn_out, (uint32_t)DS4_N_EMBD,
+                                    n_tokens, &max_abs, &rel_rms)) {
+                fprintf(stderr, "ds4: ANE shadow layer 0: max_abs %.4f "
+                                "rel_rms %.4f (synthetic weights -- large is "
+                                "expected, non-zero proves the compare is "
+                                "wired)\n", max_abs, rel_rms);
+            }
+        }
+    }
 #undef DS4_GLM_ENCODE_FFN_BATCH_SHARED
     /* P1: close the exchange window now that the disjoint work is encoded. */
     if (ffn_overlap_seq != 0) {
