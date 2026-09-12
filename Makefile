@@ -491,8 +491,9 @@ tests/probe_ane: tests/probe_ane.c ds4_metal.o ds4_gpu.h
 
 # 10k-iteration poison test for the FAST rendezvous. Every failure mode there
 # is a stale read, and a stale read produces a complete, plausible tensor.
-tests/probe_ane_handoff: tests/probe_ane_handoff.c ds4_metal.o ds4_gpu.h
-	$(CC) $(CFLAGS) -I. -o $@ tests/probe_ane_handoff.c ds4_metal.o $(METAL_LDLIBS)
+# Links ds4_ane.o so the REAL request ring is under test, not a stand-in.
+tests/probe_ane_handoff: tests/probe_ane_handoff.c ds4_metal.o ds4_ane.o ds4_gpu.h ds4_ane.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/probe_ane_handoff.c ds4_metal.o ds4_ane.o $(METAL_LDLIBS)
 
 # CPU decode sidecar: can the rank-local shared-expert slice fit the ~149 us
 # routed-MoE overlap window? No GPU, no GGUF -- bandwidth at production shapes.

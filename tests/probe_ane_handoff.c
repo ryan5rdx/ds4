@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <pthread.h>
 #include "ds4_gpu.h"
+#include "ds4_ane.h"
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_end_commands(void);
@@ -156,14 +157,54 @@ int main(void) {
     }
     g_stop = 1; pthread_join(th, NULL);
 
+    /* PASS 3: the REAL ring in ds4_ane.m, not this file's stand-in producer.
+     *
+     * Passes 1 and 2 drive the GPU fence protocol with a producer written
+     * here, so they would both have passed against the singleton request slot
+     * the ring replaced -- they never touched ds4_ane.m. This one does: the
+     * test hook lets FAST run without Core ML models, so the enqueue, the
+     * ordered drain and the sidecar's own READY/DONE handling are what is
+     * under test. A singleton drops requests and the served sequence comes
+     * back short and gapped; a ring returns 1..42 in order. */
+    int ring_ok = 0;
+    setenv("DS4_ANE_TEST_HOOK", "1", 1);
+    setenv("DS4_METAL_ANE_SHEXP", "fast", 1);
+    if (ds4_ane_mode() != 4 /* DS4_ANE_FAST */) {
+        puts("\nring: VOID -- fast mode not selected");
+    } else if (!ds4_ane_init(42, DIM, NTOK)) {
+        puts("\nring: VOID -- ds4_ane_init failed");
+    } else {
+        const uint32_t L = 42;
+        ds4_gpu_begin_commands();
+        for (uint32_t l = 0; l < L; ++l) {
+            const uint32_t sq = ds4_ane_next_seq();
+            ds4_gpu_ane_order_boundary();
+            if (!ds4_gpu_ane_pack(src, DIM, NTOK)) break;
+            if (!ds4_ane_begin_layer(l)) break;
+            if (!ds4_gpu_ane_publish_ready(sq)) { ds4_ane_cancel_layer(l); break; }
+            if (!ds4_gpu_ane_fence_done(sq)) break;
+            if (!ds4_gpu_ane_unpack(dst, DIM, NTOK, 0)) break;
+        }
+        ds4_gpu_end_commands();
+        uint32_t served[64];
+        const uint32_t n = ds4_ane_test_served(served, 64);
+        int ordered = (n == L);
+        for (uint32_t i = 0; i < n && i < 64; ++i)
+            if (served[i] != served[0] + i) ordered = 0;
+        ring_ok = ordered && !ds4_gpu_ane_sync_timed_out();
+        printf("\nring (real ds4_ane.m): %u/%u served, %s, timeout=%d -> %s\n",
+               n, L, ordered ? "in order with no gaps" : "DROPPED OR REORDERED",
+               ds4_gpu_ane_sync_timed_out(), ring_ok ? "ok" : "FAIL");
+    }
+
     printf("\niterations      %u\n", ITERS);
     printf("producer served %u (%u run-ahead + %u loop)\n",
            g_served, g_ahead, ITERS);
     printf("wrong results   %u\n", wrong);
     printf("  of which stale (previous iteration's value) %u\n", stale);
     printf("fence timeouts  %d\n", ds4_gpu_ane_sync_timed_out());
-    const int ok = !wrong && g_served == ITERS + g_ahead;
-    printf("\n%s\n", ok ? "PASS: race-free over 10k iterations AND 42-deep run-ahead"
+    const int ok = !wrong && g_served == ITERS + g_ahead && ring_ok;
+    printf("\n%s\n", ok ? "PASS: 10k iterations, 42-deep run-ahead, and the real ring in order"
                         : "FAIL: the handoff drops or reorders");
     return ok ? 0 : 1;
 }

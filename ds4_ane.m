@@ -24,11 +24,10 @@ volatile uint32_t *ds4_gpu_ane_sync_words(void);
 int  ds4_gpu_ane_sync_timed_out(void);
 
 #define DS4_ANE_MAX_LAYERS 64
-#define DS4_ANE_DIM        4096u
 
 static int       g_mode = -1;
 static int       g_ready;
-static uint32_t  g_n_layers, g_n_tok;
+static uint32_t  g_n_layers, g_n_tok, g_dim;
 static MLModel  *g_models[DS4_ANE_MAX_LAYERS];
 static MLMultiArray *g_in_array, *g_out_array;
 static dispatch_queue_t g_queue;
@@ -61,6 +60,37 @@ static ane_req   g_ring[DS4_ANE_RING];
 static volatile uint64_t g_ring_head, g_ring_tail;
 static dispatch_semaphore_t g_ring_sem;
 static uint64_t  g_backpressure;
+static uint32_t  g_expect_layers;
+static uint64_t  g_chunks;
+static uint64_t  g_cancelled;
+
+/* TEST HOOK (DS4_ANE_TEST_HOOK=1, never set in production).
+ *
+ * probe_ane_handoff exercised the GPU fence protocol with its own producer
+ * thread -- which means it would have passed against the SINGLETON request
+ * slot the ring replaced, because it never drove this file at all. The hook
+ * lets FAST run with no Core ML models so the real ring, the real ordered
+ * drain and the real READY/DONE words are under test, and records the sequence
+ * the sidecar actually served so the test can assert it arrived in order with
+ * nothing dropped. A singleton fails that assertion; a ring passes it. */
+static int      g_test_hook = -1;
+#define DS4_ANE_TEST_LOG 256u
+static uint32_t g_test_served[DS4_ANE_TEST_LOG];
+static uint32_t g_test_n;
+
+static int ds4_ane_test_hook(void) {
+    if (g_test_hook < 0) {
+        const char *e = getenv("DS4_ANE_TEST_HOOK");
+        g_test_hook = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return g_test_hook;
+}
+
+uint32_t ds4_ane_test_served(uint32_t *out, uint32_t max) {
+    const uint32_t n = g_test_n < max ? g_test_n : max;
+    for (uint32_t i = 0; i < n; ++i) out[i] = g_test_served[i];
+    return g_test_n;
+}
 
 /* Counters. Reported per run rather than per layer: a per-layer print at 42
  * layers x 32 chunks would itself perturb what it measures. */
@@ -111,7 +141,7 @@ static void ds4_ane_teardown(void) {
     }
     g_in_array = nil; g_out_array = nil; g_queue = nil;
     ds4_gpu_ane_stage_free();
-    g_ready = 0; g_n_layers = 0; g_n_tok = 0;
+    g_ready = 0; g_n_layers = 0; g_n_tok = 0; g_dim = 0;
 }
 
 /* One MLMultiArray per staging surface, built ONCE. Rebuilding per prediction
@@ -136,27 +166,30 @@ static MLMultiArray *ds4_ane_wrap(void *base, uint32_t dim, uint32_t n_tok) {
     return a;
 }
 
-int ds4_ane_init(uint32_t n_layers, uint32_t n_tokens) {
+int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
     if (ds4_ane_mode() == DS4_ANE_OFF) return 0;
-    if (n_layers == 0 || n_layers > DS4_ANE_MAX_LAYERS || n_tokens == 0) return 0;
-    if (g_ready && g_n_layers == n_layers && g_n_tok == n_tokens) return 1;
+    if (n_layers == 0 || n_layers > DS4_ANE_MAX_LAYERS || n_tokens == 0 || dim == 0)
+        return 0;
+    g_expect_layers = n_layers;
+    if (g_ready && g_n_layers == n_layers && g_n_tok == n_tokens && g_dim == dim)
+        return 1;
     ds4_ane_teardown();
 
     void *in_ptr = NULL, *out_ptr = NULL;
-    if (!ds4_gpu_ane_stage_alloc(DS4_ANE_DIM, n_tokens, &in_ptr, &out_ptr)) {
+    if (!ds4_gpu_ane_stage_alloc(dim, n_tokens, &in_ptr, &out_ptr)) {
         fprintf(stderr, "ds4: ANE staging alloc failed (dim=%u tok=%u)\n",
-                DS4_ANE_DIM, n_tokens);
+                dim, n_tokens);
         return 0;
     }
 
     @autoreleasepool {
-        g_in_array  = ds4_ane_wrap(in_ptr,  DS4_ANE_DIM, n_tokens);
-        g_out_array = ds4_ane_wrap(out_ptr, DS4_ANE_DIM, n_tokens);
+        g_in_array  = ds4_ane_wrap(in_ptr,  dim, n_tokens);
+        g_out_array = ds4_ane_wrap(out_ptr, dim, n_tokens);
         if (!g_in_array || !g_out_array) { ds4_ane_teardown(); return 0; }
 
         /* PROBE and BRIDGE deliberately load nothing: they price the fence and
          * the layout conversion, and a Core ML load would contaminate both. */
-        if (ds4_ane_mode() >= DS4_ANE_SHADOW) {
+        if (ds4_ane_mode() >= DS4_ANE_SHADOW && !ds4_ane_test_hook()) {
             const char *dir = getenv("DS4_ANE_MODEL_DIR");
             if (!dir || !dir[0]) {
                 fprintf(stderr, "ds4: ANE shadow needs DS4_ANE_MODEL_DIR\n");
@@ -188,8 +221,15 @@ int ds4_ane_init(uint32_t n_layers, uint32_t n_tokens) {
                                                          error:&err];
                 if (g_models[il]) loaded++;
             }
-            if (loaded == 0) {
-                fprintf(stderr, "ds4: ANE shadow found no models under %s\n", dir);
+            /* All or nothing. A partial load used to mean the missing layers
+             * silently fell back to the GPU while their fences waited on a
+             * publisher that never came -- and the run still reported a
+             * plausible per-prediction cost, measured over the layers that
+             * happened to work. */
+            if (loaded != n_layers) {
+                fprintf(stderr, "ds4: ANE loaded %u of %u %s models under %s "
+                                "-- refusing to run partially\n",
+                        loaded, n_layers, variant, dir);
                 ds4_ane_teardown();
                 return 0;
             }
@@ -221,7 +261,7 @@ int ds4_ane_init(uint32_t n_layers, uint32_t n_tokens) {
         }
         for (uint32_t i = 0; i < n_layers; ++i) g_done[i] = dispatch_semaphore_create(0);
     }
-    g_n_layers = n_layers; g_n_tok = n_tokens; g_ready = 1;
+    g_n_layers = n_layers; g_n_tok = n_tokens; g_dim = dim; g_ready = 1;
     return 1;
 }
 
@@ -253,9 +293,20 @@ static void *ds4_ane_sidecar_thread(void *ud) {
         const ane_req req = g_ring[t % DS4_ANE_RING];
         const uint32_t seq = req.seq;
         /* >= not ==: the GPU publishes monotonically and may already be past
-         * this seq by the time we look. Equality would hang on a skipped one. */
+         * this seq by the time we look. Equality would hang on a skipped one.
+         *
+         * Requests are queued while the HOST is encoding, often tens of
+         * milliseconds before the command buffer reaches READY, so a pure spin
+         * holds a performance core for most of the chunk. Spin briefly for the
+         * case where the GPU is already there, then back off: a 10-50 us wake
+         * is cheap against a multi-millisecond overlap window, and the core is
+         * worth more to the TP service than to this loop. */
+        uint32_t spins = 0;
         while ((int32_t)(__atomic_load_n(&w[0], __ATOMIC_ACQUIRE) - seq) < 0) {
             if (__atomic_load_n(&g_fast_stop, __ATOMIC_ACQUIRE)) return NULL;
+            if (++spins < 2000u) continue;
+            struct timespec ts = { 0, 20000 };          /* 20 us */
+            nanosleep(&ts, NULL);
         }
         MLModel *m = req.model;
         const double t0 = ds4_ane_now_ns();
@@ -272,6 +323,10 @@ static void *ds4_ane_sidecar_thread(void *ud) {
                 if (inp && [m predictionFromFeatures:inp options:opts error:&err]) g_engaged++;
                 else g_failed++;
             }
+        } else if (ds4_ane_test_hook()) {
+            if (g_test_n < DS4_ANE_TEST_LOG) g_test_served[g_test_n] = seq;
+            g_test_n++;
+            g_engaged++;
         } else {
             g_skipped++;
         }
@@ -287,7 +342,7 @@ int ds4_ane_begin_layer(uint32_t il) {
     if (!g_ready || il >= g_n_layers) return 0;
     if (ds4_ane_mode() < DS4_ANE_SHADOW) return 0;
     MLModel *m = g_models[il];
-    if (!m) { g_skipped++; return 0; }
+    if (!m && !ds4_ane_test_hook()) { g_skipped++; return 0; }
 
     if (ds4_ane_mode() == DS4_ANE_FAST) {
         /* Enqueue. Backpressure rather than overwrite: the ring holds 128 and
@@ -339,6 +394,19 @@ int ds4_ane_begin_layer(uint32_t il) {
     return 1;
 }
 
+/* Undo the most recent enqueue. Called when the GPU publish that would have
+ * released it could not be encoded: the alternative is a sidecar blocked
+ * forever on a READY nobody will write. Safe because the producer is single
+ * -- only the encoding thread enqueues. */
+void ds4_ane_cancel_layer(uint32_t il) {
+    if (!g_ready || ds4_ane_mode() != DS4_ANE_FAST) return;
+    const uint64_t h = __atomic_load_n(&g_ring_head, __ATOMIC_ACQUIRE);
+    if (h == __atomic_load_n(&g_ring_tail, __ATOMIC_ACQUIRE)) return;
+    __atomic_store_n(&g_ring_head, h - 1u, __ATOMIC_RELEASE);
+    g_cancelled++;
+    if (il < g_n_layers) g_started[il] = 0;
+}
+
 int ds4_ane_wait(uint32_t il) {
     if (!g_ready || il >= g_n_layers || !g_started[il]) return 0;
     if (ds4_ane_mode() == DS4_ANE_FAST) {
@@ -353,17 +421,28 @@ int ds4_ane_wait(uint32_t il) {
 }
 
 void ds4_ane_reset(void) {
+    /* Deliberately NOT clearing g_cancelled or the timeout word: those are
+     * run-level faults, and a per-chunk reset would let one bad chunk vanish
+     * from the record. */
     g_ns_predict = 0.0; g_engaged = g_skipped = g_failed = 0;
 }
 
 void ds4_ane_report(void) {
     if (ds4_ane_mode() == DS4_ANE_OFF) return;
     if (g_engaged == 0 && g_skipped == 0 && g_failed == 0) return;
+    g_chunks++;
+    /* One grep-able line per chunk. The harness asserts on every field:
+     * engaged must equal the sparse-layer count, and skipped, failed,
+     * cancelled and timeout must all be zero. Anything else means some layers
+     * quietly ran on the GPU while the numbers described the ones that did
+     * not. */
     fprintf(stderr,
-            "ds4: ANE sidecar: engaged=%llu skipped=%llu failed=%llu "
-            "predict=%.1f ms total (%.3f ms/engaged)\n",
-            (unsigned long long)g_engaged, (unsigned long long)g_skipped,
-            (unsigned long long)g_failed, g_ns_predict / 1.0e6,
+            "ds4: ANE chunk %llu: engaged=%llu/%u skipped=%llu failed=%llu "
+            "cancelled=%llu timeout=%d predict=%.1f ms (%.3f ms/engaged)\n",
+            (unsigned long long)g_chunks, (unsigned long long)g_engaged,
+            g_expect_layers, (unsigned long long)g_skipped,
+            (unsigned long long)g_failed, (unsigned long long)g_cancelled,
+            ds4_gpu_ane_sync_timed_out(), g_ns_predict / 1.0e6,
             g_engaged ? g_ns_predict / 1.0e6 / (double)g_engaged : 0.0);
     if (ds4_ane_mode() == DS4_ANE_FAST && g_backpressure) {
         fprintf(stderr, "ds4: ANE ring backpressure %llu spins -- the host ran "

@@ -39684,6 +39684,13 @@ static bool metal_graph_prefill_chunked_range(
             }
             return false;
         }
+        /* ds4_ane_report()/reset() had no callers at all, so fence timeouts
+         * were never printed, failed and skipped counts were never checked,
+         * and the harness's grep for them could not fire. Once per completed
+         * chunk is the right cadence: per layer would perturb what it
+         * measures, per run would hide which chunk went wrong. */
+        ds4_ane_report();
+        ds4_ane_reset();
         if (progress) {
             progress(progress_ud, "prefill_chunk", (int)chunk_end, prompt->len);
         }
@@ -51244,9 +51251,21 @@ static bool glm_graph_encode_ffn_batch(
      * reads batch_ffn_norm through shared memory, so the GPU work producing it
      * has to have landed first -- there is no ordering primitive between a
      * Metal command buffer and a Core ML prediction, only completion. */
+    /* LOGICAL sparse index, not the physical layer. GLM is 3 dense + 42 sparse
+     * + 1 MTP = 46 physical layers, this FFN path runs only the sparse ones
+     * (il in [3, 45)), and the generator emits shexp_L00..L41 by LOGICAL
+     * index. Passing il found models for 39 of 42 and silently skipped the
+     * last three -- whose fences then had no publisher and spun to timeout
+     * onto a stale surface, while shadow under-counted prediction cost by 7%. */
+    const uint32_t ane_sparse = (DS4_N_LAYER > DS4_N_LEADING_DENSE + 1u)
+            ? (uint32_t)(DS4_N_LAYER - DS4_N_LEADING_DENSE - 1u) : 0u;
+    const uint32_t ane_li = (il >= (uint32_t)DS4_N_LEADING_DENSE)
+            ? il - (uint32_t)DS4_N_LEADING_DENSE : UINT32_MAX;
     const int ane_sidecar = ok && !shared_done && ds4_ane_mode() != DS4_ANE_OFF &&
-                            ds4_ane_init((uint32_t)DS4_N_LAYER, n_tokens);
+                            ane_li < ane_sparse &&
+                            ds4_ane_init(ane_sparse, (uint32_t)DS4_N_EMBD, n_tokens);
     uint32_t ane_seq = 0;
+    int ane_started = 0;
     if (ane_sidecar) {
         /* TWO fences, and both are load-bearing.
          *
@@ -51272,20 +51291,32 @@ static bool glm_graph_encode_ffn_batch(
             /* No command-buffer round trip at all. Encoder boundaries order
              * the pack against the norm and the publish against the pack --
              * the same primitive ds4's own fast-sync gates use -- and the
-             * rendezvous is a system-coherent word instead of completion. */
-            ane_seq = ds4_ane_next_seq();
+             * rendezvous is a system-coherent word instead of completion.
+             *
+             * Enqueue BEFORE publishing, and publish only if the enqueue took:
+             * a READY with nothing queued behind it is a fence nobody will
+             * ever release. */
             ds4_gpu_ane_order_boundary();
             ok = ds4_gpu_ane_pack(g->batch_ffn_norm, (uint32_t)DS4_N_EMBD,
                                   n_tokens) != 0;
-            if (ok) ok = ds4_gpu_ane_publish_ready(ane_seq) != 0;
-            if (ok) ds4_ane_begin_layer(il);
+            if (ok) {
+                ane_seq = ds4_ane_next_seq();
+                ane_started = ds4_ane_begin_layer(ane_li);
+                if (ane_started && !ds4_gpu_ane_publish_ready(ane_seq)) {
+                    /* Queued but unreachable. Drop the request rather than
+                     * leave the sidecar waiting on a READY that never comes. */
+                    ds4_ane_cancel_layer(ane_li);
+                    ane_started = 0;
+                    ok = 0;
+                }
+            }
         } else {
             ok = glm_graph_prefill_stage_sync_boundary();
             if (ok && ds4_ane_mode() >= DS4_ANE_BRIDGE) {
                 ds4_gpu_ane_pack(g->batch_ffn_norm, (uint32_t)DS4_N_EMBD, n_tokens);
                 ok = glm_graph_prefill_stage_sync_boundary();
             }
-            if (ok) ds4_ane_begin_layer(il);
+            if (ok) ane_started = ds4_ane_begin_layer(ane_li);
         }
     }
     if (n_tokens <= 8u && (glm_decode_ablate_mask() & DS4_GLM_ABLATE_ROUTED)) { /* ablate: keep the gate */ } else
@@ -51400,14 +51431,15 @@ static bool glm_graph_encode_ffn_batch(
                                       pos0);
     }
     if (ok && !shared_done) DS4_GLM_ENCODE_FFN_BATCH_SHARED();
-    if (ane_sidecar) {
+    if (ane_sidecar && ane_started) {
         if (ds4_ane_mode() == DS4_ANE_FAST) {
             /* The GPU waits, not this thread. It reaches the fence having
              * already run routed-MoE, so a prediction that finished during
-             * that window costs nothing here. */
+             * that window costs nothing here. Gated on ane_started: a fence
+             * for a request that was never queued spins to timeout. */
             ok = ok && ds4_gpu_ane_fence_done(ane_seq) != 0;
         }
-        ds4_ane_wait(il);
+        ds4_ane_wait(ane_li);
         if (ds4_ane_mode() >= DS4_ANE_BRIDGE) {
             /* NULL destination = the bridge's own scratch. The GPU stays
              * authoritative in every mode this file supports and the sidecar's
@@ -51415,18 +51447,14 @@ static bool glm_graph_encode_ffn_batch(
              * load-bearing -- that would produce fluent, wrong text. */
             ds4_gpu_ane_unpack(NULL, (uint32_t)DS4_N_EMBD, n_tokens, 0);
         }
-        /* One divergence sample per chunk. Comparing every layer would add 42
-         * flushes to price a number that does not vary much across them. */
-        if (il == 0 && ds4_ane_mode() >= DS4_ANE_SHADOW) {
-            double max_abs = 0.0, rel_rms = 0.0;
-            if (ds4_gpu_ane_compare(g->batch_attn_out, (uint32_t)DS4_N_EMBD,
-                                    n_tokens, &max_abs, &rel_rms)) {
-                fprintf(stderr, "ds4: ANE shadow layer 0: max_abs %.4f "
-                                "rel_rms %.4f (synthetic weights -- large is "
-                                "expected, non-zero proves the compare is "
-                                "wired)\n", max_abs, rel_rms);
-            }
-        }
+        /* The divergence sample used to key on il == 0, which is DENSE and
+         * returns long before this path -- so it never ran once. It is gone
+         * rather than re-keyed to ane_li == 0, because under the S8 row split
+         * batch_attn_out holds only this rank's HALF of the rows, and
+         * comparing a full ANE output against a rank-local half would report a
+         * large divergence for a reason that has nothing to do with the ANE.
+         * Correctness belongs to `equiv` on the rig and to the Q8 logits/NLL
+         * comparison that real weights will make possible. */
     }
 #undef DS4_GLM_ENCODE_FFN_BATCH_SHARED
     /* P1: close the exchange window now that the disjoint work is encoded. */

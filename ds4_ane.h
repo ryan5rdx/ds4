@@ -70,8 +70,11 @@ int ds4_ane_mode(void);
  * Returns 0 on failure, which the caller must treat as "run the GPU path" --
  * never as a reason to abort the prefill. Safe to call repeatedly; a change of
  * n_tokens tears down and rebuilds, because a Core ML model's M is fixed at
- * conversion time and a mismatched shape must skip rather than reshape. */
-int ds4_ane_init(uint32_t n_layers, uint32_t n_tokens);
+ * conversion time and a mismatched shape must skip rather than reshape.
+ * `dim` is a parameter rather than a constant so a test can drive the ring at
+ * a small shape -- with 4096 baked in, any probe using a different width had
+ * its pack silently rejected by the staging size guard. */
+int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens);
 
 /* Start layer `il` asynchronously. The caller must already have fenced the GPU
  * work producing the input. Returns 0 if this layer is not eligible (shape
@@ -93,6 +96,15 @@ void ds4_ane_reset(void);
  * itself -- ds4.c encodes the GPU publish -- so the caller needs the sequence
  * number it must hand to ds4_gpu_ane_publish_ready/ds4_gpu_ane_fence_done. */
 uint32_t ds4_ane_next_seq(void);
+
+/* Undo the most recent enqueue when the GPU publish that would release it
+ * could not be encoded. Without this the sidecar blocks forever on a READY
+ * nobody will write. */
+void ds4_ane_cancel_layer(uint32_t il);
+
+/* TEST HOOK only (DS4_ANE_TEST_HOOK=1). Sequence numbers the sidecar actually
+ * served, in order. Returns the total count, which may exceed `max`. */
+uint32_t ds4_ane_test_served(uint32_t *out, uint32_t max);
 
 #ifdef __cplusplus
 }
