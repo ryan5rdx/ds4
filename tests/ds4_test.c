@@ -4748,6 +4748,43 @@ static void test_metal_router_weights_batch_exact(void) {
 }
 #endif
 
+
+/* RMSNorm across PARTIAL simdgroup widths.
+ *
+ * The public API takes any width divisible by four, so the threadgroup need not
+ * be a multiple of 32: n=192 dispatches 48 threads (two simdgroups) and n=96
+ * dispatches 24 (one). A cross-simdgroup reduction that computes its simdgroup
+ * count by truncating ntg.x/32 drops the partial group at 192 and yields ZERO
+ * at 96, where the row then normalises by sqrt(eps) and every output is ~1000x
+ * too large. Both regressed exactly that way while COMPACT-REDUCE was in
+ * development; the shapes GLM itself dispatches (384, 1024) did not.
+ */
+static void test_metal_rms_norm_partial_simdgroup(void) {
+    static const uint32_t widths[] = { 96u, 160u, 192u, 224u, 384u, 1024u };
+    for (size_t w = 0; w < sizeof widths / sizeof widths[0]; w++) {
+        const uint32_t n = widths[w];
+        float *x = xmalloc((size_t)n * sizeof(float));
+        float *o = xmalloc((size_t)n * sizeof(float));
+        for (uint32_t i = 0; i < n; i++) x[i] = 1.0f + 0.001f * (float)(i % 7u);
+
+        ds4_gpu_tensor *xt = ds4_gpu_tensor_alloc((uint64_t)n * sizeof(float));
+        ds4_gpu_tensor *ot = ds4_gpu_tensor_alloc((uint64_t)n * sizeof(float));
+        TEST_ASSERT(xt && ot);
+        TEST_ASSERT(ds4_gpu_tensor_write(xt, 0, x, (size_t)n * sizeof(float)));
+        TEST_ASSERT(ds4_gpu_rms_norm_plain_tensor(ot, xt, n, 1e-6f));
+        TEST_ASSERT(ds4_gpu_tensor_read(ot, 0, o, (size_t)n * sizeof(float)));
+
+        double ss = 0.0;
+        for (uint32_t i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
+        const double rms = sqrt(ss / (double)n + 1e-6);
+        for (uint32_t i = 0; i < n; i++) {
+            const double ref = (double)x[i] / rms;
+            TEST_ASSERT(fabs((double)o[i] - ref) < 2e-5);
+        }
+        ds4_gpu_tensor_free(ot); ds4_gpu_tensor_free(xt); free(o); free(x);
+    }
+}
+
 static void test_metal_kernel_group(void) {
     test_metal_f16_matvec_fast_nr0_4();
     test_metal_f16_prefill_matmul();
@@ -4773,6 +4810,7 @@ static void test_metal_kernel_group(void) {
     test_metal_hc_rms_scale_project_f16_exact();
     test_metal_router_simd_finalize_exact();
     test_metal_router_weights_batch_exact();
+    test_metal_rms_norm_partial_simdgroup();
 #endif
 }
 

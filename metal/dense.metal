@@ -2,6 +2,12 @@
 
 constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
 constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
+/* COMPACT-MV: one threadgroup barrier in the matvec cross-simdgroup reduction
+ * instead of two. Optional -- pipelines that never set it keep the shipped
+ * two-barrier form, so no call site is obliged to change. */
+constant bool FC_mv_compact_reduce [[function_constant(FC_MUL_MV + 2)]];
+constant bool mv_compact_reduce =
+    is_function_constant_defined(FC_mv_compact_reduce) ? FC_mv_compact_reduce : false;
 
 struct ds4_metal_args_mul_mv {
     int ne00;
@@ -82,6 +88,41 @@ static inline void helper_mv_reduce_and_write(
     constexpr short NW = N_SIMDWIDTH;
 
     threadgroup float * shmem_f32[NR0];
+
+    if (mv_compact_reduce) {
+        /* The shipped form zeroes all 32 scratch slots, barriers, overwrites
+         * the NSG live entries, and barriers again. The zeroing exists only so
+         * the final simd_sum sees 0 in lanes >= NSG -- which a ternary gives
+         * for free, removing the first barrier and the zeroing pass with it.
+         *
+         * BIT-IDENTICAL by construction: the 32-lane vector entering the final
+         * simd_sum is the same in both forms -- per-simdgroup sums in lanes
+         * [0, NSG) and zeros above -- so the reduction tree is unchanged.
+         *
+         * FC_mul_mv_nsg is visible here because the .metal sources are
+         * concatenated into one translation unit before compilation. */
+        const short NSG = FC_mul_mv_nsg;
+
+        for (short row = 0; row < NR0; ++row) {
+            shmem_f32[row] = (threadgroup float *) shmem + NW*row;
+            sumf[row] = simd_sum(sumf[row]);
+            if (tiisg == 0) {
+                shmem_f32[row][sgitg] = sumf[row];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
+            const float x = tiisg < NSG ? shmem_f32[row][tiisg] : 0.0f;
+            const float tot = simd_sum(x);
+
+            if (tiisg == 0 && sgitg == 0) {
+                dst_f32[r0 + row] = tot;
+            }
+        }
+        return;
+    }
 
     for (short row = 0; row < NR0; ++row) {
         shmem_f32[row] = (threadgroup float *) shmem + NW*row;

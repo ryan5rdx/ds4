@@ -4283,6 +4283,46 @@ int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled) {
     return previous;
 }
 
+/* COMPACT-MV / COMPACT-NORM -- one threadgroup barrier in the cross-simdgroup
+ * reduction instead of two. OPT-IN: DS4_METAL_COMPACT_REDUCE=mv|norm|both.
+ *
+ * Read ONCE per process and cached, deliberately unlike the per-call LORAMMA
+ * knob: this one feeds a FUNCTION CONSTANT baked into a compiled pipeline, and
+ * the pipeline cache is keyed on (name, nsg, nxpsg) without it. A knob that
+ * changed mid-process would hand back a pipeline built for the other arm. */
+/* COMPACT-MV, BANKED 2026-09-11 and DEFAULT ON. One threadgroup barrier in the
+ * matvec cross-simdgroup reduction instead of two: the shipped form zeroed all
+ * 32 scratch slots so the final simd_sum would see 0 above the live
+ * simdgroups, which a ternary supplies for free. BIT-IDENTICAL -- the 32-lane
+ * vector entering the reduction is unchanged.
+ *
+ * COMPACT measured +0.06% to +0.28% decode @131k over four serpentine reps,
+ * winning all four same-rep pairings and never falling below the control. The
+ * magnitude sits inside the control's own spread, so the RANGE is the honest
+ * figure and not the +0.28% midpoint. It ships because it is exact and
+ * strictly removes work, not because the number is large.
+ *
+ * The NORM arm is NOT here. It measured null (+0.15%, sign-inconsistent) and
+ * BOTH matched MV, so it contributed nothing on top -- while being the path
+ * that carried a real partial-simdgroup bug during development. Dropped rather
+ * than carried default-off: a null arm with a correctness hazard is not worth
+ * the code.
+ *
+ * DS4_METAL_COMPACT_REDUCE=off restores the two-barrier form. An omitted knob
+ * is ON, so a control arm must write it. */
+static int ds4_gpu_compact_reduce_mask(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_METAL_COMPACT_REDUCE");
+        cached = 1;
+        if (e && (strcmp(e, "off") == 0 || strcmp(e, "0") == 0)) {
+            cached = 0;
+            fprintf(stderr, "ds4: Metal COMPACT MV reduce DISABLED by env\n");
+        }
+    }
+    return cached;
+}
+
 static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_pipeline(
         const char *function_name,
         int16_t     nsg) {
@@ -4317,6 +4357,19 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_pipeline(
 
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
+    const BOOL mv_compact = (ds4_gpu_compact_reduce_mask() & 1) ? YES : NO;
+    [constants setConstantValue:&mv_compact type:MTLDataTypeBool atIndex:602];
+    /* Announce where the constant is BOUND TO A PIPELINE, not where the env was
+     * parsed. An env-parse announce proves only that a string was read: it
+     * cannot show the constant reached a pipeline, nor that an affected kernel
+     * ran. This fires once, from the path a dispatch takes to get its PSO. */
+    if (mv_compact) {
+        static int announced_mv;
+        if (!announced_mv) {
+            announced_mv = 1;
+            fprintf(stderr, "ds4: COMPACT MV pipeline bound\n");
+        }
+    }
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
@@ -4355,6 +4408,19 @@ static id<MTLComputePipelineState> ds4_gpu_new_mul_mv_tg_multiple_pipeline(
         int16_t     nsg) {
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
+    const BOOL mv_compact = (ds4_gpu_compact_reduce_mask() & 1) ? YES : NO;
+    [constants setConstantValue:&mv_compact type:MTLDataTypeBool atIndex:602];
+    /* Announce where the constant is BOUND TO A PIPELINE, not where the env was
+     * parsed. An env-parse announce proves only that a string was read: it
+     * cannot show the constant reached a pipeline, nor that an affected kernel
+     * ran. This fires once, from the path a dispatch takes to get its PSO. */
+    if (mv_compact) {
+        static int announced_mv;
+        if (!announced_mv) {
+            announced_mv = 1;
+            fprintf(stderr, "ds4: COMPACT MV pipeline bound\n");
+        }
+    }
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
@@ -4596,6 +4662,19 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_ext_pipeline(
 
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&nsg   type:MTLDataTypeShort atIndex:600];
+    const BOOL mv_compact = (ds4_gpu_compact_reduce_mask() & 1) ? YES : NO;
+    [constants setConstantValue:&mv_compact type:MTLDataTypeBool atIndex:602];
+    /* Announce where the constant is BOUND TO A PIPELINE, not where the env was
+     * parsed. An env-parse announce proves only that a string was read: it
+     * cannot show the constant reached a pipeline, nor that an affected kernel
+     * ran. This fires once, from the path a dispatch takes to get its PSO. */
+    if (mv_compact) {
+        static int announced_mv;
+        if (!announced_mv) {
+            announced_mv = 1;
+            fprintf(stderr, "ds4: COMPACT MV pipeline bound\n");
+        }
+    }
     [constants setConstantValue:&nxpsg type:MTLDataTypeShort atIndex:601];
 
     NSError *error = nil;
@@ -8907,6 +8986,8 @@ int ds4_gpu_init(void) {
         MTLFunctionConstantValues *moe_mv_id_constants = [[MTLFunctionConstantValues alloc] init];
         int16_t moe_mv_id_nsg = 2;
         [moe_mv_id_constants setConstantValue:&moe_mv_id_nsg type:MTLDataTypeShort atIndex:600];
+        const BOOL mv_compact = (ds4_gpu_compact_reduce_mask() & 1) ? YES : NO;
+        [moe_mv_id_constants setConstantValue:&mv_compact type:MTLDataTypeBool atIndex:602];
 
         error = nil;
         fn = [library newFunctionWithName:@"kernel_mul_mv_id_iq2_xxs_f32"
@@ -50401,43 +50482,10 @@ int ds4_gpu_glm53_matmul_bf16(
          * shapes. */
         const int bf16_splitk_shape =
             out_dim <= 64u && in_dim >= 4096u && (in_dim % 32u) == 0u;
-        /* D7: the 4096 -> 128 decode matvec, which Q1C7 caught at 22 calls per
-         * token (two in each of the 11 DSA layers) and 0.290 ms/token on the
-         * 16-threadgroup row kernel. out_dim 128 sits just past the B1 gate, so
-         * it never split.
-         *
-         * A SEPARATE predicate, not a relaxation of the one above. Widening
-         * `out_dim <= 64` to 128 would also hand this shape to HCMIX-WIDE,
-         * whose K-slice knob defaults to 4 -- the arm would silently measure
-         * W4 while reporting B1, and the banked HCMIX default would change
-         * behaviour on a shape its quality gate never covered.
-         *
-         * Default OFF, and its own K knob defaults to 0 so W2/W4 stay opt-in. */
-        const int bf16_d7_shape =
-            in_dim == 4096u && out_dim == 128u && n_rows == 1u;
-        /* BANKED 2026-09-11, DEFAULT ON for this shape. D7R: kernel 1.734x
-         * (0.2301 -> 0.1327 ms on the 22-call chain), quality gate
-         * BIT-IDENTICAL (avg_nll delta 0.000000000, 100/100 ties), greedy
-         * output byte-identical, +0.30% decode @131k and +0.20% @2k at four
-         * reps with prefill flat.
-         *
-         * DS4_METAL_GLM53_BF16_128_SPLITK=0 restores the row walk. An omitted
-         * knob is ON, so a control arm must write the 0 explicitly. */
-        const char *bf16_d7_env = getenv("DS4_METAL_GLM53_BF16_128_SPLITK");
-        const int bf16_d7 =
-            bf16_d7_shape && !(bf16_d7_env && bf16_d7_env[0] == '0');
-        if (bf16_d7_shape && !bf16_d7) {
-            static int announced_d7_off;
-            if (!announced_d7_off) {
-                announced_d7_off = 1;
-                fprintf(stderr, "ds4: GLM53 BF16 4096->128 split-K DISABLED by env\n");
-            }
-        }
         const int bf16_splitk =
             /* Default ON; DS4_METAL_GLM53_BF16_MV_SPLITK=0 disables. */
-            (!(bf16_splitk_env && bf16_splitk_env[0] == '0') &&
-             bf16_splitk_shape) ||
-            bf16_d7;
+            !(bf16_splitk_env && bf16_splitk_env[0] == '0') &&
+            bf16_splitk_shape;
         /* HCMIX-WIDE: a third grid axis over the contraction.  B1 took hc_mix
          * from 3 to 12 threadgroups by splitting K across simdgroups; this
          * splits it across threadgroups too, 12 -> 12*KSPLIT.  Two dispatches
@@ -50456,12 +50504,7 @@ int ds4_gpu_glm53_matmul_bf16(
          * 4 is the smaller reduction-order perturbation of the two tied values
          * and is the one the quality gate covers. */
         const uint32_t bf16_ksplit = bf16_splitk_shape ?
-            (uint32_t)ds4_gpu_env_u64("DS4_METAL_GLM53_BF16_MV_KSPLIT", 4u, 0u, 32u) :
-            /* D7 gets its OWN K knob defaulting to 0, so the banked HCMIX K=4
-             * cannot reach this shape by accident. 2 or 4 selects W2/W4. */
-            (bf16_d7 ?
-                (uint32_t)ds4_gpu_env_u64("DS4_METAL_GLM53_BF16_128_KSPLIT", 0u, 0u, 32u)
-              : 0u);
+            (uint32_t)ds4_gpu_env_u64("DS4_METAL_GLM53_BF16_MV_KSPLIT", 4u, 0u, 32u) : 0u;
         const int bf16_wide = bf16_ksplit >= 2u;
         const bool bc_inp = (in_dim % 32u) != 0u;
         const bool bc_out = (out_dim % 64u) != 0u || (n_rows % 32u) != 0u;
