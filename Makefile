@@ -484,6 +484,11 @@ ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 ds4_ane.o: ds4_ane.m ds4_ane.h
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_ane.m
 
+# Bridge-kernel exactness, no GGUF required. The transpose is the part that
+# fails silently: a wrong index still yields a full, plausible tensor.
+tests/probe_ane: tests/probe_ane.c ds4_metal.o ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/probe_ane.c ds4_metal.o $(METAL_LDLIBS)
+
 tests/test_glm53_kda.o: tests/test_glm53_kda.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_glm53_kda.c
 
