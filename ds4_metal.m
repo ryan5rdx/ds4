@@ -4283,6 +4283,34 @@ int ds4_gpu_set_decode_pipeline_fast_lookup(int enabled) {
     return previous;
 }
 
+/* COMPACT-MV / COMPACT-NORM -- one threadgroup barrier in the cross-simdgroup
+ * reduction instead of two. OPT-IN: DS4_METAL_COMPACT_REDUCE=mv|norm|both.
+ *
+ * Read ONCE per process and cached, deliberately unlike the per-call LORAMMA
+ * knob: this one feeds a FUNCTION CONSTANT baked into a compiled pipeline, and
+ * the pipeline cache is keyed on (name, nsg, nxpsg) without it. A knob that
+ * changed mid-process would hand back a pipeline built for the other arm. */
+static int ds4_gpu_compact_reduce_mask(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *e = getenv("DS4_METAL_COMPACT_REDUCE");
+        cached = 0;
+        if (e && *e) {
+            const int both = strcmp(e, "both") == 0;
+            if (both || strcmp(e, "mv")   == 0) cached |= 1;
+            if (both || strcmp(e, "norm") == 0) cached |= 2;
+            if (!cached) {
+                fprintf(stderr, "ds4: DS4_METAL_COMPACT_REDUCE='%s' unknown -- "
+                        "expected mv|norm|both; running the shipped form\n", e);
+            } else {
+                fprintf(stderr, "ds4: Metal COMPACT reduce ENGAGED (%s%s)\n",
+                        (cached & 1) ? "mv" : "", (cached & 2) ? " norm" : "");
+            }
+        }
+    }
+    return cached;
+}
+
 static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_pipeline(
         const char *function_name,
         int16_t     nsg) {
@@ -4317,6 +4345,8 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_pipeline(
 
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
+    const BOOL mv_compact = (ds4_gpu_compact_reduce_mask() & 1) ? YES : NO;
+    [constants setConstantValue:&mv_compact type:MTLDataTypeBool atIndex:602];
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
@@ -4355,6 +4385,8 @@ static id<MTLComputePipelineState> ds4_gpu_new_mul_mv_tg_multiple_pipeline(
         int16_t     nsg) {
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&nsg type:MTLDataTypeShort atIndex:600];
+    const BOOL mv_compact = (ds4_gpu_compact_reduce_mask() & 1) ? YES : NO;
+    [constants setConstantValue:&mv_compact type:MTLDataTypeBool atIndex:602];
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
@@ -4596,6 +4628,8 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_ext_pipeline(
 
     MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
     [constants setConstantValue:&nsg   type:MTLDataTypeShort atIndex:600];
+    const BOOL mv_compact = (ds4_gpu_compact_reduce_mask() & 1) ? YES : NO;
+    [constants setConstantValue:&mv_compact type:MTLDataTypeBool atIndex:602];
     [constants setConstantValue:&nxpsg type:MTLDataTypeShort atIndex:601];
 
     NSError *error = nil;
@@ -8817,7 +8851,13 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        fn = [library newFunctionWithName:@"kernel_rms_norm_mul_f32_4"];
+        {
+            MTLFunctionConstantValues *nc = [[MTLFunctionConstantValues alloc] init];
+            const BOOL norm_compact = (ds4_gpu_compact_reduce_mask() & 2) ? YES : NO;
+            [nc setConstantValue:&norm_compact type:MTLDataTypeBool atIndex:603];
+            NSError *nerr = nil;
+            fn = [library newFunctionWithName:@"kernel_rms_norm_mul_f32_4" constantValues:nc error:&nerr];
+        }
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_rms_norm_mul_f32_4 function not found\n");
             g_queue = nil;
@@ -8833,7 +8873,13 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
-        fn = [library newFunctionWithName:@"kernel_rms_norm_f32_4"];
+        {
+            MTLFunctionConstantValues *nc = [[MTLFunctionConstantValues alloc] init];
+            const BOOL norm_compact = (ds4_gpu_compact_reduce_mask() & 2) ? YES : NO;
+            [nc setConstantValue:&norm_compact type:MTLDataTypeBool atIndex:603];
+            NSError *nerr = nil;
+            fn = [library newFunctionWithName:@"kernel_rms_norm_f32_4" constantValues:nc error:&nerr];
+        }
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_rms_norm_f32_4 function not found\n");
             g_queue = nil;
@@ -8907,6 +8953,8 @@ int ds4_gpu_init(void) {
         MTLFunctionConstantValues *moe_mv_id_constants = [[MTLFunctionConstantValues alloc] init];
         int16_t moe_mv_id_nsg = 2;
         [moe_mv_id_constants setConstantValue:&moe_mv_id_nsg type:MTLDataTypeShort atIndex:600];
+        const BOOL mv_compact = (ds4_gpu_compact_reduce_mask() & 1) ? YES : NO;
+        [moe_mv_id_constants setConstantValue:&mv_compact type:MTLDataTypeBool atIndex:602];
 
         error = nil;
         fn = [library newFunctionWithName:@"kernel_mul_mv_id_iq2_xxs_f32"

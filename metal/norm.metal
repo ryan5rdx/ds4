@@ -16,6 +16,13 @@ struct ds4_metal_args_norm {
 // RMSNorm over one activation row, optionally fusing the learned weight
 // multiply. DS4 calls this before attention, before the FFN, and for plain
 // diagnostics that need normalized but unweighted rows.
+/* COMPACT-NORM: one threadgroup barrier in the cross-simdgroup reduction
+ * instead of two. Optional, so a pipeline built without it keeps the shipped
+ * form. Index 603 sits alongside the matvec constants at FC_MUL_MV + 0/1/2. */
+constant bool FC_norm_compact_reduce [[function_constant(603)]];
+constant bool norm_compact_reduce =
+    is_function_constant_defined(FC_norm_compact_reduce) ? FC_norm_compact_reduce : false;
+
 template <typename T, short F>
 kernel void kernel_rms_norm_fuse_impl(
         constant ds4_metal_args_norm & args,
@@ -29,7 +36,7 @@ kernel void kernel_rms_norm_fuse_impl(
         ushort  sgitg[[simdgroup_index_in_threadgroup]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
-    if (sgitg == 0) {
+    if (!norm_compact_reduce && sgitg == 0) {
         shmem_f32[tiisg] = 0.0f;
     }
 
@@ -50,16 +57,30 @@ kernel void kernel_rms_norm_fuse_impl(
     }
     sumf = simd_sum(sumf);
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (norm_compact_reduce) {
+        /* One barrier instead of two. The shipped form zeroes all 32 slots up
+         * front so the final simd_sum sees 0 above the live simdgroups; the
+         * ternary below supplies that for free. BIT-IDENTICAL: the 32-lane
+         * vector entering the final simd_sum is unchanged. */
+        const ushort nsg = ntg.x / 32u;
+        if (tiisg == 0) {
+            shmem_f32[sgitg] = sumf;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sumf = tiisg < nsg ? shmem_f32[tiisg] : 0.0f;
+        sumf = simd_sum(sumf);
+    } else {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tiisg == 0) {
-        shmem_f32[sgitg] = sumf;
+        if (tiisg == 0) {
+            shmem_f32[sgitg] = sumf;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        sumf = shmem_f32[tiisg];
+        sumf = simd_sum(sumf);
     }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    sumf = shmem_f32[tiisg];
-    sumf = simd_sum(sumf);
 
     const float mean  = sumf/args.ne00;
     const float scale = 1.0f/sqrt(mean + args.eps);
