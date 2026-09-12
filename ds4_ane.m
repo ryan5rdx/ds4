@@ -123,12 +123,22 @@ int ds4_ane_init(uint32_t n_layers, uint32_t n_tokens) {
                 ds4_ane_teardown();
                 return 0;
             }
+            /* Which graph shape to load. ANEIO3 measured _k2 at -30% against
+             * _fused on ANE-side latency with both ALL-ANE, and found _fk2
+             * fails on-device compilation outright -- concatenation and
+             * K-split are alternatives, not stackable. The default stays
+             * _fused because k2 is a change to the ARITHMETIC and ANEIO3's
+             * divergence column contradicted itself (see the review), so the
+             * numerical case is not yet made. Selectable so the rig can price
+             * either without a rebuild. */
+            const char *variant = getenv("DS4_ANE_MODEL_VARIANT");
+            if (!variant || !variant[0]) variant = "fused";
             MLModelConfiguration *cfg = [[MLModelConfiguration alloc] init];
             cfg.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
             uint32_t loaded = 0;
             for (uint32_t il = 0; il < n_layers; ++il) {
                 NSString *path = [NSString stringWithFormat:
-                        @"%s/shexp_L%02u_fused.mlpackage", dir, il];
+                        @"%s/shexp_L%02u_%s.mlpackage", dir, il, variant];
                 NSURL *url = [NSURL fileURLWithPath:path];
                 NSError *err = nil;
                 NSURL *compiled = [MLModel compileModelAtURL:url error:&err];
@@ -144,7 +154,8 @@ int ds4_ane_init(uint32_t n_layers, uint32_t n_tokens) {
                 return 0;
             }
             fprintf(stderr, "ds4: ANE loaded %u/%u shared-expert models "
-                            "(M=%u) from %s\n", loaded, n_layers, n_tokens, dir);
+                            "(variant=%s M=%u) from %s\n",
+                    loaded, n_layers, variant, n_tokens, dir);
             fprintf(stderr, "ds4: ANE shadow weights are SYNTHETIC -- the "
                             "divergence below is expected to be large and the "
                             "GPU stays authoritative\n");
