@@ -494,6 +494,11 @@ tests/probe_ane: tests/probe_ane.c ds4_metal.o ds4_gpu.h
 tests/probe_ane_handoff: tests/probe_ane_handoff.c ds4_metal.o ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/probe_ane_handoff.c ds4_metal.o $(METAL_LDLIBS)
 
+# CPU decode sidecar: can the rank-local shared-expert slice fit the ~149 us
+# routed-MoE overlap window? No GPU, no GGUF -- bandwidth at production shapes.
+tests/probe_cpu_shexp: tests/probe_cpu_shexp.c
+	$(CC) $(CFLAGS) -I. -o $@ tests/probe_cpu_shexp.c -lpthread -lm
+
 tests/test_glm53_kda.o: tests/test_glm53_kda.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_glm53_kda.c
 
