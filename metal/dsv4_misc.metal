@@ -4463,6 +4463,187 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_impl(
  * compiles in a prefix bounds check that zeroes and flags instead, for the
  * probe's negative control.
  */
+/* DSA-LORA attention, QK by SIMDgroup MMA instead of four float4 dots.
+ *
+ * The shipped group8_vec kernel already loads KV as half4, but computes each
+ * score as four float4 dots plus a simd_sum -- 16 sequential 32-lane shuffle
+ * reductions per stage per head. This replaces ONLY that, keeping the 16-row
+ * gather, the two-body prefix/tail split, the online softmax and the PxV
+ * accumulation exactly as they are, so the change is confined to how the 16
+ * scores arrive.
+ *
+ * Tile: 8 heads x 16 rows x 512 latent, from the archived Phase 2 design. The
+ * eight queries are staged once per token and the score tile is two 8x8 MMA
+ * outputs; the K contraction is split eight ways, one 64-dim slice per
+ * simdgroup, then reduced. Splitting K rather than giving two simdgroups the
+ * whole contraction matters: the latter leaves six of eight simdgroups idle
+ * through the hottest part of the kernel.
+ *
+ * HALF OPERANDS, F32 ACCUMULATE, and that is not a free choice.
+ * simdgroup_multiply_accumulate needs A and B in the SAME precision, so an
+ * f32-query MMA would force the KV tile to f32 as well -- doubling the larger
+ * buffer, not the smaller. At 512 latent that is 34 KiB at an 8-row tile and
+ * only fits at 4 rows, which is too small a tile to be a fair test of MMA. The
+ * f32-query reference is therefore the SHIPPED kernel, which already keeps the
+ * query in f32 registers; this arm is the f16-query point and needs a quality
+ * gate rather than bit-identity.
+ *
+ * Threadgroup: kv 16 KiB + q 8 KiB + reduction 4 KiB + scores 0.5 KiB. */
+template <bool assume_valid_heads>
+kernel void kernel_glm_attention_indexed_batch_lora_group8_mma_glm53_impl(
+        constant ds4_metal_args_glm_attention_indexed_batch & args,
+        device const char *q,
+        device const char *qk_low,
+        device const char *kv_lora_cache,
+        device const char *k_rope_cache,
+        device const uint32_t *selected,
+        device char *lora_out,
+        threadgroup half4 *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid_u [[thread_index_in_threadgroup]],
+        ushort lane_u [[thread_index_in_simdgroup]],
+        ushort sg_u [[simdgroup_index_in_threadgroup]]) {
+    (void)q; (void)k_rope_cache;
+    constexpr uint group_heads = 8u;
+    constexpr uint stage_rows = 16u;
+    constexpr uint DIM = 512u;
+    const uint token = tgpig.y;
+    const uint tid = (uint)tid_u;
+    const uint lane = (uint)lane_u;
+    const uint hl = (uint)sg_u;                       /* head within the group */
+    const uint head = tgpig.x * group_heads + hl + args.head_base;
+    if (token >= args.n_tokens || args.n_selected == 0u ||
+        args.cache_f16 == 0u || args.kv_lora_dim != 512u) {
+        return;
+    }
+    const bool valid_head = assume_valid_heads || head < args.n_head;
+    const uint safe_head = valid_head ? head : 0u;
+    const uint kv_vecs = DIM >> 2;
+    const uint64_t low_token_stride =
+        (uint64_t)args.n_head * args.kv_lora_dim * sizeof(float);
+
+    threadgroup half4  *kv_shared = scratch;                       /* [16][128] */
+    threadgroup half   *kv_h      = (threadgroup half *)kv_shared;
+    threadgroup half   *q_shared  = (threadgroup half *)(scratch + stage_rows * kv_vecs);
+    threadgroup float  *red       = (threadgroup float *)(q_shared + group_heads * DIM);
+    threadgroup float  *scores    = red + 2u * 8u * 64u;
+
+    device const float4 *low4 =
+        (device const float4 *)(qk_low + (uint64_t)token * low_token_stride +
+            (uint64_t)safe_head * args.kv_lora_dim * sizeof(float));
+    device const uint32_t *token_selected =
+        selected + (uint64_t)token * args.n_selected;
+
+    float4 low0 = 0.0f, low1 = 0.0f, low2 = 0.0f, low3 = 0.0f;
+    if (valid_head) {
+        low0 = low4[lane + 0u];  low1 = low4[lane + 32u];
+        low2 = low4[lane + 64u]; low3 = low4[lane + 96u];
+    }
+    /* Stage the eight queries once per token. An invalid head contributes
+     * zeros so its tile column is defined; its scores are never read. */
+    {
+        threadgroup half *qrow = q_shared + hl * DIM;
+        for (uint j = 0u; j < 4u; j++) {
+            qrow[4u * lane + 0u   + j] = half(low0[j]);
+            qrow[4u * lane + 128u + j] = half(low1[j]);
+            qrow[4u * lane + 256u + j] = half(low2[j]);
+            qrow[4u * lane + 384u + j] = half(low3[j]);
+        }
+    }
+    /* Every simdgroup writes only its OWN head's row but the MMA below reads
+     * all eight, so the staging must be visible threadgroup-wide before the
+     * first tile load. */
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float M = -FLT_MAX / 2.0f;
+    float S = 0.0f;
+    float4 o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+
+    for (uint base = 0u; base < args.n_selected; base += stage_rows) {
+        const uint rows = min(stage_rows, args.n_selected - base);
+        /* Zero the whole tile: unused columns must be finite, because a NaN
+         * staged into them would be multiplied even though its output column
+         * is discarded. */
+        for (uint off = tid; off < stage_rows * kv_vecs; off += 256u) {
+            const uint rr = off / kv_vecs;
+            const uint vv = off - rr * kv_vecs;
+            half4 v = half4(half(0.0f));
+            if (rr < rows) {
+                const uint row = token_selected[base + rr];
+                if (row < args.cache_cap) {
+                    device const half4 *src =
+                        (device const half4 *)((device const half *)kv_lora_cache +
+                            (uint64_t)row * args.kv_lora_dim);
+                    v = src[vv];
+                }
+            }
+            kv_shared[off] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Two 8x8 score tiles; this simdgroup owns the 64-dim K slice [sg*64). */
+        for (uint t = 0u; t < 2u; t++) {
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            FOR_UNROLL (uint kk = 0u; kk < 8u; kk++) {
+                const uint k0 = hl * 64u + kk * 8u;
+                simdgroup_half8x8 mq, mk;
+                simdgroup_load(mq, q_shared + k0, DIM, 0, false);
+                simdgroup_load(mk, kv_h + (t * 8u) * DIM + k0, DIM, 0, true);
+                simdgroup_multiply_accumulate(acc, mq, mk, acc);
+            }
+            simdgroup_store(acc, red + (t * 8u + hl) * 64u, 8, 0, false);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Reduce the eight K-slice partials, ascending, so the sum order is
+         * fixed rather than whatever the scheduler produces. */
+        for (uint i = tid; i < 2u * 64u; i += 256u) {
+            const uint t = i >> 6, e = i & 63u;
+            float v = 0.0f;
+            for (uint sg = 0u; sg < 8u; sg++) v += red[(t * 8u + sg) * 64u + e];
+            scores[(e >> 3) * stage_rows + t * 8u + (e & 7u)] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        /* Unchanged from the shipped kernel apart from where `sum` comes from. */
+        for (uint rr = 0u; rr < rows; rr++) {
+            threadgroup const half4 *kv_row = kv_shared + rr * kv_vecs;
+            const float sum = scores[hl * stage_rows + rr];
+            if (valid_head) {
+                const float score = sum * args.scale;
+                const float new_m = max(M, score);
+                const float old_scale = exp(M - new_m);
+                const float row_scale = exp(score - new_m);
+                o0 = o0 * old_scale + (float4)kv_row[lane + 0u] * row_scale;
+                o1 = o1 * old_scale + (float4)kv_row[lane + 32u] * row_scale;
+                o2 = o2 * old_scale + (float4)kv_row[lane + 64u] * row_scale;
+                o3 = o3 * old_scale + (float4)kv_row[lane + 96u] * row_scale;
+                S = S * old_scale + row_scale;
+                M = new_m;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (valid_head) {
+        const float inv_s = S > 0.0f ? 1.0f / S : 0.0f;
+        device float4 *out4 =
+            (device float4 *)(lora_out + (uint64_t)token * low_token_stride +
+                (uint64_t)head * args.kv_lora_dim * sizeof(float));
+        out4[lane + 0u]  = o0 * inv_s;
+        out4[lane + 32u] = o1 * inv_s;
+        out4[lane + 64u] = o2 * inv_s;
+        out4[lane + 96u] = o3 * inv_s;
+    }
+}
+
+template [[host_name("kernel_glm_attention_indexed_batch_lora_group8_mma_glm53")]]
+kernel decltype(kernel_glm_attention_indexed_batch_lora_group8_mma_glm53_impl<false>)
+kernel_glm_attention_indexed_batch_lora_group8_mma_glm53_impl<false>;
+template [[host_name("kernel_glm_attention_indexed_batch_lora_group8_mma_glm53_padded")]]
+kernel decltype(kernel_glm_attention_indexed_batch_lora_group8_mma_glm53_impl<true>)
+kernel_glm_attention_indexed_batch_lora_group8_mma_glm53_impl<true>;
+
 template <bool assume_valid_heads>
 kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl(
         constant ds4_metal_args_glm_attention_indexed_batch & args,

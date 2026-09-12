@@ -41113,8 +41113,37 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
             }
         }
 
+        /* LORAMMA -- compute the DSA-LORA QK with SIMDgroup MMA instead of four
+         * float4 dots plus a simd_sum. OPT-IN, measurement only:
+         * DS4_METAL_GLM53_DSA_LORA_MMA=1. Only the GLM53 8-head/512-latent
+         * padded shape is eligible; everything else keeps the shipped kernel.
+         *
+         * NOT bit-identical: the query is rounded to half, because
+         * simdgroup_multiply_accumulate needs A and B in the same precision and
+         * an f32 pair would put the KV tile at f32 too -- 34 KiB at an 8-row
+         * tile. The shipped kernel IS the f32-query reference. Needs a quality
+         * gate, not a cmp. */
+        /* Read PER CALL, not cached, so a variant bench can toggle it inside one
+         * process -- the same reason DS4_METAL_DISABLE_INDEXER_LLT is read per
+         * call. A function-static cache would latch whichever arm ran first and
+         * silently give every later arm the same kernel. */
+        const char *lora_mma_env = getenv("DS4_METAL_GLM53_DSA_LORA_MMA");
+        const int use_lora_mma =
+            lora_mma_env && lora_mma_env[0] == '1' && use_glm53_padded;
+        if (use_lora_mma) {
+            static int announced_mma;
+            if (!announced_mma) {
+                announced_mma = 1;
+                fprintf(stderr, "ds4: DSA-LORA QK via SIMDgroup MMA ENGAGED\n");
+            }
+        }
+
         id<MTLComputePipelineState> pipeline = nil;
-        if (use_glm53_padded) {
+        if (use_lora_mma) {
+            ds4_gpu_dsa_lora_count_dispatch();
+            pipeline = ds4_gpu_get_pipeline(
+                "kernel_glm_attention_indexed_batch_lora_group8_mma_glm53_padded");
+        } else if (use_glm53_padded) {
             /* PHASE CENSUS.  The specialisation is a sparse-noncausal-PREFILL
              * kernel; single-token decode uses the indexed-decode split-K path.
              * Static inspection agrees, but "the announce fired" only proves it
@@ -41174,7 +41203,13 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
         ds4_gpu_tp_attn_head_range(n_head, 8u, &args.head_base, &head_count);
 
 
-        const NSUInteger scratch_bytes = use_vec_lora ?
+        const NSUInteger scratch_bytes = use_lora_mma ?
+            /* kv 16x512 half + q 8x512 half + 2 tiles x 8 slices x 64 f32
+             * partials + 8x16 f32 scores. */
+            (16u * (NSUInteger)kv_lora_dim * sizeof(uint16_t) +
+             8u  * (NSUInteger)kv_lora_dim * sizeof(uint16_t) +
+             (2u * 8u * 64u + 8u * 16u) * sizeof(float)) :
+            use_vec_lora ?
             (16u * ((NSUInteger)kv_lora_dim / 4u) * sizeof(uint16_t) * 4u +
              16u * ((NSUInteger)qk_rope / 4u) * sizeof(float) * 4u) :
             (8u * ((NSUInteger)kv_lora_dim + (NSUInteger)qk_rope) * sizeof(uint16_t) +
