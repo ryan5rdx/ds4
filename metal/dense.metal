@@ -83,19 +83,21 @@ static inline void helper_mv_reduce_and_write(
 
     threadgroup float * shmem_f32[NR0];
 
+    /* One barrier, not two. The zeroing pass this replaces existed only so the
+     * final simd_sum would see 0 in the lanes above the live simdgroups; the
+     * ternary below supplies that directly, which also removes the barrier
+     * that had to separate the zeroing from the per-simdgroup writes.
+     *
+     * The 32-lane vector entering the final reduction is unchanged -- the
+     * per-simdgroup sums in [0, NSG) and zeros above -- so results are
+     * bit-identical. */
+    const short NSG = FC_mul_mv_nsg;
+
     for (short row = 0; row < NR0; ++row) {
         shmem_f32[row] = (threadgroup float *) shmem + NW*row;
 
-        if (sgitg == 0) {
-            shmem_f32[row][tiisg] = 0.0f;
-        }
-
         sumf[row] = simd_sum(sumf[row]);
-    }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (short row = 0; row < NR0; ++row) {
         if (tiisg == 0) {
             shmem_f32[row][sgitg] = sumf[row];
         }
@@ -104,7 +106,7 @@ static inline void helper_mv_reduce_and_write(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
-        float tot = simd_sum(shmem_f32[row][tiisg]);
+        float tot = simd_sum(tiisg < NSG ? shmem_f32[row][tiisg] : 0.0f);
 
         if (tiisg == 0 && sgitg == 0) {
             dst_f32[r0 + row] = tot;
