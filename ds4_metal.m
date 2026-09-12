@@ -47294,9 +47294,36 @@ int ds4_gpu_glm53_matmul_bf16(
         const char *bf16_splitk_env = getenv("DS4_METAL_GLM53_BF16_MV_SPLITK");
         const int bf16_splitk_shape =
             out_dim <= 64u && in_dim >= 4096u && (in_dim % 32u) == 0u;
+        /* The 4096 -> 128 decode matvec runs twice in each sparse-attention
+         * layer, 22 times per token, and sits just past the gate above: at 128
+         * outputs the row kernel launches only 16 threadgroups and leaves a
+         * 60-core GPU largely idle. Splitting the contraction across
+         * simdgroups takes it to 64 threadgroups and the 22-call chain from
+         * 0.2301 to 0.1327 ms per token, a 1.73x kernel speedup worth about
+         * +0.3% decode end to end.
+         *
+         * This is a SEPARATE predicate rather than a relaxation of
+         * `out_dim <= 64`, because widening that bound would also expose the
+         * shape to the two-dispatch K-split below, whose slice count defaults
+         * to 4. That variant is measurably slower here (1.02x, i.e. no better
+         * than the row walk), so the shape takes the single-dispatch form only
+         * and its slice count is pinned to 0.
+         *
+         * Scores are not bit-identical to the row walk -- the contraction is
+         * summed in a different order -- but they are closer to an f64
+         * reference, not further, and a 100-case teacher-forced comparison
+         * found zero difference in average negative log-likelihood. */
+        const int bf16_narrow_split_shape =
+            in_dim == 4096u && out_dim == 128u && n_rows == 1u;
+        const char *bf16_narrow_env =
+            getenv("DS4_METAL_GLM53_BF16_128_SPLITK");
+        const int bf16_narrow_split =
+            bf16_narrow_split_shape &&
+            !(bf16_narrow_env && bf16_narrow_env[0] == '0');
         const int bf16_splitk =
-            !(bf16_splitk_env && bf16_splitk_env[0] == '0') &&
-            bf16_splitk_shape;
+            (!(bf16_splitk_env && bf16_splitk_env[0] == '0') &&
+             bf16_splitk_shape) ||
+            bf16_narrow_split;
         /* HCMIX-WIDE: a third grid axis over the contraction.  B1 took hc_mix
          * from 3 to 12 threadgroups by splitting K across simdgroups; this
          * splits it across threadgroups too, 12 -> 12*KSPLIT.  Two dispatches
@@ -47314,7 +47341,9 @@ int ds4_gpu_glm53_matmul_bf16(
          * little of the contraction to amortise the second (reduce) dispatch.
          * 4 is the smaller reduction-order perturbation of the two tied values
          * and is the one the quality gate covers. */
-        const uint32_t bf16_ksplit = bf16_splitk_shape ?
+        /* Pinned to 0 for the narrow shape: see the note above. */
+        const uint32_t bf16_ksplit = bf16_narrow_split_shape ? 0u :
+                                     bf16_splitk_shape ?
             (uint32_t)ds4_gpu_env_u64("DS4_METAL_GLM53_BF16_MV_KSPLIT", 4u, 0u, 32u) : 0u;
         const int bf16_wide = bf16_ksplit >= 2u;
         const bool bc_inp = (in_dim % 32u) != 0u;
