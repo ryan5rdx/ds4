@@ -79,6 +79,11 @@ int  ds4_gpu_ane_publish_ready(uint32_t seq);
 int  ds4_gpu_ane_fence_done(uint32_t seq);
 volatile uint32_t *ds4_gpu_ane_sync_words(void);
 int  ds4_gpu_ane_sync_timed_out(void);
+/* Calibrated DONE-fence spin statistics (DS4_ANE_SCHED_TRACE=1). Zero spin
+ * means the prediction was already done when the GPU arrived. */
+int  ds4_gpu_ane_fence_stats(uint64_t *iters, uint64_t *execs, uint64_t *hit0,
+                             uint64_t *max_iters, double *ns_per_iter);
+void ds4_gpu_ane_fence_stats_reset(void);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 
 /* GPU-side fill of a sub-range, in elements. Unlike ds4_gpu_tensor_fill_f32

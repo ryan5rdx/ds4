@@ -12869,11 +12869,22 @@ static int ds4_gpu_tp_release_fence_encode(uint32_t slot, uint32_t want) {
  * counts above convert to microseconds.  Without this the instrument reports an
  * uncalibrated integer, and the gate budget it has to speak to is in us.
  * Runs once, at TP init, only when the profile is on. */
+/* Defined with the ANE staging further down; declared here because the TP
+ * calibration is the only thing that needs it this early. */
+static id<MTLBuffer> ds4_gpu_ane_spin_word(void);
+
 static void ds4_gpu_tp_fence_calibrate_spin(void) {
     if (!g_tp_fence_spin_profile || g_tp_fence_spin_ns_per_iter > 0.0) return;
     id<MTLComputePipelineState> pipeline =
         ds4_gpu_get_pipeline("kernel_dsv4_tp_fence_calibrate");
-    if (!pipeline || !g_tp_release_buffer) return;
+    /* The ANE fence borrows this calibration, and it is armed from the sidecar
+     * rather than from TP setup -- so accept any word to spin against. Without
+     * the fallback a single-rank probe reports 0.00 ns/iter and every spin time
+     * comes out zero, which reads as "the GPU never waited" and is the one
+     * conclusion this instrument must not fabricate. */
+    id<MTLBuffer> spin_on = g_tp_release_buffer ? g_tp_release_buffer
+                                                : ds4_gpu_ane_spin_word();
+    if (!pipeline || !spin_on) return;
     @autoreleasepool {
         id<MTLBuffer> sink = [g_device newBufferWithLength:sizeof(uint32_t)
                                                    options:MTLResourceStorageModeShared];
@@ -12888,7 +12899,7 @@ static void ds4_gpu_tp_fence_calibrate_spin(void) {
             if (!cb) return;
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:pipeline];
-            [enc setBuffer:g_tp_release_buffer offset:0 atIndex:0];
+            [enc setBuffer:spin_on offset:0 atIndex:0];
             [enc setBytes:&depth[k] length:sizeof(depth[k]) atIndex:1];
             [enc setBuffer:sink offset:0 atIndex:2];
             [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
@@ -52301,6 +52312,7 @@ static volatile uint32_t *g_ane_sync_words;
 static id<MTLBuffer> g_ane_sync_timeout_buffer;
 static id<MTLBuffer> g_ane_sync_stats_buffer;
 static uint32_t g_ane_fence_max_iters;
+static uint32_t g_ane_fence_profile;
 static uint32_t g_ane_dim, g_ane_ntok;
 
 typedef struct {
@@ -52417,6 +52429,14 @@ int ds4_gpu_ane_stage_alloc(uint32_t dim, uint32_t n_tok,
          * words: see the comment at the declarations. */
         g_ane_fence_max_iters = (uint32_t)ds4_gpu_env_u64(
                 "DS4_ANE_FENCE_MAX_ITERS", 2000000000ull, 1000ull, 4000000000ull);
+        const char *sched = getenv("DS4_ANE_SCHED_TRACE");
+        g_ane_fence_profile = (sched && sched[0] && sched[0] != '0') ? 1u : 0u;
+        if (g_ane_fence_profile) {
+            /* Borrow the TP fence's calibration so spin counts convert to
+             * microseconds, which is the unit the window budget is in. */
+            g_tp_fence_spin_profile = 1;
+            ds4_gpu_tp_fence_calibrate_spin();
+        }
         if (!g_ane_in_buf || !g_ane_out_buf || !g_ane_cmp_buf || !g_ane_scratch ||
             !g_ane_sync_buffer || !g_ane_sync_timeout_buffer || !g_ane_sync_stats_buffer) {
             ds4_gpu_ane_stage_free();
@@ -52526,6 +52546,8 @@ int ds4_gpu_ane_compare(const ds4_gpu_tensor *gpu_ref, uint32_t dim, uint32_t n_
  * Returns NULL until the staging is allocated. */
 volatile uint32_t *ds4_gpu_ane_sync_words(void) { return g_ane_sync_words; }
 
+static id<MTLBuffer> ds4_gpu_ane_spin_word(void) { return g_ane_sync_buffer; }
+
 int ds4_gpu_ane_sync_timed_out(void) {
     if (!g_ane_sync_timeout_buffer) return 0;
     return *(volatile uint32_t *)g_ane_sync_timeout_buffer.contents != 0u;
@@ -52583,7 +52605,13 @@ int ds4_gpu_ane_fence_done(uint32_t seq) {
         [enc setBytes:&g_ane_fence_max_iters length:sizeof(g_ane_fence_max_iters) atIndex:2];
         [enc setBuffer:g_ane_sync_timeout_buffer offset:0 atIndex:3];
         [enc setBuffer:g_ane_sync_stats_buffer offset:0 atIndex:4];
-        const uint32_t profile = 0u;
+        /* Profiling on. The kernel already counts spin iterations, executions,
+         * iteration-0 hits and the maximum -- the whole question of whether the
+         * ANE is late or the GPU is slower is answered by whether these are
+         * ~zero, and adding a second timing mechanism to find that out would be
+         * silly when this one is already in the kernel. Costs one uniform,
+         * never-taken branch per spin when off. */
+        const uint32_t profile = g_ane_fence_profile;
         [enc setBytes:&profile length:sizeof(profile) atIndex:5];
         [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                       threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
@@ -52611,4 +52639,26 @@ int ds4_gpu_ane_pack_naive(const ds4_gpu_tensor *src, uint32_t dim, uint32_t n_t
                                            g_ane_in_buf, 0, nil, a, 0,
                                            "ANE pack naive");
     }
+}
+
+/* Fence spin statistics, calibrated. This is the measurement that separates
+ * "the ANE finished late" from "the GPU ran slower": if the GPU spent no time
+ * spinning at the DONE fence, the prediction was already complete when it
+ * arrived, and the ~16% window stretch is not a scheduling problem. */
+int ds4_gpu_ane_fence_stats(uint64_t *iters, uint64_t *execs, uint64_t *hit0,
+                            uint64_t *max_iters, double *ns_per_iter) {
+    if (!g_ane_sync_stats_buffer) return 0;
+    const volatile uint32_t *w = (const volatile uint32_t *)g_ane_sync_stats_buffer.contents;
+    if (iters)     *iters     = w[0];
+    if (execs)     *execs     = w[1];
+    if (hit0)      *hit0      = w[2];
+    if (max_iters) *max_iters = w[3];
+    if (ns_per_iter) *ns_per_iter = g_tp_fence_spin_ns_per_iter;
+    return 1;
+}
+
+void ds4_gpu_ane_fence_stats_reset(void) {
+    if (!g_ane_sync_stats_buffer) return;
+    memset(g_ane_sync_stats_buffer.contents, 0,
+           DS4_TP_FENCE_SPIN_WORDS * sizeof(uint32_t));
 }

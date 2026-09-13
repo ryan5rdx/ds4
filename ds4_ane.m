@@ -17,6 +17,9 @@
  */
 
 /* Provided by ds4_metal.m. */
+int  ds4_gpu_ane_fence_stats(uint64_t *iters, uint64_t *execs, uint64_t *hit0,
+                             uint64_t *max_iters, double *ns_per_iter);
+void ds4_gpu_ane_fence_stats_reset(void);
 int  ds4_gpu_ane_stage_alloc(uint32_t dim, uint32_t n_tok,
                              void **in_ptr, void **out_ptr);
 void ds4_gpu_ane_stage_free(void);
@@ -55,7 +58,11 @@ static int       g_fast_running;
  * execute in program order. So a single staging surface is safe, and the only
  * thing that had to be queued was the host's INTENT. */
 #define DS4_ANE_RING 128u
-typedef struct { uint32_t seq; __unsafe_unretained MLModel *model; } ane_req;
+/* `il` rides along because the timeline is keyed by LAYER and the sequence is
+ * global: seq counts every prediction of the run, so (seq-1) % n_layers only
+ * coincides with il during the first chunk. The consumer must be told which
+ * layer it is serving rather than inferring it. */
+typedef struct { uint32_t seq; uint32_t il; __unsafe_unretained MLModel *model; } ane_req;
 static ane_req   g_ring[DS4_ANE_RING];
 static volatile uint64_t g_ring_head, g_ring_tail;
 static dispatch_semaphore_t g_ring_sem;
@@ -66,6 +73,28 @@ static uint64_t  g_cancelled;
 /* Run-level totals. The per-chunk counters are reset every boundary, so the
  * harness needs something that survives to the end to assert on. */
 static uint64_t  g_engaged_total, g_skipped_total, g_failed_total, g_short_chunks;
+
+/* ANESCHED1: the per-layer timeline, CPU side.
+ *
+ * Four numbers per layer answer the scheduling half of the ~16% question:
+ *   enq->obs   how long the sidecar waited for the GPU to publish READY
+ *   predict    Core ML's own duration in situ
+ *   obs->done  everything the sidecar did between seeing READY and releasing
+ *   slack      enq->done, i.e. how much of the routed window the sidecar used
+ * The GPU half -- whether it then had to wait at all -- comes from the fence
+ * spin counters, which the kernel already keeps and which are now calibrated.
+ * Off unless DS4_ANE_SCHED_TRACE=1: this is a diagnostic arm, not a feature. */
+static int g_sched_trace = -1;
+static int ds4_ane_sched_trace(void) {
+    if (g_sched_trace < 0) {
+        const char *e = getenv("DS4_ANE_SCHED_TRACE");
+        g_sched_trace = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return g_sched_trace;
+}
+typedef struct { double enq, obs, p0, p1, done; } ane_tl;
+static ane_tl g_tl[DS4_ANE_MAX_LAYERS];
+static double g_tl_sum[5];          /* wait, predict, release, span, n */
 
 /* TEST HOOK (DS4_ANE_TEST_HOOK=1, never set in production).
  *
@@ -406,6 +435,8 @@ static void *ds4_ane_sidecar_thread(void *ud) {
             struct timespec ts = { 0, 20000 };          /* 20 us */
             nanosleep(&ts, NULL);
         }
+        const uint32_t tl_i = req.il < DS4_ANE_MAX_LAYERS ? req.il : 0u;
+        if (ds4_ane_sched_trace()) g_tl[tl_i].obs = ds4_ane_now_ns();
         MLModel *m = req.model;
         const double t0 = ds4_ane_now_ns();
         if (m) {
@@ -429,6 +460,19 @@ static void *ds4_ane_sidecar_thread(void *ud) {
             g_skipped++;
         }
         g_ns_predict += ds4_ane_now_ns() - t0;
+        if (ds4_ane_sched_trace()) {
+            g_tl[tl_i].p0 = t0;
+            g_tl[tl_i].p1 = ds4_ane_now_ns();
+            g_tl[tl_i].done = g_tl[tl_i].p1;
+            const ane_tl *t = &g_tl[tl_i];
+            if (t->enq > 0 && t->obs >= t->enq) {
+                g_tl_sum[0] += (t->obs - t->enq) / 1e6;      /* wait for READY */
+                g_tl_sum[1] += (t->p1 - t->p0) / 1e6;        /* predict */
+                g_tl_sum[2] += (t->done - t->p1) / 1e6;      /* release */
+                g_tl_sum[3] += (t->done - t->enq) / 1e6;     /* enqueue->done */
+                g_tl_sum[4] += 1.0;
+            }
+        }
         ds4_ane_note_completion();
         /* Release-store: everything Core ML wrote to the output surface must be
          * visible to the GPU before it sees DONE. */
@@ -457,6 +501,10 @@ int ds4_ane_begin_layer(uint32_t il) {
         }
         g_ring[h % DS4_ANE_RING].seq = g_seq;
         g_ring[h % DS4_ANE_RING].model = m;
+        g_ring[h % DS4_ANE_RING].il = il;
+        if (ds4_ane_sched_trace() && il < DS4_ANE_MAX_LAYERS) {
+            g_tl[il].enq = ds4_ane_now_ns();
+        }
         __atomic_store_n(&g_ring_head, h + 1u, __ATOMIC_RELEASE);
         /* NO signal here -- see ds4_ane_commit_layer(). */
         g_started[il] = 1;
@@ -547,6 +595,23 @@ void ds4_ane_report(void) {
     g_skipped_total += g_skipped;
     g_failed_total  += g_failed;
     if (g_engaged != g_expect_layers) g_short_chunks++;
+    if (ds4_ane_sched_trace() && g_tl_sum[4] > 0) {
+        uint64_t it = 0, ex = 0, h0 = 0, mx = 0; double nspi = 0;
+        ds4_gpu_ane_fence_stats(&it, &ex, &h0, &mx, &nspi);
+        const double n = g_tl_sum[4];
+        fprintf(stderr,
+                "ds4: ANE sched chunk %llu: n=%.0f wait_ready=%.3f predict=%.3f "
+                "release=%.3f span=%.3f ms/layer | fence execs=%llu hit0=%llu "
+                "spin_avg=%.3f ms max=%.3f ms (%.2f ns/iter)\n",
+                (unsigned long long)(g_chunks + 1), n,
+                g_tl_sum[0] / n, g_tl_sum[1] / n, g_tl_sum[2] / n, g_tl_sum[3] / n,
+                (unsigned long long)ex, (unsigned long long)h0,
+                ex ? (double)it / (double)ex * nspi / 1.0e6 : 0.0,
+                (double)mx * nspi / 1.0e6, nspi);
+        fflush(stderr);
+        for (int i = 0; i < 5; i++) g_tl_sum[i] = 0.0;
+        ds4_gpu_ane_fence_stats_reset();
+    }
     /* One grep-able line per chunk. The harness asserts on every field:
      * engaged must equal the sparse-layer count, and skipped, failed,
      * cancelled and timeout must all be zero. Anything else means some layers
