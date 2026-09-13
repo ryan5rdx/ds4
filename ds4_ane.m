@@ -292,12 +292,28 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
              * So `fast - fastrepeat` is displacement with compute held fixed,
              * which is the quantity the ~16% law needs and the one no arm has
              * measured yet. */
+            /* DS4_ANE_MODEL_REPEAT=k loads k DISTINCT models and aliases the
+             * rest, so layer il runs model (il % k). k=1 is the original
+             * fastrepeat; unset or >= n_layers is the normal full rotation.
+             *
+             * This is the residency-depth sweep, and it is a falsification test
+             * rather than a hunt for a sweet spot. fastrepeat (k=1) is free and
+             * the full rotation costs +16.6 s; the displacement account says
+             * ONE 50.3 MB model just fits the ~48 MB per-die SLC and two cannot,
+             * so it predicts the elbow lands immediately at k=2. If it does,
+             * residency is dead as a direction and i8 is the whole story. An
+             * elbow further out would mean something other than the SLC is
+             * holding the weights and the account is wrong. */
             const char *repeat_env = getenv("DS4_ANE_MODEL_REPEAT");
-            const int repeat_one = (repeat_env && repeat_env[0] == '1');
+            uint32_t repeat_k = 0;
+            if (repeat_env && repeat_env[0]) {
+                const long v = strtol(repeat_env, NULL, 10);
+                if (v > 0 && v < (long)n_layers) repeat_k = (uint32_t)v;
+            }
             uint32_t loaded = 0;
             for (uint32_t il = 0; il < n_layers; ++il) {
-                if (repeat_one && il > 0) {
-                    g_models[il] = g_models[0];
+                if (repeat_k && il >= repeat_k) {
+                    g_models[il] = g_models[il % repeat_k];
                     if (g_models[il]) loaded++;
                     continue;
                 }
@@ -326,8 +342,8 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
                 return 0;
             }
             fprintf(stderr,
-                    "ds4: ANE READY loaded=%u/%u variant=%s repeat=%d M=%u dir=%s\n",
-                    loaded, n_layers, variant, repeat_one, n_tokens, dir);
+                    "ds4: ANE READY loaded=%u/%u variant=%s repeat=%u M=%u dir=%s\n",
+                    loaded, n_layers, variant, repeat_k, n_tokens, dir);
             fprintf(stderr, "ds4: ANE shadow weights are SYNTHETIC -- the "
                             "divergence below is expected to be large and the "
                             "GPU stays authoritative\n");
