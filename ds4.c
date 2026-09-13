@@ -59103,10 +59103,36 @@ static uint32_t ds4_glm53_ckpt_slots(void) {
  * band that is one checkpoint per 8k across 131072 tokens, each slot holding
  * the most recent capture that fell in its band. */
 #define DS4_GLM53_CKPT_BAND 8192
-static uint32_t ds4_glm53_ckpt_slot_for(int pos) {
+
+/* The ring is SPLIT: half banded by position, half a most-recent FIFO.
+ *
+ * Uniform banding alone was wrong, and a production log showed exactly how. A
+ * tool-use turn produces frontiers a few dozen tokens apart -- 243955, 244030,
+ * 244056, 244093 -- and at an 8192 band all four map to one slot, so each
+ * evicts the last and only the highest survives. The divergence then landed at
+ * 244054, BELOW the sole survivor, and a 655-second prefill that was 99.8%
+ * reusable was thrown away. Banding covers "diverged 80% of the way back"; it
+ * cannot cover "diverged 39 tokens back", which is the common case because
+ * divergence happens where new content meets cached history -- at the head.
+ *
+ * So: the FIRST frontier to land in a band takes the banded slot and stays
+ * there, giving long-range coverage. Every later frontier goes to the FIFO,
+ * giving dense coverage near the head. One copy per frontier either way, so
+ * capture cost is unchanged. With 8 slots that is the first-in-band checkpoint
+ * per 32k plus the last 4 frontiers; on the log above it preserves 243955
+ * (banded) and 244030 (FIFO), and the lookup finds 244030 -- 24 tokens below
+ * the divergence. */
+static uint32_t ds4_glm53_ckpt_recent_slots(void) {
     const uint32_t n = ds4_glm53_ckpt_slots();
-    if (pos <= 0) return 0;
-    return (uint32_t)((pos / DS4_GLM53_CKPT_BAND) % (int)n);
+    return n >= 2u ? n / 2u : 0u;   /* a 1-slot ring stays purely banded */
+}
+
+static uint32_t ds4_glm53_ckpt_banded_slot(int pos) {
+    const uint32_t n = ds4_glm53_ckpt_slots();
+    const uint32_t recent = ds4_glm53_ckpt_recent_slots();
+    const uint32_t banded = n - recent;
+    if (pos <= 0 || banded == 0u) return recent;
+    return recent + (uint32_t)((pos / DS4_GLM53_CKPT_BAND) % (int)banded);
 }
 #endif
 
@@ -59241,6 +59267,9 @@ struct ds4_session {
      * snapshot at all: their KV is position-addressable and simply gets
      * overwritten from the restore point. */
     glm53_ckpt_slot glm53_ckpt[DS4_GLM53_CKPT_SLOTS];
+    /* Cursor into the recent-FIFO half of the ring (see ckpt_slot_for_capture).
+     * Advances identically on both ranks because captures are mirrored. */
+    uint32_t glm53_ckpt_recent_cursor;
     /* The most recent capture, which is the one the speculative-decode rewind
      * path means by "the snapshot". -1 when there is none. */
     int glm53_rollback_pos;
@@ -60603,6 +60632,7 @@ void ds4_session_glm53_rollback_drop(ds4_session *s) {
     for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
         ds4_session_glm53_ckpt_slot_drop(&s->glm53_ckpt[i]);
     }
+    s->glm53_ckpt_recent_cursor = 0;
     s->glm53_rollback_valid = false;
     s->glm53_rollback_pos = -1;
 }
@@ -60676,19 +60706,35 @@ bool ds4_session_glm53_rollback_capture(ds4_session *s) {
         return false;
     }
 
-    const uint32_t slot_i = ds4_glm53_ckpt_slot_for(pos);
+    /* Banded slot if this frontier is the first in its band, FIFO otherwise.
+     * See ds4_glm53_ckpt_banded_slot() for why the ring is split at all. */
+    const uint32_t banded_i = ds4_glm53_ckpt_banded_slot(pos);
+    const uint32_t recent_n = ds4_glm53_ckpt_recent_slots();
+    const glm53_ckpt_slot *bslot = &s->glm53_ckpt[banded_i];
+    const int band_taken =
+        bslot->pos >= 0 &&
+        (bslot->pos / DS4_GLM53_CKPT_BAND) == (pos / DS4_GLM53_CKPT_BAND) &&
+        bslot->pos != pos;
+    uint32_t slot_i;
+    if (!band_taken || recent_n == 0u) {
+        slot_i = banded_i;
+    } else {
+        slot_i = s->glm53_ckpt_recent_cursor % recent_n;
+        s->glm53_ckpt_recent_cursor =
+            (s->glm53_ckpt_recent_cursor + 1u) % recent_n;
+    }
     glm53_ckpt_slot *c = &s->glm53_ckpt[slot_i];
 
     /* An overwrite is the ring's one DESTRUCTIVE operation and it was silent.
-     * Two frontiers in the same 8192-band evict each other, so a restore that
-     * "should" have been available can be gone for reasons nothing records.
-     * Not rate-limited by reason like the capture line -- each eviction names a
-     * different pair, and that pair is the whole diagnostic. */
+     * A production log lost a 655-second prefill to exactly this: four
+     * frontiers 39 tokens apart, one band, three silent evictions, and the sole
+     * survivor sat ABOVE the divergence. Not rate-limited by reason like the
+     * capture line -- each eviction names a different pair, and that pair is
+     * the whole diagnostic. */
     if (c->pos >= 0 && c->pos != pos) {
         fprintf(stderr,
-                "ds4: GLM checkpoint ring EVICT slot %u: pos %d -> %d "
-                "(same %d-token band)\n",
-                slot_i, c->pos, pos, DS4_GLM53_CKPT_BAND);
+                "ds4: GLM checkpoint ring EVICT slot %u (%s): pos %d -> %d\n",
+                slot_i, slot_i < recent_n ? "recent" : "banded", c->pos, pos);
     }
 
     if (!c->kda) {
@@ -60749,18 +60795,27 @@ static const glm53_ckpt_slot *ds4_session_glm53_ckpt_find(const ds4_session *s,
                                                           int pos) {
     if (!ds4_session_glm53_rollback_supported(s)) return NULL;
     if (pos < 0 || pos > s->checkpoint.len) return NULL;
-    const glm53_ckpt_slot *c = &s->glm53_ckpt[ds4_glm53_ckpt_slot_for(pos)];
-    if (c->pos != pos || c->pos < 0) return NULL;
-    if (ds4_session_token_hash(&s->checkpoint, pos) != c->token_hash) return NULL;
-    return c;
+    /* SCANS rather than indexing. With the split ring a position can live in
+     * either half depending on whether it was first in its band, so computing
+     * one slot would miss it -- and worse, a purely banded lookup would have to
+     * agree with the capture side's placement on BOTH ranks. Scanning by
+     * position removes that coupling entirely: the ranks no longer have to
+     * choose the same slot, only to hold the same position, which makes an
+     * un-exchanged DS4_GLM53_CKPT_SLOTS harmless rather than merely safe. */
+    for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
+        const glm53_ckpt_slot *c = &s->glm53_ckpt[i];
+        if (c->pos != pos || c->pos < 0) continue;
+        if (ds4_session_token_hash(&s->checkpoint, pos) != c->token_hash) continue;
+        return c;
+    }
+    return NULL;
 }
 
 /* The largest checkpoint at or below `limit`, or -1.
  *
  * This is what a prefix-cache miss wants: the prompt diverges at `limit`, and
- * anything below it is still the same history. Scans the ring rather than
- * indexing, because the slot mapping is many-to-one over positions and the
- * best candidate need not live in limit's own slot. */
+ * anything below it is still the same history. Scans the ring, because the
+ * best candidate need not live in any slot derivable from `limit`. */
 int ds4_session_glm53_ckpt_best_at_or_below(ds4_session *s, int limit) {
     if (!ds4_session_glm53_rollback_supported(s)) return -1;
     if (limit <= 0) return -1;
@@ -60768,7 +60823,7 @@ int ds4_session_glm53_ckpt_best_at_or_below(ds4_session *s, int limit) {
     for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
         const glm53_ckpt_slot *c = &s->glm53_ckpt[i];
         if (c->pos < 0 || c->pos > limit || c->pos <= best) continue;
-        if (ds4_session_glm53_ckpt_find(s, c->pos) != c) continue;
+        if (!ds4_session_glm53_ckpt_find(s, c->pos)) continue;
         best = c->pos;
     }
     return best;
@@ -71263,6 +71318,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
      * zero -- an empty ring would advertise a restore point and hand back an
      * uninitialised recurrence. Empty is -1. */
     for (uint32_t ci = 0; ci < DS4_GLM53_CKPT_SLOTS; ci++) s->glm53_ckpt[ci].pos = -1;
+    s->glm53_ckpt_recent_cursor = 0;
     s->glm53_rollback_pos = -1;
 #endif
         s->engine = e;
@@ -71292,6 +71348,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
      * zero -- an empty ring would advertise a restore point and hand back an
      * uninitialised recurrence. Empty is -1. */
     for (uint32_t ci = 0; ci < DS4_GLM53_CKPT_SLOTS; ci++) s->glm53_ckpt[ci].pos = -1;
+    s->glm53_ckpt_recent_cursor = 0;
     s->glm53_rollback_pos = -1;
 #endif
     s->ctx_size = ctx_size;
