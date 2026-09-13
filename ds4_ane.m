@@ -277,8 +277,30 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
             if (!variant || !variant[0]) variant = "fused";
             MLModelConfiguration *cfg = [[MLModelConfiguration alloc] init];
             cfg.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
+            /* DS4_ANE_MODEL_REPEAT=1 points every layer at layer 0's model.
+             *
+             * This is the eviction discriminator `fastlite` should have been.
+             * fastlite removes the 50.3 MB of weights AND essentially all of
+             * the compute, so `fast - fastlite` cannot honestly be called the
+             * weight stream's cost -- it is the cost of the stream plus the
+             * arithmetic, and the two were never separated. Repeating one
+             * full-size model keeps the FLOPs, the prediction duration, the
+             * wake, the seam and the bridge all identical, and changes exactly
+             * one thing: the rotating weight working set collapses from 42 x
+             * 50.3 MB to a single 50.3 MB that can stay resident.
+             *
+             * So `fast - fastrepeat` is displacement with compute held fixed,
+             * which is the quantity the ~16% law needs and the one no arm has
+             * measured yet. */
+            const char *repeat_env = getenv("DS4_ANE_MODEL_REPEAT");
+            const int repeat_one = (repeat_env && repeat_env[0] == '1');
             uint32_t loaded = 0;
             for (uint32_t il = 0; il < n_layers; ++il) {
+                if (repeat_one && il > 0) {
+                    g_models[il] = g_models[0];
+                    if (g_models[il]) loaded++;
+                    continue;
+                }
                 NSString *path = [NSString stringWithFormat:
                         @"%s/shexp_L%02u_%s.mlpackage", dir, il, variant];
                 NSURL *url = [NSURL fileURLWithPath:path];
@@ -303,8 +325,9 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
                 ds4_ane_required_abort(why);
                 return 0;
             }
-            fprintf(stderr, "ds4: ANE READY loaded=%u/%u variant=%s M=%u dir=%s\n",
-                    loaded, n_layers, variant, n_tokens, dir);
+            fprintf(stderr,
+                    "ds4: ANE READY loaded=%u/%u variant=%s repeat=%d M=%u dir=%s\n",
+                    loaded, n_layers, variant, repeat_one, n_tokens, dir);
             fprintf(stderr, "ds4: ANE shadow weights are SYNTHETIC -- the "
                             "divergence below is expected to be large and the "
                             "GPU stays authoritative\n");
