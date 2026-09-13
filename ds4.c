@@ -54411,14 +54411,45 @@ static bool glm_graph_forward_indexed_tokens(
                                                          n_tokens,
                                                          DS4_RMS_EPS) != 0;
         if (ok) {
+            /* Under the head split this rank reads only its own heads, so
+             * computing the full q width is waste -- about 6 ms of a 12 ms
+             * layer, 11 DSA layers, ~0.6% of prefill. Decode already slices
+             * this; prefill could not, because at n_tokens > 1 the slice is a
+             * STRIDED write and no matmul took a destination stride.
+             *
+             * It does now, and the owned half is bit-identical: ne0 was always
+             * the destination row stride while the row count came from ne01 or
+             * the dispatch grid, and the weight offset advances by whole Q8_0
+             * rows, so each output row's arithmetic is untouched. Verified at
+             * 1..2048 tokens in tests/probe_qb_slice, which covers every
+             * kernel the path can select.
+             *
+             * The unowned half keeps whatever it held. That is safe only
+             * because the head-split kernels never read it -- the same
+             * invariant that lets batch_heads carry zeros there. */
+            const uint64_t qb_rows =
+                tp_attn_head_split ? g->q_dim / 2u : g->q_dim;
+            const uint64_t qb_col0 =
+                tp_attn_head_split ? (uint64_t)g->tp_rank * (g->q_dim / 2u) : 0u;
             ok = (use_batch_q_proj ?
-                  glm_graph_matmul_q8_0_tensor(g->batch_q,
+                  (tp_attn_head_split ?
+                   ds4_gpu_matmul_q8_0_cols_tensor(g->batch_q,
+                                                   model->map,
+                                                   model->size,
+                                                   l->attn_q_b->abs_offset,
+                                                   DS4_N_LORA_Q,
+                                                   qb_rows,
+                                                   g->q_dim,
+                                                   qb_col0,
+                                                   g->batch_q_rank_norm,
+                                                   n_tokens) != 0 :
+                   glm_graph_matmul_q8_0_tensor(g->batch_q,
                                                model,
                                                l->attn_q_b->abs_offset,
                                                DS4_N_LORA_Q,
                                                g->q_dim,
                                                g->batch_q_rank_norm,
-                                               n_tokens) :
+                                               n_tokens)) :
                   glm_graph_matmul_q8_0_rows_scalar(g->batch_q,
                                                     model,
                                                     l->attn_q_b->abs_offset,

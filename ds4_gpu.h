@@ -84,6 +84,15 @@ int  ds4_gpu_ane_sync_timed_out(void);
 int  ds4_gpu_ane_fence_stats(uint64_t *iters, uint64_t *execs, uint64_t *hit0,
                              uint64_t *max_iters, double *ns_per_iter);
 void ds4_gpu_ane_fence_stats_reset(void);
+
+/* Q8_0 projection restricted to an output column range, written into a
+ * full-width destination. See the definition for why prefill needs it and
+ * decode does not. */
+int ds4_gpu_matmul_q8_0_cols_tensor(ds4_gpu_tensor *out, const void *model_map,
+                                    uint64_t model_size, uint64_t weight_offset,
+                                    uint64_t in_dim, uint64_t out_rows,
+                                    uint64_t dst_stride, uint64_t dst_col0,
+                                    const ds4_gpu_tensor *x, uint64_t n_tok);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 
 /* GPU-side fill of a sub-range, in elements. Unlike ds4_gpu_tensor_fill_f32

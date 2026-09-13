@@ -6800,6 +6800,36 @@ static ds4_gpu_mul_mm_args ds4_gpu_make_mm_args(
     };
 }
 
+/* Strided-destination variants.
+ *
+ * `ne0` is the destination ROW stride in floats, and the row count comes from
+ * ne01 (mv) or the dispatch grid (mm) -- they are already separate everywhere
+ * that matters, so writing a column slice needs no kernel change, only an
+ * ne0 that differs from the row count and a base offset.
+ *
+ * Added as overlays rather than by changing the 38 existing call sites: this is
+ * the hottest matmul in the model and every one of those sites is a chance to
+ * get it subtly wrong for no benefit. Existing callers are byte-for-byte
+ * untouched; only the sliced path takes a different route. */
+static ds4_gpu_mul_mm_args ds4_gpu_make_mm_args_strided(
+        uint64_t in_dim, uint64_t out_dim, uint64_t n_tok,
+        uint64_t row_bytes, uint64_t dst_stride) {
+    ds4_gpu_mul_mm_args a = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+    a.ne0 = (int32_t)dst_stride;
+    return a;
+}
+
+static ds4_gpu_mul_mv_ext_args ds4_gpu_make_mv_ext_args_strided(
+        uint64_t in_dim, uint64_t out_dim, uint64_t n_tok,
+        uint64_t elem_bytes, uint64_t row_bytes, uint64_t dst_stride);
+
+static ds4_gpu_q8_0_matvec_args ds4_gpu_make_q8_0_mv_args_strided(
+        uint64_t in_dim, uint64_t out_dim, uint64_t dst_stride) {
+    ds4_gpu_q8_0_matvec_args a = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+    a.ne0 = (int32_t)dst_stride;
+    return a;
+}
+
 static ds4_gpu_mul_mv_ext_args ds4_gpu_make_mv_ext_args(
         uint64_t in_dim,
         uint64_t out_dim,
@@ -6826,6 +6856,15 @@ static ds4_gpu_mul_mv_ext_args ds4_gpu_make_mv_ext_args(
         .r2 = 1,
         .r3 = 1,
     };
+}
+
+static ds4_gpu_mul_mv_ext_args ds4_gpu_make_mv_ext_args_strided(
+        uint64_t in_dim, uint64_t out_dim, uint64_t n_tok,
+        uint64_t elem_bytes, uint64_t row_bytes, uint64_t dst_stride) {
+    ds4_gpu_mul_mv_ext_args a =
+        ds4_gpu_make_mv_ext_args(in_dim, out_dim, n_tok, elem_bytes, row_bytes);
+    a.ne0 = (int32_t)dst_stride;
+    return a;
 }
 
 static int16_t ds4_gpu_mv_ext_nxpsg(uint64_t in_dim, uint64_t n_tok) {
@@ -22166,6 +22205,8 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         uint64_t                weight_offset,
         uint64_t                in_dim,
         uint64_t                out_dim,
+        uint64_t                dst_stride,   /* floats per token in `out` */
+        uint64_t                dst_col0,     /* first column written */
         const ds4_gpu_tensor *x,
         uint64_t                n_tok,
         bool                    prefer_decode_mpp) {
@@ -22179,7 +22220,11 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
         id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
         const uint64_t x_bytes = n_tok * in_dim * sizeof(float);
-        const uint64_t out_bytes = n_tok * out_dim * sizeof(float);
+        /* With a strided destination the last token's row still spans dst_stride,
+         * so the buffer must cover (n_tok-1)*stride + col0 + out_dim, not
+         * n_tok*out_dim. Getting this wrong reads as a silent short buffer. */
+        const uint64_t out_bytes =
+            ((n_tok - 1u) * dst_stride + dst_col0 + out_dim) * sizeof(float);
         if (!xbuf || !outbuf ||
             ds4_gpu_tensor_bytes(x) < x_bytes ||
             ds4_gpu_tensor_bytes(out) < out_bytes) {
@@ -22218,14 +22263,14 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                     ds4_gpu_get_mul_mm_pipeline(nax_fn, false, false);
                 if (mpp_pipeline) {
                     ds4_gpu_mul_mm_args args =
-                        ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
+                        ds4_gpu_make_mm_args_strided(in_dim, out_dim, n_tok, row_bytes, dst_stride);
 
                     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
                     DS4_SET_PIPE(enc, mpp_pipeline);
                     [enc setBytes:&args length:sizeof(args) atIndex:0];
                     [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
                     [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
-                    [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+                    [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) + (NSUInteger)(dst_col0 * sizeof(float)) atIndex:3];
                     [enc setThreadgroupMemoryLength:DS4_TG16(ds4_gpu_mm_nax_tg_mem())
                                  atIndex:0];
                     [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1u,
@@ -22242,7 +22287,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                 ds4_gpu_warn_mpp_fallback();
             }
 
-            ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+            ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_q8_0_mv_args_strided(in_dim, out_dim, dst_stride);
             ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_q8_0_mv_dispatch();
             if (out_dim > 65536u) mv_dispatch.nsg = 8;
             /* R2: the shipped kernel's K partition assumes ne00/QK8_0 >= NSG*NQ.
@@ -22296,7 +22341,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
             [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
-            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) + (NSUInteger)(dst_col0 * sizeof(float)) atIndex:3];
             [enc setThreadgroupMemoryLength:DS4_TG16(mv_dispatch.smem)
                                  atIndex:0];
             /* narrow-k gives NR0 rows to each SIMD GROUP, so one threadgroup
@@ -22334,14 +22379,15 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
             const int16_t nypsg = 32 / nxpsg;
             const uint64_t r0ptg = (uint64_t)nypsg * (uint64_t)nsg;
             ds4_gpu_mul_mv_ext_args args =
-                ds4_gpu_make_mv_ext_args(in_dim, out_dim, n_tok, 34, row_bytes);
+                ds4_gpu_make_mv_ext_args_strided(in_dim, out_dim, n_tok, 34,
+                                                 row_bytes, dst_stride);
 
             id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
             DS4_SET_PIPE(enc, pipeline);
             [enc setBytes:&args length:sizeof(args) atIndex:0];
             [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
             [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
-            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) + (NSUInteger)(dst_col0 * sizeof(float)) atIndex:3];
             [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg,
                                                   ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg,
                                                   1)
@@ -22395,14 +22441,14 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                 ds4_gpu_get_mul_mm_pipeline(nax_fn, false, false);
             if (pipeline) {
                 ds4_gpu_mul_mm_args args =
-                    ds4_gpu_make_mm_args(in_dim, out_dim, nax_rows, row_bytes);
+                    ds4_gpu_make_mm_args_strided(in_dim, out_dim, nax_rows, row_bytes, dst_stride);
 
                 id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
                 DS4_SET_PIPE(enc, pipeline);
                 [enc setBytes:&args length:sizeof(args) atIndex:0];
                 [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
                 [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
-                [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+                [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) + (NSUInteger)(dst_col0 * sizeof(float)) atIndex:3];
                 [enc setThreadgroupMemoryLength:DS4_TG16(ds4_gpu_mm_nax_tg_mem())
                                  atIndex:0];
                 [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)(nax_rows / nax_tile_n),
@@ -22431,7 +22477,7 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
         if (!pipeline) return 0;
 
         ds4_gpu_mul_mm_args args =
-            ds4_gpu_make_mm_args(in_dim, out_dim, generic_rows, row_bytes);
+            ds4_gpu_make_mm_args_strided(in_dim, out_dim, generic_rows, row_bytes, dst_stride);
 
         id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
         DS4_SET_PIPE(enc, pipeline);
@@ -22441,9 +22487,16 @@ static int ds4_gpu_matmul_q8_0_legacy_tensor(
                 offset:ds4_gpu_tensor_offset(x) +
                        (NSUInteger)(generic_row0 * in_dim * sizeof(float))
                atIndex:2];
+        /* generic_row0 walks TOKENS, so it strides by the destination row
+         * width -- which is dst_stride, not out_dim, once a column slice is in
+         * play. The multi-line form is why this bind was missed when the
+         * single-line ones were updated, and rank 1 wrote its whole slice at
+         * column 0 as a result: the probe caught it because rank 0 has
+         * dst_col0 == 0 and cannot distinguish the two. */
         [enc setBuffer:outbuf
                 offset:ds4_gpu_tensor_offset(out) +
-                       (NSUInteger)(generic_row0 * out_dim * sizeof(float))
+                       (NSUInteger)((generic_row0 * dst_stride + dst_col0) *
+                                    sizeof(float))
                atIndex:3];
         [enc setThreadgroupMemoryLength:DS4_TG16((bc_out ? 8192u : 6144u))
                                  atIndex:0];
@@ -22509,7 +22562,7 @@ int ds4_gpu_matmul_q8_0_tensor(
 
     const double profile_t0 = profile_prefill ? ds4_gpu_now_ms() : 0.0;
     int ok = ds4_gpu_matmul_q8_0_legacy_tensor(out, model_map, model_size,
-                                               weight_offset, in_dim, out_dim,
+                                               weight_offset, in_dim, out_dim, out_dim, 0,
                                                x, n_tok, false);
     if (profile_prefill) {
         if (split_batch_for_profile && ds4_gpu_end_commands() == 0) {
@@ -22624,7 +22677,7 @@ int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
     return ds4_gpu_matmul_q8_0_legacy_tensor(out, model_map, model_size,
-                                             weight_offset, in_dim, out_dim,
+                                             weight_offset, in_dim, out_dim, out_dim, 0,
                                              x, n_tok, true);
 }
 
@@ -22638,7 +22691,7 @@ int ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok) {
     return ds4_gpu_matmul_q8_0_legacy_tensor(out, model_map, model_size,
-                                             weight_offset, in_dim, out_dim,
+                                             weight_offset, in_dim, out_dim, out_dim, 0,
                                              x, n_tok, true);
 }
 
@@ -22708,6 +22761,7 @@ static int ds4_gpu_matmul_quant_impl_tensor(
                                                  weight_offset,
                                                  in_dim,
                                                  out_dim,
+                                                 out_dim, 0,
                                                  x,
                                                  n_tok,
                                                  prefer_decode_mpp);
@@ -52661,4 +52715,39 @@ void ds4_gpu_ane_fence_stats_reset(void) {
     if (!g_ane_sync_stats_buffer) return;
     memset(g_ane_sync_stats_buffer.contents, 0,
            DS4_TP_FENCE_SPIN_WORDS * sizeof(uint32_t));
+}
+
+/* Compute only rows [dst_col0, dst_col0+out_rows) of a Q8_0 projection and
+ * write them into a full-width destination at that column offset.
+ *
+ * Prefill's TP attention head split computes the FULL q width on both ranks
+ * and relies on zeroed unowned heads plus a commutative combine -- so q_b
+ * produces 64 heads where 32 are read. Decode already slices this
+ * (tp_q_rows_off, tp_heads * head_dim) and gets away with a contiguous write
+ * because n_tokens is 1; at n_tokens > 1 the same slice is strided, which is
+ * why the trick was never transplanted.
+ *
+ * It needs no kernel change: ne0 is the destination row stride and the row
+ * count comes from ne01 or the dispatch grid, so the two were already
+ * separate. The weight offset advances by whole rows, which is what makes the
+ * owned half bit-identical rather than merely close. */
+int ds4_gpu_matmul_q8_0_cols_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_rows,
+        uint64_t              dst_stride,
+        uint64_t              dst_col0,
+        const ds4_gpu_tensor *x,
+        uint64_t              n_tok) {
+    if (dst_stride < dst_col0 + out_rows) return 0;
+    const uint64_t row_bytes = (in_dim / 32u) * 34u;
+    if (in_dim == 0 || (in_dim & 31u) != 0) return 0;
+    return ds4_gpu_matmul_q8_0_legacy_tensor(out, model_map, model_size,
+                                             weight_offset + dst_col0 * row_bytes,
+                                             in_dim, out_rows,
+                                             dst_stride, dst_col0,
+                                             x, n_tok, false);
 }

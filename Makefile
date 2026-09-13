@@ -497,6 +497,10 @@ tests/probe_ane_handoff: tests/probe_ane_handoff.c ds4_metal.o ds4_ane.o ds4_gpu
 
 # CPU decode sidecar: can the rank-local shared-expert slice fit the ~149 us
 # routed-MoE overlap window? No GPU, no GGUF -- bandwidth at production shapes.
+# Byte-identity gate for the sliced q_b projection. No GGUF needed.
+tests/probe_qb_slice: tests/probe_qb_slice.c ds4_metal.o ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/probe_qb_slice.c ds4_metal.o $(METAL_LDLIBS)
+
 tests/probe_cpu_shexp: tests/probe_cpu_shexp.c
 	$(CC) $(CFLAGS) -I. -o $@ tests/probe_cpu_shexp.c -lpthread -lm
 
