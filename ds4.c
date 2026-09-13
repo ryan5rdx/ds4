@@ -61103,6 +61103,12 @@ int ds4_session_glm53_ckpt_best_at_or_below(ds4_session *s, int limit) {
     return -1;
 }
 
+int ds4_session_glm53_try_restore(ds4_session *s, const ds4_tokens *prompt,
+                                  int common) {
+    (void)s; (void)prompt; (void)common;
+    return 0;
+}
+
 void ds4_session_glm53_rollback_drop(ds4_session *s) {
     (void)s;
 }
@@ -73384,18 +73390,17 @@ static int ds4_glm53_ckpt_restore_enabled(void) {
     return !(e && e[0] == '0');
 }
 
-static void ds4_session_glm53_restore_before_sync(ds4_session *s,
-                                                  const ds4_tokens *prompt) {
-    if (!s || !prompt || prompt->len <= 0) return;
-    if (!ds4_session_glm53_rollback_supported(s)) return;
-    if (!ds4_glm53_ckpt_restore_enabled()) return;
-    if (ds4_session_tp_worker(s)) return;
+int ds4_session_glm53_try_restore(ds4_session *s, const ds4_tokens *prompt,
+                                  int common) {
+    if (!s || !prompt || prompt->len <= 0 || common <= 0) return 0;
+    if (!ds4_session_glm53_rollback_supported(s)) return 0;
+    if (!ds4_glm53_ckpt_restore_enabled()) return 0;
+    if (ds4_session_tp_worker(s)) return 0;
     /* A prompt that already extends the checkpoint is the cache-hit path and
      * needs nothing from the ring. */
     if (s->checkpoint_valid && prompt->len >= s->checkpoint.len &&
-        ds4_tokens_starts_with(prompt, &s->checkpoint)) return;
+        ds4_tokens_starts_with(prompt, &s->checkpoint)) return 0;
 
-    const int common = ds4_session_common_prefix(s, prompt);
     const int ck = ds4_session_glm53_ckpt_best_at_or_below(s, common);
     if (ck > 0) ds4_session_rewind(s, ck);
     /* Read the landing position back rather than assuming it: the rewind
@@ -73426,7 +73431,9 @@ static void ds4_session_glm53_restore_before_sync(ds4_session *s,
                 "ds4: GLM checkpoint restore: prompt diverged at %d, resuming "
                 "from %d instead of 0 (%d tokens kept)\n",
                 common, landed, landed);
+        return landed;
     }
+    return 0;
 }
 #endif
 
@@ -73442,21 +73449,21 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
 #ifndef DS4_NO_GPU
     ds4_session_dspark_scheduler_begin_request(s);
-    /* BEFORE the SYNC goes out, and that ordering is the whole point.
+    /* The checkpoint restore is NOT hooked here.
      *
-     * A diverged prompt may still have a checkpoint at or below the divergence
-     * -- GLM-5.3's append-only prefix reuse is the only reason the history
-     * below it cannot be kept, and one observed miss threw away 83% of a ~170 s
-     * re-prefill for want of a restore point. Recovering it means a mirrored
-     * REWIND, and a mirrored REWIND must reach the worker at TOP LEVEL. Doing
-     * it from inside sync_internal() sent it while the worker was already in
-     * its in-prefill poll, where a non-CANCEL frame is illegal.
+     * It used to be, and the diagnostic caught it in production: this function
+     * is reached with the caller's chunk, not the request's whole prompt, so
+     * ds4_session_common_prefix() returned 4096 -- the chunk length -- while
+     * the server's own miss line had already computed the true divergence at
+     * 246200. The ring held a usable checkpoint at 245760 and the lookup was
+     * asked for one at or below 4096, so it found nothing and a 250966-token
+     * re-prefill went ahead.
      *
-     * Running it here also means pre_sync_len below is computed AFTER the
-     * rewind, so an interrupted prefill still lands somewhere real, and
-     * sync_internal() sees a valid checkpoint the prompt extends and takes its
-     * ordinary append path. One mechanism, not two. */
-    ds4_session_glm53_restore_before_sync(s, prompt);
+     * The restore belongs where the full prompt and the authoritative `common`
+     * both exist, which is the server's cache-miss path
+     * (ds4_session_glm53_try_restore, called from ds4_server.c). That is still
+     * before any SYNC is mirrored, so REWIND continues to reach the worker at
+     * top level rather than inside its in-prefill poll. */
 #endif
     const bool mirror = ds4_session_tp_leader(s);
     /* Only a SYNC that was actually mirrored may be cancelled: sending a CANCEL
@@ -73847,7 +73854,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * run where a restore actually happened -- which is to say, it was
              * latent for exactly as long as the restore was broken for other
              * reasons. It is now done before the SYNC goes out, in
-             * ds4_session_glm53_restore_before_sync(), and a successful
+             * ds4_session_glm53_try_restore() from the server's miss path,
+             * and a successful
              * restore reaches this function as an ordinary append that takes
              * the branch above. */
             s->mtp_draft_valid = false;

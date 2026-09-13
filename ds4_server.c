@@ -13159,6 +13159,33 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    /* Last resort before a full re-prefill: GLM-5.3's checkpoint ring.
+     *
+     * Every cache source above needs the live prefix to still BE a prefix. This
+     * one does not -- it rewinds the recurrence to a snapshot at or below the
+     * divergence, which is the only way GLM-5.3 can recover a mid-prefix miss
+     * at all, its KDA state being append-only. A production log lost 655 s here
+     * at common=246200 of prompt=250966: 98% of the work was reusable and all
+     * of it was redone.
+     *
+     * `common` rather than a chunk length, and that distinction is the whole
+     * bug this replaced: hooking the restore inside ds4_session_sync() handed
+     * it 4096 (the prefill chunk) as the divergence and the lookup found
+     * nothing. Here `common` is the same number the miss line prints.
+     *
+     * prompt_for_sync stays the FULL prompt. The session now holds a valid
+     * checkpoint that the prompt extends, so ds4_session_sync() takes its
+     * ordinary append path and prefills only [landed, prompt.len). And this
+     * runs before any SYNC is mirrored, so the REWIND it sends reaches the TP
+     * worker at top level rather than inside its in-prefill poll. */
+    if (cached == 0 && common > 0) {
+        const int landed = ds4_session_glm53_try_restore(
+                slot->session, prompt_for_sync, common);
+        if (landed > 0) {
+            cached = landed;
+            cache_source = "glm53-checkpoint";
+        }
+    }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
         ((!strcmp(cache_source, "responses-visible") ||
