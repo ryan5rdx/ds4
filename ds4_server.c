@@ -11189,6 +11189,46 @@ static void trace_cache_diverge_text(ds4_engine *engine,
     }
 }
 
+/* A wide window of both renderings, to a file, when DS4_DIVERGENCE_DUMP names
+ * a directory.
+ *
+ * +-8 tokens in a log line is enough to see THAT something changed and often
+ * not enough to see what. Two misses in different conversations produced the
+ * identical pair diverge=2610/785 -- which rules out a content edit, since
+ * those would differ per conversation, and points at something structural. To
+ * name it you need the surrounding text on both sides, not two ids.
+ *
+ * Opt-in, because this writes conversation content to disk. */
+static void trace_cache_dump_divergence(ds4_engine *engine,
+                                        const ds4_tokens *live,
+                                        const ds4_tokens *prompt,
+                                        int common, int slot_id) {
+    const char *dir = getenv("DS4_DIVERGENCE_DUMP");
+    if (!dir || !dir[0] || !engine || !live || !prompt) return;
+    const int win = 512;                       /* tokens either side */
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/ds4-divergence-slot%d-%ld.txt",
+             dir, slot_id, (long)time(NULL));
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "common=%d live_len=%d prompt_len=%d window=%d\n",
+            common, live->len, prompt->len, win);
+    for (int side = 0; side < 2; side++) {
+        const ds4_tokens *t = side ? prompt : live;
+        const int lo = common - win < 0 ? 0 : common - win;
+        const int hi = common + win > t->len ? t->len : common + win;
+        fprintf(f, "\n===== %s [%d,%d) =====\n", side ? "PROMPT" : "LIVE", lo, hi);
+        ds4_tokens span = { .v = t->v + lo, .len = hi - lo, .cap = hi - lo };
+        size_t n = 0;
+        char *txt = render_tokens_text(engine, &span, &n);
+        if (txt) { fwrite(txt, 1, n, f); free(txt); }
+        fprintf(f, "\n----- split at %d is %d tokens into this window -----\n",
+                common, common - lo);
+    }
+    fclose(f);
+    server_log(DS4_LOG_WARNING, "ds4-server: divergence dumped to %s", path);
+}
+
 /* First token ids that differ, for the cache-miss log.  The capture window is
  * centred on `common`, so the divergent pair is at that offset when it is in
  * range; -1 means "past the end of that side". */
@@ -13014,6 +13054,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         char live_txt[192], prompt_txt[192];
         trace_cache_diverge_text(s->engine, &cache_diag,
                                  live_txt, prompt_txt, sizeof(live_txt));
+        trace_cache_dump_divergence(s->engine,
+                                    ds4_session_reusable_tokens(slot->session),
+                                    &j->req.prompt, common, slot->id);
         server_log(DS4_LOG_WARNING,
                    "ds4-server: live kv cache miss%s slot=%d live=%d prompt=%d common=%d lost=%d vision=%s reason=%s diverge=%d/%d tool_replay=mem:%d/disk:%d/canonical:%d/missing:%d",
                    responses_protocol ? " RESPPROTO" : "",
