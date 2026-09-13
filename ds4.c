@@ -60791,10 +60791,24 @@ static void ds4_session_glm53_ckpt_slot_drop(glm53_ckpt_slot *c) {
  * per reason per process: the capture runs at every sync frontier. */
 static void ds4_glm53_capture_say(const char *reason, int pos) {
     static const char *seen[8];
+    static unsigned hits[8];
     static int n;
-    for (int i = 0; i < n; i++) if (seen[i] == reason) return;
-    if (n < 8) seen[n++] = reason;
-    fprintf(stderr, "ds4: GLM checkpoint capture %s (pos %d)\n", reason, pos);
+    for (int i = 0; i < n; i++) {
+        if (seen[i] != reason) continue;
+        /* CKPTRING2: deduping a PER-FRONTIER event by reason alone suppressed
+         * exactly the repeats that show the ring filling, so one "ok" line read
+         * as one capture and the first run's "the ring was empty" inference was
+         * drawn from silence the instrument created. Keep the rate limit --
+         * this runs at every sync frontier -- but let the count through on a
+         * geometric schedule so the ring's growth stays visible for free. */
+        const unsigned k = ++hits[i];
+        if ((k & (k - 1u)) != 0u) return;          /* powers of two only */
+        fprintf(stderr, "ds4: GLM checkpoint capture %s (pos %d, #%u)\n",
+                reason, pos, k);
+        return;
+    }
+    if (n < 8) { seen[n] = reason; hits[n] = 1u; n++; }
+    fprintf(stderr, "ds4: GLM checkpoint capture %s (pos %d, #1)\n", reason, pos);
 }
 
 bool ds4_session_glm53_rollback_capture(ds4_session *s) {
@@ -60899,6 +60913,36 @@ int ds4_session_glm53_ckpt_best_at_or_below(ds4_session *s, int limit) {
         best = c->pos;
     }
     return best;
+}
+
+/* Render the ring for the divergence diagnostic: which positions are actually
+ * held, and how many.
+ *
+ * CKPTRING2 ran the gate twice and could not distinguish "the capture never
+ * landed" from "the lookup rejected a capture that did" -- and those live on
+ * opposite sides of the feature. Printing the ring alongside the lookup's
+ * answer separates them in a single run: the ring holding 15591 while the
+ * lookup returns -1 is the token_hash check in ckpt_find(), whereas a ring
+ * without it is a capture-side failure after all.
+ *
+ * Caller buffer, no allocation: this runs on a diagnostic path that must not
+ * be able to fail. */
+static void ds4_session_glm53_ckpt_describe(const ds4_session *s,
+                                            char *buf, size_t cap,
+                                            uint32_t *live_out) {
+    size_t off = 0;
+    uint32_t live = 0;
+    if (buf && cap) buf[0] = '\0';
+    if (s) {
+        for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
+            const int p = s->glm53_ckpt[i].pos;
+            if (p < 0) continue;
+            live++;
+            if (buf && cap > off + 24)
+                off += (size_t)snprintf(buf + off, cap - off, "[%u]=%d ", i, p);
+        }
+    }
+    if (live_out) *live_out = live;
 }
 
 /* Can a rewind to `pos` be served from a snapshot?  Pure predicate: the
@@ -70119,6 +70163,24 @@ uint64_t ds4_glm53_rollback_session_bytes(void) {
     return total;
 }
 
+/* How many checkpoint-ring slots this process will use.
+ *
+ * Exported because the server's startup memory line reported only the single
+ * rollback snapshot and said nothing about the ring -- which is the same size
+ * again per slot, allocated lazily, and default-on. At the default 8 slots that
+ * under-states a GLM-5.3 session's snapshot memory by 9x, and at
+ * DS4_GLM53_CKPT_SLOTS=16 by 17x. Shipping a default-on feature whose memory
+ * does not appear in the memory report is the kind of thing that surfaces as an
+ * unexplained OOM on someone else's box. */
+uint32_t ds4_glm53_ckpt_slot_count(void) {
+#ifndef DS4_NO_GPU
+    if (!ds4_model_is_glm53() || !ds4_glm53_rollback_enabled()) return 0;
+    return ds4_glm53_ckpt_slots();
+#else
+    return 0;
+#endif
+}
+
 int ds4_engine_embd_dim(ds4_engine *e) {
     (void)e;
     return (int)DS4_N_EMBD;
@@ -73591,8 +73653,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * above instead. Deriving the position independently on both ranks
              * is exactly the asymmetry rewind_core exists to remove. */
             const int common = ds4_session_common_prefix(s, prompt);
+            int ck = 0;
             if (!ds4_session_tp_worker(s)) {
-                const int ck = ds4_session_glm53_ckpt_best_at_or_below(s, common);
+                ck = ds4_session_glm53_ckpt_best_at_or_below(s, common);
                 if (ck > 0) ds4_session_rewind(s, ck);
             }
             /* Read the landing position back rather than assuming it: the
@@ -73600,8 +73663,27 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * restore did not take. */
             const int landed = ds4_session_reusable_pos(s);
             s->mtp_draft_valid = false;
-            if (landed > 0 && landed <= common &&
-                ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            const int prefix_ok =
+                ds4_tokens_starts_with(prompt, &s->checkpoint) ? 1 : 0;
+            /* Unconditional, and deliberately NOT routed through the capture
+             * side's reason-dedup -- that dedup is what hid the ring filling
+             * and turned two runs into "no restore, cause unknown". Every step
+             * between the lookup and the announce used to be silent, so an
+             * empty ring, a rejected hash and a rewind that did not take were
+             * indistinguishable from each other. One line per divergence is the
+             * right rate: divergences are rare by construction. */
+            {
+                char ring[256];
+                uint32_t live = 0;
+                ds4_session_glm53_ckpt_describe(s, ring, sizeof ring, &live);
+                fprintf(stderr,
+                        "ds4: GLM checkpoint restore attempt: common=%d ck=%d "
+                        "landed=%d prefix_ok=%d live=%u ring=%s-> %s\n",
+                        common, ck, landed, prefix_ok, live, ring,
+                        (landed > 0 && landed <= common && prefix_ok)
+                            ? "RESTORE" : "re-prefill");
+            }
+            if (landed > 0 && landed <= common && prefix_ok) {
                 start = landed;
                 resumed_checkpoint = true;
                 fprintf(stderr,

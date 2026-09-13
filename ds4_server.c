@@ -15198,14 +15198,24 @@ static void log_context_memory(ds4_backend backend, int ctx_size,
      * folding it in, because it appears only after traffic. */
     const uint64_t rb = ds4_glm53_rollback_session_bytes();
     if (rb != 0) {
+        /* "slots" meant SESSION slots here while the checkpoint ring also has
+         * slots, and a reviewer reasonably read "across 1 slots" as the ring
+         * being misconfigured. Say which, and count the ring: it is the same
+         * snapshot size again per slot, lazily allocated and default-on, so the
+         * old line under-stated a GLM-5.3 session by 9x at the default 8. */
+        const uint32_t ring = ds4_glm53_ckpt_slot_count();
+        const int sess = session_count > 0 ? session_count : 1;
+        const double per_session = (double)rb * (double)(1u + ring);
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: glm53 rollback snapshot %.2f MiB per session, "
-                   "up to %.2f GiB across %d slots once warmed "
-                   "(DS4_GLM_KDA_ROLLBACK=0 to disable)",
+                   "ds4-server: glm53 rollback snapshot %.2f MiB + checkpoint "
+                   "ring %u x %.2f MiB = %.2f GiB per session, up to %.2f GiB "
+                   "across %d session slots once warmed (DS4_GLM_KDA_ROLLBACK=0 "
+                   "to disable, DS4_GLM53_CKPT_SLOTS=1 to shrink the ring)",
                    (double)rb / (1024.0 * 1024.0),
-                   (double)rb * (double)(session_count > 0 ? session_count : 1) /
-                       (1024.0 * 1024.0 * 1024.0),
-                   session_count > 0 ? session_count : 1);
+                   ring, (double)rb / (1024.0 * 1024.0),
+                   per_session / (1024.0 * 1024.0 * 1024.0),
+                   per_session * (double)sess / (1024.0 * 1024.0 * 1024.0),
+                   sess);
     }
 }
 /* Leader-side tensor-parallel transport. File scope so every exit path in
