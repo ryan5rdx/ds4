@@ -60888,7 +60888,13 @@ static void ds4_glm53_capture_say(const char *reason, int pos) {
  * DS4_GLM53_CKPT_VERIFY=1. Off by default -- it synchronises the GPU. */
 static int ds4_glm53_ckpt_verify_enabled(void) {
     const char *e = getenv("DS4_GLM53_CKPT_VERIFY");
-    return e && e[0] == '1';
+    return e && (e[0] == '1' || e[0] == '2');
+}
+
+/* =2 adds a per-layer line for every kind. */
+static int ds4_glm53_ckpt_verify_verbose(void) {
+    const char *e = getenv("DS4_GLM53_CKPT_VERIFY");
+    return e && e[0] == '2';
 }
 
 /* `live_frac` bounds the digest to the leading fraction of the tensor that a
@@ -60956,6 +60962,7 @@ static void ds4_glm53_state_digest(ds4_session *s, const char *label, int pos) {
     /* Rows are position-indexed against compact_cache_cap (or ctx_cap when the
      * compact path is off), so the fraction a restore must reproduce is
      * pos/cap. Clamped to (0,1]; 0 or an unknown cap means digest everything. */
+    const int verbose = ds4_glm53_ckpt_verify_verbose();
     const uint32_t cap = g->compact_cache_cap ? g->compact_cache_cap : g->ctx_cap;
     double live_frac = 1.0;
     if (cap > 0 && pos > 0 && (uint32_t)pos < cap) {
@@ -60980,16 +60987,43 @@ static void ds4_glm53_state_digest(ds4_session *s, const char *label, int pos) {
          * only matters once a kind is implicated. */
         uint64_t h = UINT64_C(1469598103934665603);
         uint64_t hb = UINT64_C(1469598103934665603);
-        uint32_t n = 0;
+        uint32_t n = 0, sized = 0;
         for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
             ds4_gpu_tensor *t = kinds[k].arr[il];
             if (!t) continue;
-            h = (h ^ ds4_glm53_tensor_digest(t)) * UINT64_C(1099511628211);
-            hb = (hb ^ ds4_glm53_tensor_digest_bounded(t, live_frac)) *
-                 UINT64_C(1099511628211);
+            if (ds4_gpu_tensor_bytes(t) >= 4) sized++;
+            const uint64_t dh = ds4_glm53_tensor_digest(t);
+            const uint64_t db = ds4_glm53_tensor_digest_bounded(t, live_frac);
+            h  = (h  ^ dh) * UINT64_C(1099511628211);
+            hb = (hb ^ db) * UINT64_C(1099511628211);
             n++;
+            /* VERIFY=2: per layer, which is what a search INSIDE an accused
+             * kind needs. The fold names the kind; only the layer narrows it
+             * further, and by then there is one kind left so the volume is
+             * affordable. */
+            if (verbose) {
+                fprintf(stderr,
+                        "ds4: CKPTSTATE %-8s pos=%-7d %-14s L%02u full=%016llx "
+                        "bounded=%016llx\n",
+                        label, pos, kinds[k].name, il,
+                        (unsigned long long)dh, (unsigned long long)db);
+            }
         }
         if (n == 0) continue;
+        /* A kind whose every tensor is empty folds to a FIXED nonzero constant
+         * -- 11 zero digests fold to d8586981e924eca1 -- which reads exactly
+         * like a real hash that happens to match. That is how k_rope got cited
+         * as evidence in CKPTSTATE and CKPTSTATE2: GLM 5.3 Flash has n_rot=0,
+         * so the tensor is 1 byte, the digest returns 0, and "full == bounded,
+         * consistent with a position-determined tensor" was a reading of
+         * nothing at all. Say ABSENT instead. */
+        if (sized == 0) {
+            fprintf(stderr,
+                    "ds4: CKPTSTATE %-8s pos=%-7d %-14s n=%-3u ABSENT "
+                    "(all tensors zero-sized -- no evidence either way)\n",
+                    label, pos, kinds[k].name, n);
+            continue;
+        }
         /* BOUNDED is the column that decides. FULL is kept beside it because a
          * kind that differs in FULL and matches in BOUNDED is the signature of
          * a position-addressed cache behaving correctly, and telling that apart
