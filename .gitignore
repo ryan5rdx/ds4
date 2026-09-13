@@ -80,3 +80,6 @@ tests/bench_*
 
 # stamp used by the scratch repo probe runner to detect stale objects
 .probe-objects.stamp
+tests/probe_ane
+tests/probe_ane_handoff
+tests/probe_cpu_shexp
