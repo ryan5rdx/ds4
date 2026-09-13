@@ -63,6 +63,9 @@ static uint64_t  g_backpressure;
 static uint32_t  g_expect_layers;
 static uint64_t  g_chunks;
 static uint64_t  g_cancelled;
+/* Run-level totals. The per-chunk counters are reset every boundary, so the
+ * harness needs something that survives to the end to assert on. */
+static uint64_t  g_engaged_total, g_skipped_total, g_failed_total, g_short_chunks;
 
 /* TEST HOOK (DS4_ANE_TEST_HOOK=1, never set in production).
  *
@@ -125,6 +128,7 @@ int ds4_ane_mode(void) {
 }
 
 static void *ds4_ane_sidecar_thread(void *ud);
+static void ds4_ane_atexit(void);
 
 /* A sidecar that silently declines to run is the most dangerous outcome under
  * TP2, and ANESIDE3 is what that looks like: the models existed only on the
@@ -291,10 +295,53 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
         for (uint32_t i = 0; i < n_layers; ++i) g_done[i] = dispatch_semaphore_create(0);
     }
     g_n_layers = n_layers; g_n_tok = n_tokens; g_dim = dim; g_ready = 1;
+    static int atexit_armed;
+    if (!atexit_armed) { atexit_armed = 1; atexit(ds4_ane_atexit); }
     return 1;
 }
 
 uint32_t ds4_ane_next_seq(void) { return ++g_seq; }
+
+/* ANESIDE5B emitted ZERO of these lines on either rank, and the reason is that
+ * the only caller sat in metal_graph_prefill_chunked_range -- which
+ * metal_graph_prefill_raw_swa and ds4_session_eval_layer_slice_impl both
+ * bypass by calling metal_graph_prefill_layer_major directly. Adding the call
+ * to each of those would work until the next path appears.
+ *
+ * So the sidecar reports itself. It sees every layer it serves, so it knows
+ * when logical layer 0 comes round again, and that IS a chunk boundary no
+ * matter which loop above produced it. */
+static void ds4_ane_chunk_boundary(void) {
+    if (g_engaged || g_skipped || g_failed) { ds4_ane_report(); ds4_ane_reset(); }
+}
+
+/* The authoritative line, via atexit so it does not depend on a caller either.
+ * Drains the ring first: in FAST the sidecar is asynchronous, so a prediction
+ * from the final chunk can still be in flight and would otherwise be counted
+ * as a shortfall. */
+static void ds4_ane_atexit(void) {
+    if (ds4_ane_mode() == DS4_ANE_OFF) return;
+    if (g_fast_running) {
+        const double t0 = ds4_ane_now_ns();
+        while (__atomic_load_n(&g_ring_head, __ATOMIC_ACQUIRE) !=
+               __atomic_load_n(&g_ring_tail, __ATOMIC_ACQUIRE)) {
+            if (ds4_ane_now_ns() - t0 > 5.0e9) break;      /* 5 s, then give up */
+            struct timespec ts = { 0, 100000 };
+            nanosleep(&ts, NULL);
+        }
+    }
+    ds4_ane_chunk_boundary();
+    fprintf(stderr,
+            "ds4: ANE TOTAL chunks=%llu engaged=%llu expect_per_chunk=%u "
+            "shortfall_chunks=%llu skipped=%llu failed=%llu cancelled=%llu "
+            "backpressure=%llu timeout=%d\n",
+            (unsigned long long)g_chunks, (unsigned long long)g_engaged_total,
+            g_expect_layers, (unsigned long long)g_short_chunks,
+            (unsigned long long)g_skipped_total, (unsigned long long)g_failed_total,
+            (unsigned long long)g_cancelled, (unsigned long long)g_backpressure,
+            ds4_gpu_ane_sync_timed_out());
+    fflush(stderr);
+}
 
 /* The FAST rendezvous, run on a dedicated thread so the encoding thread never
  * blocks. Spin rather than sleep: the wait is a few hundred microseconds at
@@ -372,6 +419,9 @@ int ds4_ane_begin_layer(uint32_t il) {
     if (ds4_ane_mode() < DS4_ANE_SHADOW) return 0;
     MLModel *m = g_models[il];
     if (!m && !ds4_ane_test_hook()) { g_skipped++; return 0; }
+
+    /* Logical layer 0 means a new chunk started: flush the previous one. */
+    if (il == 0) ds4_ane_chunk_boundary();
 
     if (ds4_ane_mode() == DS4_ANE_FAST) {
         /* Enqueue. Backpressure rather than overwrite: the ring holds 128 and
@@ -460,6 +510,10 @@ void ds4_ane_report(void) {
     if (ds4_ane_mode() == DS4_ANE_OFF) return;
     if (g_engaged == 0 && g_skipped == 0 && g_failed == 0) return;
     g_chunks++;
+    g_engaged_total += g_engaged;
+    g_skipped_total += g_skipped;
+    g_failed_total  += g_failed;
+    if (g_engaged != g_expect_layers) g_short_chunks++;
     /* One grep-able line per chunk. The harness asserts on every field:
      * engaged must equal the sparse-layer count, and skipped, failed,
      * cancelled and timeout must all be zero. Anything else means some layers
