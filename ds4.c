@@ -59261,11 +59261,20 @@ static uint32_t ds4_glm53_ckpt_slots(void) {
 /* Slot from POSITION, so both TP ranks choose identically. A round-robin
  * counter diverges the instant one rank skips a capture the other took, and a
  * restore into the wrong slot is a silently wrong recurrence rather than an
- * error. */
+ * error.
+ *
+ * Banded, not modular over a small unit. Captures happen at request frontiers,
+ * and in a growing conversation the last N frontiers all cluster near the end
+ * -- a ring holding "the most recent N" would have no checkpoint anywhere near
+ * a divergence 80% of the way back, which is exactly the case this exists for.
+ * Banding by position tiles the context instead: with 16 slots and an 8192
+ * band that is one checkpoint per 8k across 131072 tokens, each slot holding
+ * the most recent capture that fell in its band. */
+#define DS4_GLM53_CKPT_BAND 8192
 static uint32_t ds4_glm53_ckpt_slot_for(int pos) {
     const uint32_t n = ds4_glm53_ckpt_slots();
     if (pos <= 0) return 0;
-    return (uint32_t)((pos / 1024) % (int)n);
+    return (uint32_t)((pos / DS4_GLM53_CKPT_BAND) % (int)n);
 }
 #endif
 
@@ -73511,18 +73520,59 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             resumed_checkpoint = true;
             s->mtp_draft_valid = false;
         } else {
-            s->checkpoint.len = 0;
-            s->checkpoint_valid = false;
+            /* The prompt diverged. Before throwing the recurrence away, see
+             * whether a checkpoint sits at or below the divergence point:
+             * everything below it is still the same history, and GLM-5.3's
+             * append-only prefix reuse is the only reason it cannot be kept.
+             * One observed miss had common=62318 of 75435 -- 83% of a ~170 s
+             * re-prefill discarded for want of a restore point.
+             *
+             * LEADER ONLY, and through ds4_session_rewind() rather than by
+             * hand. That function mirrors: it sends REWIND with the KEEP flag,
+             * waits for the worker's ack, and invalidates both ranks when the
+             * applied results differ. It also does the bookkeeping an
+             * open-coded restore would skip -- compressor-window alignment,
+             * the MTP draft, layer_n_comp -- any of which left stale would be
+             * a wrong recurrence rather than a slow one.
+             *
+             * The worker must not run this: it receives the mirrored REWIND
+             * before its own sync, so by the time it reaches here its
+             * checkpoint is already valid at ck and it takes the append path
+             * above instead. Deriving the position independently on both ranks
+             * is exactly the asymmetry rewind_core exists to remove. */
+            const int common = ds4_session_common_prefix(s, prompt);
+            if (!ds4_session_tp_worker(s)) {
+                const int ck = ds4_session_glm53_ckpt_best_at_or_below(s, common);
+                if (ck > 0) ds4_session_rewind(s, ck);
+            }
+            /* Read the landing position back rather than assuming it: the
+             * rewind aligns down to a compressor window and reports 0 if the
+             * restore did not take. */
+            const int landed = ds4_session_reusable_pos(s);
             s->mtp_draft_valid = false;
-            /* Re-prefilling a different history invalidates any snapshot taken
-             * against the old one, even at the same length.  Unconditional for
-             * the same reason as ds4_session_invalidate(): both ranks must
-             * reach the same state, and the worker has no hold. */
-            ds4_session_glm53_rollback_drop(s);
-            ds4_session_glm_reset_dense_cache(s);
-            if (!ds4_session_glm_reset_kda_state(s)) {
-                snprintf(err, errlen, "%s GLM KDA state reset failed", backend_name);
-                return 1;
+            if (landed > 0 && landed <= common &&
+                ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+                start = landed;
+                resumed_checkpoint = true;
+                fprintf(stderr,
+                        "ds4: GLM checkpoint restore: prompt diverged at %d, "
+                        "resuming from %d instead of 0 (%d tokens kept)\n",
+                        common, landed, landed);
+            } else {
+                s->checkpoint.len = 0;
+                s->checkpoint_valid = false;
+                /* Re-prefilling a different history invalidates any snapshot
+                 * taken against the old one, even at the same length.
+                 * Unconditional for the same reason as
+                 * ds4_session_invalidate(): both ranks must reach the same
+                 * state, and the worker has no hold. */
+                ds4_session_glm53_rollback_drop(s);
+                ds4_session_glm_reset_dense_cache(s);
+                if (!ds4_session_glm_reset_kda_state(s)) {
+                    snprintf(err, errlen, "%s GLM KDA state reset failed",
+                             backend_name);
+                    return 1;
+                }
             }
         }
 
