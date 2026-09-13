@@ -60711,6 +60711,99 @@ static void ds4_glm53_capture_say(const char *reason, int pos) {
     fprintf(stderr, "ds4: GLM checkpoint capture %s (pos %d, #1)\n", reason, pos);
 }
 
+/* CKPTSTATE: hash EVERY GLM-5.3 state tensor, not just the snapshotted ones.
+ *
+ * CKPTRING3 showed a deep restore that passes every check we have -- it fires,
+ * the token_hash matches, it lands exactly, prefix_ok=1 -- and still produces a
+ * different continuation. Text-level evidence is exhausted: a restore can be
+ * wrong in a way only 7901 tokens of recurrence reveal, and faithful at 13.
+ *
+ * The decisive question is which piece of state is not being restored, and the
+ * way to answer it is to digest the state at CAPTURE and again at RESTORE and
+ * diff. Any tensor whose digest differs either round-tripped badly or is not in
+ * the snapshot at all -- and the second is the suspicion, since the snapshot
+ * covers exactly three things (KDA conv, KDA recurrent, indexer tail) while the
+ * graph holds a dozen more.
+ *
+ * Deliberately hashes the UNSNAPSHOTTED tensors too. Digesting only what we
+ * save could only ever confirm that saving works, which is the hypothesis least
+ * likely to be true given the restore already verifies its own hash.
+ *
+ * Sampled rather than exhaustive: these caches run to gigabytes at 131k, and a
+ * stride-sampled FNV over each catches a changed tensor without making the
+ * diagnostic itself a performance event. Sampling can miss a difference; it
+ * cannot invent one, so a reported difference is real.
+ *
+ * DS4_GLM53_CKPT_VERIFY=1. Off by default -- it synchronises the GPU. */
+static int ds4_glm53_ckpt_verify_enabled(void) {
+    const char *e = getenv("DS4_GLM53_CKPT_VERIFY");
+    return e && e[0] == '1';
+}
+
+static uint64_t ds4_glm53_tensor_digest(ds4_gpu_tensor *t) {
+    if (!t) return 0;
+    const uint64_t bytes = ds4_gpu_tensor_bytes(t);
+    if (bytes < 4) return 0;
+    const uint32_t *p = (const uint32_t *)ds4_gpu_tensor_contents(t);
+    if (!p) return 0;
+    const uint64_t words = bytes / 4u;
+    /* At most 4096 samples per tensor, evenly spread. */
+    uint64_t stride = words / 4096u;
+    if (stride == 0) stride = 1;
+    uint64_t h = UINT64_C(1469598103934665603);
+    for (uint64_t i = 0; i < words; i += stride) {
+        h = (h ^ (uint64_t)p[i]) * UINT64_C(1099511628211);
+    }
+    /* Length is part of the identity: a resized tensor is a different one. */
+    h = (h ^ bytes) * UINT64_C(1099511628211);
+    return h;
+}
+
+static void ds4_glm53_state_digest(ds4_session *s, const char *label, int pos) {
+    if (!s || !ds4_glm53_ckpt_verify_enabled()) return;
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    if (!s->glm_graph_ready || !g->glm53) return;
+    (void)ds4_gpu_synchronize();
+    struct { const char *name; ds4_gpu_tensor **arr; } kinds[] = {
+        { "kda_conv",      g->layer_kda_conv_state },
+        { "kda_recur",     g->layer_kda_recurrent_state },
+        { "idx_tail_k",    g->layer_indexer_tail_k },
+        { "idx_tail_gate", g->layer_indexer_tail_gate },
+        { "idx_key_cache", g->layer_indexer_key_cache },
+        { "k_rope",        g->layer_k_rope_cache },
+        { "kv_lora",       g->layer_kv_lora_cache },
+        { "key_cache",     g->layer_key_cache },
+        { "value_cache",   g->layer_value_cache },
+    };
+    for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
+        if (!kinds[k].arr) continue;
+        /* One digest per KIND, folded over layers: a per-layer table at 46
+         * layers x 15 kinds is 690 lines per call and unreadable in a log. The
+         * fold still names the kind, which is what picks the culprit; the layer
+         * only matters once a kind is implicated. */
+        uint64_t h = UINT64_C(1469598103934665603);
+        uint32_t n = 0;
+        for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
+            ds4_gpu_tensor *t = kinds[k].arr[il];
+            if (!t) continue;
+            h = (h ^ ds4_glm53_tensor_digest(t)) * UINT64_C(1099511628211);
+            n++;
+        }
+        if (n == 0) continue;
+        fprintf(stderr, "ds4: CKPTSTATE %-8s pos=%-7d %-14s n=%-3u %016llx\n",
+                label, pos, kinds[k].name, n, (unsigned long long)h);
+    }
+    /* Scalars the restore sets by hand rather than copying. dense_cache_len is
+     * reinstated from the snapshot; the graph's own frontier counters are not
+     * reinstated at all, and if the recurrence reads them a stale one is a
+     * candidate in its own right. */
+    fprintf(stderr,
+            "ds4: CKPTSTATE %-8s pos=%-7d %-14s dense_len=%u ctx_cap=%u "
+            "compact_cap=%u layers=%u..%u\n",
+            label, pos, "scalars", s->glm_dense_cache_len,
+            g->ctx_cap, g->compact_cache_cap, g->layer_start, g->layer_end);
+}
+
 /* Write the session's current GLM-5.3 state into `c`. Shared by the ring and
  * by the interrupt-recovery slot, which differ only in WHERE they store, never
  * in what a snapshot contains. */
@@ -60825,6 +60918,7 @@ bool ds4_session_glm53_rollback_capture(ds4_session *s) {
     }
 
     if (!ds4_session_glm53_ckpt_fill(s, c, pos)) return false;
+    ds4_glm53_state_digest(s, "capture", pos);
     s->glm53_rollback_pos = pos;
     s->glm53_rollback_valid = true;
     ds4_glm53_capture_say("ok", pos);
@@ -60938,6 +61032,10 @@ static bool ds4_session_glm53_rollback_restore(ds4_session *s, int pos) {
     }
     s->glm_dense_cache_len = c->dense_len;
     s->glm_graph.kda_state_exchange_pending = 0;
+    /* Diff this against the "capture" line at the same pos. Any kind that
+     * differs was either not restored or did not round-trip, and that is the
+     * answer CKPTRING3 could not get from text. */
+    ds4_glm53_state_digest(s, "restore", pos);
     return true;
 }
 
