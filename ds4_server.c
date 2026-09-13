@@ -3037,7 +3037,44 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
         }
         buf_free(&tools);
     }
-    for (int i = 0; msgs && i < msgs->len; i++) {
+    /* Hoist only the LEADING system messages.
+     *
+     * Every system message used to be moved to the front. Claude Code appends
+     * a system block when something happens mid-turn -- a background command
+     * finishing, or the user typing while the assistant works -- which is a
+     * cache-friendly APPEND. Hoisting relocated it ahead of the entire
+     * conversation, so every token after it shifted and a 175k prefix was
+     * discarded to prefill ~200 new ones: 25,245 matched, 149,323 thrown away,
+     * about six and a half minutes. Four misses were diagnosed to this, all
+     * reporting the same diverge=2610/785 because it is always the same
+     * structural boundary.
+     *
+     * GLM 5.3 makes it unrecoverable rather than merely expensive: prefix
+     * reuse is append-only, because the KDA recurrence cannot rewind, so there
+     * is no splicing the shifted tail back the way a pure-attention KV cache
+     * could.
+     *
+     * Rendering them where the client put them is also the more faithful
+     * reading. A notice about something that just happened belongs at its
+     * conversation position, not beside the tool definitions.
+     *
+     * DS4_SERVER_SYSTEM_HOIST_ALL=1 restores the old behaviour. */
+    int sys_inline_from = msgs ? msgs->len : 0;
+    {
+        static int hoist_all = -1;
+        if (hoist_all < 0) {
+            const char *e = getenv("DS4_SERVER_SYSTEM_HOIST_ALL");
+            hoist_all = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (!hoist_all) {
+            sys_inline_from = 0;
+            for (int i = 0; msgs && i < msgs->len; i++) {
+                if (!role_is_system(msgs->v[i].role)) break;
+                sys_inline_from = i + 1;
+            }
+        }
+    }
+    for (int i = 0; msgs && i < sys_inline_from; i++) {
         const chat_msg *m = &msgs->v[i];
         if (!role_is_system(m->role)) continue;
         buf_puts(&out, "<|system|>");
@@ -3050,6 +3087,10 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
             observation_open = false;
+            if (i >= sys_inline_from) {
+                buf_puts(&out, "<|system|>");
+                buf_puts(&out, m->content ? m->content : "");
+            }
             continue;
         } else if (chat_msg_is_glm_tool_result(m)) {
             if (!observation_open) buf_puts(&out, "<|observation|>");
@@ -17562,6 +17603,52 @@ static void test_render_glm_chat_prompt_text(void) {
     chat_msgs_free(&msgs);
 }
 
+/* A system message appended mid-conversation must render WHERE IT IS.
+ *
+ * Hoisting it to the front is what turned Claude Code's cache-friendly append
+ * into a mid-prefix insertion: 149,323 tokens discarded and ~6.5 minutes of
+ * re-prefill, four times over, each reporting the same diverge=2610/785. The
+ * leading system messages still hoist, because the main system prompt belongs
+ * at the front; anything after the first user turn does not. */
+static void test_glm_prompt_late_system_message_renders_in_situ(void) {
+    /* The escape hatch restores the behaviour this test exists to forbid. */
+    const char *hoist = getenv("DS4_SERVER_SYSTEM_HOIST_ALL");
+    if (hoist && hoist[0] && hoist[0] != '0') return;
+    chat_msgs msgs = {0};
+    chat_msg lead = {0};
+    lead.role = xstrdup("system");
+    lead.content = xstrdup("You are terse.");
+    chat_msgs_push(&msgs, lead);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+    chat_msg late = {0};
+    late.role = xstrdup("system");
+    late.content = xstrdup("Background job finished.");
+    chat_msgs_push(&msgs, late);
+
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(prompt != NULL);
+    const char *expected =
+        "[gMASK]<sop>"
+        "<|system|>You are terse."
+        "<|user|>Hello"
+        "<|system|>Background job finished."
+        "<|assistant|><think></think>";
+    if (strcmp(prompt, expected)) {
+        fprintf(stderr, "got:      %s\nexpected: %s\n", prompt, expected);
+    }
+    TEST_ASSERT(!strcmp(prompt, expected));
+    /* The whole point: the prefix through the user turn is untouched, so a
+     * cache holding it stays valid. */
+    TEST_ASSERT(!strncmp(prompt, "[gMASK]<sop><|system|>You are terse.<|user|>Hello",
+                         strlen("[gMASK]<sop><|system|>You are terse.<|user|>Hello")));
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
 static void test_render_glm_drops_old_reasoning_without_tools(void) {
     chat_msgs msgs = {0};
     chat_msg user1 = {0};
@@ -21631,6 +21718,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
+    test_glm_prompt_late_system_message_renders_in_situ();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
     test_render_glm_groups_tool_results();
