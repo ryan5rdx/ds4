@@ -60830,6 +60830,37 @@ static int ds4_session_interrupt_rewind_target(ds4_session *s, int pre_sync_len)
     (void)s;
     return pre_sync_len;
 }
+#else
+/* CPU-build stubs.
+ *
+ * The GLM-5.3 rollback and checkpoint machinery is GPU-only -- its state lives
+ * in ds4_gpu_tensors -- but three of its entry points are called from code that
+ * is not itself GPU-guarded: the interrupt rewind target, the ring lookup in
+ * the sync divergence branch, and the drop on invalidate. Without these,
+ * `make cpu` and `make test-session-state` fail to build, which is how the
+ * checkpoint ring shipped: it was only ever compiled one way.
+ *
+ * Semantics are the no-checkpoint ones the CPU path already assumes -- rewind
+ * exactly where asked, no checkpoint below any divergence, nothing to drop --
+ * so the CPU build behaves as it did before the ring existed. */
+static int ds4_session_interrupt_rewind_target(ds4_session *s, int pre_sync_len) {
+    (void)s;
+    return pre_sync_len;
+}
+
+int ds4_session_glm53_ckpt_best_at_or_below(ds4_session *s, int limit) {
+    (void)s; (void)limit;
+    return -1;
+}
+
+void ds4_session_glm53_rollback_drop(ds4_session *s) {
+    (void)s;
+}
+
+/* The server calls this around its internal syncs unconditionally. */
+void ds4_session_rollback_hold(ds4_session *s, bool hold) {
+    (void)s; (void)hold;
+}
 #endif
 
 static uint32_t ds4_model_normal_layer_count(void) {
@@ -73073,6 +73104,65 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
     return true;
 }
 
+#ifndef DS4_NO_GPU
+/* Rescue a diverged prompt from the checkpoint ring, before any SYNC is sent.
+ *
+ * LEADER ONLY, and through ds4_session_rewind() rather than by hand. That
+ * function mirrors: it sends REWIND with the KEEP flag, waits for the worker's
+ * ack, and invalidates both ranks when the applied results differ. It also does
+ * the bookkeeping an open-coded restore would skip -- compressor-window
+ * alignment, the MTP draft, layer_n_comp -- any of which left stale would be a
+ * wrong recurrence rather than a slow one.
+ *
+ * The worker must not run the lookup: it receives the mirrored REWIND and its
+ * checkpoint is already valid at ck by the time its own sync arrives. Deriving
+ * the position independently on both ranks is exactly the asymmetry
+ * rewind_core exists to remove. */
+static void ds4_session_glm53_restore_before_sync(ds4_session *s,
+                                                  const ds4_tokens *prompt) {
+    if (!s || !prompt || prompt->len <= 0) return;
+    if (!ds4_session_glm53_rollback_supported(s)) return;
+    if (ds4_session_tp_worker(s)) return;
+    /* A prompt that already extends the checkpoint is the cache-hit path and
+     * needs nothing from the ring. */
+    if (s->checkpoint_valid && prompt->len >= s->checkpoint.len &&
+        ds4_tokens_starts_with(prompt, &s->checkpoint)) return;
+
+    const int common = ds4_session_common_prefix(s, prompt);
+    const int ck = ds4_session_glm53_ckpt_best_at_or_below(s, common);
+    if (ck > 0) ds4_session_rewind(s, ck);
+    /* Read the landing position back rather than assuming it: the rewind
+     * aligns down to a compressor window and reports 0 if it did not take. */
+    const int landed = ds4_session_reusable_pos(s);
+    const int prefix_ok = ds4_tokens_starts_with(prompt, &s->checkpoint) ? 1 : 0;
+    const int ok = (landed > 0 && landed <= common && prefix_ok);
+
+    /* Unconditional, and deliberately NOT routed through the capture side's
+     * reason-dedup -- that dedup is what hid the ring filling and turned two
+     * CKPTRING runs into "no restore, cause unknown". Every step between the
+     * lookup and the announce used to be silent, so an empty ring, a rejected
+     * token_hash and a rewind that did not take were indistinguishable. The
+     * ring's contents are printed because that is what separates a capture-side
+     * failure from a lookup-side one. One line per divergence is the right
+     * rate: divergences are rare by construction. */
+    char ring[256];
+    uint32_t live = 0;
+    ds4_session_glm53_ckpt_describe(s, ring, sizeof ring, &live);
+    fprintf(stderr,
+            "ds4: GLM checkpoint restore attempt: common=%d ck=%d landed=%d "
+            "prefix_ok=%d live=%u ring=%s-> %s\n",
+            common, ck, landed, prefix_ok, live, ring,
+            ok ? "RESTORE" : "re-prefill");
+    if (ok) {
+        s->mtp_draft_valid = false;
+        fprintf(stderr,
+                "ds4: GLM checkpoint restore: prompt diverged at %d, resuming "
+                "from %d instead of 0 (%d tokens kept)\n",
+                common, landed, landed);
+    }
+}
+#endif
+
 /* Under tensor parallelism the leader mirrors every public sync/eval to the
  * worker before doing the work itself, so both engines execute the same
  * graph sequence and the per-layer gates pair up.  The worker acks a sync
@@ -73085,6 +73175,21 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
 #ifndef DS4_NO_GPU
     ds4_session_dspark_scheduler_begin_request(s);
+    /* BEFORE the SYNC goes out, and that ordering is the whole point.
+     *
+     * A diverged prompt may still have a checkpoint at or below the divergence
+     * -- GLM-5.3's append-only prefix reuse is the only reason the history
+     * below it cannot be kept, and one observed miss threw away 83% of a ~170 s
+     * re-prefill for want of a restore point. Recovering it means a mirrored
+     * REWIND, and a mirrored REWIND must reach the worker at TOP LEVEL. Doing
+     * it from inside sync_internal() sent it while the worker was already in
+     * its in-prefill poll, where a non-CANCEL frame is illegal.
+     *
+     * Running it here also means pre_sync_len below is computed AFTER the
+     * rewind, so an interrupted prefill still lands somewhere real, and
+     * sync_internal() sees a valid checkpoint the prompt extends and takes its
+     * ordinary append path. One mechanism, not two. */
+    ds4_session_glm53_restore_before_sync(s, prompt);
 #endif
     const bool mirror = ds4_session_tp_leader(s);
     /* Only a SYNC that was actually mirrored may be cancelled: sending a CANCEL
@@ -73464,79 +73569,34 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             resumed_checkpoint = true;
             s->mtp_draft_valid = false;
         } else {
-            /* The prompt diverged. Before throwing the recurrence away, see
-             * whether a checkpoint sits at or below the divergence point:
-             * everything below it is still the same history, and GLM-5.3's
-             * append-only prefix reuse is the only reason it cannot be kept.
-             * One observed miss had common=62318 of 75435 -- 83% of a ~170 s
-             * re-prefill discarded for want of a restore point.
+            /* The prompt diverged and no checkpoint rescued it.
              *
-             * LEADER ONLY, and through ds4_session_rewind() rather than by
-             * hand. That function mirrors: it sends REWIND with the KEEP flag,
-             * waits for the worker's ack, and invalidates both ranks when the
-             * applied results differ. It also does the bookkeeping an
-             * open-coded restore would skip -- compressor-window alignment,
-             * the MTP draft, layer_n_comp -- any of which left stale would be
-             * a wrong recurrence rather than a slow one.
-             *
-             * The worker must not run this: it receives the mirrored REWIND
-             * before its own sync, so by the time it reaches here its
-             * checkpoint is already valid at ck and it takes the append path
-             * above instead. Deriving the position independently on both ranks
-             * is exactly the asymmetry rewind_core exists to remove. */
-            const int common = ds4_session_common_prefix(s, prompt);
-            int ck = 0;
-            if (!ds4_session_tp_worker(s)) {
-                ck = ds4_session_glm53_ckpt_best_at_or_below(s, common);
-                if (ck > 0) ds4_session_rewind(s, ck);
-            }
-            /* Read the landing position back rather than assuming it: the
-             * rewind aligns down to a compressor window and reports 0 if the
-             * restore did not take. */
-            const int landed = ds4_session_reusable_pos(s);
+             * The rescue itself no longer lives here. It ran at this point
+             * originally, which is AFTER the leader has already sent SYNC --
+             * so the mirrored REWIND arrived while the worker sat in its
+             * in-prefill poll, where a non-CANCEL frame is illegal
+             * (ds4_tp.c). That is a deadlock or a corrupted control stream
+             * rather than a slow path, and it could only ever have fired on a
+             * run where a restore actually happened -- which is to say, it was
+             * latent for exactly as long as the restore was broken for other
+             * reasons. It is now done before the SYNC goes out, in
+             * ds4_session_glm53_restore_before_sync(), and a successful
+             * restore reaches this function as an ordinary append that takes
+             * the branch above. */
             s->mtp_draft_valid = false;
-            const int prefix_ok =
-                ds4_tokens_starts_with(prompt, &s->checkpoint) ? 1 : 0;
-            /* Unconditional, and deliberately NOT routed through the capture
-             * side's reason-dedup -- that dedup is what hid the ring filling
-             * and turned two runs into "no restore, cause unknown". Every step
-             * between the lookup and the announce used to be silent, so an
-             * empty ring, a rejected hash and a rewind that did not take were
-             * indistinguishable from each other. One line per divergence is the
-             * right rate: divergences are rare by construction. */
-            {
-                char ring[256];
-                uint32_t live = 0;
-                ds4_session_glm53_ckpt_describe(s, ring, sizeof ring, &live);
-                fprintf(stderr,
-                        "ds4: GLM checkpoint restore attempt: common=%d ck=%d "
-                        "landed=%d prefix_ok=%d live=%u ring=%s-> %s\n",
-                        common, ck, landed, prefix_ok, live, ring,
-                        (landed > 0 && landed <= common && prefix_ok)
-                            ? "RESTORE" : "re-prefill");
-            }
-            if (landed > 0 && landed <= common && prefix_ok) {
-                start = landed;
-                resumed_checkpoint = true;
-                fprintf(stderr,
-                        "ds4: GLM checkpoint restore: prompt diverged at %d, "
-                        "resuming from %d instead of 0 (%d tokens kept)\n",
-                        common, landed, landed);
-            } else {
-                s->checkpoint.len = 0;
-                s->checkpoint_valid = false;
-                /* Re-prefilling a different history invalidates any snapshot
-                 * taken against the old one, even at the same length.
-                 * Unconditional for the same reason as
-                 * ds4_session_invalidate(): both ranks must reach the same
-                 * state, and the worker has no hold. */
-                ds4_session_glm53_rollback_drop(s);
-                ds4_session_glm_reset_dense_cache(s);
-                if (!ds4_session_glm_reset_kda_state(s)) {
-                    snprintf(err, errlen, "%s GLM KDA state reset failed",
-                             backend_name);
-                    return 1;
-                }
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+            /* Re-prefilling a different history invalidates any snapshot
+             * taken against the old one, even at the same length.
+             * Unconditional for the same reason as ds4_session_invalidate():
+             * both ranks must reach the same state, and the worker has no
+             * hold. */
+            ds4_session_glm53_rollback_drop(s);
+            ds4_session_glm_reset_dense_cache(s);
+            if (!ds4_session_glm_reset_kda_state(s)) {
+                snprintf(err, errlen, "%s GLM KDA state reset failed",
+                         backend_name);
+                return 1;
             }
         }
 
