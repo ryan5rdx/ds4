@@ -52485,11 +52485,25 @@ int ds4_gpu_ane_stage_alloc(uint32_t dim, uint32_t n_tok,
                 "DS4_ANE_FENCE_MAX_ITERS", 2000000000ull, 1000ull, 4000000000ull);
         const char *sched = getenv("DS4_ANE_SCHED_TRACE");
         g_ane_fence_profile = (sched && sched[0] && sched[0] != '0') ? 1u : 0u;
-        if (g_ane_fence_profile) {
-            /* Borrow the TP fence's calibration so spin counts convert to
-             * microseconds, which is the unit the window budget is in. */
+        /* Calibration is NOT run here.
+         *
+         * It spins 1M and 5M system-fence iterations, which cost 3.37 s when
+         * it happened to land inside the first timed prefill -- a diagnostic
+         * that pays for itself out of the measurement is worse than no
+         * diagnostic. Raw iteration counts are reported unconditionally; the
+         * conversion to microseconds is opt-in through
+         * DS4_ANE_SCHED_CALIBRATE and must be run outside a timed region.
+         *
+         * It also must not touch g_tp_fence_spin_profile. Setting that gave
+         * every TP gate extra atomics in the arms that enable ANE tracing and
+         * not in `off`, which is a confound in the very A/B the trace exists
+         * to inform. */
+        const char *cal = getenv("DS4_ANE_SCHED_CALIBRATE");
+        if (g_ane_fence_profile && cal && cal[0] && cal[0] != '0') {
+            const uint32_t saved = g_tp_fence_spin_profile;
             g_tp_fence_spin_profile = 1;
             ds4_gpu_tp_fence_calibrate_spin();
+            g_tp_fence_spin_profile = saved;
         }
         if (!g_ane_in_buf || !g_ane_out_buf || !g_ane_cmp_buf || !g_ane_scratch ||
             !g_ane_sync_buffer || !g_ane_sync_timeout_buffer || !g_ane_sync_stats_buffer) {

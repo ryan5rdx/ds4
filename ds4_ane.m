@@ -25,6 +25,7 @@ int  ds4_gpu_ane_stage_alloc(uint32_t dim, uint32_t n_tok,
 void ds4_gpu_ane_stage_free(void);
 volatile uint32_t *ds4_gpu_ane_sync_words(void);
 int  ds4_gpu_ane_sync_timed_out(void);
+int  ds4_gpu_synchronize(void);
 
 #define DS4_ANE_MAX_LAYERS 64
 
@@ -92,9 +93,8 @@ static int ds4_ane_sched_trace(void) {
     }
     return g_sched_trace;
 }
-typedef struct { double enq, obs, p0, p1, done; } ane_tl;
+typedef struct { double enq, obs, p0, p1, done; int valid; } ane_tl;
 static ane_tl g_tl[DS4_ANE_MAX_LAYERS];
-static double g_tl_sum[5];          /* wait, predict, release, span, n */
 
 /* TEST HOOK (DS4_ANE_TEST_HOOK=1, never set in production).
  *
@@ -381,7 +381,22 @@ static void ds4_ane_atexit(void) {
             nanosleep(&ts, NULL);
         }
     }
+    /* Let the GPU finish before the final fence read: the counters are written
+     * by the fence kernel, and anything still queued would be missed. This is
+     * the one place a sync is free, because the run is over. */
+    ds4_gpu_synchronize();
     ds4_ane_chunk_boundary();
+    {
+        uint64_t it = 0, ex = 0, h0 = 0, mx = 0; double nspi = 0;
+        if (ds4_ane_sched_trace() &&
+            ds4_gpu_ane_fence_stats(&it, &ex, &h0, &mx, &nspi)) {
+            fprintf(stderr,
+                    "ds4: ANE FENCE TOTAL execs=%llu hit0=%llu iters=%llu "
+                    "max=%llu ns_per_iter=%.2f (after GPU sync)\n",
+                    (unsigned long long)ex, (unsigned long long)h0,
+                    (unsigned long long)it, (unsigned long long)mx, nspi);
+        }
+    }
     fprintf(stderr,
             "ds4: ANE TOTAL chunks=%llu engaged=%llu expect_per_chunk=%u "
             "shortfall_chunks=%llu skipped=%llu failed=%llu cancelled=%llu "
@@ -459,25 +474,26 @@ static void *ds4_ane_sidecar_thread(void *ud) {
         } else {
             g_skipped++;
         }
-        g_ns_predict += ds4_ane_now_ns() - t0;
-        if (ds4_ane_sched_trace()) {
-            g_tl[tl_i].p0 = t0;
-            g_tl[tl_i].p1 = ds4_ane_now_ns();
-            g_tl[tl_i].done = g_tl[tl_i].p1;
-            const ane_tl *t = &g_tl[tl_i];
-            if (t->enq > 0 && t->obs >= t->enq) {
-                g_tl_sum[0] += (t->obs - t->enq) / 1e6;      /* wait for READY */
-                g_tl_sum[1] += (t->p1 - t->p0) / 1e6;        /* predict */
-                g_tl_sum[2] += (t->done - t->p1) / 1e6;      /* release */
-                g_tl_sum[3] += (t->done - t->enq) / 1e6;     /* enqueue->done */
-                g_tl_sum[4] += 1.0;
-            }
-        }
-        ds4_ane_note_completion();
+        const double t1 = ds4_ane_now_ns();
+        g_ns_predict += t1 - t0;
         /* Release-store: everything Core ML wrote to the output surface must be
-         * visible to the GPU before it sees DONE. */
+         * visible to the GPU before it sees DONE.
+         *
+         * FIRST, before any bookkeeping. The trace used to run ahead of this
+         * and delayed the store it was trying to measure -- and `done` was set
+         * to p1, so `release` was unconditionally zero and the instrument
+         * could not have shown its own cost. DONE, then timestamp, then
+         * report. */
         __atomic_store_n(&w[1], seq, __ATOMIC_RELEASE);
+        const double tdone = ds4_ane_now_ns();
+        if (ds4_ane_sched_trace() && tl_i < DS4_ANE_MAX_LAYERS) {
+            g_tl[tl_i].p0 = t0;
+            g_tl[tl_i].p1 = t1;
+            g_tl[tl_i].done = tdone;
+            g_tl[tl_i].valid = 1;
+        }
         __atomic_store_n(&g_ring_tail, t + 1u, __ATOMIC_RELEASE);
+        ds4_ane_note_completion();
     }
 }
 
@@ -590,33 +606,51 @@ void ds4_ane_reset(void) {
 void ds4_ane_report(void) {
     if (ds4_ane_mode() == DS4_ANE_OFF) return;
     if (g_engaged == 0 && g_skipped == 0 && g_failed == 0) return;
-    g_chunks++;
     g_engaged_total += g_engaged;
     g_skipped_total += g_skipped;
     g_failed_total  += g_failed;
     if (g_engaged != g_expect_layers) g_short_chunks++;
-    if (ds4_ane_sched_trace() && g_tl_sum[4] > 0) {
+    if (ds4_ane_sched_trace()) {
+        /* PER LAYER, as promised -- averages hid the shape, and the shape is
+         * the question. Buffered and emitted once at the chunk boundary so the
+         * I/O is not inside the per-layer path it measures.
+         *
+         * Fence counters are reported CUMULATIVE and never reset here. The old
+         * code read and zeroed them from the 42nd completion, which runs when
+         * the CPU stores the last DONE -- before the GPU has necessarily
+         * executed the matching fence. That is why n=42 but execs=41, and the
+         * reset could land while fence 42 was still running. Cumulative counts
+         * have no reset to race; the per-chunk delta is the reader's
+         * subtraction, and the atexit total is taken after a GPU sync. */
         uint64_t it = 0, ex = 0, h0 = 0, mx = 0; double nspi = 0;
         ds4_gpu_ane_fence_stats(&it, &ex, &h0, &mx, &nspi);
-        const double n = g_tl_sum[4];
+        for (uint32_t i = 0; i < g_expect_layers && i < DS4_ANE_MAX_LAYERS; ++i) {
+            const ane_tl *t = &g_tl[i];
+            if (!t->valid) continue;
+            fprintf(stderr,
+                    "ds4: ANE layer chunk=%llu il=%u wait_ready=%.3f "
+                    "predict=%.3f release=%.3f span=%.3f ms\n",
+                    (unsigned long long)(g_chunks + 1u), i,
+                    (t->obs - t->enq) / 1e6, (t->p1 - t->p0) / 1e6,
+                    (t->done - t->p1) / 1e6, (t->done - t->enq) / 1e6);
+        }
         fprintf(stderr,
-                "ds4: ANE sched chunk %llu: n=%.0f wait_ready=%.3f predict=%.3f "
-                "release=%.3f span=%.3f ms/layer | fence execs=%llu hit0=%llu "
-                "spin_avg=%.3f ms max=%.3f ms (%.2f ns/iter)\n",
-                (unsigned long long)(g_chunks + 1), n,
-                g_tl_sum[0] / n, g_tl_sum[1] / n, g_tl_sum[2] / n, g_tl_sum[3] / n,
+                "ds4: ANE sched chunk=%llu fence_cum execs=%llu hit0=%llu "
+                "iters=%llu max=%llu ns_per_iter=%.2f%s\n",
+                (unsigned long long)(g_chunks + 1u),
                 (unsigned long long)ex, (unsigned long long)h0,
-                ex ? (double)it / (double)ex * nspi / 1.0e6 : 0.0,
-                (double)mx * nspi / 1.0e6, nspi);
+                (unsigned long long)it, (unsigned long long)mx, nspi,
+                nspi > 0.0 ? "" : "  (raw iterations; set DS4_ANE_SCHED_CALIBRATE"
+                                  " outside a timed run to convert)");
         fflush(stderr);
-        for (int i = 0; i < 5; i++) g_tl_sum[i] = 0.0;
-        ds4_gpu_ane_fence_stats_reset();
+        for (uint32_t i = 0; i < DS4_ANE_MAX_LAYERS; ++i) g_tl[i].valid = 0;
     }
     /* One grep-able line per chunk. The harness asserts on every field:
      * engaged must equal the sparse-layer count, and skipped, failed,
      * cancelled and timeout must all be zero. Anything else means some layers
      * quietly ran on the GPU while the numbers described the ones that did
      * not. */
+    g_chunks++;
     fprintf(stderr,
             "ds4: ANE chunk %llu: engaged=%llu/%u skipped=%llu failed=%llu "
             "cancelled=%llu timeout=%d predict=%.1f ms (%.3f ms/engaged)\n",
