@@ -11994,6 +11994,30 @@ static int server_session_sync(server *s, server_slot *slot,
     int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
 
+    /* Batched mode rebuilds the prompt ONE QUANTUM AT A TIME, so this loop
+     * calls ds4_session_sync() dozens of times for one request -- and
+     * ds4_session_sync() takes the GLM-5.3 rollback snapshot at its end,
+     * believing itself to be at a request frontier.
+     *
+     * It cost a production TP pair. A 250966-token prefill ran ~61 syncs, each
+     * copying ~146 MiB of KDA state and mirroring a ROLLBACK_CAPTURE with an
+     * ack round-trip: roughly 8.9 GB of GPU copies and 61 control round-trips
+     * threaded through the prefill. The worker's command buffers hit
+     * kIOGPUCommandBufferCallbackErrorTimeout sixteen times and it exited,
+     * which failed the transport and took both ranks down.
+     *
+     * It also poisoned the ring it was trying to fill. Every slot ended up
+     * holding a mid-prefill position from the request in flight -- 147456,
+     * 151552, 155648 ... -- having evicted every genuine request frontier. Those
+     * positions are worthless: the next request carries the whole prompt, so a
+     * checkpoint from the middle of prefilling it can never be the thing a
+     * future divergence needs.
+     *
+     * So capture only on the LAST quantum, which is the only one that lands on
+     * a real frontier. Preserves an outer hold rather than clobbering it: the
+     * flag is a plain bool and the server nests these. */
+    const bool outer_hold = ds4_session_rollback_is_held(slot->session);
+
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (!called || done < prompt->len)) {
         int quantum = server_prefill_quantum(s);
@@ -12003,9 +12027,15 @@ static int server_session_sync(server *s, server_slot *slot,
 
         ds4_tokens prefix = *prompt;
         prefix.len = target;
-        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (!server_prefill_enter(s, slot)) {
+            ds4_session_rollback_hold(slot->session, outer_hold);
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+        ds4_session_rollback_hold(slot->session,
+                                  outer_hold || target < prompt->len);
         int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
+        ds4_session_rollback_hold(slot->session, outer_hold);
         server_prefill_leave(s);
         called = true;
         if (rc != 0) return rc;
@@ -12063,6 +12093,7 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
                                             images, image_count);
     pthread_mutex_unlock(&s->inference_mu);
     bool called = false;
+    const bool mm_outer_hold = ds4_session_rollback_is_held(slot->session);
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (!called || done < prompt->len)) {
         int quantum = server_prefill_quantum(s);
@@ -12086,11 +12117,19 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
         }
         ds4_tokens prefix = *prompt;
         prefix.len = target;
-        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (!server_prefill_enter(s, slot)) {
+            ds4_session_rollback_hold(slot->session, mm_outer_hold);
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+        /* Same defect as the text loop: one sync per quantum, and the capture
+         * lives at the end of ds4_session_sync(). See there for what it cost. */
+        ds4_session_rollback_hold(slot->session,
+                                  mm_outer_hold || target < prompt->len);
         int rc = ds4_session_sync_multimodal(slot->session, &prefix,
                                              images, prefix_images,
                                              err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
+        ds4_session_rollback_hold(slot->session, mm_outer_hold);
         server_prefill_leave(s);
         called = true;
         if (rc != 0) return rc;

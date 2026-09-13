@@ -60641,6 +60641,13 @@ void ds4_session_rollback_hold(ds4_session *s, bool hold) {
     if (s) s->glm53_rollback_held = hold;
 }
 
+/* So a caller can suppress capture over a span WITHOUT clobbering an outer
+ * suppression it does not own. The flag is a plain bool, not a count, and the
+ * server nests these. */
+bool ds4_session_rollback_is_held(const ds4_session *s) {
+    return s && s->glm53_rollback_held;
+}
+
 
 
 /* Capture the state at the current checkpoint frontier.
@@ -60945,10 +60952,12 @@ void ds4_session_glm53_rollback_drop(ds4_session *s) {
     (void)s;
 }
 
-/* The server calls this around its internal syncs unconditionally. */
+/* The server calls these around its internal syncs unconditionally. */
 void ds4_session_rollback_hold(ds4_session *s, bool hold) {
     (void)s; (void)hold;
 }
+
+bool ds4_session_rollback_is_held(const ds4_session *s) { (void)s; return false; }
 #endif
 
 static uint32_t ds4_model_normal_layer_count(void) {
