@@ -13051,20 +13051,24 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
               j->req.has_tools, false, false, false);
     if (responses_live_continuation) {
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: responses live continuation RESPPROTO match=%s ids=%d cached=%d prompt=%d",
+                   "ds4-server: responses live continuation RESPPROTO slot=%d "
+                   "match=%s ids=%d cached=%d prompt=%d",
+                   slot->id,
                    responses_live_match ? responses_live_match : "unknown",
                    responses_live_match_ids,
                    cached,
                    prompt_tokens);
     } else if (anthropic_live_continuation) {
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: anthropic live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   "ds4-server: anthropic live continuation slot=%d match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   slot->id,
                    anthropic_live_match_ids,
                    cached,
                    prompt_tokens);
     } else if (chat_live_continuation) {
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: chat live continuation match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   "ds4-server: chat live continuation slot=%d match=tool-output-ids ids=%d cached=%d prompt=%d",
+                   slot->id,
                    chat_live_match_ids,
                    cached,
                    prompt_tokens);
