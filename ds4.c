@@ -60780,21 +60780,48 @@ static void ds4_session_glm53_ckpt_slot_drop(glm53_ckpt_slot *c) {
     c->dense_len = 0;
 }
 
+/* Announce, once per distinct outcome.
+ *
+ * CKPTRING found an empty ring and could not say why: every failure path here
+ * returned false silently, and the leader's caller dropped on !local_ok with no
+ * line either. "Nothing in the log shows a capture" was uninformative because
+ * success was not logged, so absence proved nothing. This is the same gap as
+ * ANESCHED1's discarded ms/engaged -- an instrument that only reports when it
+ * is happy tells you nothing on the run that matters. Rate-limited to one line
+ * per reason per process: the capture runs at every sync frontier. */
+static void ds4_glm53_capture_say(const char *reason, int pos) {
+    static const char *seen[8];
+    static int n;
+    for (int i = 0; i < n; i++) if (seen[i] == reason) return;
+    if (n < 8) seen[n++] = reason;
+    fprintf(stderr, "ds4: GLM checkpoint capture %s (pos %d)\n", reason, pos);
+}
+
 bool ds4_session_glm53_rollback_capture(ds4_session *s) {
-    if (!ds4_session_glm53_rollback_supported(s)) return false;
+    const int pos = s ? s->checkpoint.len : -1;
+    if (!ds4_session_glm53_rollback_supported(s)) {
+        ds4_glm53_capture_say(
+            !s ? "skipped: no session"
+               : !s->glm_graph_ready ? "skipped: graph not ready"
+               : !s->glm_graph.glm53 ? "skipped: not GLM-5.3"
+               : "skipped: disabled by DS4_GLM_KDA_ROLLBACK=0", pos);
+        return false;
+    }
     ds4_glm_gpu_graph *g = &s->glm_graph;
     const uint64_t kda_bytes = glm53_graph_kda_state_bytes(g);
     const uint64_t idx_bytes = glm53_graph_index_tail_bytes(g);
-    if (kda_bytes == 0) return false;
+    if (kda_bytes == 0) {
+        ds4_glm53_capture_say("FAILED: kda_state_bytes == 0 -- no KDA state "
+                              "tensors on this graph", pos);
+        return false;
+    }
 
-    const int pos = s->checkpoint.len;
     glm53_ckpt_slot *c = &s->glm53_ckpt[ds4_glm53_ckpt_slot_for(pos)];
 
     if (!c->kda) {
         c->kda = ds4_gpu_tensor_alloc(kda_bytes);
         if (!c->kda) {
-            fprintf(stderr, "ds4: GLM checkpoint alloc failed (%llu bytes)\n",
-                    (unsigned long long)kda_bytes);
+            ds4_glm53_capture_say("FAILED: kda slot alloc", pos);
             return false;
         }
     }
@@ -60802,20 +60829,28 @@ bool ds4_session_glm53_rollback_capture(ds4_session *s) {
         c->index = ds4_gpu_tensor_alloc(idx_bytes);
         if (!c->index) {
             ds4_session_glm53_ckpt_slot_drop(c);
+            ds4_glm53_capture_say("FAILED: index slot alloc", pos);
             return false;
         }
     }
     if (!c->logits) {
         c->logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
-        if (!c->logits) return false;
+        if (!c->logits) {
+            ds4_glm53_capture_say("FAILED: logits alloc", pos);
+            return false;
+        }
     }
 
-    if (!glm53_graph_copy_kda_state_to(g, c->kda, true) ||
-        (idx_bytes != 0 && !glm53_graph_copy_index_tail(g, c->index, true)))
-    {
+    if (!glm53_graph_copy_kda_state_to(g, c->kda, true)) {
         /* A half-written slot must not be reachable: the restore that found it
          * would apply a mixed state, which is worse than re-prefilling. */
         ds4_session_glm53_ckpt_slot_drop(c);
+        ds4_glm53_capture_say("FAILED: copy_kda_state_to", pos);
+        return false;
+    }
+    if (idx_bytes != 0 && !glm53_graph_copy_index_tail(g, c->index, true)) {
+        ds4_session_glm53_ckpt_slot_drop(c);
+        ds4_glm53_capture_say("FAILED: copy_index_tail", pos);
         return false;
     }
     if (s->logits) {
@@ -60826,6 +60861,7 @@ bool ds4_session_glm53_rollback_capture(ds4_session *s) {
     c->token_hash = ds4_session_token_hash(&s->checkpoint, pos);
     s->glm53_rollback_pos = pos;
     s->glm53_rollback_valid = true;
+    ds4_glm53_capture_say("ok", pos);
     return true;
 }
 
@@ -73304,6 +73340,17 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                     s->engine->tp.ctx, s->tp_session_id, "rollback capture",
                     &wstatus, terr, sizeof(terr));
             if (!local_ok || !sent || !acked || wstatus != 0) {
+                /* Name which half failed. The leader's own !local_ok dropped
+                 * silently while the worker's refusal logged, so an empty
+                 * leader ring beside a populated worker ring -- which is
+                 * exactly what a leader-only capture failure produces, and
+                 * exactly what disables the restore -- looked identical to
+                 * "nothing was ever attempted". */
+                fprintf(stderr,
+                        "ds4: GLM checkpoint capture DROPPED at %d: local=%d "
+                        "sent=%d acked=%d worker_status=%d\n",
+                        s->checkpoint.len, local_ok ? 1 : 0, sent ? 1 : 0,
+                        acked ? 1 : 0, wstatus);
                 /* Either rank without a snapshot means neither may claim one:
                  * a later RESTORE the peer cannot serve costs a forced
                  * invalidate of both.  Drop ours and fall back to the old
@@ -73312,6 +73359,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                 if (!sent) ds4_tp_mark_failed(s->engine->tp.ctx);
             }
         } else if (!local_ok) {
+            fprintf(stderr, "ds4: GLM checkpoint capture DROPPED at %d "
+                            "(single rank, local capture failed)\n",
+                    s->checkpoint.len);
             ds4_session_glm53_rollback_drop(s);
         }
     }
