@@ -126,6 +126,33 @@ int ds4_ane_mode(void) {
 
 static void *ds4_ane_sidecar_thread(void *ud);
 
+/* A sidecar that silently declines to run is the most dangerous outcome under
+ * TP2, and ANESIDE3 is what that looks like: the models existed only on the
+ * coordinator, so the worker's init failed, fell back to the GPU path and ran
+ * at full speed while the coordinator stalled ~14 ms per layer in Core ML.
+ * Roughly 590 ms of ONE-SIDED skew per chunk against a 750 ms gate budget ends
+ * as "big gate window barrier failed" -- which reads as a transport fault and
+ * is actually a missing directory on one host.
+ *
+ * So an explicitly requested sidecar that cannot start is fatal by default.
+ * Failing loudly on one rank is recoverable; running on one rank is not. */
+static void ds4_ane_required_abort(const char *why) {
+    if (getenv("DS4_ANE_OPTIONAL")) {
+        fprintf(stderr, "ds4: ANE sidecar unavailable (%s) -- continuing on the "
+                        "GPU path because DS4_ANE_OPTIONAL is set. Under TP this "
+                        "is only safe if EVERY rank is also without it.\n", why);
+        return;
+    }
+    fprintf(stderr,
+            "ds4: FATAL: ANE sidecar was requested but cannot start (%s).\n"
+            "ds4:   Refusing to fall back silently: under TP2 a sidecar running\n"
+            "ds4:   on one rank and not the other skews the gate window and\n"
+            "ds4:   surfaces as 'big gate window barrier failed', which looks\n"
+            "ds4:   like a transport fault and is not one.\n"
+            "ds4:   Set DS4_ANE_OPTIONAL=1 to allow the fallback.\n", why);
+    exit(1);
+}
+
 static void ds4_ane_teardown(void) {
     if (g_fast_running) {
         __atomic_store_n(&g_fast_stop, 1, __ATOMIC_RELEASE);
@@ -177,8 +204,10 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
 
     void *in_ptr = NULL, *out_ptr = NULL;
     if (!ds4_gpu_ane_stage_alloc(dim, n_tokens, &in_ptr, &out_ptr)) {
-        fprintf(stderr, "ds4: ANE staging alloc failed (dim=%u tok=%u)\n",
-                dim, n_tokens);
+        char why[128];
+        snprintf(why, sizeof(why), "staging alloc failed (dim=%u tok=%u)",
+                 dim, n_tokens);
+        ds4_ane_required_abort(why);
         return 0;
     }
 
@@ -192,8 +221,8 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
         if (ds4_ane_mode() >= DS4_ANE_SHADOW && !ds4_ane_test_hook()) {
             const char *dir = getenv("DS4_ANE_MODEL_DIR");
             if (!dir || !dir[0]) {
-                fprintf(stderr, "ds4: ANE shadow needs DS4_ANE_MODEL_DIR\n");
                 ds4_ane_teardown();
+                ds4_ane_required_abort("DS4_ANE_MODEL_DIR is unset");
                 return 0;
             }
             /* Which graph shape to load. ANEIO3 measured _k2 at -30% against
@@ -227,14 +256,14 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
              * plausible per-prediction cost, measured over the layers that
              * happened to work. */
             if (loaded != n_layers) {
-                fprintf(stderr, "ds4: ANE loaded %u of %u %s models under %s "
-                                "-- refusing to run partially\n",
-                        loaded, n_layers, variant, dir);
+                char why[512];
+                snprintf(why, sizeof(why), "loaded %u of %u %s models under %s",
+                         loaded, n_layers, variant, dir);
                 ds4_ane_teardown();
+                ds4_ane_required_abort(why);
                 return 0;
             }
-            fprintf(stderr, "ds4: ANE loaded %u/%u shared-expert models "
-                            "(variant=%s M=%u) from %s\n",
+            fprintf(stderr, "ds4: ANE READY loaded=%u/%u variant=%s M=%u dir=%s\n",
                     loaded, n_layers, variant, n_tokens, dir);
             fprintf(stderr, "ds4: ANE shadow weights are SYNTHETIC -- the "
                             "divergence below is expected to be large and the "
