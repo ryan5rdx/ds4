@@ -59435,6 +59435,22 @@ struct ds4_session {
      * snapshot at all: their KV is position-addressable and simply gets
      * overwritten from the restore point. */
     glm53_ckpt_slot glm53_ckpt[DS4_GLM53_CKPT_SLOTS];
+    /* The interrupt-recovery snapshot, deliberately OUTSIDE the ring above.
+     *
+     * Two different jobs were being served by one mechanism and it cost both.
+     * ds4_session_sync() is called once per prefill QUANTUM, and the
+     * interrupted-prefill path rewinds to pre_sync_len -- the previous
+     * quantum's frontier -- so recovery needs a snapshot at every quantum.
+     * The prefix-cache ring needs the opposite: request frontiers only, since
+     * a checkpoint from the middle of prefilling a prompt can never be what a
+     * later divergence wants.
+     *
+     * Capturing into the ring on every quantum (the original behaviour)
+     * poisoned it and helped kill a TP pair on GPU command-buffer timeouts.
+     * Capturing once per request (16d58cd) fixed that and silently broke
+     * interrupt recovery, so a cron landing mid-prefill dropped the whole
+     * conversation and restarted from zero. This slot separates them. */
+    glm53_ckpt_slot glm53_rolling;
     /* Cursor into the recent-FIFO half of the ring (see ckpt_slot_for_capture).
      * Advances identically on both ranks because captures are mirrored. */
     uint32_t glm53_ckpt_recent_cursor;
@@ -60800,6 +60816,7 @@ void ds4_session_glm53_rollback_drop(ds4_session *s) {
     for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
         ds4_session_glm53_ckpt_slot_drop(&s->glm53_ckpt[i]);
     }
+    ds4_session_glm53_ckpt_slot_drop(&s->glm53_rolling);
     s->glm53_ckpt_recent_cursor = 0;
     s->glm53_rollback_valid = false;
     s->glm53_rollback_pos = -1;
@@ -60862,6 +60879,57 @@ static void ds4_glm53_capture_say(const char *reason, int pos) {
     fprintf(stderr, "ds4: GLM checkpoint capture %s (pos %d, #1)\n", reason, pos);
 }
 
+/* Write the session's current GLM-5.3 state into `c`. Shared by the ring and
+ * by the interrupt-recovery slot, which differ only in WHERE they store, never
+ * in what a snapshot contains. */
+static bool ds4_session_glm53_ckpt_fill(ds4_session *s, glm53_ckpt_slot *c,
+                                        int pos) {
+    ds4_glm_gpu_graph *g = &s->glm_graph;
+    const uint64_t kda_bytes = glm53_graph_kda_state_bytes(g);
+    const uint64_t idx_bytes = glm53_graph_index_tail_bytes(g);
+    if (!c->kda) {
+        c->kda = ds4_gpu_tensor_alloc(kda_bytes);
+        if (!c->kda) {
+            ds4_glm53_capture_say("FAILED: kda slot alloc", pos);
+            return false;
+        }
+    }
+    if (idx_bytes != 0 && !c->index) {
+        c->index = ds4_gpu_tensor_alloc(idx_bytes);
+        if (!c->index) {
+            ds4_session_glm53_ckpt_slot_drop(c);
+            ds4_glm53_capture_say("FAILED: index slot alloc", pos);
+            return false;
+        }
+    }
+    if (!c->logits) {
+        c->logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+        if (!c->logits) {
+            ds4_glm53_capture_say("FAILED: logits alloc", pos);
+            return false;
+        }
+    }
+    if (!glm53_graph_copy_kda_state_to(g, c->kda, true)) {
+        /* A half-written slot must not be reachable: the restore that found it
+         * would apply a mixed state, which is worse than re-prefilling. */
+        ds4_session_glm53_ckpt_slot_drop(c);
+        ds4_glm53_capture_say("FAILED: copy_kda_state_to", pos);
+        return false;
+    }
+    if (idx_bytes != 0 && !glm53_graph_copy_index_tail(g, c->index, true)) {
+        ds4_session_glm53_ckpt_slot_drop(c);
+        ds4_glm53_capture_say("FAILED: copy_index_tail", pos);
+        return false;
+    }
+    if (s->logits) {
+        memcpy(c->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    }
+    c->pos = pos;
+    c->dense_len = s->glm_dense_cache_len;
+    c->token_hash = ds4_session_token_hash(&s->checkpoint, pos);
+    return true;
+}
+
 bool ds4_session_glm53_rollback_capture(ds4_session *s) {
     const int pos = s ? s->checkpoint.len : -1;
     if (!ds4_session_glm53_rollback_supported(s)) {
@@ -60874,11 +60942,23 @@ bool ds4_session_glm53_rollback_capture(ds4_session *s) {
     }
     ds4_glm_gpu_graph *g = &s->glm_graph;
     const uint64_t kda_bytes = glm53_graph_kda_state_bytes(g);
-    const uint64_t idx_bytes = glm53_graph_index_tail_bytes(g);
     if (kda_bytes == 0) {
         ds4_glm53_capture_say("FAILED: kda_state_bytes == 0 -- no KDA state "
                               "tensors on this graph", pos);
         return false;
+    }
+
+    /* A HELD capture is an intermediate prefill quantum: it must still leave a
+     * snapshot for interrupt recovery, but must NOT claim a ring slot. */
+    if (s->glm53_rollback_held) {
+        glm53_ckpt_slot *r = &s->glm53_rolling;
+        if (!ds4_session_glm53_ckpt_fill(s, r, pos)) {
+            ds4_session_glm53_ckpt_slot_drop(r);
+            return false;
+        }
+        s->glm53_rollback_pos = pos;
+        s->glm53_rollback_valid = true;
+        return true;
     }
 
     /* Banded slot if this frontier is the first in its band, FIFO otherwise.
@@ -60912,47 +60992,7 @@ bool ds4_session_glm53_rollback_capture(ds4_session *s) {
                 slot_i, slot_i < recent_n ? "recent" : "banded", c->pos, pos);
     }
 
-    if (!c->kda) {
-        c->kda = ds4_gpu_tensor_alloc(kda_bytes);
-        if (!c->kda) {
-            ds4_glm53_capture_say("FAILED: kda slot alloc", pos);
-            return false;
-        }
-    }
-    if (idx_bytes != 0 && !c->index) {
-        c->index = ds4_gpu_tensor_alloc(idx_bytes);
-        if (!c->index) {
-            ds4_session_glm53_ckpt_slot_drop(c);
-            ds4_glm53_capture_say("FAILED: index slot alloc", pos);
-            return false;
-        }
-    }
-    if (!c->logits) {
-        c->logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
-        if (!c->logits) {
-            ds4_glm53_capture_say("FAILED: logits alloc", pos);
-            return false;
-        }
-    }
-
-    if (!glm53_graph_copy_kda_state_to(g, c->kda, true)) {
-        /* A half-written slot must not be reachable: the restore that found it
-         * would apply a mixed state, which is worse than re-prefilling. */
-        ds4_session_glm53_ckpt_slot_drop(c);
-        ds4_glm53_capture_say("FAILED: copy_kda_state_to", pos);
-        return false;
-    }
-    if (idx_bytes != 0 && !glm53_graph_copy_index_tail(g, c->index, true)) {
-        ds4_session_glm53_ckpt_slot_drop(c);
-        ds4_glm53_capture_say("FAILED: copy_index_tail", pos);
-        return false;
-    }
-    if (s->logits) {
-        memcpy(c->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
-    }
-    c->pos = pos;
-    c->dense_len = s->glm_dense_cache_len;
-    c->token_hash = ds4_session_token_hash(&s->checkpoint, pos);
+    if (!ds4_session_glm53_ckpt_fill(s, c, pos)) return false;
     s->glm53_rollback_pos = pos;
     s->glm53_rollback_valid = true;
     ds4_glm53_capture_say("ok", pos);
@@ -60982,6 +61022,14 @@ static const glm53_ckpt_slot *ds4_session_glm53_ckpt_find(const ds4_session *s,
         if (c->pos != pos || c->pos < 0) continue;
         if (ds4_session_token_hash(&s->checkpoint, pos) != c->token_hash) continue;
         return c;
+    }
+    /* The interrupt-recovery slot is searched last: it is the one a rewind to
+     * pre_sync_len lands on mid-prefill, and it holds a position no ring slot
+     * does. */
+    const glm53_ckpt_slot *r = &s->glm53_rolling;
+    if (r->pos == pos && r->pos >= 0 &&
+        ds4_session_token_hash(&s->checkpoint, pos) == r->token_hash) {
+        return r;
     }
     return NULL;
 }
