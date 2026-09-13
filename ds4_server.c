@@ -11151,6 +11151,44 @@ static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
     return "live-prefix-match";
 }
 
+/* The same window as text.
+ *
+ * diverge=2610/785 says two ids differ and nothing about WHY, and the why is
+ * the whole question: a client that truncated an earlier tool result, one that
+ * moved a cache_control breakpoint, and one that re-rendered a timestamp all
+ * produce a mid-prefix divergence and need completely different fixes. Rendering
+ * the window around the split names the edit directly. Escaped and bounded,
+ * because this is a log line and the payload is arbitrary user text. */
+static void trace_cache_diverge_text(ds4_engine *engine,
+                                     const trace_cache_diag *d,
+                                     char *live_out, char *prompt_out,
+                                     size_t out_sz) {
+    live_out[0] = prompt_out[0] = '\0';
+    if (!engine || !d || !d->valid || d->count <= 0) return;
+    for (int side = 0; side < 2; side++) {
+        const int *ids = side ? d->prompt_id : d->live_id;
+        char *out = side ? prompt_out : live_out;
+        size_t used = 0;
+        for (int i = 0; i < d->count && used + 8 < out_sz; i++) {
+            if (ids[i] < 0) continue;
+            size_t len = 0;
+            char *piece = ds4_token_text(engine, ids[i], &len);
+            if (!piece) continue;
+            for (size_t k = 0; k < len && used + 8 < out_sz; k++) {
+                const unsigned char c = (unsigned char)piece[k];
+                if (c == '\n')      { out[used++] = '\\'; out[used++] = 'n'; }
+                else if (c == '\t') { out[used++] = '\\'; out[used++] = 't'; }
+                else if (c < 0x20 || c == 0x7f) {
+                    used += (size_t)snprintf(out + used, out_sz - used, "\\x%02x", c);
+                } else if (c == '"') { out[used++] = '\\'; out[used++] = '"'; }
+                else                 { out[used++] = (char)c; }
+            }
+            free(piece);
+        }
+        out[used < out_sz ? used : out_sz - 1] = '\0';
+    }
+}
+
 /* First token ids that differ, for the cache-miss log.  The capture window is
  * centred on `common`, so the divergent pair is at that offset when it is in
  * range; -1 means "past the end of that side". */
@@ -12973,6 +13011,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * pair that differs, which pins the divergence to a concrete edit. */
         int live_tok = -1, prompt_tok = -1;
         trace_cache_diverge_tokens(&cache_diag, &live_tok, &prompt_tok);
+        char live_txt[192], prompt_txt[192];
+        trace_cache_diverge_text(s->engine, &cache_diag,
+                                 live_txt, prompt_txt, sizeof(live_txt));
         server_log(DS4_LOG_WARNING,
                    "ds4-server: live kv cache miss%s slot=%d live=%d prompt=%d common=%d lost=%d vision=%s reason=%s diverge=%d/%d tool_replay=mem:%d/disk:%d/canonical:%d/missing:%d",
                    responses_protocol ? " RESPPROTO" : "",
@@ -12984,7 +13025,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    j->req.tool_replay.mem,
                    j->req.tool_replay.disk,
                    j->req.tool_replay.canonical,
-                   j->req.tool_replay.missing_ids);
+                   j->req.tool_replay.missing_ids,
+                   live_txt, prompt_txt);
     }
     if (multimodal && cached > 0) {
         server_log(DS4_LOG_KVCACHE,
