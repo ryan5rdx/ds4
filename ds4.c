@@ -73370,10 +73370,25 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
  * checkpoint is already valid at ck by the time its own sync arrives. Deriving
  * the position independently on both ranks is exactly the asymmetry
  * rewind_core exists to remove. */
+/* The one switch that turns OFF restoring from the ring without turning off the
+ * rollback machinery itself.
+ *
+ * DS4_GLM_KDA_ROLLBACK=0 would also disable the single-snapshot rewind that
+ * speculative decode and interrupt recovery depend on, so it is the wrong
+ * instrument for backing out this feature specifically. This one leaves capture
+ * and spec-decode rewind intact and only declines to resume a DIVERGED prompt,
+ * which restores exactly the pre-ring behaviour: full re-prefill on any
+ * mid-prefix divergence, slow but never wrong. */
+static int ds4_glm53_ckpt_restore_enabled(void) {
+    const char *e = getenv("DS4_GLM53_CKPT_RESTORE");
+    return !(e && e[0] == '0');
+}
+
 static void ds4_session_glm53_restore_before_sync(ds4_session *s,
                                                   const ds4_tokens *prompt) {
     if (!s || !prompt || prompt->len <= 0) return;
     if (!ds4_session_glm53_rollback_supported(s)) return;
+    if (!ds4_glm53_ckpt_restore_enabled()) return;
     if (ds4_session_tp_worker(s)) return;
     /* A prompt that already extends the checkpoint is the cache-hit path and
      * needs nothing from the ring. */
