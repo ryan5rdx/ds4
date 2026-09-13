@@ -651,6 +651,12 @@ int ds4_session_rollback_frontier(ds4_session *s);
  * Every resident slot that has synced holds one, so multiply by slot count. */
 uint64_t ds4_glm53_rollback_session_bytes(void);
 uint32_t ds4_glm53_ckpt_slot_count(void);
+/* Resume a diverged prompt from the checkpoint ring. `common` must be the
+ * caller's authoritative divergence position against the live session, not a
+ * chunk boundary. Returns the landing position, or 0 if nothing was restored.
+ * Leader-only; mirrors a REWIND, so it must not be called inside a SYNC. */
+int ds4_session_glm53_try_restore(ds4_session *s, const ds4_tokens *prompt,
+                                  int common);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
 uint32_t ds4_session_raw_rewind_budget(const ds4_session *s);
