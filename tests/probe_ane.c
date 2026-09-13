@@ -107,8 +107,50 @@ int main(void) {
         }
     }
 
-    printf("\n%s\n", (bad_t || bad_r || bad_a) ? "FAIL" : "PASS: bridge kernels exact");
-    return (bad_t || bad_r || bad_a) ? 1 : 0;
+    /* 6. ROW IDENTITY. Under S8 each rank packs its own half of the chunk --
+     *    rank 0 rows [0,2048), rank 1 rows [2048,4096) -- and a wrong offset
+     *    produces a full, plausible tensor of the WRONG tokens. The transpose
+     *    tests above would not notice: they check shape and values, not which
+     *    source rows were read. Stamp each row with its index and verify the
+     *    packed surface carries the expected half. */
+    int row_bad = 0;
+    {
+        const uint32_t D = 64, ROWS = 8, HALF = ROWS / 2;
+        void *rin = NULL, *rout = NULL;
+        if (ds4_gpu_ane_stage_alloc(D, HALF, &rin, &rout)) {
+            ds4_gpu_tensor *full = ds4_gpu_tensor_alloc((uint64_t)D * ROWS * sizeof(float));
+            if (full) {
+                float *fp = ds4_gpu_tensor_contents(full);
+                for (uint32_t t = 0; t < ROWS; ++t)
+                    for (uint32_t d = 0; d < D; ++d)
+                        fp[t * D + d] = (float)t;      /* every element = its row */
+                for (uint32_t rank = 0; rank < 2; ++rank) {
+                    const uint32_t row0 = rank * HALF;
+                    ds4_gpu_tensor *view = ds4_gpu_tensor_view(
+                            full, (uint64_t)row0 * D * sizeof(float),
+                            (uint64_t)HALF * D * sizeof(float));
+                    ds4_gpu_begin_commands();
+                    const int okp = view && ds4_gpu_ane_pack(view, D, HALF);
+                    ds4_gpu_end_commands();
+                    if (!okp) { row_bad++; if (view) ds4_gpu_tensor_free(view); continue; }
+                    const uint16_t *h = (const uint16_t *)rin;
+                    int wrong = 0;
+                    for (uint32_t d = 0; d < D; ++d)
+                        for (uint32_t t = 0; t < HALF; ++t) {
+                            _Float16 v; __builtin_memcpy(&v, &h[(size_t)d * HALF + t], 2);
+                            if (fabsf((float)v - (float)(row0 + t)) > 1e-3f) wrong++;
+                        }
+                    printf("rowid  : rank %u packs rows [%u,%u) -> %s (%d wrong)\n",
+                           rank, row0, row0 + HALF, wrong ? "FAIL" : "ok", wrong);
+                    if (wrong) row_bad++;
+                    ds4_gpu_tensor_free(view);
+                }
+            }
+        } else row_bad++;
+    }
+
+    printf("\n%s\n", (bad_t || bad_r || bad_a || row_bad) ? "FAIL" : "PASS: bridge kernels exact");
+    return (bad_t || bad_r || bad_a || row_bad) ? 1 : 0;
 }
 /* Stubs: ds4_metal.o references these from ds4.c, which the probe omits. */
 int ds4_log_is_tty(void) { return 0; }

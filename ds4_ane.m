@@ -322,6 +322,21 @@ static void ds4_ane_chunk_boundary(void) {
     if (g_engaged || g_skipped || g_failed) { ds4_ane_report(); ds4_ane_reset(); }
 }
 
+/* Count COMPLETIONS, not encoder-side layer-0 arrivals.
+ *
+ * Reporting at the next layer 0 left the final chunk of a run unreported
+ * unless the process exited cleanly -- and the harness SIGKILLs the worker, so
+ * the worker's last chunk was always lost. It also read counters the sidecar
+ * thread was concurrently writing. Now the thread that owns the counters is
+ * the one that decides a chunk is done, at every n-th completion, so there is
+ * no cross-thread read and no dependence on exit. */
+static uint32_t g_completed;
+static void ds4_ane_note_completion(void) {
+    if (++g_completed < g_expect_layers || g_expect_layers == 0) return;
+    g_completed = 0;
+    ds4_ane_chunk_boundary();
+}
+
 /* The authoritative line, via atexit so it does not depend on a caller either.
  * Drains the ring first: in FAST the sidecar is asynchronous, so a prediction
  * from the final chunk can still be in flight and would otherwise be counted
@@ -414,6 +429,7 @@ static void *ds4_ane_sidecar_thread(void *ud) {
             g_skipped++;
         }
         g_ns_predict += ds4_ane_now_ns() - t0;
+        ds4_ane_note_completion();
         /* Release-store: everything Core ML wrote to the output surface must be
          * visible to the GPU before it sees DONE. */
         __atomic_store_n(&w[1], seq, __ATOMIC_RELEASE);
@@ -428,9 +444,6 @@ int ds4_ane_begin_layer(uint32_t il) {
     if (!m && !ds4_ane_test_hook() && ds4_ane_mode() != DS4_ANE_FASTNULL) {
         g_skipped++; return 0;
     }
-
-    /* Logical layer 0 means a new chunk started: flush the previous one. */
-    if (il == 0) ds4_ane_chunk_boundary();
 
     if (ds4_ane_mode() >= DS4_ANE_FAST) {
         /* Enqueue. Backpressure rather than overwrite: the ring holds 128 and
@@ -476,6 +489,7 @@ int ds4_ane_begin_layer(uint32_t il) {
                 g_failed++;
             }
             g_ns_predict += ds4_ane_now_ns() - t0;
+            ds4_ane_note_completion();
         }
         dispatch_semaphore_signal(done);
     });

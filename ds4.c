@@ -51273,9 +51273,26 @@ static bool glm_graph_encode_ffn_batch(
      * production row count. */
     const uint32_t ane_rows = shared_row_split ? shared_rows : n_tokens;
     const uint32_t ane_row0 = shared_row_split ? shared_row0 : 0u;
+    /* A Core ML model's M is fixed at conversion. Short final chunks, resumed
+     * suffixes and a disabled S8 all produce a different ane_rows, and a
+     * mismatched shape does not reshape -- it skips, which shows up as a
+     * shortfall the harness then VOIDs on. Engage only at the exact production
+     * shape until the generator emits a padded model with a valid_rows input. */
+    const int ane_shape_ok = (n_tokens == 4096u && shared_row_split &&
+                              ane_rows == 2048u);
     const int ane_sidecar = ok && !shared_done && ds4_ane_mode() != DS4_ANE_OFF &&
-                            ane_li < ane_sparse && ane_rows > 0u &&
+                            ane_li < ane_sparse && ane_shape_ok &&
                             ds4_ane_init(ane_sparse, (uint32_t)DS4_N_EMBD, ane_rows);
+    if (ok && !shared_done && ds4_ane_mode() != DS4_ANE_OFF &&
+        ane_li < ane_sparse && !ane_shape_ok) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr, "ds4: ANE sidecar idle: n_tokens=%u rows=%u split=%d "
+                            "-- models are M=2048 at a 4096 chunk under S8\n",
+                    n_tokens, ane_rows, shared_row_split ? 1 : 0);
+        }
+    }
     uint32_t ane_seq = 0;
     int ane_started = 0;
     if (ane_sidecar) {
@@ -51334,14 +51351,19 @@ static bool glm_graph_encode_ffn_batch(
         } else {
             ok = glm_graph_prefill_stage_sync_boundary();
             if (ok && ds4_ane_mode() >= DS4_ANE_BRIDGE) {
+                /* A dropped row view or a rejected pack used to be ignored
+                 * here, so a failed dispatch still produced an "engaged" run
+                 * with plausible timings and nothing measured. */
                 ds4_gpu_tensor *ane_src = glm_graph_tensor_row_view_strided(
                         g->batch_ffn_norm, ane_row0, DS4_N_EMBD,
                         (uint64_t)ane_rows * DS4_N_EMBD);
-                if (ane_src) {
-                    ds4_gpu_ane_pack(ane_src, (uint32_t)DS4_N_EMBD, ane_rows);
-                    ds4_gpu_tensor_free(ane_src);
+                ok = ane_src && ds4_gpu_ane_pack(ane_src, (uint32_t)DS4_N_EMBD,
+                                                 ane_rows) != 0;
+                if (ane_src) ds4_gpu_tensor_free(ane_src);
+                if (!ok) {
+                    fprintf(stderr, "ds4: ANE bridge pack failed (layer %u)\n", il);
                 }
-                ok = glm_graph_prefill_stage_sync_boundary();
+                if (ok) ok = glm_graph_prefill_stage_sync_boundary();
             }
             if (ok) ane_started = ds4_ane_begin_layer(ane_li);
         }
@@ -51477,7 +51499,10 @@ static bool glm_graph_encode_ffn_batch(
              * authoritative in every mode this file supports and the sidecar's
              * weights are synthetic, so the result must not reach anything
              * load-bearing -- that would produce fluent, wrong text. */
-            ds4_gpu_ane_unpack(NULL, (uint32_t)DS4_N_EMBD, ane_rows, 0);
+            if (!ds4_gpu_ane_unpack(NULL, (uint32_t)DS4_N_EMBD, ane_rows, 0)) {
+                fprintf(stderr, "ds4: ANE bridge unpack failed (layer %u)\n", il);
+                ok = 0;
+            }
         }
         /* The divergence sample used to key on il == 0, which is DENSE and
          * returns long before this path -- so it never ran once. It is gone
