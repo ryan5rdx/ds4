@@ -83,3 +83,4 @@ tests/bench_*
 tests/probe_ane
 tests/probe_ane_handoff
 tests/probe_cpu_shexp
+tests/probe_qb_slice
