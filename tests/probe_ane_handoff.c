@@ -182,6 +182,7 @@ int main(void) {
             if (!ds4_gpu_ane_pack(src, DIM, NTOK)) break;
             if (!ds4_ane_begin_layer(l)) break;
             if (!ds4_gpu_ane_publish_ready(sq)) { ds4_ane_cancel_layer(l); break; }
+            ds4_ane_commit_layer();
             if (!ds4_gpu_ane_fence_done(sq)) break;
             if (!ds4_gpu_ane_unpack(dst, DIM, NTOK, 0)) break;
         }

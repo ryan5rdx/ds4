@@ -113,12 +113,13 @@ int ds4_ane_mode(void) {
     if (e && e[0]) {
         if      (!strcmp(e, "probe"))  g_mode = DS4_ANE_PROBE;
         else if (!strcmp(e, "fast"))   g_mode = DS4_ANE_FAST;
+        else if (!strcmp(e, "fastnull")) g_mode = DS4_ANE_FASTNULL;
         else if (!strcmp(e, "bridge")) g_mode = DS4_ANE_BRIDGE;
         else if (!strcmp(e, "shadow")) g_mode = DS4_ANE_SHADOW;
         else if (!strcmp(e, "0") || !strcmp(e, "off")) g_mode = DS4_ANE_OFF;
         else {
             fprintf(stderr, "ds4: DS4_METAL_ANE_SHEXP=%s unrecognised "
-                            "(probe|bridge|shadow|fast|off) -- sidecar off\n", e);
+                            "(probe|bridge|shadow|fast|fastnull|off) -- sidecar off\n", e);
         }
     }
     if (g_mode != DS4_ANE_OFF) {
@@ -222,7 +223,13 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
 
         /* PROBE and BRIDGE deliberately load nothing: they price the fence and
          * the layout conversion, and a Core ML load would contaminate both. */
-        if (ds4_ane_mode() >= DS4_ANE_SHADOW && !ds4_ane_test_hook()) {
+        /* FASTNULL loads nothing on purpose: it is FAST's seam -- pack, ring,
+         * release-word fence, unpack -- with the prediction removed, so
+         * fast-null vs off is the fixed cost and fast vs fast-null is Core ML.
+         * ANESIDE5B could not separate those and the k2 projection depends
+         * entirely on which one the 4.8 ms/layer belongs to. */
+        if (ds4_ane_mode() >= DS4_ANE_SHADOW &&
+            ds4_ane_mode() != DS4_ANE_FASTNULL && !ds4_ane_test_hook()) {
             const char *dir = getenv("DS4_ANE_MODEL_DIR");
             if (!dir || !dir[0]) {
                 ds4_ane_teardown();
@@ -275,7 +282,7 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
         }
 
         g_queue = dispatch_queue_create("ds4.ane.shexp", DISPATCH_QUEUE_SERIAL);
-        if (ds4_ane_mode() == DS4_ANE_FAST && !g_fast_running) {
+        if (ds4_ane_mode() >= DS4_ANE_FAST && !g_fast_running) {
             __atomic_store_n(&g_fast_stop, 0, __ATOMIC_RELEASE);
             g_ring_head = g_ring_tail = 0; g_backpressure = 0;
             g_ring_sem = dispatch_semaphore_create(0);
@@ -399,7 +406,7 @@ static void *ds4_ane_sidecar_thread(void *ud) {
                 if (inp && [m predictionFromFeatures:inp options:opts error:&err]) g_engaged++;
                 else g_failed++;
             }
-        } else if (ds4_ane_test_hook()) {
+        } else if (ds4_ane_test_hook() || ds4_ane_mode() == DS4_ANE_FASTNULL) {
             if (g_test_n < DS4_ANE_TEST_LOG) g_test_served[g_test_n] = seq;
             g_test_n++;
             g_engaged++;
@@ -418,12 +425,14 @@ int ds4_ane_begin_layer(uint32_t il) {
     if (!g_ready || il >= g_n_layers) return 0;
     if (ds4_ane_mode() < DS4_ANE_SHADOW) return 0;
     MLModel *m = g_models[il];
-    if (!m && !ds4_ane_test_hook()) { g_skipped++; return 0; }
+    if (!m && !ds4_ane_test_hook() && ds4_ane_mode() != DS4_ANE_FASTNULL) {
+        g_skipped++; return 0;
+    }
 
     /* Logical layer 0 means a new chunk started: flush the previous one. */
     if (il == 0) ds4_ane_chunk_boundary();
 
-    if (ds4_ane_mode() == DS4_ANE_FAST) {
+    if (ds4_ane_mode() >= DS4_ANE_FAST) {
         /* Enqueue. Backpressure rather than overwrite: the ring holds 128 and
          * a chunk is 42 layers, so this should never spin -- if it does, the
          * host has run further ahead than the design assumed, and that is
@@ -436,7 +445,7 @@ int ds4_ane_begin_layer(uint32_t il) {
         g_ring[h % DS4_ANE_RING].seq = g_seq;
         g_ring[h % DS4_ANE_RING].model = m;
         __atomic_store_n(&g_ring_head, h + 1u, __ATOMIC_RELEASE);
-        dispatch_semaphore_signal(g_ring_sem);
+        /* NO signal here -- see ds4_ane_commit_layer(). */
         g_started[il] = 1;
         return 1;
     }
@@ -477,8 +486,18 @@ int ds4_ane_begin_layer(uint32_t il) {
  * released it could not be encoded: the alternative is a sidecar blocked
  * forever on a READY nobody will write. Safe because the producer is single
  * -- only the encoding thread enqueues. */
+/* Wake the sidecar for the request enqueued by the last begin_layer. Split
+ * from the enqueue because cancel used to rewind g_ring_head AFTER signalling,
+ * which races a consumer that may already have taken the slot. With the signal
+ * held back until the publish is encoded, a cancel is a pure single-producer
+ * rewind and cannot race anything. */
+void ds4_ane_commit_layer(void) {
+    if (!g_ready || ds4_ane_mode() < DS4_ANE_FAST) return;
+    dispatch_semaphore_signal(g_ring_sem);
+}
+
 void ds4_ane_cancel_layer(uint32_t il) {
-    if (!g_ready || ds4_ane_mode() != DS4_ANE_FAST) return;
+    if (!g_ready || ds4_ane_mode() < DS4_ANE_FAST) return;
     const uint64_t h = __atomic_load_n(&g_ring_head, __ATOMIC_ACQUIRE);
     if (h == __atomic_load_n(&g_ring_tail, __ATOMIC_ACQUIRE)) return;
     __atomic_store_n(&g_ring_head, h - 1u, __ATOMIC_RELEASE);
@@ -488,7 +507,7 @@ void ds4_ane_cancel_layer(uint32_t il) {
 
 int ds4_ane_wait(uint32_t il) {
     if (!g_ready || il >= g_n_layers || !g_started[il]) return 0;
-    if (ds4_ane_mode() == DS4_ANE_FAST) {
+    if (ds4_ane_mode() >= DS4_ANE_FAST) {
         /* Nothing to wait for on this thread: the GPU fence does it. Waiting
          * here would reintroduce exactly the host round trip FAST removes. */
         g_started[il] = 0;
@@ -527,12 +546,16 @@ void ds4_ane_report(void) {
             (unsigned long long)g_failed, (unsigned long long)g_cancelled,
             ds4_gpu_ane_sync_timed_out(), g_ns_predict / 1.0e6,
             g_engaged ? g_ns_predict / 1.0e6 / (double)g_engaged : 0.0);
-    if (ds4_ane_mode() == DS4_ANE_FAST && g_backpressure) {
+    /* The worker is SIGKILLed by the harness, so atexit never runs there and
+     * anything still in the stdio buffer is lost. Per-chunk lines are the
+     * primary record and must be on disk when they are written. */
+    fflush(stderr);
+    if (ds4_ane_mode() >= DS4_ANE_FAST && g_backpressure) {
         fprintf(stderr, "ds4: ANE ring backpressure %llu spins -- the host ran "
                         "further ahead than %u layers\n",
                 (unsigned long long)g_backpressure, DS4_ANE_RING);
     }
-    if (ds4_ane_mode() == DS4_ANE_FAST && ds4_gpu_ane_sync_timed_out()) {
+    if (ds4_ane_mode() >= DS4_ANE_FAST && ds4_gpu_ane_sync_timed_out()) {
         fprintf(stderr, "ds4: ANE FAST fence TIMED OUT -- the GPU gave up "
                         "waiting on DONE, so at least one layer consumed a "
                         "stale output surface. Raise DS4_ANE_FENCE_MAX_ITERS; "

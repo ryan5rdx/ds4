@@ -51287,7 +51287,7 @@ static bool glm_graph_encode_ffn_batch(
          * system-coherent release-word fence, and ANE-FAST-HANDOFF exists to
          * price the same handoff on it. Read the cost measured here as the
          * public-API ceiling. */
-        if (ds4_ane_mode() == DS4_ANE_FAST) {
+        if (ds4_ane_mode() >= DS4_ANE_FAST) {
             /* No command-buffer round trip at all. Encoder boundaries order
              * the pack against the norm and the publish against the pack --
              * the same primitive ds4's own fast-sync gates use -- and the
@@ -51301,13 +51301,18 @@ static bool glm_graph_encode_ffn_batch(
                                   n_tokens) != 0;
             if (ok) {
                 ane_seq = ds4_ane_next_seq();
+                /* Enqueue, publish, THEN wake the sidecar. The commit is what
+                 * makes the request visible: cancelling after a signal races
+                 * a consumer that may already hold the slot. */
                 ane_started = ds4_ane_begin_layer(ane_li);
-                if (ane_started && !ds4_gpu_ane_publish_ready(ane_seq)) {
-                    /* Queued but unreachable. Drop the request rather than
-                     * leave the sidecar waiting on a READY that never comes. */
-                    ds4_ane_cancel_layer(ane_li);
-                    ane_started = 0;
-                    ok = 0;
+                if (ane_started) {
+                    if (ds4_gpu_ane_publish_ready(ane_seq)) {
+                        ds4_ane_commit_layer();
+                    } else {
+                        ds4_ane_cancel_layer(ane_li);
+                        ane_started = 0;
+                        ok = 0;
+                    }
                 }
             }
         } else {
@@ -51431,15 +51436,20 @@ static bool glm_graph_encode_ffn_batch(
                                       pos0);
     }
     if (ok && !shared_done) DS4_GLM_ENCODE_FFN_BATCH_SHARED();
-    if (ane_sidecar && ane_started) {
-        if (ds4_ane_mode() == DS4_ANE_FAST) {
+    if (ane_sidecar) {
+        /* ane_started gates only the RENDEZVOUS. Gating the unpack on it too
+         * meant BRIDGE never unpacked at all -- ds4_ane_begin_layer() returns
+         * 0 below SHADOW, so the arm that exists to price the layout
+         * conversion measured only its pack half. Every layout number from
+         * ANESIDE3/4/5B is therefore a lower bound on the real cost. */
+        if (ane_started && ds4_ane_mode() >= DS4_ANE_FAST) {
             /* The GPU waits, not this thread. It reaches the fence having
              * already run routed-MoE, so a prediction that finished during
              * that window costs nothing here. Gated on ane_started: a fence
              * for a request that was never queued spins to timeout. */
             ok = ok && ds4_gpu_ane_fence_done(ane_seq) != 0;
         }
-        ds4_ane_wait(ane_li);
+        if (ane_started) ds4_ane_wait(ane_li);
         if (ds4_ane_mode() >= DS4_ANE_BRIDGE) {
             /* NULL destination = the bridge's own scratch. The GPU stays
              * authoritative in every mode this file supports and the sidecar's

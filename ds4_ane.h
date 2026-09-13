@@ -60,6 +60,12 @@ enum {
      * the GPU is inside routed-MoE, stores DONE on completion, and a GPU fence
      * spins on DONE before the unpack. Nothing is committed in between. */
     DS4_ANE_FAST   = 4,
+    /* FAST's seam with the prediction removed: pack, ring, release-word fence,
+     * unpack, no Core ML. fast-null vs off is the FIXED cost of the handoff;
+     * fast vs fast-null is what Core ML actually adds. ANESIDE5B could not
+     * separate the two, and the whole k2 projection turns on which of them
+     * owns the 4.8 ms/layer that did not hide. */
+    DS4_ANE_FASTNULL = 5,
 };
 
 /* Parsed once from the environment. 0 when unset or when this build has no
@@ -101,6 +107,10 @@ uint32_t ds4_ane_next_seq(void);
  * could not be encoded. Without this the sidecar blocks forever on a READY
  * nobody will write. */
 void ds4_ane_cancel_layer(uint32_t il);
+
+/* Wake the sidecar for the request just enqueued. Separate from begin_layer so
+ * a cancel before the wake cannot race the consumer. */
+void ds4_ane_commit_layer(void);
 
 /* TEST HOOK only (DS4_ANE_TEST_HOOK=1). Sequence numbers the sidecar actually
  * served, in order. Returns the total count, which may exceed `max`. */

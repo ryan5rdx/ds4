@@ -2630,15 +2630,26 @@ int ds4_tp_create(
     if (tmo) tp->timeout_sec = (uint64_t)atoi(tmo);
     tp->gate_timeout_ms = DS4_TP_DEFAULT_GATE_TIMEOUT_MS;
     tp->gate_timeout_src = "default";
-    /* An ANE shared-expert sidecar adds ~14-17 ms per layer for the gate window
-     * to absorb, and 750 ms was sized without one. ANESIDE4 shipped a harness
-     * that exported DS4_TP_GATE_TIMEOUT_MS=3000 and the process still came up
-     * at 750, so the arms that needed the mitigation ran without it and failed
-     * the same way as before -- a mitigation that depends on an env surviving
-     * ssh, env(1) and nohup is a mitigation that can silently go missing.
+    /* A floor, and an admittedly blunt one.
      *
-     * So the transport raises its own budget when a sidecar is configured. The
-     * explicit knob still wins; this only moves the FLOOR. */
+     * What the gate actually has to absorb is SKEW between the ranks, not the
+     * sidecar's own latency -- if both ranks stall ~14 ms per layer in lockstep
+     * the barrier sees nothing. The earlier comment here conflated the two. The
+     * skew that matters is the DIFFERENCE in how long each rank's sidecar takes
+     * to come up and settle, which is largest at the first chunk and should
+     * decay; 3000 ms buys room for that while it does.
+     *
+     * It is a workaround, not a design. Masking up to three seconds of skew
+     * permanently also masks a real desync, which is the failure mode this
+     * whole arm has already hit twice. The right fix is to warm and
+     * rendezvous both sidecars once before prefill starts and then put the
+     * budget back; until that exists, this keeps the experiment runnable.
+     *
+     * It exists at all because a mitigation carried by an env can silently go
+     * missing: ANESIDE4 exported DS4_TP_GATE_TIMEOUT_MS=3000 and the process
+     * still came up at 750. The explicit knob still wins; this only moves the
+     * floor -- and note ANESIDE5B logged 3000ms(env), so the automatic source
+     * below has still never actually been exercised on the rig. */
     const char *ane = getenv("DS4_METAL_ANE_SHEXP");
     const int ane_on = ane && ane[0] && strcmp(ane, "0") != 0 &&
                        strcmp(ane, "off") != 0;
