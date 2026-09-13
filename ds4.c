@@ -60748,12 +60748,26 @@ static uint64_t ds4_session_token_hash(const ds4_tokens *t, int n) {
 }
 
 static void ds4_session_glm53_ckpt_slot_drop(glm53_ckpt_slot *c);
+static void ds4_session_glm53_ckpt_describe(const ds4_session *s, char *buf,
+                                            size_t cap, uint32_t *live_out);
 
 void ds4_session_glm53_rollback_drop(ds4_session *s) {
     if (!s) return;
     /* Drops the WHOLE ring. Callers reach here when the timeline itself is in
      * doubt -- a failed mirrored capture, an invalidate -- and in that state no
-     * slot is trustworthy, not merely the newest. */
+     * slot is trustworthy, not merely the newest.
+     *
+     * Announced, because this is the other way a restore silently becomes
+     * unavailable: CKPTRING's whole investigation was about a ring that turned
+     * out to be emptied by an upstream prompt-rendering bug, and nothing said
+     * so. Only when there was something to lose. */
+    char ring[256];
+    uint32_t live = 0;
+    ds4_session_glm53_ckpt_describe(s, ring, sizeof ring, &live);
+    if (live > 0) {
+        fprintf(stderr, "ds4: GLM checkpoint ring DROP ALL: %u live %s\n",
+                live, ring);
+    }
     for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
         ds4_session_glm53_ckpt_slot_drop(&s->glm53_ckpt[i]);
     }
@@ -60830,7 +60844,20 @@ bool ds4_session_glm53_rollback_capture(ds4_session *s) {
         return false;
     }
 
-    glm53_ckpt_slot *c = &s->glm53_ckpt[ds4_glm53_ckpt_slot_for(pos)];
+    const uint32_t slot_i = ds4_glm53_ckpt_slot_for(pos);
+    glm53_ckpt_slot *c = &s->glm53_ckpt[slot_i];
+
+    /* An overwrite is the ring's one DESTRUCTIVE operation and it was silent.
+     * Two frontiers in the same 8192-band evict each other, so a restore that
+     * "should" have been available can be gone for reasons nothing records.
+     * Not rate-limited by reason like the capture line -- each eviction names a
+     * different pair, and that pair is the whole diagnostic. */
+    if (c->pos >= 0 && c->pos != pos) {
+        fprintf(stderr,
+                "ds4: GLM checkpoint ring EVICT slot %u: pos %d -> %d "
+                "(same %d-token band)\n",
+                slot_i, c->pos, pos, DS4_GLM53_CKPT_BAND);
+    }
 
     if (!c->kda) {
         c->kda = ds4_gpu_tensor_alloc(kda_bytes);
