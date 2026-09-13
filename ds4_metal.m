@@ -52264,6 +52264,9 @@ void ds4_gpu_set_glm_mtp_verify_mode(bool enabled) {
 static id<MTLComputePipelineState> g_ane_pack_pipeline;
 static id<MTLComputePipelineState> g_ane_unpack_pipeline;
 static id<MTLComputePipelineState> g_ane_cmp_pipeline;
+/* Kept only so probe_ane can A/B them against the tiled pair. */
+static id<MTLComputePipelineState> g_ane_pack_naive_pipeline;
+static id<MTLComputePipelineState> g_ane_unpack_naive_pipeline;
 static IOSurfaceRef g_ane_in_surface, g_ane_out_surface;
 static id<MTLBuffer> g_ane_in_buf, g_ane_out_buf, g_ane_cmp_buf;
 static void *g_ane_in_ptr, *g_ane_out_ptr;
@@ -52307,13 +52310,16 @@ typedef struct {
 } ds4_ane_bridge_args;
 
 static int ds4_gpu_ane_pipelines(void) {
-    if (g_ane_pack_pipeline && g_ane_unpack_pipeline && g_ane_cmp_pipeline) return 1;
+    if (g_ane_pack_pipeline && g_ane_unpack_pipeline && g_ane_cmp_pipeline &&
+        g_ane_pack_naive_pipeline && g_ane_unpack_naive_pipeline) return 1;
     if (!g_library) return 0;
     NSError *error = nil;
     struct { const char *name; __strong id<MTLComputePipelineState> *slot; } want[] = {
         { "kernel_ds4_ane_pack_f32_to_f16",   &g_ane_pack_pipeline   },
         { "kernel_ds4_ane_unpack_f16_to_f32", &g_ane_unpack_pipeline },
         { "kernel_ds4_ane_compare",           &g_ane_cmp_pipeline    },
+        { "kernel_ds4_ane_pack_f32_to_f16_naive",   &g_ane_pack_naive_pipeline   },
+        { "kernel_ds4_ane_unpack_f16_to_f32_naive", &g_ane_unpack_naive_pipeline },
     };
     for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); ++i) {
         if (*want[i].slot) continue;
@@ -52428,6 +52434,7 @@ static int ds4_gpu_ane_bridge_dispatch(id<MTLComputePipelineState> pipe,
                                        id<MTLBuffer> b1, uint64_t o1,
                                        id<MTLBuffer> b3,
                                        ds4_ane_bridge_args args,
+                                       int tiled,
                                        const char *label) {
     int owned = 0;
     id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
@@ -52438,14 +52445,24 @@ static int ds4_gpu_ane_bridge_dispatch(id<MTLComputePipelineState> pipe,
     [enc setBuffer:b1 offset:o1 atIndex:1];
     [enc setBytes:&args length:sizeof(args) atIndex:2];
     if (b3) [enc setBuffer:b3 offset:0 atIndex:3];
-    NSUInteger tx = pipe.threadExecutionWidth;
-    if (tx == 0u) tx = 32u;
-    NSUInteger ty = pipe.maxTotalThreadsPerThreadgroup / tx;
-    if (ty == 0u) ty = 1u;
-    if (ty > 8u) ty = 8u;
-    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((args.dim + tx - 1u) / tx,
-                                                    (args.n_tok + ty - 1u) / ty, 1)
-                  threadsPerThreadgroup:MTLSizeMake(tx, ty, 1)];
+    /* 32x32 tiles staged in threadgroup memory, 32x8 threads doing four rows
+     * each. The grid is in TILES, not elements: the compare kernel keeps the
+     * element mapping, so it passes tile=0 and gets the old shape. */
+    const NSUInteger TILE = 32u, ROWS = 8u;
+    if (tiled) {
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((args.dim + TILE - 1u) / TILE,
+                                                        (args.n_tok + TILE - 1u) / TILE, 1)
+                      threadsPerThreadgroup:MTLSizeMake(TILE, ROWS, 1)];
+    } else {
+        NSUInteger tx = pipe.threadExecutionWidth;
+        if (tx == 0u) tx = 32u;
+        NSUInteger ty = pipe.maxTotalThreadsPerThreadgroup / tx;
+        if (ty == 0u) ty = 1u;
+        if (ty > 8u) ty = 8u;
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((args.dim + tx - 1u) / tx,
+                                                        (args.n_tok + ty - 1u) / ty, 1)
+                      threadsPerThreadgroup:MTLSizeMake(tx, ty, 1)];
+    }
     ds4_gpu_end_compute_encoder(cb, enc);
     return ds4_gpu_finish_command_buffer(cb, owned, label);
 }
@@ -52459,7 +52476,7 @@ int ds4_gpu_ane_pack(const ds4_gpu_tensor *src, uint32_t dim, uint32_t n_tok) {
         ds4_ane_bridge_args a = { dim, n_tok, 0 };
         return ds4_gpu_ane_bridge_dispatch(g_ane_pack_pipeline,
                                            sb, ds4_gpu_tensor_offset(src),
-                                           g_ane_in_buf, 0, nil, a, "ANE pack");
+                                           g_ane_in_buf, 0, nil, a, 1, "ANE pack");
     }
 }
 
@@ -52478,7 +52495,7 @@ int ds4_gpu_ane_unpack(ds4_gpu_tensor *dst, uint32_t dim, uint32_t n_tok,
         return ds4_gpu_ane_bridge_dispatch(g_ane_unpack_pipeline,
                                            g_ane_out_buf, 0,
                                            db, ds4_gpu_tensor_offset(dst),
-                                           nil, a, "ANE unpack");
+                                           nil, a, 1, "ANE unpack");
     }
 }
 
@@ -52494,7 +52511,7 @@ int ds4_gpu_ane_compare(const ds4_gpu_tensor *gpu_ref, uint32_t dim, uint32_t n_
         if (!ds4_gpu_ane_bridge_dispatch(g_ane_cmp_pipeline,
                                          g_ane_out_buf, 0,
                                          rb, ds4_gpu_tensor_offset(gpu_ref),
-                                         g_ane_cmp_buf, a, "ANE compare")) return 0;
+                                         g_ane_cmp_buf, a, 0, "ANE compare")) return 0;
         /* The comparison result is only meaningful once the GPU has run it. */
         if (ds4_gpu_end_commands() == 0) return 0;
         if (ds4_gpu_begin_commands() == 0) return 0;
@@ -52580,3 +52597,18 @@ int ds4_gpu_ane_fence_done(uint32_t seq) {
 /* Encoder-boundary ordering for the pack, so the fast path can keep everything
  * in one command buffer instead of committing to get ordering. */
 void ds4_gpu_ane_order_boundary(void) { ds4_gpu_close_batch_encoder(); }
+
+/* Diagnostic only: the pre-tiling bridge, so the probe can measure the ratio
+ * the tiling was supposed to buy instead of taking the arithmetic on faith. */
+int ds4_gpu_ane_pack_naive(const ds4_gpu_tensor *src, uint32_t dim, uint32_t n_tok) {
+    if (!g_ane_in_buf || !src || dim != g_ane_dim || n_tok != g_ane_ntok) return 0;
+    @autoreleasepool {
+        id<MTLBuffer> sb = ds4_gpu_tensor_buffer(src);
+        if (!sb) return 0;
+        ds4_ane_bridge_args a = { dim, n_tok, 0 };
+        return ds4_gpu_ane_bridge_dispatch(g_ane_pack_naive_pipeline,
+                                           sb, ds4_gpu_tensor_offset(src),
+                                           g_ane_in_buf, 0, nil, a, 0,
+                                           "ANE pack naive");
+    }
+}

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <stdint.h>
+#include <time.h>
 #include "ds4_gpu.h"
 int ds4_gpu_begin_commands(void); int ds4_gpu_end_commands(void);
 int main(void) {
@@ -69,6 +70,42 @@ int main(void) {
     ds4_gpu_ane_compare(src, D, M, &ma, &rr);
     printf("compare: perturbed   max_abs %.6f rel_rms %.6f\n", ma, rr);
     ds4_gpu_end_commands();
+
+    /* 5. tiled vs naive at PRODUCTION shape. A ratio between two kernels timed
+     *    together on one box transfers even when the absolute microseconds do
+     *    not -- and the naive form's 64x write amplification is a property of
+     *    the access pattern, not of this GPU. */
+    {
+        const uint32_t PD = 4096, PM = 2048;
+        void *pin = NULL, *pout = NULL;
+        if (ds4_gpu_ane_stage_alloc(PD, PM, &pin, &pout)) {
+            ds4_gpu_tensor *big = ds4_gpu_tensor_alloc((uint64_t)PD * PM * sizeof(float));
+            if (big) {
+                float *bp = ds4_gpu_tensor_contents(big);
+                for (uint32_t i = 0; i < PD * PM; ++i) bp[i] = (float)(i % 251) * 0.01f;
+                const double useful = (double)PD * PM * 6.0;   /* 4 B in + 2 B out */
+                for (int naive = 0; naive < 2; ++naive) {
+                    ds4_gpu_begin_commands();
+                    (naive ? ds4_gpu_ane_pack_naive : ds4_gpu_ane_pack)(big, PD, PM);
+                    ds4_gpu_end_commands();                     /* warm */
+                    struct timespec a0, a1;
+                    clock_gettime(CLOCK_MONOTONIC, &a0);
+                    const int reps = 200;
+                    ds4_gpu_begin_commands();
+                    for (int r = 0; r < reps; ++r)
+                        (naive ? ds4_gpu_ane_pack_naive : ds4_gpu_ane_pack)(big, PD, PM);
+                    ds4_gpu_end_commands();
+                    clock_gettime(CLOCK_MONOTONIC, &a1);
+                    const double ms = ((double)(a1.tv_sec - a0.tv_sec) * 1e3 +
+                                       (double)(a1.tv_nsec - a0.tv_nsec) / 1e6) / reps;
+                    printf("pack %-5s @4096x2048: %7.3f ms  %6.1f GB/s useful"
+                           "  -> %6.1f ms/chunk (42 layers x2 directions)\n",
+                           naive ? "naive" : "tiled", ms, useful / (ms * 1e-3) / 1e9,
+                           ms * 42.0 * 2.0);
+                }
+            }
+        }
+    }
 
     printf("\n%s\n", (bad_t || bad_r || bad_a) ? "FAIL" : "PASS: bridge kernels exact");
     return (bad_t || bad_r || bad_a) ? 1 : 0;

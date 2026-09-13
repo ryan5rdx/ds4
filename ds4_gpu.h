@@ -62,6 +62,8 @@ int  ds4_gpu_ane_stage_alloc(uint32_t dim, uint32_t n_tok,
                              void **in_ptr, void **out_ptr);
 void ds4_gpu_ane_stage_free(void);
 int  ds4_gpu_ane_pack(const ds4_gpu_tensor *src, uint32_t dim, uint32_t n_tok);
+/* Diagnostic: the pre-tiling bridge, for A/B only. */
+int  ds4_gpu_ane_pack_naive(const ds4_gpu_tensor *src, uint32_t dim, uint32_t n_tok);
 int  ds4_gpu_ane_unpack(ds4_gpu_tensor *dst, uint32_t dim, uint32_t n_tok,
                         int accumulate);
 int  ds4_gpu_ane_compare(const ds4_gpu_tensor *gpu_ref, uint32_t dim,
