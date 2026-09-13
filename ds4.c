@@ -51261,9 +51261,21 @@ static bool glm_graph_encode_ffn_batch(
             ? (uint32_t)(DS4_N_LAYER - DS4_N_LEADING_DENSE - 1u) : 0u;
     const uint32_t ane_li = (il >= (uint32_t)DS4_N_LEADING_DENSE)
             ? il - (uint32_t)DS4_N_LEADING_DENSE : UINT32_MAX;
+    /* THE RANK'S OWN ROWS, not the whole chunk.
+     *
+     * Under S8 the prefill shared expert is split by token ROW, not by expert
+     * width: each rank computes the full 2048-lane expert for half the chunk's
+     * rows, and glm_graph_encode_shared_rows_into() below does exactly that.
+     * The sidecar was packing all n_tokens and predicting over the whole
+     * chunk, so it did twice the work its rank owns -- and did it on both
+     * ranks. Nothing was wrong with the OUTPUT, because shadow and fast
+     * discard it, but every ANE timing taken so far is for double the
+     * production row count. */
+    const uint32_t ane_rows = shared_row_split ? shared_rows : n_tokens;
+    const uint32_t ane_row0 = shared_row_split ? shared_row0 : 0u;
     const int ane_sidecar = ok && !shared_done && ds4_ane_mode() != DS4_ANE_OFF &&
-                            ane_li < ane_sparse &&
-                            ds4_ane_init(ane_sparse, (uint32_t)DS4_N_EMBD, n_tokens);
+                            ane_li < ane_sparse && ane_rows > 0u &&
+                            ds4_ane_init(ane_sparse, (uint32_t)DS4_N_EMBD, ane_rows);
     uint32_t ane_seq = 0;
     int ane_started = 0;
     if (ane_sidecar) {
@@ -51297,8 +51309,12 @@ static bool glm_graph_encode_ffn_batch(
              * a READY with nothing queued behind it is a fence nobody will
              * ever release. */
             ds4_gpu_ane_order_boundary();
-            ok = ds4_gpu_ane_pack(g->batch_ffn_norm, (uint32_t)DS4_N_EMBD,
-                                  n_tokens) != 0;
+            ds4_gpu_tensor *ane_src = glm_graph_tensor_row_view_strided(
+                    g->batch_ffn_norm, ane_row0, DS4_N_EMBD,
+                    (uint64_t)ane_rows * DS4_N_EMBD);
+            ok = ane_src && ds4_gpu_ane_pack(ane_src, (uint32_t)DS4_N_EMBD,
+                                             ane_rows) != 0;
+            ds4_gpu_tensor_free(ane_src);
             if (ok) {
                 ane_seq = ds4_ane_next_seq();
                 /* Enqueue, publish, THEN wake the sidecar. The commit is what
@@ -51318,7 +51334,13 @@ static bool glm_graph_encode_ffn_batch(
         } else {
             ok = glm_graph_prefill_stage_sync_boundary();
             if (ok && ds4_ane_mode() >= DS4_ANE_BRIDGE) {
-                ds4_gpu_ane_pack(g->batch_ffn_norm, (uint32_t)DS4_N_EMBD, n_tokens);
+                ds4_gpu_tensor *ane_src = glm_graph_tensor_row_view_strided(
+                        g->batch_ffn_norm, ane_row0, DS4_N_EMBD,
+                        (uint64_t)ane_rows * DS4_N_EMBD);
+                if (ane_src) {
+                    ds4_gpu_ane_pack(ane_src, (uint32_t)DS4_N_EMBD, ane_rows);
+                    ds4_gpu_tensor_free(ane_src);
+                }
                 ok = glm_graph_prefill_stage_sync_boundary();
             }
             if (ok) ane_started = ds4_ane_begin_layer(ane_li);
@@ -51455,7 +51477,7 @@ static bool glm_graph_encode_ffn_batch(
              * authoritative in every mode this file supports and the sidecar's
              * weights are synthetic, so the result must not reach anything
              * load-bearing -- that would produce fluent, wrong text. */
-            ds4_gpu_ane_unpack(NULL, (uint32_t)DS4_N_EMBD, n_tokens, 0);
+            ds4_gpu_ane_unpack(NULL, (uint32_t)DS4_N_EMBD, ane_rows, 0);
         }
         /* The divergence sample used to key on il == 0, which is DENSE and
          * returns long before this path -- so it never ran once. It is gone
