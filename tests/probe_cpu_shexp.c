@@ -76,6 +76,14 @@ static int      g_check   = 0;
 static double   g_duration = 0.0;      /* seconds; 0 = not a load run */
 static double   g_duty     = 1.0;      /* 1.0 = continuous stress */
 static const char *g_stopfile = NULL;
+/* Idle policy between dispatches. Under a duty cycle the pool is idle most of
+ * the time, and the two options are a real engineering choice rather than a
+ * detail: SLEEP frees the cores the duty cycle is supposed to free but pays a
+ * wake-up on every layer (measured: 157 -> 224 us at 8 threads), while SPIN
+ * keeps the pool hot and holds the cores through the ~520 us gap between
+ * layers that decode actually leaves. Production has to pick one; the probe
+ * should price both rather than bake one in. */
+static int      g_idle_spin = 0;
 
 typedef struct { uint8_t *gate, *up, *down; } layer_w;
 
@@ -375,8 +383,17 @@ static void *pool_worker(void *vid) {
     pthread_set_qos_class_self_np(g_pool.qos, 0);
     uint32_t seen = 0;
     for (;;) {
+        /* Spin briefly, then back off. Under a duty cycle the workers are
+         * idle most of the time by design, and a pure spin would keep every
+         * core pinned through the nominal idle window -- which is the opposite
+         * of what a 22%-duty load is supposed to represent, and would make the
+         * contention arm measure a busy machine either way. */
+        uint32_t idle = 0;
         while (__atomic_load_n(&g_pool.gen, __ATOMIC_ACQUIRE) == seen) {
             if (__atomic_load_n(&g_pool.stop, __ATOMIC_ACQUIRE)) return NULL;
+            if (g_idle_spin || ++idle < 4000u) continue;
+            struct timespec ts = { 0, 20000 };          /* 20 us */
+            nanosleep(&ts, NULL);
         }
         seen = __atomic_load_n(&g_pool.gen, __ATOMIC_ACQUIRE);
         pool_do(id);
@@ -496,6 +513,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--duration") && i + 1 < argc) g_duration = atof(argv[++i]);
         else if (!strcmp(argv[i], "--duty") && i + 1 < argc) g_duty = atof(argv[++i]);
         else if (!strcmp(argv[i], "--stop") && i + 1 < argc) g_stopfile = argv[++i];
+        else if (!strcmp(argv[i], "--idle") && i + 1 < argc) g_idle_spin = !strcmp(argv[++i], "spin");
         else if (!strcmp(argv[i], "--tiles") && i + 1 < argc) {
             n_tiles = 0;
             for (char *t = strtok(argv[++i], ","); t && n_tiles < 4; t = strtok(NULL, ","))
@@ -610,7 +628,6 @@ int main(int argc, char **argv) {
         uint32_t n = 0; uint64_t rots = 0;
         while (now_us() < t_end) {
             if (g_stopfile && access(g_stopfile, F_OK) == 0) break;
-            const double r0 = now_us();
             for (uint32_t l = 0; l < g_layers; ++l) {
                 c.L = &W[l];
                 const double t0 = now_us();
@@ -618,23 +635,31 @@ int main(int argc, char **argv) {
                 pool_run(stage_gate_up, &c, N_LANE);
                 quantize_q8_0(mid, N_LANE, midq, midd);
                 pool_run(stage_down, &c, N_EMBD);
-                if (n < 200000) samp[n++] = now_us() - t0;
+                const double busy = now_us() - t0;
+                if (n < 200000) samp[n++] = busy;
+                /* Pace PER LAYER. Running all 42 flat out and then sleeping
+                 * gave the right average and the wrong shape: production
+                 * interleaves one layer of CPU with one layer of GPU, so a
+                 * burst followed by an idle window is a different contention
+                 * experiment from the one being claimed. */
+                if (g_duty > 0.0 && g_duty < 1.0) {
+                    const double idle = busy * (1.0 / g_duty - 1.0);
+                    struct timespec ts = { (time_t)(idle / 1e6),
+                                           (long)((idle - (long)(idle / 1e6) * 1e6) * 1e3) };
+                    nanosleep(&ts, NULL);
+                }
+                if (g_stopfile && access(g_stopfile, F_OK) == 0) break;
             }
             rots++;
-            const double busy = now_us() - r0;
-            if (g_duty > 0.0 && g_duty < 1.0) {
-                const double idle = busy * (1.0 / g_duty - 1.0);
-                struct timespec ts = { (time_t)(idle / 1e6),
-                                       (long)((idle - (long)(idle / 1e6) * 1e6) * 1e3) };
-                nanosleep(&ts, NULL);
-            }
         }
         pool_stop();
         qsort(samp, n, sizeof(double), cmp_d);
-        printf("load\tthreads\tduty\trotations\tlayers\tp50_us\tp95_us\n");
-        printf("load\t%u\t%.2f\t%llu\t%u\t%.1f\t%.1f\n", threads[0], g_duty,
+        printf("load\tthreads\tduty\tidle\trotations\tlayers\tp50_us\tp95_us\trot42_med_us\n");
+        printf("load\t%u\t%.2f\t%s\t%llu\t%u\t%.1f\t%.1f\t%.1f\n", threads[0], g_duty,
+               g_idle_spin ? "spin" : "sleep",
                (unsigned long long)rots, n,
-               n ? samp[n / 2] : 0.0, n ? samp[(n * 95) / 100] : 0.0);
+               n ? samp[n / 2] : 0.0, n ? samp[(n * 95) / 100] : 0.0,
+               n ? samp[n / 2] * 42.0 : 0.0);
         free(samp);
         return 0;
     }
