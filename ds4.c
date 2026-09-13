@@ -59226,6 +59226,49 @@ typedef struct {
     uint8_t fingerprint[32];
 } ds4_vision_identity;
 
+#ifndef DS4_NO_GPU
+/* Each slot is one fixed-size KDA snapshot, so the ring is a straight
+ * memory-for-recoverable-prefill trade. */
+#define DS4_GLM53_CKPT_SLOTS_MAX 16
+#define DS4_GLM53_CKPT_SLOTS     DS4_GLM53_CKPT_SLOTS_MAX
+
+/* One GLM-5.3 state snapshot. Fixed size: the KDA conv and recurrent state per
+ * layer, plus the DSA indexer tail, neither of which grows with context. */
+typedef struct {
+    ds4_gpu_tensor *kda;
+    ds4_gpu_tensor *index;
+    float          *logits;
+    int             pos;            /* -1 when empty */
+    uint32_t        dense_len;
+    /* Hash of checkpoint tokens [0, pos) at capture. A snapshot is only valid
+     * for the timeline that produced it; re-prefilling different tokens to the
+     * same length must not be able to restore into it. */
+    uint64_t        token_hash;
+} glm53_ckpt_slot;
+
+static uint32_t ds4_glm53_ckpt_slots(void) {
+    static uint32_t cached;
+    if (cached) return cached;
+    cached = 8u;
+    const char *e = getenv("DS4_GLM53_CKPT_SLOTS");
+    if (e && e[0]) {
+        const long v = strtol(e, NULL, 10);
+        if (v >= 1 && v <= DS4_GLM53_CKPT_SLOTS_MAX) cached = (uint32_t)v;
+    }
+    return cached;
+}
+
+/* Slot from POSITION, so both TP ranks choose identically. A round-robin
+ * counter diverges the instant one rank skips a capture the other took, and a
+ * restore into the wrong slot is a silently wrong recurrence rather than an
+ * error. */
+static uint32_t ds4_glm53_ckpt_slot_for(int pos) {
+    const uint32_t n = ds4_glm53_ckpt_slots();
+    if (pos <= 0) return 0;
+    return (uint32_t)((pos / 1024) % (int)n);
+}
+#endif
+
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
@@ -59336,15 +59379,30 @@ struct ds4_session {
      * throw the whole checkpoint away.  Captured at the frontier of a
      * successful sync, restored when a rewind targets exactly that frontier.
      * See ds4_session_glm53_rollback_capture(). */
-    ds4_gpu_tensor *glm53_rollback_kda;
-    ds4_gpu_tensor *glm53_rollback_index;
-    float *glm53_rollback_logits;
+    /* A RING of snapshots, not one.
+     *
+     * One snapshot only ever served a rewind to exactly the frontier it was
+     * taken at, which is what speculative decode needs. A prefix-cache miss
+     * needs something else: the client's prompt diverges at some position
+     * `common` well below the frontier, and with GLM-5.3's append-only prefix
+     * reuse the whole prompt is re-prefilled from zero. A ring lets the session
+     * restart from the largest checkpoint at or below `common` instead. One
+     * observed miss had common=62318 of 75435, so 83% of a ~170 s re-prefill
+     * was recoverable and was being thrown away.
+     *
+     * Slots are chosen from the POSITION, not from a counter: both ranks must
+     * pick the same slot for the same capture, and a counter diverges the
+     * moment one rank skips a capture the other took.
+     *
+     * The KDA snapshot is fixed size -- conv_state plus recurrent_state per
+     * layer, independent of context length -- so N slots cost N times a
+     * constant rather than N times a growing KV. The DSA layers need no
+     * snapshot at all: their KV is position-addressable and simply gets
+     * overwritten from the restore point. */
+    glm53_ckpt_slot glm53_ckpt[DS4_GLM53_CKPT_SLOTS];
+    /* The most recent capture, which is the one the speculative-decode rewind
+     * path means by "the snapshot". -1 when there is none. */
     int glm53_rollback_pos;
-    uint32_t glm53_rollback_dense_len;
-    /* Hash of checkpoint tokens [0, pos) at capture.  A snapshot is only valid
-     * for the timeline that produced it; re-prefilling different tokens to the
-     * same length must not be able to restore into it. */
-    uint64_t glm53_rollback_token_hash;
     bool glm53_rollback_valid;
     /* Set while an INTERNAL sync runs -- a tool-recovery suffix, a canonical
      * rewrite, a cold-checkpoint prefix.  Those advance the session past the
@@ -60431,15 +60489,10 @@ static bool ds4_glm53_rollback_enabled(void) {
  * CPU-only rank has no KDA state to snapshot, so it always refuses -- which
  * the leader reads as "no snapshot on the peer" and handles by dropping its
  * own. */
+/* Invalidate one slot. The buffers are kept: they are fixed size and will be
+ * reused by the next capture at this slot, and freeing them here would make a
+ * transient failure cost an allocation on every retry. */
 bool ds4_session_glm53_rollback_capture(ds4_session *s) { (void)s; return false; }
-void ds4_session_glm53_rollback_drop(ds4_session *s) { (void)s; }
-void ds4_session_rollback_hold(ds4_session *s, bool hold) { (void)s; (void)hold; }
-/* No snapshot exists without the GPU backend, so an interrupted sync always
- * lands where it started.  See the real one next to the rollback helpers. */
-static int ds4_session_interrupt_rewind_target(ds4_session *s, int pre_sync_len) {
-    (void)s;
-    return pre_sync_len;
-}
 #endif
 
 #ifndef DS4_NO_GPU
@@ -60685,11 +60738,18 @@ static uint64_t ds4_session_token_hash(const ds4_tokens *t, int n) {
     return h;
 }
 
+static void ds4_session_glm53_ckpt_slot_drop(glm53_ckpt_slot *c);
+
 void ds4_session_glm53_rollback_drop(ds4_session *s) {
     if (!s) return;
+    /* Drops the WHOLE ring. Callers reach here when the timeline itself is in
+     * doubt -- a failed mirrored capture, an invalidate -- and in that state no
+     * slot is trustworthy, not merely the newest. */
+    for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
+        ds4_session_glm53_ckpt_slot_drop(&s->glm53_ckpt[i]);
+    }
     s->glm53_rollback_valid = false;
     s->glm53_rollback_pos = -1;
-    s->glm53_rollback_token_hash = 0;
 }
 
 void ds4_session_rollback_hold(ds4_session *s, bool hold) {
@@ -60704,88 +60764,121 @@ void ds4_session_rollback_hold(ds4_session *s, bool hold) {
  * decision is taken independently on each side and then reconciled by the
  * mirrored rewind mode.  The only such point is the frontier of a sync that
  * both ranks completed; see ds4_session_sync(). */
+static void ds4_session_glm53_ckpt_slot_drop(glm53_ckpt_slot *c) {
+    if (!c) return;
+    c->pos = -1;
+    c->token_hash = 0;
+    c->dense_len = 0;
+}
+
 bool ds4_session_glm53_rollback_capture(ds4_session *s) {
     if (!ds4_session_glm53_rollback_supported(s)) return false;
-    if (!s->checkpoint_valid || s->checkpoint.len <= 0) return false;
     ds4_glm_gpu_graph *g = &s->glm_graph;
-
     const uint64_t kda_bytes = glm53_graph_kda_state_bytes(g);
     const uint64_t idx_bytes = glm53_graph_index_tail_bytes(g);
     if (kda_bytes == 0) return false;
 
-    if (!s->glm53_rollback_kda) {
-        s->glm53_rollback_kda = ds4_gpu_tensor_alloc(kda_bytes);
-        if (!s->glm53_rollback_kda) {
-            fprintf(stderr,
-                    "ds4: glm53 rollback: could not allocate %llu bytes of KDA "
-                    "snapshot; rewinds will re-prefill\n",
+    const int pos = s->checkpoint.len;
+    glm53_ckpt_slot *c = &s->glm53_ckpt[ds4_glm53_ckpt_slot_for(pos)];
+
+    if (!c->kda) {
+        c->kda = ds4_gpu_tensor_alloc(kda_bytes);
+        if (!c->kda) {
+            fprintf(stderr, "ds4: GLM checkpoint alloc failed (%llu bytes)\n",
                     (unsigned long long)kda_bytes);
             return false;
         }
     }
-    if (idx_bytes != 0 && !s->glm53_rollback_index) {
-        s->glm53_rollback_index = ds4_gpu_tensor_alloc(idx_bytes);
-        if (!s->glm53_rollback_index) {
-            fprintf(stderr,
-                    "ds4: glm53 rollback: could not allocate %llu bytes of "
-                    "indexer snapshot; rewinds will re-prefill\n",
-                    (unsigned long long)idx_bytes);
+    if (idx_bytes != 0 && !c->index) {
+        c->index = ds4_gpu_tensor_alloc(idx_bytes);
+        if (!c->index) {
+            ds4_session_glm53_ckpt_slot_drop(c);
             return false;
         }
     }
-    if (!s->glm53_rollback_logits) {
-        s->glm53_rollback_logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
-        if (!s->glm53_rollback_logits) return false;
+    if (!c->logits) {
+        c->logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+        if (!c->logits) return false;
     }
 
-    if (!glm53_graph_copy_kda_state_to(g, s->glm53_rollback_kda, true) ||
-        (idx_bytes != 0 &&
-         !glm53_graph_copy_index_tail(g, s->glm53_rollback_index, true)))
+    if (!glm53_graph_copy_kda_state_to(g, c->kda, true) ||
+        (idx_bytes != 0 && !glm53_graph_copy_index_tail(g, c->index, true)))
     {
-        ds4_session_glm53_rollback_drop(s);
+        /* A half-written slot must not be reachable: the restore that found it
+         * would apply a mixed state, which is worse than re-prefilling. */
+        ds4_session_glm53_ckpt_slot_drop(c);
         return false;
     }
     if (s->logits) {
-        memcpy(s->glm53_rollback_logits, s->logits,
-               (size_t)DS4_N_VOCAB * sizeof(float));
+        memcpy(c->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
     }
-    s->glm53_rollback_pos = s->checkpoint.len;
-    s->glm53_rollback_dense_len = s->glm_dense_cache_len;
-    s->glm53_rollback_token_hash =
-        ds4_session_token_hash(&s->checkpoint, s->checkpoint.len);
+    c->pos = pos;
+    c->dense_len = s->glm_dense_cache_len;
+    c->token_hash = ds4_session_token_hash(&s->checkpoint, pos);
+    s->glm53_rollback_pos = pos;
     s->glm53_rollback_valid = true;
     return true;
 }
 
 /* Can a rewind to `pos` be served from the snapshot?  Pure predicate: the
  * leader evaluates it to choose the mirrored rewind mode. */
+/* The slot holding an exact, hash-matching snapshot for `pos`, or NULL.
+ *
+ * Same length is not the same history, which is why the hash is checked and
+ * not just the position: a different prompt prefilled to the same length must
+ * not be able to restore into someone else's recurrence. */
+static const glm53_ckpt_slot *ds4_session_glm53_ckpt_find(const ds4_session *s,
+                                                          int pos) {
+    if (!ds4_session_glm53_rollback_supported(s)) return NULL;
+    if (pos < 0 || pos > s->checkpoint.len) return NULL;
+    const glm53_ckpt_slot *c = &s->glm53_ckpt[ds4_glm53_ckpt_slot_for(pos)];
+    if (c->pos != pos || c->pos < 0) return NULL;
+    if (ds4_session_token_hash(&s->checkpoint, pos) != c->token_hash) return NULL;
+    return c;
+}
+
+/* The largest checkpoint at or below `limit`, or -1.
+ *
+ * This is what a prefix-cache miss wants: the prompt diverges at `limit`, and
+ * anything below it is still the same history. Scans the ring rather than
+ * indexing, because the slot mapping is many-to-one over positions and the
+ * best candidate need not live in limit's own slot. */
+int ds4_session_glm53_ckpt_best_at_or_below(ds4_session *s, int limit) {
+    if (!ds4_session_glm53_rollback_supported(s)) return -1;
+    if (limit <= 0) return -1;
+    int best = -1;
+    for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
+        const glm53_ckpt_slot *c = &s->glm53_ckpt[i];
+        if (c->pos < 0 || c->pos > limit || c->pos <= best) continue;
+        if (ds4_session_glm53_ckpt_find(s, c->pos) != c) continue;
+        best = c->pos;
+    }
+    return best;
+}
+
+/* Can a rewind to `pos` be served from a snapshot?  Pure predicate: the
+ * leader evaluates it to choose the mirrored rewind mode. */
 static bool ds4_session_glm53_rollback_can_restore(const ds4_session *s, int pos) {
-    if (!ds4_session_glm53_rollback_supported(s)) return false;
-    if (!s->glm53_rollback_valid || s->glm53_rollback_pos != pos) return false;
-    if (pos < 0 || pos > s->checkpoint.len) return false;
-    /* Same length is not the same history. */
-    return ds4_session_token_hash(&s->checkpoint, pos) ==
-           s->glm53_rollback_token_hash;
+    return ds4_session_glm53_ckpt_find(s, pos) != NULL;
 }
 
 static bool ds4_session_glm53_rollback_restore(ds4_session *s, int pos) {
-    if (!ds4_session_glm53_rollback_can_restore(s, pos)) return false;
+    const glm53_ckpt_slot *c = ds4_session_glm53_ckpt_find(s, pos);
+    if (!c) return false;
     ds4_glm_gpu_graph *g = &s->glm_graph;
     const uint64_t idx_bytes = glm53_graph_index_tail_bytes(g);
-    if (!glm53_graph_copy_kda_state_to(g, s->glm53_rollback_kda, false) ||
-        (idx_bytes != 0 &&
-         !glm53_graph_copy_index_tail(g, s->glm53_rollback_index, false)))
+    if (!glm53_graph_copy_kda_state_to(g, c->kda, false) ||
+        (idx_bytes != 0 && !glm53_graph_copy_index_tail(g, c->index, false)))
     {
         /* A half-applied restore is worse than none: the caller must fall back
          * to invalidating. */
         ds4_session_glm53_rollback_drop(s);
         return false;
     }
-    if (s->logits && s->glm53_rollback_logits) {
-        memcpy(s->logits, s->glm53_rollback_logits,
-               (size_t)DS4_N_VOCAB * sizeof(float));
+    if (s->logits && c->logits) {
+        memcpy(s->logits, c->logits, (size_t)DS4_N_VOCAB * sizeof(float));
     }
-    s->glm_dense_cache_len = s->glm53_rollback_dense_len;
+    s->glm_dense_cache_len = c->dense_len;
     s->glm_graph.kda_state_exchange_pending = 0;
     return true;
 }
@@ -71168,6 +71261,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
         ds4_session *s = xcalloc(1, sizeof(*s));
+#ifndef DS4_NO_GPU
+    /* xcalloc leaves pos = 0, which reads as a VALID checkpoint at position
+     * zero -- an empty ring would advertise a restore point and hand back an
+     * uninitialised recurrence. Empty is -1. */
+    for (uint32_t ci = 0; ci < DS4_GLM53_CKPT_SLOTS; ci++) s->glm53_ckpt[ci].pos = -1;
+    s->glm53_rollback_pos = -1;
+#endif
         s->engine = e;
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
@@ -71190,6 +71290,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
+#ifndef DS4_NO_GPU
+    /* xcalloc leaves pos = 0, which reads as a VALID checkpoint at position
+     * zero -- an empty ring would advertise a restore point and hand back an
+     * uninitialised recurrence. Empty is -1. */
+    for (uint32_t ci = 0; ci < DS4_GLM53_CKPT_SLOTS; ci++) s->glm53_ckpt[ci].pos = -1;
+    s->glm53_rollback_pos = -1;
+#endif
     s->ctx_size = ctx_size;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const uint32_t normal_layers = glm_graph_normal_layer_count();
@@ -71547,9 +71654,11 @@ void ds4_session_free(ds4_session *s) {
 #ifndef DS4_NO_GPU
     free(s->glm_mtp_hc);
     free(s->glm_mtp_logits0);
-    ds4_gpu_tensor_free(s->glm53_rollback_kda);
-    ds4_gpu_tensor_free(s->glm53_rollback_index);
-    free(s->glm53_rollback_logits);
+    for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
+        ds4_gpu_tensor_free(s->glm53_ckpt[i].kda);
+        ds4_gpu_tensor_free(s->glm53_ckpt[i].index);
+        free(s->glm53_ckpt[i].logits);
+    }
 #endif
     free(s->mtp_logits);
 #ifndef DS4_NO_GPU
