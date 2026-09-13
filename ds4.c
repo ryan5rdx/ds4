@@ -59435,22 +59435,6 @@ struct ds4_session {
      * snapshot at all: their KV is position-addressable and simply gets
      * overwritten from the restore point. */
     glm53_ckpt_slot glm53_ckpt[DS4_GLM53_CKPT_SLOTS];
-    /* The interrupt-recovery snapshot, deliberately OUTSIDE the ring above.
-     *
-     * Two different jobs were being served by one mechanism and it cost both.
-     * ds4_session_sync() is called once per prefill QUANTUM, and the
-     * interrupted-prefill path rewinds to pre_sync_len -- the previous
-     * quantum's frontier -- so recovery needs a snapshot at every quantum.
-     * The prefix-cache ring needs the opposite: request frontiers only, since
-     * a checkpoint from the middle of prefilling a prompt can never be what a
-     * later divergence wants.
-     *
-     * Capturing into the ring on every quantum (the original behaviour)
-     * poisoned it and helped kill a TP pair on GPU command-buffer timeouts.
-     * Capturing once per request (16d58cd) fixed that and silently broke
-     * interrupt recovery, so a cron landing mid-prefill dropped the whole
-     * conversation and restarted from zero. This slot separates them. */
-    glm53_ckpt_slot glm53_rolling;
     /* Cursor into the recent-FIFO half of the ring (see ckpt_slot_for_capture).
      * Advances identically on both ranks because captures are mirrored. */
     uint32_t glm53_ckpt_recent_cursor;
@@ -60816,7 +60800,6 @@ void ds4_session_glm53_rollback_drop(ds4_session *s) {
     for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
         ds4_session_glm53_ckpt_slot_drop(&s->glm53_ckpt[i]);
     }
-    ds4_session_glm53_ckpt_slot_drop(&s->glm53_rolling);
     s->glm53_ckpt_recent_cursor = 0;
     s->glm53_rollback_valid = false;
     s->glm53_rollback_pos = -1;
@@ -61097,19 +61080,6 @@ bool ds4_session_glm53_rollback_capture(ds4_session *s) {
         return false;
     }
 
-    /* A HELD capture is an intermediate prefill quantum: it must still leave a
-     * snapshot for interrupt recovery, but must NOT claim a ring slot. */
-    if (s->glm53_rollback_held) {
-        glm53_ckpt_slot *r = &s->glm53_rolling;
-        if (!ds4_session_glm53_ckpt_fill(s, r, pos)) {
-            ds4_session_glm53_ckpt_slot_drop(r);
-            return false;
-        }
-        s->glm53_rollback_pos = pos;
-        s->glm53_rollback_valid = true;
-        return true;
-    }
-
     /* Banded slot if this frontier is the first in its band, FIFO otherwise.
      * See ds4_glm53_ckpt_banded_slot() for why the ring is split at all. */
     const uint32_t banded_i = ds4_glm53_ckpt_banded_slot(pos);
@@ -61172,14 +61142,6 @@ static const glm53_ckpt_slot *ds4_session_glm53_ckpt_find(const ds4_session *s,
         if (c->pos != pos || c->pos < 0) continue;
         if (ds4_session_token_hash(&s->checkpoint, pos) != c->token_hash) continue;
         return c;
-    }
-    /* The interrupt-recovery slot is searched last: it is the one a rewind to
-     * pre_sync_len lands on mid-prefill, and it holds a position no ring slot
-     * does. */
-    const glm53_ckpt_slot *r = &s->glm53_rolling;
-    if (r->pos == pos && r->pos >= 0 &&
-        ds4_session_token_hash(&s->checkpoint, pos) == r->token_hash) {
-        return r;
     }
     return NULL;
 }
@@ -61311,6 +61273,8 @@ int ds4_session_glm53_ckpt_best_at_or_below(ds4_session *s, int limit) {
     (void)s; (void)limit;
     return -1;
 }
+
+int ds4_glm53_restore_enabled(void) { return 0; }
 
 int ds4_session_glm53_try_restore(ds4_session *s, const ds4_tokens *prompt,
                                   int common) {
@@ -73596,7 +73560,7 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
  * and spec-decode rewind intact and only declines to resume a DIVERGED prompt,
  * which restores exactly the pre-ring behaviour: full re-prefill on any
  * mid-prefix divergence, slow but never wrong. */
-static int ds4_glm53_ckpt_restore_enabled(void) {
+int ds4_glm53_restore_enabled(void) {
     /* DEFAULT OFF as of CKPTRING3, which failed the gate on a live defect.
      *
      * A deep restore fires, hash-verifies (prefix_ok=1), lands exactly, keeps
@@ -73628,7 +73592,7 @@ int ds4_session_glm53_try_restore(ds4_session *s, const ds4_tokens *prompt,
                                   int common) {
     if (!s || !prompt || prompt->len <= 0 || common <= 0) return 0;
     if (!ds4_session_glm53_rollback_supported(s)) return 0;
-    if (!ds4_glm53_ckpt_restore_enabled()) return 0;
+    if (!ds4_glm53_restore_enabled()) return 0;
     if (ds4_session_tp_worker(s)) return 0;
     /* A prompt that already extends the checkpoint is the cache-hit path and
      * needs nothing from the ring. */

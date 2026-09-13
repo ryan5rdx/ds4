@@ -652,6 +652,11 @@ int ds4_session_rollback_frontier(ds4_session *s);
  * Every resident slot that has synced holds one, so multiply by slot count. */
 uint64_t ds4_glm53_rollback_session_bytes(void);
 uint32_t ds4_glm53_ckpt_slot_count(void);
+/* Nonzero when DS4_GLM53_CKPT_RESTORE=1. Every path that can resume a GLM-5.3
+ * session from a snapshot must consult this, not just the ring lookup: the
+ * switch documents "full re-prefill on any divergence" and that guarantee is
+ * only true if the live-prefix rewind honours it too. */
+int ds4_glm53_restore_enabled(void);
 /* Resume a diverged prompt from the checkpoint ring. `common` must be the
  * caller's authoritative divergence position against the live session, not a
  * chunk boundary. Returns the landing position, or 0 if nothing was restored.

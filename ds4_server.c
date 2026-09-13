@@ -13059,7 +13059,16 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * assistant turn -- a stripped think block, a re-rendered tool call --
          * that turns a full re-prefill into one of the generated tail. */
         const bool is_glm53 = ds4_engine_is_glm53(s->engine);
-        const int rollback_frontier = is_glm53 ?
+        /* Honour DS4_GLM53_CKPT_RESTORE here too.
+         *
+         * The switch was added to back out GLM-5.3 snapshot restores after
+         * CKPTRING3 showed a deep one producing different text, and it was
+         * documented as restoring "full re-prefill on any divergence". That was
+         * false: it gated only the ring lookup in ds4.c, while this path
+         * obtains the rollback frontier and rewinds to it unconditionally. A
+         * kill switch that leaves a second restore path live is worse than no
+         * kill switch, because the guarantee gets believed. */
+        const int rollback_frontier = (is_glm53 && ds4_glm53_restore_enabled()) ?
             ds4_session_rollback_frontier(slot->session) : -1;
         const uint32_t raw_budget = is_glm ? 0 : ds4_session_raw_rewind_budget(slot->session);
         /* Budget against the tail actually discarded, old_pos - common, not
