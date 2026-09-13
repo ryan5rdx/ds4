@@ -65,6 +65,9 @@
  * microseconds. Fail well before Metal's command-buffer watchdog if the peer
  * stalls while keeping its sockets open. */
 #define DS4_TP_DEFAULT_GATE_TIMEOUT_MS 750
+/* Floor when an ANE sidecar is configured: it adds ~14-17 ms per layer of skew
+ * for the barrier to absorb, and over 42 layers that is well past 750 ms. */
+#define DS4_TP_ANE_GATE_TIMEOUT_MS 3000
 /* "Once both ranks enter" is the whole caveat, and it does not cover how they
  * get there.  A batch or big gate opens with a header pair on data_fd, and that
  * pair IS the barrier that puts both ranks inside the gate: until it completes
@@ -324,6 +327,9 @@ struct ds4_tp {
     uint64_t prefill_bounce_in_off;  /* one prefill chunk, peer partial    */
     uint64_t timeout_sec;
     uint64_t gate_timeout_ms;   /* exchange, both ranks already in the gate */
+    /* Where gate_timeout_ms came from. Printed at connect so a missing
+     * override is visible in one line instead of inferred from a crash. */
+    const char *gate_timeout_src;
     uint64_t meet_timeout_ms;   /* arrival barrier, peer may still be behind */
     atomic_bool failed;
     /* Serializes control-plane (control_fd) sends/receives and the paired
@@ -2623,10 +2629,34 @@ int ds4_tp_create(
     const char *tmo = getenv("DS4_TP_TIMEOUT_SEC");
     if (tmo) tp->timeout_sec = (uint64_t)atoi(tmo);
     tp->gate_timeout_ms = DS4_TP_DEFAULT_GATE_TIMEOUT_MS;
+    tp->gate_timeout_src = "default";
+    /* An ANE shared-expert sidecar adds ~14-17 ms per layer for the gate window
+     * to absorb, and 750 ms was sized without one. ANESIDE4 shipped a harness
+     * that exported DS4_TP_GATE_TIMEOUT_MS=3000 and the process still came up
+     * at 750, so the arms that needed the mitigation ran without it and failed
+     * the same way as before -- a mitigation that depends on an env surviving
+     * ssh, env(1) and nohup is a mitigation that can silently go missing.
+     *
+     * So the transport raises its own budget when a sidecar is configured. The
+     * explicit knob still wins; this only moves the FLOOR. */
+    const char *ane = getenv("DS4_METAL_ANE_SHEXP");
+    const int ane_on = ane && ane[0] && strcmp(ane, "0") != 0 &&
+                       strcmp(ane, "off") != 0;
+    if (ane_on && tp->gate_timeout_ms < DS4_TP_ANE_GATE_TIMEOUT_MS) {
+        tp->gate_timeout_ms = DS4_TP_ANE_GATE_TIMEOUT_MS;
+        tp->gate_timeout_src = "ane-sidecar";
+    }
     const char *gate_tmo = getenv("DS4_TP_GATE_TIMEOUT_MS");
     if (gate_tmo) {
         const long value = strtol(gate_tmo, NULL, 10);
-        if (value > 0 && value <= 60000) tp->gate_timeout_ms = (uint64_t)value;
+        if (value > 0 && value <= 60000) {
+            tp->gate_timeout_ms = (uint64_t)value;
+            tp->gate_timeout_src = "env";
+        } else {
+            fprintf(stderr, "ds4-tp: DS4_TP_GATE_TIMEOUT_MS=%s out of range "
+                            "(1..60000) -- IGNORED, staying at %llums\n",
+                    gate_tmo, (unsigned long long)tp->gate_timeout_ms);
+        }
     }
     tp->meet_timeout_ms = DS4_TP_DEFAULT_MEET_TIMEOUT_MS;
     const char *meet_tmo = getenv("DS4_TP_MEET_TIMEOUT_MS");
@@ -2703,11 +2733,11 @@ int ds4_tp_create(
     }
     if (listener >= 0) close(listener);
     fprintf(stderr,
-            "ds4-tp: %s connected, transport=%s gate-timeout=%llums "
+            "ds4-tp: %s connected, transport=%s gate-timeout=%llums(%s) "
             "meet-timeout=%llums\n",
             tp->rank == 0 ? "worker" : "leader",
             tp->rdma_active ? "rdma" : "tcp",
-            (unsigned long long)tp->gate_timeout_ms,
+            (unsigned long long)tp->gate_timeout_ms, tp->gate_timeout_src,
             (unsigned long long)tp->meet_timeout_ms);
     *out = tp;
     return 1;
