@@ -635,6 +635,7 @@ void ds4_session_glm53_rollback_drop(ds4_session *s);
  * common prefix and is unusable; the snapshot must stay pinned at the external
  * prompt frontier.  Always pair with a matching `false`. */
 void ds4_session_rollback_hold(ds4_session *s, bool hold);
+bool ds4_session_rollback_is_held(const ds4_session *s);
 /* TEST ONLY.  Force the next canonical rewrite down the REBUILD_NEEDED branch.
  * That branch is otherwise unreachable: the canonical renderer replays the
  * model's raw tool-call bytes verbatim, so the canonical form always equals the
