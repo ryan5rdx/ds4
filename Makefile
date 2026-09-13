@@ -111,6 +111,10 @@ gguf-tools/quality-testing/score_official: gguf-tools/quality-testing/score_offi
 tests/test_metal_session_batch.o: tests/test_metal_session_batch.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_metal_session_batch.c
 
+# Byte-identity gate for the sliced q_b projection. No GGUF needed.
+tests/probe_qb_slice: tests/probe_qb_slice.c ds4_metal.o ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/probe_qb_slice.c ds4_metal.o $(METAL_LDLIBS)
+
 tests/test_metal_session_batch: tests/test_metal_session_batch.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 

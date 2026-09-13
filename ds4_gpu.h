@@ -50,6 +50,14 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
+/* Q8_0 projection restricted to an output column range, written into a
+ * full-width destination. See the definition for why prefill needs it and
+ * decode does not. */
+int ds4_gpu_matmul_q8_0_cols_tensor(ds4_gpu_tensor *out, const void *model_map,
+                                    uint64_t model_size, uint64_t weight_offset,
+                                    uint64_t in_dim, uint64_t out_rows,
+                                    uint64_t dst_stride, uint64_t dst_col0,
+                                    const ds4_gpu_tensor *x, uint64_t n_tok);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 
 /* GPU-side fill of a sub-range, in elements. Unlike ds4_gpu_tensor_fill_f32
