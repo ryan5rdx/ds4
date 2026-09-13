@@ -60908,6 +60908,44 @@ static int ds4_glm53_ckpt_verify_enabled(void) {
     return e && e[0] == '1';
 }
 
+/* `live_frac` bounds the digest to the leading fraction of the tensor that a
+ * restore to `pos` must reproduce.
+ *
+ * The first cut of this hashed WHOLE tensors, and that over-reports. The
+ * compact DSA caches are sized for the entire context and addressed by
+ * position -- `pos + n > compact_cache_cap` is a hard refusal and
+ * glm_graph_ensure_compact_cache() errors rather than recycling -- so at
+ * restore time the rows ABOVE the restore point still hold the trajectory the
+ * session had reached, and they differ from the capture legitimately. The
+ * re-prefill overwrites exactly that span. Reporting it as a mismatch invents a
+ * defect out of correct behaviour, which is the one thing a diagnostic must not
+ * do; the first CKPTSTATE run named idx_key_cache and kv_lora on that basis and
+ * the claim needs re-taking under this bound.
+ *
+ * Rows [0, pos) are the ones that must match, because nothing rewrites them. */
+static uint64_t ds4_glm53_tensor_digest_bounded(ds4_gpu_tensor *t,
+                                                double live_frac) {
+    if (!t) return 0;
+    uint64_t bytes = ds4_gpu_tensor_bytes(t);
+    if (bytes < 4) return 0;
+    if (live_frac > 0.0 && live_frac < 1.0) {
+        uint64_t b = (uint64_t)((double)bytes * live_frac);
+        b &= ~(uint64_t)3;                 /* whole words */
+        if (b >= 4) bytes = b;
+    }
+    const uint32_t *p = (const uint32_t *)ds4_gpu_tensor_contents(t);
+    if (!p) return 0;
+    const uint64_t words = bytes / 4u;
+    uint64_t stride = words / 4096u;
+    if (stride == 0) stride = 1;
+    uint64_t h = UINT64_C(1469598103934665603);
+    for (uint64_t i = 0; i < words; i += stride) {
+        h = (h ^ (uint64_t)p[i]) * UINT64_C(1099511628211);
+    }
+    h = (h ^ bytes) * UINT64_C(1099511628211);
+    return h;
+}
+
 static uint64_t ds4_glm53_tensor_digest(ds4_gpu_tensor *t) {
     if (!t) return 0;
     const uint64_t bytes = ds4_gpu_tensor_bytes(t);
@@ -60932,6 +60970,14 @@ static void ds4_glm53_state_digest(ds4_session *s, const char *label, int pos) {
     ds4_glm_gpu_graph *g = &s->glm_graph;
     if (!s->glm_graph_ready || !g->glm53) return;
     (void)ds4_gpu_synchronize();
+    /* Rows are position-indexed against compact_cache_cap (or ctx_cap when the
+     * compact path is off), so the fraction a restore must reproduce is
+     * pos/cap. Clamped to (0,1]; 0 or an unknown cap means digest everything. */
+    const uint32_t cap = g->compact_cache_cap ? g->compact_cache_cap : g->ctx_cap;
+    double live_frac = 1.0;
+    if (cap > 0 && pos > 0 && (uint32_t)pos < cap) {
+        live_frac = (double)pos / (double)cap;
+    }
     struct { const char *name; ds4_gpu_tensor **arr; } kinds[] = {
         { "kda_conv",      g->layer_kda_conv_state },
         { "kda_recur",     g->layer_kda_recurrent_state },
@@ -60950,16 +60996,26 @@ static void ds4_glm53_state_digest(ds4_session *s, const char *label, int pos) {
          * fold still names the kind, which is what picks the culprit; the layer
          * only matters once a kind is implicated. */
         uint64_t h = UINT64_C(1469598103934665603);
+        uint64_t hb = UINT64_C(1469598103934665603);
         uint32_t n = 0;
         for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
             ds4_gpu_tensor *t = kinds[k].arr[il];
             if (!t) continue;
             h = (h ^ ds4_glm53_tensor_digest(t)) * UINT64_C(1099511628211);
+            hb = (hb ^ ds4_glm53_tensor_digest_bounded(t, live_frac)) *
+                 UINT64_C(1099511628211);
             n++;
         }
         if (n == 0) continue;
-        fprintf(stderr, "ds4: CKPTSTATE %-8s pos=%-7d %-14s n=%-3u %016llx\n",
-                label, pos, kinds[k].name, n, (unsigned long long)h);
+        /* BOUNDED is the column that decides. FULL is kept beside it because a
+         * kind that differs in FULL and matches in BOUNDED is the signature of
+         * a position-addressed cache behaving correctly, and telling that apart
+         * from a real defect is the whole point of the pair. */
+        fprintf(stderr,
+                "ds4: CKPTSTATE %-8s pos=%-7d %-14s n=%-3u full=%016llx "
+                "bounded=%016llx\n",
+                label, pos, kinds[k].name, n,
+                (unsigned long long)h, (unsigned long long)hb);
     }
     /* Scalars the restore sets by hand rather than copying. dense_cache_len is
      * reinstated from the snapshot; the graph's own frontier counters are not
