@@ -904,6 +904,22 @@ static void chat_msgs_free(chat_msgs *msgs) {
     memset(msgs, 0, sizeof(*msgs));
 }
 
+/* Insert at the FRONT. The Anthropic `system` parameter is parsed after the
+ * messages array and would otherwise be appended last -- which was harmless
+ * while every system message was hoisted to the front, and became a serious
+ * bug the moment late system messages started rendering in situ: the main
+ * system prompt would have landed AFTER the whole conversation. It belongs
+ * where the client put it, which is before the messages. */
+static void chat_msgs_push_front(chat_msgs *msgs, chat_msg msg) {
+    if (msgs->len == msgs->cap) {
+        msgs->cap = msgs->cap ? msgs->cap * 2 : 8;
+        msgs->v = xrealloc(msgs->v, (size_t)msgs->cap * sizeof(msgs->v[0]));
+    }
+    memmove(&msgs->v[1], &msgs->v[0], (size_t)msgs->len * sizeof(msgs->v[0]));
+    msgs->v[0] = msg;
+    msgs->len++;
+}
+
 static void chat_msgs_push(chat_msgs *msgs, chat_msg msg) {
     if (msgs->len == msgs->cap) {
         msgs->cap = msgs->cap ? msgs->cap * 2 : 8;
@@ -3987,7 +4003,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         msg.role = xstrdup("system");
         msg.content = system;
         system = NULL;
-        chat_msgs_push(&msgs, msg);
+        chat_msgs_push_front(&msgs, msg);
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
@@ -17610,6 +17626,47 @@ static void test_render_glm_chat_prompt_text(void) {
  * re-prefill, four times over, each reporting the same diverge=2610/785. The
  * leading system messages still hoist, because the main system prompt belongs
  * at the front; anything after the first user turn does not. */
+/* The Anthropic `system` parameter must lead the prompt, not trail it.
+ *
+ * It is parsed after the messages array, so it was appended LAST. That was
+ * invisible while every system message was hoisted to the front, and became a
+ * severe bug the moment late system messages rendered in situ: the main system
+ * prompt would have been emitted after the entire conversation. Inserted at
+ * the front now, and this test is the guard. */
+static void test_anthropic_system_param_leads_the_prompt(void) {
+    const char *hoist = getenv("DS4_SERVER_SYSTEM_HOIST_ALL");
+    if (hoist && hoist[0] && hoist[0] != '0') return;
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("Hello");
+    chat_msgs_push(&msgs, user);
+    chat_msg remind = {0};                    /* an injected reminder, late */
+    remind.role = xstrdup("system");
+    remind.content = xstrdup("The task tools haven't been used recently.");
+    chat_msgs_push(&msgs, remind);
+    chat_msg sys = {0};                       /* the `system` parameter */
+    sys.role = xstrdup("system");
+    sys.content = xstrdup("You are Claude Code.");
+    chat_msgs_push_front(&msgs, sys);
+
+    char *prompt = render_chat_prompt_text_for_syntax(
+        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, DS4_THINK_NONE);
+    TEST_ASSERT(prompt != NULL);
+    const char *expected =
+        "[gMASK]<sop>"
+        "<|system|>You are Claude Code."
+        "<|user|>Hello"
+        "<|system|>The task tools haven't been used recently."
+        "<|assistant|><think></think>";
+    if (strcmp(prompt, expected)) {
+        fprintf(stderr, "got:      %s\nexpected: %s\n", prompt, expected);
+    }
+    TEST_ASSERT(!strcmp(prompt, expected));
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
 static void test_glm_prompt_late_system_message_renders_in_situ(void) {
     /* The escape hatch restores the behaviour this test exists to forbid. */
     const char *hoist = getenv("DS4_SERVER_SYSTEM_HOIST_ALL");
@@ -21719,6 +21776,7 @@ static void ds4_server_unit_tests_run(void) {
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
     test_glm_prompt_late_system_message_renders_in_situ();
+    test_anthropic_system_param_leads_the_prompt();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
     test_render_glm_groups_tool_results();
