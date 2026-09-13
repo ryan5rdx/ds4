@@ -9060,6 +9060,11 @@ static double now_sec(void) {
 
 static pthread_mutex_t server_log_mu = PTHREAD_MUTEX_INITIALIZER;
 
+/* printf-checked. Without this the compiler cannot see a format/argument
+ * mismatch here, and it did not: a format string that was never extended kept
+ * two trailing arguments it no longer had conversions for, so the divergence
+ * text this line exists to carry was silently dropped for three runs. */
+__attribute__((format(printf, 2, 3)))
 static void server_log(ds4_log_type type, const char *fmt, ...) {
     time_t now = time(NULL);
     struct tm tm;
@@ -13058,7 +13063,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                     ds4_session_reusable_tokens(slot->session),
                                     &j->req.prompt, common, slot->id);
         server_log(DS4_LOG_WARNING,
-                   "ds4-server: live kv cache miss%s slot=%d live=%d prompt=%d common=%d lost=%d vision=%s reason=%s diverge=%d/%d tool_replay=mem:%d/disk:%d/canonical:%d/missing:%d",
+                   "ds4-server: live kv cache miss%s slot=%d live=%d prompt=%d common=%d "
+                   "lost=%d vision=%s reason=%s diverge=%d/%d "
+                   "tool_replay=mem:%d/disk:%d/canonical:%d/missing:%d "
+                   "live_txt=\"%s\" prompt_txt=\"%s\"",
                    responses_protocol ? " RESPPROTO" : "",
                    slot->id,
                    old_pos, j->req.prompt.len, common, old_pos - common,
