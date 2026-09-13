@@ -73395,8 +73395,31 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
  * which restores exactly the pre-ring behaviour: full re-prefill on any
  * mid-prefix divergence, slow but never wrong. */
 static int ds4_glm53_ckpt_restore_enabled(void) {
+    /* DEFAULT OFF as of CKPTRING3, which failed the gate on a live defect.
+     *
+     * A deep restore fires, hash-verifies (prefix_ok=1), lands exactly, keeps
+     * 66% of the prompt -- and then produces a DIFFERENT continuation from the
+     * one a full re-prefill produces. Fluent, plausible, wrong: precisely the
+     * failure the gate exists to catch, caught on code shipped ahead of it.
+     * The snapshot's state is not bit-faithful, and the error only surfaces
+     * once enough recurrence runs to cross an argmax boundary (faithful at 13
+     * tokens re-created, unfaithful at 7901).
+     *
+     * Not merely depth-capped, and that is deliberate. Both production misses
+     * this feature was shipped for needed 5206 and 7908 tokens of recurrence
+     * after the landing point -- squarely in or beside the known-bad region.
+     * A cap tight enough to be defensible would not rescue either, so it would
+     * trade a measured correctness defect for a benefit that does not arrive.
+     * A slow prefill is recoverable; a silently wrong answer is not.
+     *
+     * The near-head restore IS verified byte-faithful and saves 52.2 s of a
+     * 52.5 s re-prefill, so this comes back on -- behind DS4_GLM53_CKPT_RESTORE=1
+     * for anyone who wants it now, and by default once the state-faithfulness
+     * defect is found and the gate passes at depth. Capture stays on
+     * regardless: it is cheap now that it runs once per request, and the ring
+     * has to be populated for the fix to be testable. */
     const char *e = getenv("DS4_GLM53_CKPT_RESTORE");
-    return !(e && e[0] == '0');
+    return e && e[0] == '1';
 }
 
 int ds4_session_glm53_try_restore(ds4_session *s, const ds4_tokens *prompt,
