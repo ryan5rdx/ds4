@@ -3827,6 +3827,15 @@ static void ds4_gpu_sgasync_log_binding(const char *base, const char *bound) {
     fprintf(stderr, "ds4: SGASYNC bind %s -> %s\n", base, bound);
 }
 
+/* SGASYNC target "small": the 512 B - 2 KiB same-type stages. One helper for
+ * all of them because they are ONE arm -- the expected per-site effect is far
+ * below the noise floor, so five separate A/Bs would be five nulls. They add no
+ * threadgroup memory and no barrier, so unlike the introduce-staging targets
+ * they cannot regress on occupancy; the reason to measure them together is to
+ * find out whether the aggregate is visible at all. */
+static id<MTLComputePipelineState> ds4_gpu_get_sgasync_small(
+        id<MTLComputePipelineState> hot, const char *base);
+
 static id<MTLComputePipelineState> ds4_gpu_get_sgasync_pipeline(
         const char *base, const char *target) {
     const int arm = ds4_gpu_sgasync_arm();
@@ -3870,6 +3879,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_sgasync_pipeline(
     return ds4_gpu_get_pipeline(base);
 }
 
+
 static int ds4_gpu_disable_hot_pipeline_statics(void) {
     static int initialized;
     static int disabled;
@@ -3886,6 +3896,25 @@ static id<MTLComputePipelineState> ds4_gpu_hot_pipeline(
     if (!ds4_gpu_disable_hot_pipeline_statics()) return pipeline;
     return ds4_gpu_get_pipeline(fallback_name);
 }
+
+static id<MTLComputePipelineState> ds4_gpu_get_sgasync_small(
+        id<MTLComputePipelineState> hot, const char *base) {
+    if (ds4_gpu_sgasync_arm() == 0 || !ds4_gpu_sgasync_target_selected("small")) {
+        return ds4_gpu_hot_pipeline(hot, base);
+    }
+    if (ds4_gpu_sgasync_arm() == 1) {
+        id<MTLComputePipelineState> p = ds4_gpu_get_private_pipeline(base);
+        ds4_gpu_sgasync_log_binding(base, p ? "private/non-async"
+                                            : "SHIPPING (private unavailable)");
+        return p ? p : ds4_gpu_hot_pipeline(hot, base);
+    }
+    char name[256];
+    snprintf(name, sizeof(name), "%s_sgasync1", base);
+    id<MTLComputePipelineState> p = ds4_gpu_get_private_pipeline(name);
+    ds4_gpu_sgasync_log_binding(base, p ? name : "SHIPPING (arm absent)");
+    return p ? p : ds4_gpu_hot_pipeline(hot, base);
+}
+
 
 /* ROUTER-SIMD: iterative simdgroup top-k instead of a 512-wide bitonic sort.
  * Bit-identical selections and weights -- ds4_glm_router_better is a total
@@ -6380,6 +6409,11 @@ static NSString *ds4_gpu_full_source(void) {
      * run can swap one source file without changing the executable.
      */
     NSArray<NSArray<NSString *> *> *required_sources = @[
+        /* FIRST: the SGASYNC helpers must precede every file that uses them,
+         * and dsv4_rope.metal comes before dsv4_misc.metal where they used to
+         * live. Empty in the modern corpus -- the whole file is behind
+         * DS4_PRIVATE_CLONE. */
+        @[@"DS4_METAL_SGASYNC_PRELUDE_SOURCE", @"metal/sgasync_prelude.metal"],
         @[@"DS4_METAL_FLASH_ATTN_SOURCE", @"metal/flash_attn.metal"],
         @[@"DS4_METAL_DENSE_SOURCE",      @"metal/dense.metal"],
         @[@"DS4_METAL_GLM53_BF16_SOURCE", @"metal/glm53_bf16.metal"],
@@ -21520,7 +21554,7 @@ int ds4_gpu_indexer_score_one_tensor(
                 ? ds4_gpu_get_pipeline(score_tight
                         ? "kernel_dsv4_indexer_scores_llt_tight"
                         : "kernel_dsv4_indexer_scores_llt")
-                : ds4_gpu_hot_pipeline(g_dsv4_indexer_score_one_direct_pipeline,
+                : ds4_gpu_get_sgasync_small(g_dsv4_indexer_score_one_direct_pipeline,
                                         "kernel_dsv4_indexer_score_one_direct");
             if (!direct_pipeline) return 0;
 
@@ -38161,8 +38195,8 @@ int ds4_gpu_glm_k_b_project_typed_tensor(
         if (!weightbuf) return 0;
 
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_hot_pipeline(g_glm_k_b_project_pipeline,
-                                 "kernel_glm_k_b_project_q8_0");
+            ds4_gpu_get_sgasync_small(g_glm_k_b_project_pipeline,
+                                      "kernel_glm_k_b_project_q8_0");
         if (!pipeline) return 0;
 
         int owned = 0;
@@ -40619,7 +40653,7 @@ int ds4_gpu_glm_value_project_typed_batch_heads_tensor(
             use_mma ?
                 ds4_gpu_hot_pipeline(g_glm_value_project_q8_0_batch_heads_mma_pipeline,
                                      "kernel_glm_value_project_q8_0_batch_heads_mma") :
-                ds4_gpu_hot_pipeline(g_glm_value_project_q8_0_batch_heads_pipeline,
+                ds4_gpu_get_sgasync_small(g_glm_value_project_q8_0_batch_heads_pipeline,
                                      "kernel_glm_value_project_q8_0_batch_heads");
         if (!pipeline) return 0;
 

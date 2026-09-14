@@ -1,44 +1,3 @@
-/* SGASYNC: the private simdgroup_async_copy intrinsics exist only under the
- * Xcode 14.2 Metal frontend, so everything async in this file is behind
- * DS4_PRIVATE_CLONE, which only tests/make_private_clone_source.py defines. The
- * modern runtime corpus never sees a line of it -- which is what lets the SAME
- * source produce all three control arms (shipping, 14.2 non-async, 14.2 async)
- * instead of a hand-copied fork that would drift from the kernel it measures. */
-#ifdef DS4_PRIVATE_CLONE
-#include <metal_simdgroup_async>
-#if !defined(__HAVE_SIMDGROUP_ASYNC_COPY__)
-#error "DS4_PRIVATE_CLONE set but the toolchain has no simdgroup async copy"
-#endif
-
-/* A run of `n_rows` CONSECUTIVE cache rows is one contiguous copy.
- *
- * GLM53 selection is not an arbitrary gather: kernel_glm53_expand_pool_selection
- * emits `pool * pool_size + slot % pool_size`, so each pool contributes
- * pool_size consecutive raw rows. A 16-row stage at pool_size 4 is therefore
- * four independent contiguous 4 KiB copies -- which is the only reason the copy
- * engine applies here at all.
- *
- * That is a property of the producer, not a guarantee, so it is CHECKED per
- * run and the caller falls back to the scalar path when it does not hold
- * (short tails, invalid rows, a different pool_size). Assuming it would be a
- * silent wrong-rows bug, and attention output is exactly the kind of thing that
- * degrades without failing. */
-static inline bool ds4_sgasync_run_is_contiguous(
-        device const uint32_t *selected, uint base, uint n_rows, uint cache_cap) {
-    const uint first = selected[base];
-    if (first >= cache_cap || first + n_rows > cache_cap) return false;
-    for (uint i = 1; i < n_rows; ++i) {
-        if (selected[base + i] != first + i) return false;
-    }
-    return true;
-}
-/* ABI marker. ds4_gpu_private_library() refuses an artifact without the exact
- * name this build expects, which is the only cheap way to catch a stale
- * metallib: a mismatched one binds fine and then misreads its arguments. */
-kernel void ds4_private_clone_abi_1(device uint *sink [[buffer(0)]]) { sink[0] = 1u; }
-
-#endif  /* DS4_PRIVATE_CLONE */
-
 struct ds4_metal_args_dsv4_topk_mask {
     int64_t  ne00;
     int64_t  ne01;
@@ -497,6 +456,7 @@ kernel void kernel_dsv4_directional_steering_project_f32(
 // walks the 64 indexer heads in four-head groups.  This avoids materializing the
 // intermediate [compressed rows x heads] score matrix used by the generic
 // matvec + weighted-sum path.
+template <bool ASYNC_SMALL = false>
 kernel void kernel_dsv4_indexer_score_one_direct(
         constant ds4_metal_args_dsv4_indexer_scores_fused & args,
         device const char *q,
@@ -515,10 +475,17 @@ kernel void kernel_dsv4_indexer_score_one_direct(
     threadgroup float *ktg = shared;          // [128]
     threadgroup float *dotbuf = ktg + 128u;   // [64], one slot per head
 
-    if (tid < 128u) {
+    {
         device const float *krow = (device const float *)(index_comp +
             (uint64_t)row * args.index_row_stride);
-        ktg[tid] = krow[tid];
+#ifdef DS4_PRIVATE_CLONE
+        if (ASYNC_SMALL) {
+            ds4_sgasync_stage_1d(ktg, krow, 128u, sg);
+        } else
+#endif
+        if (tid < 128u) {
+            ktg[tid] = krow[tid];
+        }
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -680,6 +647,7 @@ static inline float glm_quant_weight_at(
         device const char *row,
         uint col);
 
+template <bool ASYNC_SMALL = false>
 kernel void kernel_glm_k_b_project_q8_0(
         constant ds4_metal_args_glm_k_b_project & args,
         device const char *weight,
@@ -702,6 +670,12 @@ kernel void kernel_glm_k_b_project_q8_0(
         (device float *)(dst +
             ((uint64_t)token * args.n_head + head) * args.qk_nope * sizeof(float));
 
+#ifdef DS4_PRIVATE_CLONE
+    if (ASYNC_SMALL) {
+        ds4_sgasync_stage_1d(kv_scratch, kv, args.kv_lora_dim,
+                             (ushort)(tid / 32u));
+    } else
+#endif
     for (uint j = tid; j < args.kv_lora_dim; j += nth) {
         kv_scratch[j] = kv[j];
     }
@@ -3177,6 +3151,7 @@ kernel void kernel_glm_qk_lowrank_q8_0_batch_glm53_t4(
     }
 }
 
+template <bool ASYNC_SMALL = false>
 kernel void kernel_glm_value_project_q8_0(
         constant ds4_metal_args_glm_qk_lowrank & args,
         device const char *weight,
@@ -3191,6 +3166,11 @@ kernel void kernel_glm_value_project_q8_0(
     const uint nth = ntg_u.x;
     device const float *src =
         (device const float *)(lora + (uint64_t)head * args.kv_lora_dim * sizeof(float));
+#ifdef DS4_PRIVATE_CLONE
+    if (ASYNC_SMALL) {
+        ds4_sgasync_stage_1d(x, src, args.kv_lora_dim, (ushort)(tid / 32u));
+    } else
+#endif
     for (uint j = tid; j < args.kv_lora_dim; j += nth) {
         x[j] = src[j];
     }
@@ -3205,6 +3185,7 @@ kernel void kernel_glm_value_project_q8_0(
     }
 }
 
+template <bool ASYNC_SMALL = false>
 kernel void kernel_glm_value_project_q8_0_batch_heads(
         constant ds4_metal_args_glm_qk_lowrank_batch & args,
         device const char *weight,
@@ -3232,6 +3213,11 @@ kernel void kernel_glm_value_project_q8_0_batch_heads(
             (uint64_t)token * heads_token_stride +
             (uint64_t)head * value_dim * sizeof(float));
 
+#ifdef DS4_PRIVATE_CLONE
+    if (ASYNC_SMALL) {
+        ds4_sgasync_stage_1d(x, src, args.kv_lora_dim, (ushort)(tid / 32u));
+    } else
+#endif
     for (uint j = tid; j < args.kv_lora_dim; j += nth) {
         x[j] = src[j];
     }
@@ -9075,3 +9061,29 @@ kernel void kernel_dspark_markov_argmax_reduce(
         out_key[0] = (ulong(value_key) << 32u) | ulong(~indices[0]);
     }
 }
+
+
+#ifdef DS4_PRIVATE_CLONE
+/* SGASYNC target "small": the 512 B - 2 KiB same-type stages the corpus sweep
+ * found. ONE target for all of them rather than one arm each -- the expected
+ * effect per site is far below the noise floor (the indexer, with an 8 KiB
+ * stage, measured flat), so five separate A/Bs would be five nulls. Tested
+ * together, enabled together.
+ *
+ * They add no threadgroup memory and no barrier -- the caller's existing
+ * barrier publishes the copy -- so unlike the introduce-staging targets these
+ * cannot regress on occupancy. Byte-identical by construction: same values,
+ * same order, only the instruction that moves them differs. */
+template [[host_name("kernel_dsv4_indexer_score_one_direct_sgasync1")]]
+kernel decltype(kernel_dsv4_indexer_score_one_direct<true>)
+kernel_dsv4_indexer_score_one_direct<true>;
+template [[host_name("kernel_glm_k_b_project_q8_0_sgasync1")]]
+kernel decltype(kernel_glm_k_b_project_q8_0<true>)
+kernel_glm_k_b_project_q8_0<true>;
+template [[host_name("kernel_glm_value_project_q8_0_sgasync1")]]
+kernel decltype(kernel_glm_value_project_q8_0<true>)
+kernel_glm_value_project_q8_0<true>;
+template [[host_name("kernel_glm_value_project_q8_0_batch_heads_sgasync1")]]
+kernel decltype(kernel_glm_value_project_q8_0_batch_heads<true>)
+kernel_glm_value_project_q8_0_batch_heads<true>;
+#endif
