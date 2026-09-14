@@ -914,8 +914,10 @@ int main(int argc, char **argv) {
          *   - --dump-frontier-logits, which calls ds4_session_copy_logits() and
          *     is refused on a carrier (correctly: there are no real values);
          *   - the DSpark / speculative paths, which need real logit values.
-         * DS4_TP_COMPACT_TOP1=0 is the A/B control and is honoured by the
-         * session layer, so it is deliberately not re-checked here. */
+         * DS4_TP_COMPACT_TOP1=0 is the A/B control. It is read at the eval
+         * chokepoint by ds4_session_compact_top1_enabled(), so it applies here
+         * without this file knowing about it -- which was NOT true when this
+         * comment was first written and the knob lived in ds4_server.c only. */
         {
             ds4_raw_argmax_ctx rax = {
                 .temperature = 0.0f,
