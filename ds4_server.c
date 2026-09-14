@@ -12800,19 +12800,6 @@ static void *decode_worker_main(void *arg) {
     return NULL;
 }
 
-/* U64TOP1-TP kill switch. Default ON follows the v4 convention that an omitted
- * knob is enabled, so a control arm must say DS4_TP_COMPACT_TOP1=0 explicitly --
- * an omitted knob is NOT a control here. Setting 0 restores the full vocabulary
- * half on the wire and every logits consumer with it, which is the fallback the
- * brief requires to stay available. */
-static int server_compact_top1_enabled(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char *e = getenv("DS4_TP_COMPACT_TOP1");
-        v = (e && e[0] == '0') ? 0 : 1;
-    }
-    return v;
-}
 
 /* Execute one request on the worker-owned session.
  *
@@ -13527,7 +13514,10 @@ decode_again:
         }
         /* ignore_eos is not a sampler knob the ctx models, so it disarms here
          * rather than being squeezed into a field that means something else. */
-        const bool armable = server_compact_top1_enabled() && !j->req.ignore_eos;
+        /* The kill switch is NOT re-checked here: ds4_session_compact_top1_enabled()
+         * reads it at the eval chokepoint, so every caller and both ranks get
+         * it. A second copy in this file is what made ds4-bench ignore it. */
+        const bool armable = !j->req.ignore_eos;
         ds4_session_set_raw_argmax_ctx(slot->session, armable ? &rax : NULL);
     }
 

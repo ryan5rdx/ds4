@@ -735,10 +735,15 @@ tests/test_tp_commands: tests/test_tp_commands.o $(filter-out ds4_tp.o,$(CPU_COR
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 .PHONY: test-session-state
+# A decision implemented in one caller while the measurement runs through
+# another is how U64TOP1-TP broke three times. Cheap, so it runs with the tests.
+test-single-knob-readers:
+	./tests/check_single_knob_reader.sh
+
 test-top1-merge: tests/test_top1_merge
 	./tests/test_top1_merge
 
-test-session-state: tests/test_session_state tests/test_tp_commands tests/test_top1_merge
+test-session-state: tests/test_session_state tests/test_tp_commands tests/test_top1_merge test-single-knob-readers
 	./tests/test_session_state
 	./tests/test_tp_commands
 	./tests/test_top1_merge

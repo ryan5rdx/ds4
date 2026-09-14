@@ -59223,6 +59223,7 @@ struct ds4_session {
 static void ds4_session_logits_mark_full(ds4_session *s);
 static bool ds4_session_logits_are_compact(const ds4_session *s);
 static bool ds4_session_glm_top2_keys(ds4_session *s, uint64_t out[2]);
+static int ds4_session_compact_top1_enabled(void);
 static bool ds4_session_tp_leader(const ds4_session *s);
 
 #ifndef DS4_NO_GPU
@@ -74489,6 +74490,40 @@ bool ds4_sampler_can_use_raw_argmax(const ds4_raw_argmax_ctx *c) {
  * S5 materialises rank r's rows in place at r*vhalf, so the base is the offset
  * into s->logits and the packed ids are already global.
  */
+/* U64TOP1-TP kill switch, read HERE and nowhere else.
+ *
+ * It lived in ds4_server.c, which meant ds4-bench ignored it entirely: the
+ * rerun's control arm printed ACTIVE alongside the compact arm and there was no
+ * A/B. Worse, ds4_bench.c carried a comment of mine asserting the knob "is
+ * honoured by the session layer" -- an assertion about code I had not written,
+ * which is exactly why I did not write it.
+ *
+ * That is the third time this feature broke the same way: an eligibility
+ * predicate the production request could not satisfy, then an arming call only
+ * one binary made, now a kill switch only one binary read. Each fix was local
+ * to a caller. This one is at the chokepoint every caller and BOTH ranks pass
+ * through, so a new caller inherits it instead of having to remember it.
+ *
+ * Leader-only is sufficient -- a disarmed leader sends no
+ * DS4_TP_EVAL_F_COMPACT_TOP1 and the worker follows the frame -- but setting it
+ * on both launch lines is harmless and is what the harness does.
+ *
+ * Default ON follows the v4 convention that an omitted knob is enabled, so a
+ * control arm must say 0 explicitly. */
+static int ds4_session_compact_top1_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_TP_COMPACT_TOP1");
+        v = (e && e[0] == '0') ? 0 : 1;
+        if (!v) {
+            fprintf(stderr,
+                    "ds4: TP compact top-1 DISABLED by DS4_TP_COMPACT_TOP1=0 "
+                    "(full vocabulary half on the wire)\n");
+        }
+    }
+    return v;
+}
+
 static bool ds4_session_glm_top2_keys(ds4_session *s, uint64_t out[2]) {
     if (!s || !s->logits || !out) return false;
     if (!s->engine || !s->engine->tp.active || !s->engine->tp.vocab_split) {
@@ -75988,7 +76023,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
      * feature dead in the one configuration it targets, with nothing failing to
      * say so. support_kind is the fact that decides whether a draft runs. */
     const bool is_leader = ds4_session_tp_leader(s);
-    const bool structural =
+    const bool structural = ds4_session_compact_top1_enabled() &&
         s->engine && s->engine->support_kind == DS4_SUPPORT_NONE &&
         !s->tp_eval_spec && s->engine->tp.active && s->engine->tp.vocab_split &&
         ds4_tp_peer_supports_compact_top1(s->engine->tp.ctx);
