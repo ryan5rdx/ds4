@@ -2545,23 +2545,9 @@ static int tp_hello_exchange(ds4_tp *tp, const ds4_tp_identity *id, int rdma_ok,
      * two incompatible wire protocols that would both have completed bring-up
      * against each other's frame numbering.  A post-merge smoke test has to be
      * able to READ the version, not infer it. */
-    /* The checkpoint-ring slot count is printed rather than exchanged.
-     *
-     * It belongs in the identity check, but adding a field to the hello struct
-     * is a wire change and therefore a protocol version bump, which is not
-     * worth spending on this: a mismatch degrades SAFELY rather than
-     * corrupting. slot_for() differs between ranks, so the worker's find()
-     * either locates the same absolute pos or nothing -- it cannot return a
-     * DIFFERENT checkpoint, because find() rejects on `c->pos != pos`. A miss
-     * makes the mirrored rewind disagree and rewind_core invalidates both
-     * ranks: wasteful, not wrong. Printing it on both ranks makes the
-     * mismatch diffable from the logs, which is what the harness checks. */
-    fprintf(stderr,
-            "ds4-tp: hello ok, protocol version %u, %u gate slots/layer, "
-            "%u glm53 checkpoint slots\n",
+    fprintf(stderr, "ds4-tp: hello ok, protocol version %u, %u gate slots/layer\n",
             (unsigned)DS4_TP_PROTOCOL_VERSION,
-            (unsigned)DS4_TP_GATES_PER_LAYER,
-            (unsigned)ds4_glm53_ckpt_slot_count());
+            (unsigned)DS4_TP_GATES_PER_LAYER);
     if (theirs.role == mine.role) {
         tp_set_err(err, errlen, "tp hello: both sides claim role %u", mine.role);
         return 0;
