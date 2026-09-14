@@ -3592,6 +3592,167 @@ static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
     return pipeline;
 }
 
+/* ---- SGASYNC private clone library -------------------------------------
+ *
+ * A SECOND MTLLibrary, loaded from a prebuilt metallib rather than compiled at
+ * runtime. It exists because the private simdgroup_async_copy intrinsics are
+ * only reachable through the Xcode 14.2 Metal frontend, which no current
+ * toolchain has -- so those kernels cannot live in the runtime-compiled corpus
+ * at all.
+ *
+ * The artifact is produced by tests/make_private_clone_source.py, which
+ * assembles the SAME sources ds4_gpu_full_source() does and elides the handful
+ * of definitions using device-scope atomics that the old frontend lacks. So the
+ * clone is the real kernels, not a hand-copied fork that would drift -- and an
+ * elided kernel is simply absent, which makes asking for it a loud nil rather
+ * than a silently weaker memory fence.
+ *
+ * That is also what makes the THREE-CONTROL protocol possible. Every SGASYNC
+ * experiment needs modern-shipping, Xcode-14.2-non-async, and Xcode-14.2-async
+ * arms; without the middle one a compiler-version difference is
+ * indistinguishable from an async-copy result. The first comes from g_library,
+ * the second and third from this one.
+ *
+ * Absent or unloadable is NEVER fatal: one diagnostic, then every caller falls
+ * back to the shipping pipeline. The private metallib must not be required to
+ * start the server. */
+static id<MTLLibrary> g_private_library;
+static int g_private_library_state;   /* 0 untried, 1 loaded, -1 unavailable */
+
+static const char *ds4_gpu_private_metallib_path(void) {
+    const char *env = getenv("DS4_PRIVATE_METALLIB");
+    if (env && env[0]) return env;
+    return "ds4_private_clone.metallib";
+}
+
+static id<MTLLibrary> ds4_gpu_private_library(void) {
+    if (g_private_library_state != 0) return g_private_library;
+    g_private_library_state = -1;
+    const char *path = ds4_gpu_private_metallib_path();
+    NSString *p = [NSString stringWithUTF8String:path];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:p]) {
+        fprintf(stderr,
+                "ds4: private clone metallib not present at %s; SGASYNC arms "
+                "will fall back to the shipping kernels\n", path);
+        return nil;
+    }
+    NSError *error = nil;
+    id<MTLLibrary> lib = [g_device newLibraryWithURL:[NSURL fileURLWithPath:p]
+                                               error:&error];
+    if (!lib) {
+        fprintf(stderr, "ds4: private clone metallib %s failed to load: %s\n",
+                path, [[error localizedDescription] UTF8String]);
+        return nil;
+    }
+    g_private_library = lib;
+    g_private_library_state = 1;
+    /* Say it out loud on success. A private artifact that silently failed to
+     * load looks exactly like one that loaded and did not help -- the same
+     * distinction the TP protocol line exists for. */
+    fprintf(stderr, "ds4: private clone metallib loaded from %s\n", path);
+    return lib;
+}
+
+/* Pipeline from the private library. Separate cache keyspace from
+ * ds4_gpu_get_pipeline: the two libraries can hold the same function NAME with
+ * different code, which is the entire point of the non-async control arm, so
+ * sharing a cache would return whichever was asked for first. */
+static id<MTLComputePipelineState> ds4_gpu_get_private_pipeline(
+        const char *function_name) {
+    id<MTLLibrary> lib = ds4_gpu_private_library();
+    if (!lib) return nil;
+
+    static NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *cache;
+    if (!cache) cache = [NSMutableDictionary dictionary];
+    NSString *key = [NSString stringWithUTF8String:function_name];
+    id<MTLComputePipelineState> cached = [cache objectForKey:key];
+    if (cached) return cached;
+
+    NSError *error = nil;
+    id<MTLFunction> fn = [lib newFunctionWithName:key];
+    if (!fn) {
+        /* Either the kernel was elided as un-compilable under 14.2, or the
+         * artifact predates it. Both mean "fall back", and both are worth
+         * saying once. */
+        fprintf(stderr, "ds4: private clone has no function %s\n", function_name);
+        return nil;
+    }
+    id<MTLComputePipelineState> pipeline = ds4_gpu_new_pipeline(fn, &error);
+    if (!pipeline) {
+        fprintf(stderr, "ds4: private clone pipeline %s failed: %s\n",
+                function_name, [[error localizedDescription] UTF8String]);
+        return nil;
+    }
+    [cache setObject:pipeline forKey:key];
+    return pipeline;
+}
+
+/* Which library an SGASYNC-capable call site should use.
+ *
+ * 0 = shipping (modern frontend, no async)   -- the production control
+ * 1 = private clone, non-async               -- the COMPILER control
+ * 2 = private clone, async                   -- the experiment
+ *
+ * Arm 1 is not optional. Without it a measured difference between 0 and 2 could
+ * be the Xcode 14.2 code generator rather than the copy primitive, and the two
+ * are not separable after the fact. */
+static int ds4_gpu_sgasync_arm(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_SGASYNC_ARM");
+        v = (e && e[0] >= '0' && e[0] <= '2') ? (e[0] - '0') : 0;
+        if (v != 0) {
+            fprintf(stderr, "ds4: SGASYNC arm %d (%s)\n", v,
+                    v == 1 ? "private clone, NON-async -- compiler control"
+                           : "private clone, ASYNC");
+        }
+    }
+    return v;
+}
+
+/* Resolve a pipeline for a kernel that has an SGASYNC async variant.
+ * `base` is the shipping function name; the async variant is `base` +
+ * "_sgasync". Falls back to shipping whenever the private library cannot
+ * serve the request, so a missing artifact degrades to the control arm rather
+ * than to a failure. */
+static id<MTLComputePipelineState> ds4_gpu_get_sgasync_pipeline(
+        const char *base) {
+    const int arm = ds4_gpu_sgasync_arm();
+    if (arm == 0) return ds4_gpu_get_pipeline(base);
+    if (arm == 1) {
+        id<MTLComputePipelineState> p = ds4_gpu_get_private_pipeline(base);
+        return p ? p : ds4_gpu_get_pipeline(base);
+    }
+    /* DS4_SGASYNC_STAGE picks the partitioning arm: 4 = one 4 KiB run per
+     * simdgroup across four simdgroups, 8 = a 2 KiB run across eight. They are
+     * separate entry points rather than a runtime branch so neither pays for
+     * the other's register pressure. */
+    static int stage = -1;
+    if (stage < 0) {
+        const char *e = getenv("DS4_SGASYNC_STAGE");
+        stage = (e && e[0]) ? atoi(e) : 0;
+    }
+    /* Each target names its own partitionings, and they are not the same set:
+     * the decode stage splits 16 rows into 4 or 8 runs, the indexer tile is one
+     * copy or four. An unset or unmatched DS4_SGASYNC_STAGE tries the target's
+     * partitionings in order rather than guessing a number that exists for a
+     * different kernel. */
+    static const int kStages[] = {4, 8, 1, 2};
+    char name[256];
+    if (stage > 0) {
+        snprintf(name, sizeof(name), "%s_sgasync%d", base, stage);
+        id<MTLComputePipelineState> p = ds4_gpu_get_private_pipeline(name);
+        if (p) return p;
+        fprintf(stderr, "ds4: SGASYNC stage %d has no arm for %s\n", stage, base);
+    }
+    for (size_t i = 0; i < sizeof(kStages) / sizeof(kStages[0]); i++) {
+        snprintf(name, sizeof(name), "%s_sgasync%d", base, kStages[i]);
+        id<MTLComputePipelineState> p = ds4_gpu_get_private_pipeline(name);
+        if (p) return p;
+    }
+    return ds4_gpu_get_pipeline(base);
+}
+
 static int ds4_gpu_disable_hot_pipeline_statics(void) {
     static int initialized;
     static int disabled;
@@ -39804,6 +39965,13 @@ static int ds4_gpu_glm_indexer_scores_batch_grouped_tensor(
             use_tiled
                 ? ((!use_tiled_f32 && !ds4_gpu_idxport_kreg())
                    ? ds4_gpu_get_pipeline("kernel_glm_indexer_scores_tiled_original")
+                   /* SGASYNC target 3. Only the f16 tiled path has an async
+                    * arm -- the f32 variant needs a conversion the copy engine
+                    * cannot do -- so an arm selected against f32 falls through
+                    * to the shipping pipeline rather than silently measuring
+                    * the wrong kernel. */
+                   : (!use_tiled_f32 && ds4_gpu_sgasync_arm() != 0)
+                     ? ds4_gpu_get_sgasync_pipeline("kernel_glm_indexer_scores_tiled")
                    : ds4_gpu_hot_pipeline(use_tiled_f32 ? g_glm_indexer_scores_tiled_f32_pipeline
                                                         : g_glm_indexer_scores_tiled_pipeline,
                                           use_tiled_f32 ? "kernel_glm_indexer_scores_tiled_f32"
@@ -40711,13 +40879,21 @@ int ds4_gpu_glm_attention_indexed_decode_split_group8_typed_tensor(
 
         const bool use_valid_fullheads =
             selected_rows_valid && (n_head % 8u) == 0u;
+        const char *partial_name =
+            use_valid_fullheads ?
+                "kernel_glm_attention_indexed_decode_split_group8_partial_valid_fullheads" :
+                "kernel_glm_attention_indexed_decode_split_group8_partial";
+        /* SGASYNC target 1. Arm 0 keeps the hot-pipeline static entirely, so
+         * the production path is byte-for-byte what it was; arms 1 and 2 route
+         * through the private library and deliberately skip the static, since
+         * the whole point is that the same NAME resolves to different code. */
         id<MTLComputePipelineState> partial_pipeline =
-            ds4_gpu_hot_pipeline(use_valid_fullheads ?
-                                     g_glm_attention_indexed_decode_split_group8_partial_valid_fullheads_pipeline :
-                                     g_glm_attention_indexed_decode_split_group8_partial_pipeline,
-                                 use_valid_fullheads ?
-                                     "kernel_glm_attention_indexed_decode_split_group8_partial_valid_fullheads" :
-                                     "kernel_glm_attention_indexed_decode_split_group8_partial");
+            ds4_gpu_sgasync_arm() != 0 ?
+                ds4_gpu_get_sgasync_pipeline(partial_name) :
+                ds4_gpu_hot_pipeline(use_valid_fullheads ?
+                                         g_glm_attention_indexed_decode_split_group8_partial_valid_fullheads_pipeline :
+                                         g_glm_attention_indexed_decode_split_group8_partial_pipeline,
+                                     partial_name);
         const bool use_reduce16 =
             n_blocks == 16u && block_rows == 128u &&
             n_selected == 2048u && value_dim == 256u;

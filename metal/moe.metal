@@ -2577,6 +2577,14 @@ static inline uchar2 ds4_get_scale_min_k4_just2_tg(int j, int k,
                           uchar((q[j+4+k] >>  4) | ((q[j-0+k] & 0xc0) >> 2))};
 }
 
+/* Tag dispatch instead of `if constexpr`, which the Xcode 14.2 frontend (C++14)
+ * does not have -- and the private-clone corpus has to compile there. The
+ * generic overload is never called: RAW_STAGE static_asserts nl == 16, which
+ * only Q4_K satisfies. It exists so the other instantiations type-check. */
+template <typename block_q>
+static inline void ds4_moe_raw_dequant(threadgroup const block_q *, short,
+                                       thread half4x4 &) {}
+
 template <typename type4x4>
 void dequantize_q4_K_tg(threadgroup const block_q4_K *xb, short il,
                         thread type4x4 &reg) {
@@ -2597,6 +2605,12 @@ void dequantize_q4_K_tg(threadgroup const block_q4_K *xb, short il,
     for (int i = 0; i < 16; ++i) {
         reg[i / 4][i % 4] = dl * (q[i] & mask) - ml;
     }
+}
+
+template <>
+inline void ds4_moe_raw_dequant<block_q4_K>(threadgroup const block_q4_K *xb,
+                                            short il, thread half4x4 &reg) {
+    dequantize_q4_K_tg(xb, il, reg);
 }
 
 template <typename type4x4>
@@ -8835,7 +8849,7 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
         half4x4 temp_gate;
         half4x4 temp_up;
-        if constexpr (RAW_STAGE) {
+        if (RAW_STAGE) {
             /* Refill on the UNIFORM loop counter, not on `il`.
              *
              * il starts at il0 = tiitg % NL0, so half the threadgroup runs the
@@ -8872,8 +8886,8 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            dequantize_q4_K_tg(raw_gate + lr0, il, temp_gate);
-            dequantize_q4_K_tg(raw_up   + lr0, il, temp_up);
+            ds4_moe_raw_dequant(raw_gate + lr0, il, temp_gate);
+            ds4_moe_raw_dequant(raw_up   + lr0, il, temp_up);
         } else {
             dequantize_func(xg, il, temp_gate);
             dequantize_func(xu, il, temp_up);

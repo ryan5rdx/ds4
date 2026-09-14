@@ -1,3 +1,39 @@
+/* SGASYNC: the private simdgroup_async_copy intrinsics exist only under the
+ * Xcode 14.2 Metal frontend, so everything async in this file is behind
+ * DS4_PRIVATE_CLONE, which only tests/make_private_clone_source.py defines. The
+ * modern runtime corpus never sees a line of it -- which is what lets the SAME
+ * source produce all three control arms (shipping, 14.2 non-async, 14.2 async)
+ * instead of a hand-copied fork that would drift from the kernel it measures. */
+#ifdef DS4_PRIVATE_CLONE
+#include <metal_simdgroup_async>
+#if !defined(__HAVE_SIMDGROUP_ASYNC_COPY__)
+#error "DS4_PRIVATE_CLONE set but the toolchain has no simdgroup async copy"
+#endif
+
+/* A run of `n_rows` CONSECUTIVE cache rows is one contiguous copy.
+ *
+ * GLM53 selection is not an arbitrary gather: kernel_glm53_expand_pool_selection
+ * emits `pool * pool_size + slot % pool_size`, so each pool contributes
+ * pool_size consecutive raw rows. A 16-row stage at pool_size 4 is therefore
+ * four independent contiguous 4 KiB copies -- which is the only reason the copy
+ * engine applies here at all.
+ *
+ * That is a property of the producer, not a guarantee, so it is CHECKED per
+ * run and the caller falls back to the scalar path when it does not hold
+ * (short tails, invalid rows, a different pool_size). Assuming it would be a
+ * silent wrong-rows bug, and attention output is exactly the kind of thing that
+ * degrades without failing. */
+static inline bool ds4_sgasync_run_is_contiguous(
+        device const uint32_t *selected, uint base, uint n_rows, uint cache_cap) {
+    const uint first = selected[base];
+    if (first >= cache_cap || first + n_rows > cache_cap) return false;
+    for (uint i = 1; i < n_rows; ++i) {
+        if (selected[base + i] != first + i) return false;
+    }
+    return true;
+}
+#endif  /* DS4_PRIVATE_CLONE */
+
 struct ds4_metal_args_dsv4_topk_mask {
     int64_t  ne00;
     int64_t  ne01;
@@ -2419,7 +2455,18 @@ kernel void kernel_glm_indexer_scores_tiled_f32(
 #define IDX_ORIGINAL 0
 #define IDX_KREG     1
 
-template<int MODE>
+/* SGASYNC target 3 (prefill indexer). K_ASYNC selects how the contiguous
+ * TN x D = 32 x 128 half K tile (8 KiB) is filled: 0 = the shipping scalar
+ * loop, 1 = one whole-tile copy, 4 = four partitioned 2 KiB copies, one per
+ * simdgroup. Everything downstream -- the Q staging, the barriers, the MMA
+ * loop -- is untouched.
+ *
+ * The fast path needs the cache to already be f16 (async copies bytes; it
+ * cannot do the f32->f16 conversion glm_cache_load_f32_or_f16 performs), the
+ * row pitch to equal D (so the tile is one contiguous run), and the tile to be
+ * full. The final ragged tile keeps the checked scalar path, which is also
+ * where the zero-fill for rows past n_rows lives. */
+template<int MODE, int K_ASYNC = 0>
 static inline void glm_indexer_scores_tiled_mode_impl(
         constant ds4_metal_args_glm_indexer_scores_batch & args,
         device const char *q,
@@ -2462,17 +2509,45 @@ static inline void glm_indexer_scores_tiled_mode_impl(
         return;
     }
 
-    for (uint i = tid; i < TN*D; i += 128) {
-        const uint rc = i / D;
-        const uint d = i - rc*D;
-        const uint row = row_base + rc;
-        half v = half(0.0f);
-        if (row < args.n_rows) {
-            v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
-                                               (uint64_t)row * args.head_dim + d,
-                                               args.cache_f16));
+    bool k_staged = false;
+#ifdef DS4_PRIVATE_CLONE
+    if (K_ASYNC != 0 && args.cache_f16 && args.head_dim == D &&
+        row_base + TN <= args.n_rows) {
+        device const half *ksrc =
+            (device const half *)indexer_key_cache + (uint64_t)row_base * D;
+        if (K_ASYNC == 1) {
+            /* One simdgroup issues the whole tile; the barrier the shipping
+             * code already runs below is what publishes it to the others --
+             * wait() orders only the issuing simdgroup. */
+            if (sg == 0) {
+                simdgroup_future<void> c =
+                    simdgroup_async_copy(ktg, ksrc, (ulong)(TN * D));
+                c.wait();
+            }
+        } else {
+            constexpr uint rows_per_sg = TN / 4u;
+            const uint r0 = (uint)sg * rows_per_sg;
+            simdgroup_future<void> c = simdgroup_async_copy(
+                ktg + r0 * D, ksrc + (uint64_t)r0 * D,
+                (ulong)(rows_per_sg * D));
+            c.wait();
         }
-        ktg[i] = v;
+        k_staged = true;
+    }
+#endif
+    if (!k_staged) {
+        for (uint i = tid; i < TN*D; i += 128) {
+            const uint rc = i / D;
+            const uint d = i - rc*D;
+            const uint row = row_base + rc;
+            half v = half(0.0f);
+            if (row < args.n_rows) {
+                v = half(glm_cache_load_f32_or_f16(indexer_key_cache,
+                                                   (uint64_t)row * args.head_dim + d,
+                                                   args.cache_f16));
+            }
+            ktg[i] = v;
+        }
     }
 
     const uint cell0 = lane;
@@ -2583,6 +2658,40 @@ kernel void kernel_glm_indexer_scores_tiled(
     glm_indexer_scores_tiled_mode_impl<IDX_KREG>(args, q, weights, indexer_key_cache,
                                            scores, shared, tgpig, tid, lane, sg);
 }
+
+#ifdef DS4_PRIVATE_CLONE
+/* SGASYNC target 3 arms. The plain kernel above, recompiled by the 14.2
+ * frontend into the same private library, is the compiler control. */
+kernel void kernel_glm_indexer_scores_tiled_sgasync1(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    glm_indexer_scores_tiled_mode_impl<IDX_KREG, 1>(args, q, weights,
+        indexer_key_cache, scores, shared, tgpig, tid, lane, sg);
+}
+
+kernel void kernel_glm_indexer_scores_tiled_sgasync4(
+        constant ds4_metal_args_glm_indexer_scores_batch & args,
+        device const char *q,
+        device const char *weights,
+        device const char *indexer_key_cache,
+        device char *scores,
+        threadgroup float *shared [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    glm_indexer_scores_tiled_mode_impl<IDX_KREG, 4>(args, q, weights,
+        indexer_key_cache, scores, shared, tgpig, tid, lane, sg);
+}
+#endif
 
 /* Reversibility only: DS4_METAL_IDXPORT=original restores the pre-bank loop. */
 kernel void kernel_glm_indexer_scores_tiled_original(
@@ -3297,7 +3406,13 @@ kernel void kernel_glm_value_project_q8_0_batch_heads_mma(
     }
 }
 
-template <bool assume_valid_rows, bool assume_valid_heads>
+/* SGASYNC target 1 (decode). ASYNC_STAGE selects how the 16-row x 512-half KV
+ * stage is filled: 0 = the shipping scalar gather, 4 = four simdgroups each
+ * copying one 4-row/4 KiB run, 8 = eight simdgroups each copying a 2-row/2 KiB
+ * run. The allocation, the barrier structure and everything downstream are
+ * untouched -- only the fill changes, which is what keeps this an A/B of the
+ * copy rather than of the kernel. */
+template <bool assume_valid_rows, bool assume_valid_heads, int ASYNC_STAGE = 0>
 kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
         constant ds4_metal_args_glm_attention_indexed_decode_split & args,
         device const char *q,
@@ -3390,18 +3505,57 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
 
     for (uint base = block_start; base < block_end; base += stage_rows) {
         const uint rows = min(stage_rows, block_end - base);
-        for (uint off = tid; off < rows * kv_vecs; off += 256u) {
-            const uint rr = off / kv_vecs;
-            const uint vv = off - rr * kv_vecs;
-            const uint row = selected[base + rr];
-            const bool valid_row = assume_valid_rows || row < args.cache_cap;
-            if (valid_row) {
-                device const half4 *src =
-                    (device const half4 *)((device const half *)kv_lora_cache +
-                        (uint64_t)row * args.kv_lora_dim);
-                kv_shared[off] = src[vv];
-            } else {
-                kv_shared[off] = half4(half(0.0f));
+        bool kv_staged = false;
+#ifdef DS4_PRIVATE_CLONE
+        if (ASYNC_STAGE != 0) {
+            /* Split the stage into equal runs, one per participating
+             * simdgroup. Every run must be contiguous or the whole stage falls
+             * back -- a partial async fill would need a second barrier to be
+             * safe, and the point is to leave the barrier structure alone. */
+            const uint run_rows = (uint)(16 / ASYNC_STAGE);
+            const uint n_runs = (uint)ASYNC_STAGE;
+            /* Every thread evaluates the SAME predicate over all runs, rather
+             * than one thread per run publishing through a threadgroup flag.
+             * The flag would have needed storage past rope_shared -- past the
+             * end of what the host allocates -- and an extra barrier. 16 reads
+             * of a cache-resident index array is cheaper than either, and it
+             * keeps the decision uniform without synchronisation. */
+            bool ok = (rows == stage_rows);
+            for (uint r = 0u; ok && r < n_runs; ++r) {
+                ok = ds4_sgasync_run_is_contiguous(selected, base + r * run_rows,
+                                                   run_rows, args.cache_cap);
+            }
+            if (ok) {
+                if (head_in_group < n_runs) {
+                    const uint r0 = head_in_group * run_rows;
+                    device const half4 *src =
+                        (device const half4 *)((device const half *)kv_lora_cache +
+                            (uint64_t)selected[base + r0] * args.kv_lora_dim);
+                    simdgroup_future<void> c = simdgroup_async_copy(
+                        kv_shared + r0 * kv_vecs, src,
+                        (ulong)run_rows * kv_vecs);
+                    c.wait();
+                }
+                /* Published by the barrier the shipping code already runs
+                 * below; wait() only orders the ISSUING simdgroup. */
+                kv_staged = true;
+            }
+        }
+#endif
+        if (!kv_staged) {
+            for (uint off = tid; off < rows * kv_vecs; off += 256u) {
+                const uint rr = off / kv_vecs;
+                const uint vv = off - rr * kv_vecs;
+                const uint row = selected[base + rr];
+                const bool valid_row = assume_valid_rows || row < args.cache_cap;
+                if (valid_row) {
+                    device const half4 *src =
+                        (device const half4 *)((device const half *)kv_lora_cache +
+                            (uint64_t)row * args.kv_lora_dim);
+                    kv_shared[off] = src[vv];
+                } else {
+                    kv_shared[off] = half4(half(0.0f));
+                }
             }
         }
         for (uint off = tid; off < rows * rope_vecs; off += 256u) {
@@ -3505,6 +3659,27 @@ kernel_glm_attention_indexed_decode_split_group8_partial_impl<false, false>;
 template [[host_name("kernel_glm_attention_indexed_decode_split_group8_partial_valid_fullheads")]]
 kernel glm_attention_indexed_decode_split_group8_partial_t
 kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true>;
+
+#ifdef DS4_PRIVATE_CLONE
+/* SGASYNC target 1 arms. Same template, same instantiation arguments, only the
+ * stage fill differs -- so the private library's NON-async entry (the plain
+ * names above, recompiled by the 14.2 frontend) is the compiler control and
+ * these two are the experiment. */
+typedef decltype(kernel_glm_attention_indexed_decode_split_group8_partial_impl<false, false, 4>)
+        glm_attn_idx_dec_split_g8_partial_a4_t;
+template [[host_name("kernel_glm_attention_indexed_decode_split_group8_partial_sgasync4")]]
+kernel glm_attn_idx_dec_split_g8_partial_a4_t
+kernel_glm_attention_indexed_decode_split_group8_partial_impl<false, false, 4>;
+template [[host_name("kernel_glm_attention_indexed_decode_split_group8_partial_sgasync8")]]
+kernel glm_attn_idx_dec_split_g8_partial_a4_t
+kernel_glm_attention_indexed_decode_split_group8_partial_impl<false, false, 8>;
+template [[host_name("kernel_glm_attention_indexed_decode_split_group8_partial_valid_fullheads_sgasync4")]]
+kernel glm_attn_idx_dec_split_g8_partial_a4_t
+kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true, 4>;
+template [[host_name("kernel_glm_attention_indexed_decode_split_group8_partial_valid_fullheads_sgasync8")]]
+kernel glm_attn_idx_dec_split_g8_partial_a4_t
+kernel_glm_attention_indexed_decode_split_group8_partial_impl<true, true, 8>;
+#endif
 
 template<uint FIXED_BLOCKS>
 static void kernel_glm_attention_indexed_decode_split_group8_reduce_impl(
