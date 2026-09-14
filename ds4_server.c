@@ -13320,6 +13320,33 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                     "responses replay missing reasoning state; continuing from visible history source=%s cached=%d",
                     cache_source, cached);
     }
+    /* Refuse work once the TP transport has declared itself unrecoverable.
+     *
+     * ds4_tp_failed() has always existed and ds4.c consults it in four places,
+     * but the server never did. So after "this pair can no longer stay in sync
+     * and both ranks must be restarted" the server kept accepting requests and
+     * starting a fresh prompt for each one, about once a second, every one of
+     * them doomed -- a production log shows four `prompt start` lines in five
+     * seconds after a GPU command-buffer timeout killed the pair mid-prefill.
+     *
+     * Failing here rather than deeper in is deliberate: past this point the
+     * request has allocated a slot, mutated the session's cache bookkeeping,
+     * and begun a prefill that can only end in another transport error. A
+     * clear refusal is also what tells an operator to restart, instead of the
+     * log filling with restarts of the same prompt. */
+    if (ds4_engine_tp_failed(s->engine)) {
+        static int announced;
+        if (!announced) {
+            announced = 1;
+            server_log(DS4_LOG_ERROR,
+                       "ds4-server: TP transport has failed; refusing new work. "
+                       "Both ranks must be restarted.");
+        }
+        ds4_tokens_free(&effective_prompt);
+        http_error(j->fd, s->enable_cors, 503,
+                   "tensor-parallel transport failed; both ranks must be restarted");
+        return;
+    }
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt start",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
