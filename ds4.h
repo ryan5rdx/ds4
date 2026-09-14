@@ -361,6 +361,9 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
+/* True once the TP transport has marked itself unrecoverable. Both ranks must
+ * be restarted; callers must refuse work rather than retry. */
+bool ds4_engine_tp_failed(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);

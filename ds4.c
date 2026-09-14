@@ -70238,6 +70238,28 @@ int ds4_engine_model_id(ds4_engine *e) {
     return (int)DS4_MODEL_VARIANT;
 }
 
+/* Has the TP transport declared itself unrecoverable?
+ *
+ * ds4_tp_failed() existed and was consulted in four places inside ds4.c, but
+ * NOWHERE in the server. So when the transport logged "this pair can no longer
+ * stay in sync and both ranks must be restarted", the server did not know: it
+ * kept accepting requests and starting a fresh prompt for each, once a second,
+ * every one of them doomed. A production log shows four `prompt start` lines in
+ * five seconds after the pair died.
+ *
+ * Exposed at engine level so the server can refuse work instead of spinning.
+ * Deliberately not a "reset" -- the message means what it says, and pretending
+ * otherwise is how a half-dead pair produces wrong results rather than errors. */
+bool ds4_engine_tp_failed(ds4_engine *e) {
+#ifndef DS4_NO_GPU
+    if (!e || !e->tp.ctx) return false;
+    return ds4_tp_failed(e->tp.ctx);
+#else
+    (void)e;
+    return false;
+#endif
+}
+
 bool ds4_engine_is_glm53(ds4_engine *e) {
     (void)e;
     return ds4_model_is_glm53();
