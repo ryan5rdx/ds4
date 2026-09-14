@@ -86,10 +86,18 @@ static int derive_z_mapping(void) {
     int8_t  *y = (int8_t *)gy.data;
     int32_t *z = (int32_t *)gz.data;
 
+    /* corsix/matint.md, mode 8 with 32-bit Z: "only every fourth Y lane
+     * participates, each reused four times, so each 4x4 byte block accumulates
+     * Z row k from X lane k times Y lane 0."
+     *
+     * So the mapping to derive is x lane -> Z row, with y FIXED at lane 0.
+     * Sweeping y[1..3] and calling the empty result a failure was testing
+     * against a geometry the hardware does not have -- which is how the first
+     * version reported 2/16 and blamed the unit. */
     int mapped = 0, ambiguous = 0;
     int loc[4][4];
     for (int i = 0; i < 4; i++) {
-        for (int j = 0; j < 4; j++) {
+        for (int j = 0; j < 1; j++) {
             loc[i][j] = -1;
             memset(x, 0, 64); memset(y, 0, 64);
             memset(z, 0, (size_t)ZROWS * ZPERROW * 4);
@@ -99,7 +107,7 @@ static int derive_z_mapping(void) {
             AMX_LDY(AMX_PTR_ROW_FLAGS(y, 0, 0));
             for (int r = 0; r < ZROWS; r++)
                 AMX_LDZ(AMX_PTR_ROW_FLAGS(&z[r * ZPERROW], r, 0));
-            AMX_MATINT(0);
+            AMX_MATINT(DS4_AMX_MATINT_I8_I32);
             for (int r = 0; r < ZROWS; r++)
                 AMX_STZ(AMX_PTR_ROW_FLAGS(&z[r * ZPERROW], r, 0));
             AMX_CLR();
@@ -123,13 +131,13 @@ static int derive_z_mapping(void) {
      * distinct place. Anything less is not a layout a kernel can be written
      * against, so it is a failure rather than a partial success. */
     int distinct = 1;
-    for (int a = 0; a < 16 && distinct; a++)
-        for (int b = a + 1; b < 16; b++)
-            if (loc[a/4][a%4] >= 0 && loc[a/4][a%4] == loc[b/4][b%4]) { distinct = 0; break; }
+    for (int a = 0; a < 4 && distinct; a++)
+        for (int b = a + 1; b < 4; b++)
+            if (loc[a][0] >= 0 && loc[a][0] == loc[b][0]) { distinct = 0; break; }
 
-    printf("  Z mapping: %d/16 one-hot products located, %d ambiguous, "
+    printf("  Z mapping: %d/4 x-lane products located, %d ambiguous, "
            "distinct=%s\n", mapped, ambiguous, distinct ? "yes" : "NO");
-    if (mapped != 16) {
+    if (mapped != 4) {
         /* CURRENT STATE ON M1 MAX: 2/16, at x[0]y[0] -> Z row 0 and
          * x[0]y[2] -> Z row 2. y indexes the Z ROW, only even rows respond, and
          * no x beyond 0 contributes. That is the shape of a lane/mask field in
@@ -142,10 +150,8 @@ static int derive_z_mapping(void) {
          * step. Until then no Track B kernel may be written against this
          * layout, and this failure is the thing preventing that -- which is
          * precisely what Track A is for. */
-        fail("only %d/16 one-hot products were observable -- the MATINT operand "
-             "encoding (mask/mode fields, passed as 0 here) is incomplete. No "
-             "Track B kernel may be written against this layout until 16/16",
-             mapped);
+        fail("only %d/4 x-lane products were observable with the documented "
+             "i8->i32 operand; the layout still does not derive", mapped);
     } else if (!distinct || ambiguous) {
         fail("the Z mapping is not one-to-one (%d ambiguous)", ambiguous);
     } else {
@@ -155,7 +161,7 @@ static int derive_z_mapping(void) {
                loc[0][0], stride, rstride);
     }
     free(gx.base); free(gy.base); free(gz.base);
-    return mapped == 16 && distinct && !ambiguous;
+    return mapped == 4 && distinct && !ambiguous;
 }
 
 /* ---- 3. SET/CLR discipline ---------------------------------------------- */

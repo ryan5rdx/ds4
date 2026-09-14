@@ -17,6 +17,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+
 static ds4_amx_caps g_caps;
 static bool g_probed;
 
@@ -67,7 +68,7 @@ static bool canary_matint_i8(void) {
     AMX_LDY(AMX_PTR_ROW_FLAGS(y, 0, 0));
     /* Zero the Z region this op accumulates into before using it. */
     AMX_LDZ(AMX_PTR_ROW_FLAGS(z, 0, 0));
-    AMX_MATINT(0);
+    AMX_MATINT(DS4_AMX_MATINT_I8_I32);
     AMX_STZ(AMX_PTR_ROW_FLAGS(z, 0, 0));
     AMX_CLR();
 
@@ -90,7 +91,7 @@ static bool canary_matfp_f16(void) {
     AMX_LDX(AMX_PTR_ROW_FLAGS(x, 0, 0));
     AMX_LDY(AMX_PTR_ROW_FLAGS(y, 0, 0));
     AMX_LDZ(AMX_PTR_ROW_FLAGS(z, 0, 0));
-    AMX_MATFP(1ull << 42);           /* F16 operands, F32 accumulate */
+    AMX_MATFP(DS4_AMX_MATFP_F16_F32);
     AMX_STZ(AMX_PTR_ROW_FLAGS(z, 0, 0));
     AMX_CLR();
 
@@ -114,7 +115,7 @@ static bool canary_bf16(void) {
     AMX_LDX(AMX_PTR_ROW_FLAGS(x, 0, 0));
     AMX_LDY(AMX_PTR_ROW_FLAGS(y, 0, 0));
     AMX_LDZ(AMX_PTR_ROW_FLAGS(z, 0, 0));
-    AMX_MATFP((1ull << 42) | (1ull << 62));   /* BF16 mode, if honoured */
+    AMX_MATFP(DS4_AMX_MATFP_BF16_F32);
     AMX_STZ(AMX_PTR_ROW_FLAGS(z, 0, 0));
     AMX_CLR();
 

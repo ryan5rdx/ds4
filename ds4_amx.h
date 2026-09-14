@@ -76,6 +76,33 @@
 #define AMX_PTR_ROW_FLAGS(ptr, row, flags) \
     (((uint64_t)(ptr)) + (((uint64_t)((row) + (flags) * 64)) << 56))
 
+/* Operand encodings from corsix/amx (matint.md, matfp.md). These were GUESSED
+ * in the first version and every one was wrong, which produced two false
+ * capability readings and a Z mapping that would not derive:
+ *
+ *   MATINT(0)                 -> ALU mode 0, lane width 0. Not an i8 outer
+ *                                product at all.
+ *   MATFP(1 << 42)  as "f16"  -> lane width 1 IS bf16->f32, M2 only. On M1 it
+ *                                falls through to f16->f16.
+ *   MATFP(... | 1 << 62)      -> bit 62 is inside the Y-enable VALUE field
+ *                                (57-62), not a bf16 flag.
+ *
+ * Named constants now, with the field each bit belongs to spelled out, because
+ * a magic literal here is indistinguishable from the wrong magic literal. */
+
+/* MATINT: signed i8 x i8 -> i32 over the whole Z grid.
+ *   bit 63      X signed
+ *   bits 47-52  ALU mode 8 = multiply-accumulate
+ *   bits 42-45  lane width 10 = 8-bit multiplicands, 32-bit Z, all rows
+ *   bit 26      Y signed
+ * Everything else zero: no shuffles, no shift, all lanes enabled, Z row 0. */
+#define DS4_AMX_MATINT_I8_I32 \
+    ((1ull << 63) | (8ull << 47) | (10ull << 42) | (1ull << 26))
+
+/* MATFP: bits 47-52 = ALU mode 0 (z + x*y), bits 42-45 = lane width. */
+#define DS4_AMX_MATFP_F16_F32  (3ull << 42)   /* f16  x f16  -> f32           */
+#define DS4_AMX_MATFP_BF16_F32 (1ull << 42)   /* bf16 x bf16 -> f32, M2 only  */
+
 #endif /* DS4_AMX_BUILDABLE */
 
 /* What a given host actually supports, established behaviourally. Every field
