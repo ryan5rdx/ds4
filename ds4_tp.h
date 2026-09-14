@@ -39,8 +39,15 @@ enum {
  * PLAIN eval even though --mtp is set.  A worker that inferred "speculative"
  * from its own startup --mtp would then run a full spec cycle against a
  * leader doing a one-token decode and hang on gates nobody fires. */
+/* The same authority argument applies to the compact top-1 exchange, and more
+ * sharply: the two ranks must agree per eval on WHICH FRAME follows the eval,
+ * an 8-byte key or a 310 KB vocabulary half. Disagreement is a hang, not a
+ * wrong token -- the right failure, but still a failure, and inferring it from
+ * local sampler state would make it reachable. The leader decides, because the
+ * leader is the only side that sees the sampler request. */
 enum {
-    DS4_TP_EVAL_F_GLM_SPEC = 1u << 0,
+    DS4_TP_EVAL_F_GLM_SPEC     = 1u << 0,
+    DS4_TP_EVAL_F_COMPACT_TOP1 = 1u << 1,
 };
 
 /* Engine identity exchanged in the hello so a mismatched pair aborts before
@@ -304,6 +311,19 @@ typedef enum {
      * length.  Capturing only on this command keeps the two snapshots at the
      * same frontier at all times. */
     DS4_TP_FRAME_ROLLBACK_CAPTURE = 23,
+    /* Compact greedy top-1: ONE 8-byte packed key per active row, replacing a
+     * whole vocabulary half.
+     *
+     * Each rank packs with its GLOBAL vocabulary base, so the key already
+     * carries the real token id and rank 0 needs only an unsigned max of the
+     * two. Adding a rank offset after the reduction would be wrong -- the
+     * maximum was taken over locally-numbered keys and the winner's identity
+     * would already be lost.
+     *
+     * Sent only when both ranks negotiated it for this request, which requires
+     * the sampler contract to permit a raw argmax. The full-logit frame stays
+     * the fallback for everything else and for any request that cannot use it. */
+    DS4_TP_FRAME_TOP1_KEYS = 24,
 } ds4_tp_frame_type;
 
 typedef struct {
@@ -335,6 +355,15 @@ int ds4_tp_hash_check(ds4_tp *tp, uint64_t seq, uint64_t hash, char *err, size_t
 /* Vocab-split output head: the worker ships its logits half to the leader
  * after every eval (and after a sync) on the control socket. */
 int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count);
+/* Whether the peer speaks the compact top-1 frame. See the definition. */
+int ds4_tp_peer_supports_compact_top1(const ds4_tp *tp);
+/* Compact greedy top-1 exchange: `count` packed keys, one per active row.
+ * Each key must already carry the GLOBAL token id -- see
+ * DS4_TP_FRAME_TOP1_KEYS. Same framing and locking as the logits half; the
+ * payload is 8 bytes per row instead of a vocabulary half (310 KB at GLM's
+ * 154880). */
+int ds4_tp_send_top1_keys(ds4_tp *tp, const uint64_t *keys, uint32_t count);
+int ds4_tp_recv_top1_keys(ds4_tp *tp, uint64_t *keys, uint32_t count);
 int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count);
 
 /* Speculative verify mirroring.  The leader announces a draft block right

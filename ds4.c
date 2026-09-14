@@ -45,6 +45,7 @@
 #include "ds4_distributed.h"
 #include "ds4_image.h"
 #include "ds4_tp.h"
+#include "ds4_top1_key.h"
 #ifdef DS4_ROCM_BUILD
 #include "ds4_linux_memory.h"
 #endif
@@ -59098,6 +59099,14 @@ struct ds4_session {
     size_t sync_image_count;
     token_vec greedy_splitkv_segment;
     float *logits;
+    /* Compact greedy top-1 (U64TOP1-TP). `armed` is per request and must be
+     * identical on both ranks; `key` holds the merged winner after the
+     * exchange, and `valid` says the sampler may read it instead of logits. */
+    bool     compact_top1_request;  /* leader: this request's sampler allows it */
+    bool     compact_top1_armed;
+    bool     compact_top1_valid;
+    uint64_t compact_top1_key;
+
     float *sample_probs;
     float *mtp_logits;
     int greedy_splitkv_anchor_len;
@@ -74222,11 +74231,25 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
 
 int ds4_session_argmax(ds4_session *s) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    /* Compact path. s->logits was canonicalised to a one-hot carrier for the
+     * winner, so scanning it would give the right answer anyway -- this returns
+     * the key directly to skip a 154880-element scan for a value already known.
+     * The correctness of the compact path does not rest on this branch. */
+    if (s->compact_top1_valid) {
+        return (int)ds4_top1_key_index(s->compact_top1_key);
+    }
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    /* The compact path leaves a one-hot vector, not real logits: every id but
+     * the winner reads DS4_NEG_INF. That answers "what is the argmax" and
+     * nothing else, and this entry point asks something else -- it may need to
+     * pass over the winner and rank the rest, which a one-hot vector cannot
+     * support. Arming excludes it upstream; refusing here is what makes a
+     * missed exclusion visible instead of a quietly arbitrary token. */
+    if (s->compact_top1_valid) return -1;
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(
                 s->logits, DS4_N_VOCAB, excluded_id);
@@ -74247,6 +74270,13 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
                                     ds4_think_mode think_mode) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    /* The compact path leaves a one-hot vector, not real logits: every id but
+     * the winner reads DS4_NEG_INF. That answers "what is the argmax" and
+     * nothing else, and this entry point asks something else -- it may need to
+     * pass over the winner and rank the rest, which a one-hot vector cannot
+     * support. Arming excludes it upstream; refusing here is what makes a
+     * missed exclusion visible instead of a quietly arbitrary token. */
+    if (s->compact_top1_valid) return -1;
     int best = -1;
     float best_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -74263,6 +74293,80 @@ int ds4_session_argmax_ignoring_eos(ds4_session *s,
     return best;
 }
 
+/* Is one raw argmax over the raw logits sufficient for THIS request?
+ *
+ * The compact TP top-1 sends an 8-byte key instead of a vocabulary half, which
+ * means the full logit vector never reaches the host. That is only sound where
+ * nothing downstream needs it, and "temperature == 0" does not establish that.
+ * sample_top_p_min_p() short-circuits to sample_argmax() at temperature <= 0
+ * and ignores top_k/top_p/min_p there -- but penalties, logit bias and grammar
+ * masks are applied to the vector BEFORE the sampler ever sees it, and a
+ * logprobs response reads it afterwards. Any of those and the compact path
+ * silently returns the pre-transform argmax: a different token, with nothing
+ * downstream able to detect the substitution.
+ *
+ * So every condition is a field the caller must state, rather than something
+ * inferred here. A zeroed struct is INELIGIBLE by construction, because
+ * `peer_negotiated` must be affirmatively true -- a new call site that forgets
+ * to fill this in gets the safe answer, which is the opposite of what defaulting
+ * the flags to "absent" would give.
+ */
+bool ds4_sampler_can_use_raw_argmax(const ds4_raw_argmax_ctx *c) {
+    if (!c) return false;
+    if (!c->peer_negotiated) return false;      /* zeroed struct lands here */
+    if (!(c->temperature <= 0.0f)) return false;
+    /* Belt and braces: the sampler ignores these at temperature <= 0, but a
+     * caller passing them is describing an intent the compact path cannot
+     * honour if that short-circuit is ever narrowed. */
+    if (c->top_k > 0) return false;
+    if (c->top_p > 0.0f && c->top_p < 1.0f) return false;
+    if (c->min_p > 0.0f) return false;
+    if (c->wants_logprobs) return false;
+    if (c->has_logit_bias) return false;
+    if (c->has_penalties) return false;
+    if (c->has_grammar_mask) return false;
+    if (c->speculative) return false;
+    return true;
+}
+
+/* This rank's half of the vocabulary, reduced to one packed key carrying a
+ * GLOBAL token id (S5 materialises rank r's rows in place at r*vhalf, so the
+ * base is the offset into s->logits, not a separate mapping).
+ *
+ * The reduction is the CPU argmax the sampler itself would run, not a second
+ * implementation of it, so the compact path cannot pick a different token from
+ * the full path on the same data. Only the PACKING is shared with the GPU
+ * reducer, via ds4_top1_key.h -- and it must be, since rank 0 compares a key
+ * this function produced against one the peer produced by whichever route.
+ *
+ * ~77k floats is ~20 us here against the ~0.4 ms exchange it replaces, so this
+ * lands the wire saving without touching the graph. Encoding the reduction into
+ * the still-open command batch is the further optimisation, and this function
+ * is the seam it would replace: nothing above it knows where the key came from.
+ */
+static bool ds4_session_glm_top1_key(ds4_session *s, uint64_t *out_key) {
+    if (!s || !s->logits || !out_key) return false;
+    if (!s->engine || !s->engine->tp.active || !s->engine->tp.vocab_split) {
+        return false;
+    }
+    const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
+    const uint32_t base  = (uint32_t)s->engine->tp.rank * vhalf;
+    /* Seeded at `base`, not 0, and with sample_argmax_unrolled8()'s own
+     * DS4_NEG_INF. The seed is the answer when no column beats it -- an all-NaN
+     * half, say -- and 0 there would have rank 1 claim a token id it does not
+     * own. `base` keeps that case meaning "this half's first column", which is
+     * what the full path's `best = 0` means for the whole vector. */
+    int   best   = (int)base;
+    float best_v = DS4_NEG_INF;
+    argmax_f32_unrolled8_range(s->logits, base, base + vhalf, &best, &best_v);
+    /* Pack the logit AT the winner, never best_v: best_v may still be the
+     * DS4_NEG_INF seed, and rank 0's unsigned max compares score halves across
+     * ranks. A sentinel on one side and a real logit on the other would order
+     * by the sentinel's value rather than by the data. */
+    *out_key = ds4_top1_pack_key(s->logits[best], (uint32_t)best);
+    return true;
+}
+
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!logits || n_vocab <= 0) return 0;
@@ -74276,12 +74380,34 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (s->compact_top1_valid) {
+        /* Re-check against the parameters of THIS call, not the ones recorded
+         * when the request armed. The two can differ -- the server drops
+         * temperature to 0 mid-stream for tool syntax, and any future path that
+         * moved it the other way would otherwise sample from a vector whose
+         * peer half was never transferred. Cheap, and it turns the one
+         * dangerous mismatch into a visible error instead of a wrong token. */
+        const ds4_raw_argmax_ctx live = {
+            .temperature     = temperature,
+            .top_k           = top_k,
+            .top_p           = top_p,
+            .min_p           = min_p,
+            .peer_negotiated = true,   /* the exchange already happened */
+        };
+        if (!ds4_sampler_can_use_raw_argmax(&live)) return -1;
+        return (int)ds4_top1_key_index(s->compact_top1_key);
+    }
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
 }
 
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
+    /* wants_logprobs makes the compact path ineligible, so arming and reaching
+     * here is a contradiction. The one-hot vector would produce a confident
+     * ranking -- 1.0 for the winner and nothing else -- which is exactly the
+     * kind of plausible output a caller would never question. */
+    if (s->compact_top1_valid) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
@@ -74341,6 +74467,10 @@ int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
 
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
     if (!s || !out || cap < (int)DS4_N_VOCAB) return 0;
+    /* Handing out the one-hot vector is the worst case: it looks like logits,
+     * the caller cannot tell, and every consumer of the copy inherits the
+     * fault. See ds4_session_argmax. */
+    if (s->compact_top1_valid) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
     return (int)DS4_N_VOCAB;
 }
@@ -75684,13 +75814,55 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         payload_set_err(err, errlen, "decode requires a synchronized checkpoint");
         return 1;
     }
-    if (ds4_session_tp_leader(s)) {
+    /* Arm the compact top-1 for THIS eval, before the frame goes out.
+     *
+     * Three classes of condition and all three must hold:
+     *   - the request's sampler contract (compact_top1_request, set once per
+     *     request from ds4_sampler_can_use_raw_argmax),
+     *   - the transport (vocabulary split active, peer at this protocol),
+     *   - and this eval in particular -- a support draft (MTP or DSPARK) or a
+     *     speculative cycle needs real logit VALUES, which a compact exchange
+     *     does not produce, so neither can run against one.
+     * The leader evaluates all three and SENDS the answer; the worker never
+     * re-derives it. See DS4_TP_EVAL_F_COMPACT_TOP1.
+     *
+     * The draft test is support_kind, NOT the probe_mtp argument. probe_mtp
+     * defaults to true at every caller and is only lowered for DSPARK, so
+     * gating on !probe_mtp would have armed exactly the DSPARK case it was
+     * meant to exclude and disarmed every ordinary decode -- leaving the
+     * feature dead in the one configuration it targets, with nothing failing to
+     * say so. support_kind is the fact that decides whether a draft runs. */
+    const bool is_leader = ds4_session_tp_leader(s);
+    const bool structural =
+        s->engine && s->engine->support_kind == DS4_SUPPORT_NONE &&
+        !s->tp_eval_spec && s->engine->tp.active && s->engine->tp.vocab_split &&
+        ds4_tp_peer_supports_compact_top1(s->engine->tp.ctx);
+    /* The worker's flag came from the frame and is already set; recomputing it
+     * here would disarm it, because compact_top1_request is a leader-only fact.
+     * That was not a hypothetical -- it was the first version of this function:
+     * the worker would send a vocabulary half to a leader blocked reading 8
+     * bytes, and the pair would hang. The worker still applies the
+     * structural conditions -- if it cannot honour the frame it must fail
+     * loudly rather than answer in the wrong format. */
+    const bool compact_ok =
+        is_leader ? (s->compact_top1_request && structural)
+                  : (s->compact_top1_armed && structural);
+    if (!is_leader && s->compact_top1_armed && !structural) {
+        snprintf(err, errlen,
+                 "tp: worker cannot honour compact top-1 for this eval");
+        return 1;
+    }
+    s->compact_top1_armed = compact_ok;
+    s->compact_top1_valid = false;
+    if (is_leader) {
         ds4_engine *e = s->engine;
         /* Plain eval: no speculative cycle announced, so the worker must not
          * run one.  This is one of the sites that made the old
          * infer-from-own-argv scheme unsafe. */
+        const uint32_t eval_flags =
+            compact_ok ? (uint32_t)DS4_TP_EVAL_F_COMPACT_TOP1 : 0u;
         if (!ds4_tp_send_eval(e->tp.ctx, s->tp_session_id,
-                              ++e->tp.eval_seq, token, 0u)) {
+                              ++e->tp.eval_seq, token, eval_flags)) {
             snprintf(err, errlen, "tp: worker eval send failed");
             return 1;
         }
@@ -75728,7 +75900,91 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         }
         const uint32_t logits_xfer = vhalf;
         const double logits_t0 = logits_profile ? now_sec() : 0.0;
-        if (s->engine->tp.rank == 0) {
+        /* COMPACT TOP-1: 8 bytes instead of a vocabulary half (310 KB at GLM's
+         * 154880), when the sampler contract permits a raw argmax.
+         *
+         * Both ranks must agree per eval, and they do because the leader put
+         * the decision in the EVAL frame (above) rather than each side deriving
+         * it. Half the pair sending 8 bytes while the other expects 310 KB is a
+         * hang, not a wrong answer -- the right failure, but still a failure,
+         * and worth designing out rather than detecting.
+         *
+         * Each rank packs with its GLOBAL vocabulary base, so no offset may be
+         * applied after the reduction: the maximum is taken over keys that
+         * already carry real token ids, and the loser's identity is gone. */
+        if (s->compact_top1_armed) {
+            /* Say it once per process, on both ranks. A wire-format change that
+             * silently fails to engage looks exactly like one that engaged and
+             * did not help, and the rig has burned runs on that distinction
+             * before -- the same argument the vocab_split bring-up line makes.
+             * One branch on a static after the first token. */
+            static int announced = 0;
+            if (!announced) {
+                announced = 1;
+                fprintf(stderr,
+                        "ds4: TP compact top-1 ACTIVE (rank %d): 8 bytes/token "
+                        "replaces a %u-byte vocabulary half\n",
+                        s->engine->tp.rank,
+                        (unsigned)((uint64_t)vhalf * sizeof(float)));
+            }
+            uint64_t my_key = 0, peer_key = 0;
+            if (!ds4_session_glm_top1_key(s, &my_key)) {
+                snprintf(err, errlen, "tp: compact top-1 key unavailable");
+                return 1;
+            }
+            if (s->engine->tp.rank == 0) {
+                if (!ds4_tp_recv_top1_keys(s->engine->tp.ctx, &peer_key, 1u)) {
+                    snprintf(err, errlen, "tp: worker top-1 key missing");
+                    ds4_session_invalidate(s);
+                    return 1;
+                }
+                s->compact_top1_key = my_key > peer_key ? my_key : peer_key;
+                s->compact_top1_valid = true;
+                /* CANONICALISE s->logits to a one-hot carrier for the winner.
+                 *
+                 * Without this the vector is half stale -- rank 1's half holds
+                 * a previous step's values -- and every reader has to be found
+                 * and guarded. ds4_session_save_payload() is one such reader,
+                 * reached from the server's best-effort KV-cache store inside
+                 * the decode loop, and a half-stale vector persisted there
+                 * would come back on restore with nothing able to detect it.
+                 * Auditing every reader is the approach that fails quietly the
+                 * first time someone adds one.
+                 *
+                 * A one-hot vector is instead CORRECT for any consumer that
+                 * wants the argmax, which is what the arming contract says all
+                 * of them want. It is not the true logits, so the consumers
+                 * that need real values (logprobs, copy_logits) still refuse
+                 * explicitly -- the two defences cover different things.
+                 *
+                 * ~310 KB of stores, ~10 us, against the ~0.4 ms exchange this
+                 * replaces. */
+                const uint32_t win = ds4_top1_key_index(s->compact_top1_key);
+                if (win >= (uint32_t)DS4_N_VOCAB) {
+                    /* Only a corrupt peer key reaches here, and the cost of
+                     * continuing is an out-of-range token id handed to the
+                     * detokeniser. The frame's length and type checks cannot
+                     * catch this one -- the bytes are well formed, the id is
+                     * not -- so it is checked where the id is first usable. */
+                    snprintf(err, errlen,
+                             "tp: compact top-1 key out of range (id %u >= %u)",
+                             win, (unsigned)DS4_N_VOCAB);
+                    s->compact_top1_valid = false;
+                    ds4_session_invalidate(s);
+                    return 1;
+                }
+                for (uint32_t i = 0; i < (uint32_t)DS4_N_VOCAB; i++) {
+                    s->logits[i] = DS4_NEG_INF;
+                }
+                s->logits[win] = 0.0f;
+            } else {
+                if (!ds4_tp_send_top1_keys(s->engine->tp.ctx, &my_key, 1u)) {
+                    snprintf(err, errlen, "tp: top-1 key send failed");
+                    return 1;
+                }
+                s->compact_top1_key = my_key;
+            }
+        } else if (s->engine->tp.rank == 0) {
             if (!ds4_tp_recv_logits_half(s->engine->tp.ctx, s->logits + vhalf, logits_xfer)) {
                 snprintf(err, errlen, "tp: worker logits half missing");
                 ds4_session_invalidate(s);
@@ -75762,6 +76018,29 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
 
 void ds4_session_set_tp_eval_spec(ds4_session *s, int on) {
     if (s) s->tp_eval_spec = on ? 1 : 0;
+}
+
+void ds4_session_set_compact_top1(ds4_session *s, int on) {
+    if (!s) return;
+    s->compact_top1_armed = on ? true : false;
+    if (!on) s->compact_top1_valid = false;
+}
+
+void ds4_session_set_raw_argmax_ctx(ds4_session *s,
+                                    const ds4_raw_argmax_ctx *c) {
+    if (!s) return;
+    /* peer_negotiated is the session's to assert, not the caller's: it is the
+     * one field about the TRANSPORT rather than the sampler, and a caller
+     * setting it would be asserting something it cannot know. */
+    if (!c) {
+        s->compact_top1_request = false;
+        return;
+    }
+    ds4_raw_argmax_ctx local = *c;
+    local.peer_negotiated =
+        s->engine && s->engine->tp.active && s->engine->tp.vocab_split &&
+        ds4_tp_peer_supports_compact_top1(s->engine->tp.ctx);
+    s->compact_top1_request = ds4_sampler_can_use_raw_argmax(&local);
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {

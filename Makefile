@@ -723,6 +723,10 @@ ifeq ($(XCODE14_METAL),)
 else
 	@$(MAKE) --no-print-directory ds4_private_clone.metallib
 endif
+# -ffast-math filtered out: the NaN and signed-zero cases ARE the test, and
+# fast-math is licensed to assume they do not occur.
+tests/test_top1_merge: tests/test_top1_merge.c ds4_top1_key.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ tests/test_top1_merge.c -lm
 
 tests/test_tp_commands.o: tests/test_tp_commands.c ds4_tp.c ds4_tp.h ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -731,9 +735,13 @@ tests/test_tp_commands: tests/test_tp_commands.o $(filter-out ds4_tp.o,$(CPU_COR
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 .PHONY: test-session-state
-test-session-state: tests/test_session_state tests/test_tp_commands
+test-top1-merge: tests/test_top1_merge
+	./tests/test_top1_merge
+
+test-session-state: tests/test_session_state tests/test_tp_commands tests/test_top1_merge
 	./tests/test_session_state
 	./tests/test_tp_commands
+	./tests/test_top1_merge
 
 ifneq ($(UNAME_S),Darwin)
 tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_gpu_mgpu.h
@@ -886,6 +894,6 @@ clean:
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
 	rm -f tests/test_ssd_cache
-	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
+	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands tests/test_top1_merge
 	rm -f tests/test_metal_tp_spec
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/metal_flash_attn_decode_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
