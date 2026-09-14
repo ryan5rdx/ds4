@@ -6125,6 +6125,11 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_BIN_SOURCE",        @"metal/bin.metal"],
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
         @[@"DS4_METAL_ANE_BRIDGE_SOURCE", @"metal/ane_bridge.metal"],
+        /* The shared packed-key definition, concatenated BEFORE top1.metal.
+         * A quoted #include cannot resolve inside newLibraryWithSource:, so
+         * ordering in this list is what makes one definition serve both the
+         * shader and the C host. Keep the pair adjacent. */
+        @[@"DS4_METAL_TOP1_KEY_SOURCE",   @"ds4_top1_key.h"],
         @[@"DS4_METAL_TOP1_SOURCE",       @"metal/top1.metal"],
         @[@"DS4_METAL_CMPSEL_SOURCE",     @"metal/cmpsel.metal"],
     ];

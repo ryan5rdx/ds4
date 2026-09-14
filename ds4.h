@@ -571,6 +571,15 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
  * by the leader as a speculative cycle.  Consumed by the next
  * ds4_session_eval() and cleared there. */
 void ds4_session_set_tp_eval_spec(ds4_session *s, int on);
+/* Worker side of the compact top-1: armed from the EVAL frame flag, never from
+ * local state. See DS4_TP_EVAL_F_COMPACT_TOP1. */
+void ds4_session_set_compact_top1(ds4_session *s, int on);
+/* Leader side: the sampler contract for the NEXT eval. Call once per request
+ * before decoding; it is consulted by ds4_sampler_can_use_raw_argmax() and
+ * combined with the structural conditions (vocabulary split, no MTP probe, no
+ * speculative cycle) that the session alone can see. Passing NULL disarms. */
+void ds4_session_set_raw_argmax_ctx(ds4_session *s,
+                                    const ds4_raw_argmax_ctx *c);
 
 typedef struct {
     ds4_session *session;

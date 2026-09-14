@@ -58,7 +58,12 @@
  * spent on CANCEL / ROLLBACK_CAPTURE (renumbered to 22/23 in ds4_tp.h).  Both
  * 10 and 11 therefore name two incompatible wire protocols, so the merged
  * binary must refuse BOTH -- hence 12 rather than 11-and-keep-going. */
-#define DS4_TP_PROTOCOL_VERSION 12u
+/* 13 adds DS4_TP_FRAME_TOP1_KEYS, the compact greedy top-1 exchange. A version
+ * bump rather than a capability flag, for the reason 12 exists: the frame
+ * numbering is what a mixed pair gets wrong, and a peer that does not know 24
+ * would read it as an unknown frame mid-decode rather than refusing at
+ * bring-up. */
+#define DS4_TP_PROTOCOL_VERSION 13u
 
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
@@ -3780,6 +3785,45 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     return ok;
 }
 
+/* The hello refuses any version mismatch outright, so a completed handshake
+ * already proves the peer speaks frame 24. This is a named predicate rather
+ * than an inline `tp != NULL` so the arming site reads as a negotiation and so
+ * a future capability-flag negotiation has one place to land. */
+int ds4_tp_peer_supports_compact_top1(const ds4_tp *tp) {
+    return tp != NULL && tp->control_fd >= 0;
+}
+
+int ds4_tp_send_top1_keys(ds4_tp *tp, const uint64_t *keys, uint32_t count) {
+    if (!tp || !keys || count == 0u) return 0;
+    pthread_mutex_lock(&tp->control_lock);
+    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_TOP1_KEYS,
+                                 keys, count * sizeof(uint64_t));
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
+}
+
+int ds4_tp_recv_top1_keys(ds4_tp *tp, uint64_t *keys, uint32_t count) {
+    if (!tp || !keys || count == 0u) return 0;
+    pthread_mutex_lock(&tp->control_lock);
+    uint32_t type = 0, bytes = 0;
+    const uint32_t want = count * (uint32_t)sizeof(uint64_t);
+    /* Exact type AND size. A short or mistyped frame here produces a wrong
+     * TOKEN, and nothing downstream can see that -- unlike a logits half, where
+     * a truncated payload at least perturbs a distribution someone might
+     * notice. */
+    int ok = tp_read_frame_header(tp->control_fd, &type, &bytes) &&
+             type == DS4_TP_FRAME_TOP1_KEYS && bytes == want;
+    if (!ok) {
+        fprintf(stderr, "ds4-tp: bad top1 keys frame (type %u bytes %u, "
+                        "expected %u / %u)\n",
+                type, bytes, (unsigned)DS4_TP_FRAME_TOP1_KEYS, want);
+    } else {
+        ok = tp_read_full(tp->control_fd, keys, bytes);
+    }
+    pthread_mutex_unlock(&tp->control_lock);
+    return ok;
+}
+
 int ds4_tp_send_logits_half(ds4_tp *tp, const float *half, uint32_t count) {
     pthread_mutex_lock(&tp->control_lock);
     const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_LOGITS,
@@ -4142,6 +4186,15 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             break;
         }
 
+        /* The compact top-1 flag is scoped to ONE eval frame. Clearing it for
+         * every other frame is what makes that true: otherwise a spec cycle or
+         * MTP frame arriving after an armed eval would run against a leftover
+         * arm, and its nested eval -- which cannot honour the compact format --
+         * would abort a perfectly good cycle. */
+        if (session && command.type != DS4_TP_FRAME_EVAL) {
+            ds4_session_set_compact_top1(session, 0);
+        }
+
         if (command.type == DS4_TP_FRAME_SYNC ||
             command.type == DS4_TP_FRAME_SYNC_MULTIMODAL) {
             prompt.len = 0;
@@ -4209,6 +4262,10 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             /* The frame decides, not this rank's argv. */
             ds4_session_set_tp_eval_spec(
                     session, (command.flags & DS4_TP_EVAL_F_GLM_SPEC) != 0);
+            /* Same rule: the frame decides. A worker that armed from its own
+             * state could send 8 bytes to a leader expecting 310 KB. */
+            ds4_session_set_compact_top1(
+                    session, (command.flags & DS4_TP_EVAL_F_COMPACT_TOP1) != 0);
             if (ds4_session_eval(session, command.value, err, sizeof(err)) != 0) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker eval: %s", err);
                 rc = 1;

@@ -12800,6 +12800,20 @@ static void *decode_worker_main(void *arg) {
     return NULL;
 }
 
+/* U64TOP1-TP kill switch. Default ON follows the v4 convention that an omitted
+ * knob is enabled, so a control arm must say DS4_TP_COMPACT_TOP1=0 explicitly --
+ * an omitted knob is NOT a control here. Setting 0 restores the full vocabulary
+ * half on the wire and every logits consumer with it, which is the fallback the
+ * brief requires to stay available. */
+static int server_compact_top1_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_TP_COMPACT_TOP1");
+        v = (e && e[0] == '0') ? 0 : 1;
+    }
+    return v;
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -13478,6 +13492,44 @@ decode_again:
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
     dsml_tracker.model_syntax = j->req.model_syntax;
+
+    /* Arm the compact top-1 TP exchange for this job, from the request's BASE
+     * sampling parameters -- deliberately not the per-iteration ones.
+     *
+     * The loop lowers temperature to 0 for tool syntax on some iterations, and
+     * arming is consumed one iteration LATER than it is set (the eval at
+     * iteration N feeds the sample at N+1). Arming off a transiently greedy
+     * iteration would leave the next one, back at its real temperature, holding
+     * a logit vector whose peer half was never transferred -- a visible error,
+     * but a false one, on an ordinary tool-calling request. The base parameters
+     * are loop-invariant, so arming on them cannot go stale.
+     *
+     * ignore_eos routes to ds4_session_argmax_ignoring_eos(), which scans the
+     * full vector to skip stop tokens and so cannot be served by a single key;
+     * it disarms outright. This server has no logprobs, logit bias, penalties
+     * or grammar, so those fields stay false -- the struct is what documents
+     * what would have to change if it grew any of them. */
+    {
+        ds4_raw_argmax_ctx rax = {
+            .temperature = j->req.temperature,
+            .top_k       = j->req.top_k,
+            .top_p       = j->req.top_p,
+            .min_p       = j->req.min_p,
+            .speculative = !s->batched_mode &&
+                           ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+                           getenv("DS4_MTP_SPEC_DISABLE") == NULL,
+        };
+        if (ds4_think_mode_enabled(j->req.think_mode)) {
+            if (!j->req.temperature_set) rax.temperature = DS4_DEFAULT_TEMPERATURE;
+            if (!j->req.top_k_set) rax.top_k = 0;
+            if (!j->req.top_p_set) rax.top_p = DS4_DEFAULT_TOP_P;
+            if (!j->req.min_p_set) rax.min_p = DS4_DEFAULT_MIN_P;
+        }
+        /* ignore_eos is not a sampler knob the ctx models, so it disarms here
+         * rather than being squeezed into a field that means something else. */
+        const bool armable = server_compact_top1_enabled() && !j->req.ignore_eos;
+        ds4_session_set_raw_argmax_ctx(slot->session, armable ? &rax : NULL);
+    }
 
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&

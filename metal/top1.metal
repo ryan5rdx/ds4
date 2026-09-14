@@ -16,33 +16,11 @@ using namespace metal;
  * rather than two publication mechanisms.
  */
 
-/* Pack (score, index) so that UNSIGNED MAX reproduces the CPU sampler exactly.
- *
- * The CPU is argmax_f32_unrolled8_range()'s `if (x > v)`: strictly greater, so
- * ties keep the LOWEST index. `0xffffffff - idx` inverts the index into the low
- * word, which makes a lower index a higher key, so unsigned max keeps it too.
- *
- * Two float cases are not handled by the bit trick alone and both would produce
- * a different token from the CPU:
- *
- *   -0.0 vs +0.0 -- `>` says neither is greater, so the CPU keeps the first.
- *     The raw bits disagree: +0 maps to 0x80000000 and -0 to 0x7fffffff, so a
- *     later +0 would beat an earlier -0. Canonicalised on the bits, because
- *     `v == 0.0f ? 0.0f : v` is exactly what fast-math is licensed to delete.
- *
- *   NaN -- `NaN > v` is false, so the CPU never selects one; the bit trick
- *     makes NaN the LARGEST key and would always select it. Mapped to
- *     -infinity's key WITH ITS INDEX RETAINED, which reproduces the CPU in both
- *     directions: a NaN loses to any finite value, and an all-NaN row falls
- *     back to index 0 exactly as the CPU's `best = 0` initialiser does.
- */
-static inline ulong ds4_top1_pack_key(float v, uint32_t idx) {
-    uint32_t u = as_type<uint32_t>(v);
-    if ((u & 0x7fffffffu) == 0u) u = 0u;                    /* -0.0 -> +0.0 */
-    if ((u & 0x7fffffffu) > 0x7f800000u) u = 0xff800000u;   /* NaN -> -inf  */
-    const uint32_t ordered = (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
-    return ((ulong)ordered << 32) | (ulong)(0xffffffffu - idx);
-}
+/* ds4_top1_pack_key() is defined in ds4_top1_key.h, shared verbatim with the C
+ * host -- see that header for why a second copy would be a silent correctness
+ * hazard rather than duplication. It is CONCATENATED ahead of this file by
+ * ds4_gpu_full_source(); a quoted #include does not resolve in a runtime source
+ * string, so the loader list is the mechanism. */
 
 struct ds4_metal_args_top1 {
     uint32_t n_cols;        /* columns in this rank's slice                 */
