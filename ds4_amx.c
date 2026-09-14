@@ -162,11 +162,29 @@ static bool canary_genlut4(void) {
  * false, so an unknown host gets the fallback path.
  */
 static unsigned amx_z_written_vectors(uint64_t op_is_vecfp, uint64_t operand) {
-    enum { NV = 8, VEC = 16 };                 /* 8 vectors x 64 bytes */
+    /* ALL 64 Z rows, not the first 8.
+     *
+     * corsix/vecfp.md on the multiple-vector form: "the row stepping by 32 or
+     * 16 per iteration". Two vectors therefore write Z rows 0 and 32; four
+     * write 0, 16, 32 and 48. Scanning rows 0-7 could only ever observe row 0
+     * in BOTH arms, so the differential reported "no difference" and
+     * vecfp_multi=0 on hardware whose capability it never looked at. The rig
+     * ran that twice and the second run was specifically to settle whether the
+     * absence was real. It was not; it was this. */
+    enum { NV = 64, VEC = 16 };                /* 64 rows x 64 bytes */
     __attribute__((aligned(256))) float z[NV * VEC];
+    __attribute__((aligned(256))) float x[VEC], y[VEC];
     for (unsigned i = 0; i < NV * VEC; i++) z[i] = -12345.0f;
+    /* X and Y MUST be loaded. The ALU mode is z + x*y, so with the registers
+     * left at zero the operation is z + 0 and Z never changes -- which is what
+     * the previous version measured: single=0, two=0, four=0, and it read that
+     * as "the multi-vector form does nothing" rather than "I did not give it
+     * anything to multiply". */
+    for (unsigned i = 0; i < VEC; i++) { x[i] = 2.0f; y[i] = 3.0f; }
 
     AMX_SET();
+    AMX_LDX(AMX_PTR_ROW_FLAGS(x, 0, 0));
+    AMX_LDY(AMX_PTR_ROW_FLAGS(y, 0, 0));
     for (unsigned v = 0; v < NV; v++)
         AMX_LDZ(AMX_PTR_ROW_FLAGS(&z[v * VEC], v, 0));
     if (op_is_vecfp) AMX_VECFP(operand); else AMX_EXTRX(operand);
@@ -184,10 +202,15 @@ static unsigned amx_z_written_vectors(uint64_t op_is_vecfp, uint64_t operand) {
 }
 
 static bool canary_vecfp_multi(void) {
-    /* Both arms do a real f32 z + x*y; they differ only in bit 31. */
+    /* Both arms do a real f32 z + x*y and differ only in bit 31 (+ bit 25). */
     const unsigned single = amx_z_written_vectors(1, DS4_AMX_VECFP_F32_ONE);
     const unsigned two    = amx_z_written_vectors(1, DS4_AMX_VECFP_F32_TWO);
     const unsigned four   = amx_z_written_vectors(1, DS4_AMX_VECFP_F32_FOUR);
+    if (getenv("DS4_AMX_VERBOSE")) {
+        fprintf(stderr, "ds4: AMX vecfp Z rows touched: single=%u two=%u four=%u "
+                        "(spec: 1 / 2 at rows 0,32 / 4 at rows 0,16,32,48)\n",
+                single, two, four);
+    }
     return two > single || four > single;
 }
 
