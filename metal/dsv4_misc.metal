@@ -32,6 +32,11 @@ static inline bool ds4_sgasync_run_is_contiguous(
     }
     return true;
 }
+/* ABI marker. ds4_gpu_private_library() refuses an artifact without the exact
+ * name this build expects, which is the only cheap way to catch a stale
+ * metallib: a mismatched one binds fine and then misreads its arguments. */
+kernel void ds4_private_clone_abi_1(device uint *sink [[buffer(0)]]) { sink[0] = 1u; }
+
 #endif  /* DS4_PRIVATE_CLONE */
 
 struct ds4_metal_args_dsv4_topk_mask {
@@ -3512,22 +3517,28 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
              * simdgroup. Every run must be contiguous or the whole stage falls
              * back -- a partial async fill would need a second barrier to be
              * safe, and the point is to leave the barrier structure alone. */
+            /* EACH SIMDGROUP OWNS ONE RUN END TO END: it either async-copies
+             * its rows or scalar-fills them itself. No cross-simdgroup verdict,
+             * so no extra storage and no extra barrier -- each simdgroup writes
+             * only its own disjoint slice of kv_shared, and the barrier the
+             * shipping code already runs below publishes all of it either way.
+             * A mixed async/manual stage is therefore safe.
+             *
+             * The first version had every thread check every run and called it
+             * "16 reads". It is 16 per THREAD: 256 x 16 = 4096 lane-checks per
+             * stage, against a stage that moves 16 KiB -- a real fraction of
+             * the work the copy exists to save, and it would have read as the
+             * primitive underperforming rather than as probe overhead. All 32
+             * lanes of a simdgroup redundantly checking only their OWN run is
+             * run_rows reads each: 512 in total at ASYNC_STAGE=4, and uniform
+             * by construction with no broadcast intrinsic. */
             const uint run_rows = (uint)(16 / ASYNC_STAGE);
             const uint n_runs = (uint)ASYNC_STAGE;
-            /* Every thread evaluates the SAME predicate over all runs, rather
-             * than one thread per run publishing through a threadgroup flag.
-             * The flag would have needed storage past rope_shared -- past the
-             * end of what the host allocates -- and an extra barrier. 16 reads
-             * of a cache-resident index array is cheaper than either, and it
-             * keeps the decision uniform without synchronisation. */
-            bool ok = (rows == stage_rows);
-            for (uint r = 0u; ok && r < n_runs; ++r) {
-                ok = ds4_sgasync_run_is_contiguous(selected, base + r * run_rows,
-                                                   run_rows, args.cache_cap);
-            }
-            if (ok) {
-                if (head_in_group < n_runs) {
-                    const uint r0 = head_in_group * run_rows;
+            const uint r0 = head_in_group * run_rows;
+            if (head_in_group < n_runs && rows == stage_rows) {
+                const bool run_ok = ds4_sgasync_run_is_contiguous(
+                    selected, base + r0, run_rows, args.cache_cap);
+                if (run_ok) {
                     device const half4 *src =
                         (device const half4 *)((device const half *)kv_lora_cache +
                             (uint64_t)selected[base + r0] * args.kv_lora_dim);
@@ -3535,9 +3546,26 @@ kernel void kernel_glm_attention_indexed_decode_split_group8_partial_impl(
                         kv_shared + r0 * kv_vecs, src,
                         (ulong)run_rows * kv_vecs);
                     c.wait();
+                } else {
+                    /* This simdgroup's own rows, its own 32 lanes. */
+                    for (uint off = lane; off < run_rows * kv_vecs; off += 32u) {
+                        const uint rr = r0 + off / kv_vecs;
+                        const uint vv = off - (off / kv_vecs) * kv_vecs;
+                        const uint row = selected[base + rr];
+                        const bool valid_row =
+                            assume_valid_rows || row < args.cache_cap;
+                        kv_shared[rr * kv_vecs + vv] = valid_row
+                            ? ((device const half4 *)((device const half *)
+                                   kv_lora_cache +
+                                   (uint64_t)row * args.kv_lora_dim))[vv]
+                            : half4(half(0.0f));
+                    }
                 }
-                /* Published by the barrier the shipping code already runs
-                 * below; wait() only orders the ISSUING simdgroup. */
+                kv_staged = true;
+            } else if (rows == stage_rows) {
+                /* ASYNC_STAGE=4 leaves simdgroups 4..7 with no run; they simply
+                 * do not participate in staging, which the barrier below
+                 * already accounts for. */
                 kv_staged = true;
             }
         }
