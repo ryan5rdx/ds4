@@ -3953,9 +3953,14 @@ static NSUInteger ds4_gpu_moe_tg_probe_bytes(const char *env, const char *what,
                         "arm.\n");
         abort();
     }
-    fprintf(stderr, "ds4: MoE decode occupancy probe -- %s reserves %lu B of "
-                    "UNUSED threadgroup memory (arithmetic unchanged; residency "
-                    "is the variable)\n", what, (unsigned long)v);
+    /* Says "live pointer", not "unused memory". The arithmetic still ignores
+     * the buffer -- residency is the only variable -- but calling it UNUSED is
+     * what licensed the `(void)scratch;` that made the 2026-09-14 sweep void:
+     * an unreachable threadgroup argument is deleted and the reservation is
+     * then discarded without a diagnostic. The clone keeps it reachable. */
+    fprintf(stderr, "ds4: MoE decode occupancy probe -- %s clone reserves %lu B "
+                    "behind a LIVE threadgroup pointer (arithmetic unchanged; "
+                    "residency is the variable)\n", what, (unsigned long)v);
     return v;
 }
 
