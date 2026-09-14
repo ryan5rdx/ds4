@@ -59226,84 +59226,6 @@ typedef struct {
     uint8_t fingerprint[32];
 } ds4_vision_identity;
 
-#ifndef DS4_NO_GPU
-/* Each slot is one fixed-size KDA snapshot, so the ring is a straight
- * memory-for-recoverable-prefill trade. */
-#define DS4_GLM53_CKPT_SLOTS_MAX 16
-#define DS4_GLM53_CKPT_SLOTS     DS4_GLM53_CKPT_SLOTS_MAX
-
-/* One GLM-5.3 state snapshot. Fixed size: the KDA conv and recurrent state per
- * layer, plus the DSA indexer tail, neither of which grows with context. */
-typedef struct {
-    ds4_gpu_tensor *kda;
-    ds4_gpu_tensor *index;
-    float          *logits;
-    int             pos;            /* -1 when empty */
-    uint32_t        dense_len;
-    /* Hash of checkpoint tokens [0, pos) at capture. A snapshot is only valid
-     * for the timeline that produced it; re-prefilling different tokens to the
-     * same length must not be able to restore into it. */
-    uint64_t        token_hash;
-} glm53_ckpt_slot;
-
-static uint32_t ds4_glm53_ckpt_slots(void) {
-    static uint32_t cached;
-    if (cached) return cached;
-    cached = 8u;
-    const char *e = getenv("DS4_GLM53_CKPT_SLOTS");
-    if (e && e[0]) {
-        const long v = strtol(e, NULL, 10);
-        if (v >= 1 && v <= DS4_GLM53_CKPT_SLOTS_MAX) cached = (uint32_t)v;
-    }
-    return cached;
-}
-
-/* Slot from POSITION, so both TP ranks choose identically. A round-robin
- * counter diverges the instant one rank skips a capture the other took, and a
- * restore into the wrong slot is a silently wrong recurrence rather than an
- * error.
- *
- * Banded, not modular over a small unit. Captures happen at request frontiers,
- * and in a growing conversation the last N frontiers all cluster near the end
- * -- a ring holding "the most recent N" would have no checkpoint anywhere near
- * a divergence 80% of the way back, which is exactly the case this exists for.
- * Banding by position tiles the context instead: with 16 slots and an 8192
- * band that is one checkpoint per 8k across 131072 tokens, each slot holding
- * the most recent capture that fell in its band. */
-#define DS4_GLM53_CKPT_BAND 8192
-
-/* The ring is SPLIT: half banded by position, half a most-recent FIFO.
- *
- * Uniform banding alone was wrong, and a production log showed exactly how. A
- * tool-use turn produces frontiers a few dozen tokens apart -- 243955, 244030,
- * 244056, 244093 -- and at an 8192 band all four map to one slot, so each
- * evicts the last and only the highest survives. The divergence then landed at
- * 244054, BELOW the sole survivor, and a 655-second prefill that was 99.8%
- * reusable was thrown away. Banding covers "diverged 80% of the way back"; it
- * cannot cover "diverged 39 tokens back", which is the common case because
- * divergence happens where new content meets cached history -- at the head.
- *
- * So: the FIRST frontier to land in a band takes the banded slot and stays
- * there, giving long-range coverage. Every later frontier goes to the FIFO,
- * giving dense coverage near the head. One copy per frontier either way, so
- * capture cost is unchanged. With 8 slots that is the first-in-band checkpoint
- * per 32k plus the last 4 frontiers; on the log above it preserves 243955
- * (banded) and 244030 (FIFO), and the lookup finds 244030 -- 24 tokens below
- * the divergence. */
-static uint32_t ds4_glm53_ckpt_recent_slots(void) {
-    const uint32_t n = ds4_glm53_ckpt_slots();
-    return n >= 2u ? n / 2u : 0u;   /* a 1-slot ring stays purely banded */
-}
-
-static uint32_t ds4_glm53_ckpt_banded_slot(int pos) {
-    const uint32_t n = ds4_glm53_ckpt_slots();
-    const uint32_t recent = ds4_glm53_ckpt_recent_slots();
-    const uint32_t banded = n - recent;
-    if (pos <= 0 || banded == 0u) return recent;
-    return recent + (uint32_t)((pos / DS4_GLM53_CKPT_BAND) % (int)banded);
-}
-#endif
-
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
@@ -59414,33 +59336,15 @@ struct ds4_session {
      * throw the whole checkpoint away.  Captured at the frontier of a
      * successful sync, restored when a rewind targets exactly that frontier.
      * See ds4_session_glm53_rollback_capture(). */
-    /* A RING of snapshots, not one.
-     *
-     * One snapshot only ever served a rewind to exactly the frontier it was
-     * taken at, which is what speculative decode needs. A prefix-cache miss
-     * needs something else: the client's prompt diverges at some position
-     * `common` well below the frontier, and with GLM-5.3's append-only prefix
-     * reuse the whole prompt is re-prefilled from zero. A ring lets the session
-     * restart from the largest checkpoint at or below `common` instead. One
-     * observed miss had common=62318 of 75435, so 83% of a ~170 s re-prefill
-     * was recoverable and was being thrown away.
-     *
-     * Slots are chosen from the POSITION, not from a counter: both ranks must
-     * pick the same slot for the same capture, and a counter diverges the
-     * moment one rank skips a capture the other took.
-     *
-     * The KDA snapshot is fixed size -- conv_state plus recurrent_state per
-     * layer, independent of context length -- so N slots cost N times a
-     * constant rather than N times a growing KV. The DSA layers need no
-     * snapshot at all: their KV is position-addressable and simply gets
-     * overwritten from the restore point. */
-    glm53_ckpt_slot glm53_ckpt[DS4_GLM53_CKPT_SLOTS];
-    /* Cursor into the recent-FIFO half of the ring (see ckpt_slot_for_capture).
-     * Advances identically on both ranks because captures are mirrored. */
-    uint32_t glm53_ckpt_recent_cursor;
-    /* The most recent capture, which is the one the speculative-decode rewind
-     * path means by "the snapshot". -1 when there is none. */
+    ds4_gpu_tensor *glm53_rollback_kda;
+    ds4_gpu_tensor *glm53_rollback_index;
+    float *glm53_rollback_logits;
     int glm53_rollback_pos;
+    uint32_t glm53_rollback_dense_len;
+    /* Hash of checkpoint tokens [0, pos) at capture.  A snapshot is only valid
+     * for the timeline that produced it; re-prefilling different tokens to the
+     * same length must not be able to restore into it. */
+    uint64_t glm53_rollback_token_hash;
     bool glm53_rollback_valid;
     /* Set while an INTERNAL sync runs -- a tool-recovery suffix, a canonical
      * rewrite, a cold-checkpoint prefix.  Those advance the session past the
@@ -60527,10 +60431,15 @@ static bool ds4_glm53_rollback_enabled(void) {
  * CPU-only rank has no KDA state to snapshot, so it always refuses -- which
  * the leader reads as "no snapshot on the peer" and handles by dropping its
  * own. */
-/* Invalidate one slot. The buffers are kept: they are fixed size and will be
- * reused by the next capture at this slot, and freeing them here would make a
- * transient failure cost an allocation on every retry. */
 bool ds4_session_glm53_rollback_capture(ds4_session *s) { (void)s; return false; }
+void ds4_session_glm53_rollback_drop(ds4_session *s) { (void)s; }
+void ds4_session_rollback_hold(ds4_session *s, bool hold) { (void)s; (void)hold; }
+/* No snapshot exists without the GPU backend, so an interrupted sync always
+ * lands where it started.  See the real one next to the rollback helpers. */
+static int ds4_session_interrupt_rewind_target(ds4_session *s, int pre_sync_len) {
+    (void)s;
+    return pre_sync_len;
+}
 #endif
 
 #ifndef DS4_NO_GPU
@@ -60776,44 +60685,15 @@ static uint64_t ds4_session_token_hash(const ds4_tokens *t, int n) {
     return h;
 }
 
-static void ds4_session_glm53_ckpt_slot_drop(glm53_ckpt_slot *c);
-static void ds4_session_glm53_ckpt_describe(const ds4_session *s, char *buf,
-                                            size_t cap, uint32_t *live_out);
-
 void ds4_session_glm53_rollback_drop(ds4_session *s) {
     if (!s) return;
-    /* Drops the WHOLE ring. Callers reach here when the timeline itself is in
-     * doubt -- a failed mirrored capture, an invalidate -- and in that state no
-     * slot is trustworthy, not merely the newest.
-     *
-     * Announced, because this is the other way a restore silently becomes
-     * unavailable: CKPTRING's whole investigation was about a ring that turned
-     * out to be emptied by an upstream prompt-rendering bug, and nothing said
-     * so. Only when there was something to lose. */
-    char ring[256];
-    uint32_t live = 0;
-    ds4_session_glm53_ckpt_describe(s, ring, sizeof ring, &live);
-    if (live > 0) {
-        fprintf(stderr, "ds4: GLM checkpoint ring DROP ALL: %u live %s\n",
-                live, ring);
-    }
-    for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
-        ds4_session_glm53_ckpt_slot_drop(&s->glm53_ckpt[i]);
-    }
-    s->glm53_ckpt_recent_cursor = 0;
     s->glm53_rollback_valid = false;
     s->glm53_rollback_pos = -1;
+    s->glm53_rollback_token_hash = 0;
 }
 
 void ds4_session_rollback_hold(ds4_session *s, bool hold) {
     if (s) s->glm53_rollback_held = hold;
-}
-
-/* So a caller can suppress capture over a span WITHOUT clobbering an outer
- * suppression it does not own. The flag is a plain bool, not a count, and the
- * server nests these. */
-bool ds4_session_rollback_is_held(const ds4_session *s) {
-    return s && s->glm53_rollback_held;
 }
 
 
@@ -60824,438 +60704,89 @@ bool ds4_session_rollback_is_held(const ds4_session *s) {
  * decision is taken independently on each side and then reconciled by the
  * mirrored rewind mode.  The only such point is the frontier of a sync that
  * both ranks completed; see ds4_session_sync(). */
-static void ds4_session_glm53_ckpt_slot_drop(glm53_ckpt_slot *c) {
-    if (!c) return;
-    c->pos = -1;
-    c->token_hash = 0;
-    c->dense_len = 0;
-}
-
-/* Announce, once per distinct outcome.
- *
- * CKPTRING found an empty ring and could not say why: every failure path here
- * returned false silently, and the leader's caller dropped on !local_ok with no
- * line either. "Nothing in the log shows a capture" was uninformative because
- * success was not logged, so absence proved nothing. This is the same gap as
- * ANESCHED1's discarded ms/engaged -- an instrument that only reports when it
- * is happy tells you nothing on the run that matters. Rate-limited to one line
- * per reason per process: the capture runs at every sync frontier. */
-static void ds4_glm53_capture_say(const char *reason, int pos) {
-    static const char *seen[8];
-    static unsigned hits[8];
-    static int n;
-    for (int i = 0; i < n; i++) {
-        if (seen[i] != reason) continue;
-        /* CKPTRING2: deduping a PER-FRONTIER event by reason alone suppressed
-         * exactly the repeats that show the ring filling, so one "ok" line read
-         * as one capture and the first run's "the ring was empty" inference was
-         * drawn from silence the instrument created. Keep the rate limit --
-         * this runs at every sync frontier -- but let the count through on a
-         * geometric schedule so the ring's growth stays visible for free. */
-        const unsigned k = ++hits[i];
-        if ((k & (k - 1u)) != 0u) return;          /* powers of two only */
-        fprintf(stderr, "ds4: GLM checkpoint capture %s (pos %d, #%u)\n",
-                reason, pos, k);
-        return;
-    }
-    if (n < 8) { seen[n] = reason; hits[n] = 1u; n++; }
-    fprintf(stderr, "ds4: GLM checkpoint capture %s (pos %d, #1)\n", reason, pos);
-}
-
-/* CKPTSTATE: hash EVERY GLM-5.3 state tensor, not just the snapshotted ones.
- *
- * CKPTRING3 showed a deep restore that passes every check we have -- it fires,
- * the token_hash matches, it lands exactly, prefix_ok=1 -- and still produces a
- * different continuation. Text-level evidence is exhausted: a restore can be
- * wrong in a way only 7901 tokens of recurrence reveal, and faithful at 13.
- *
- * The decisive question is which piece of state is not being restored, and the
- * way to answer it is to digest the state at CAPTURE and again at RESTORE and
- * diff. Any tensor whose digest differs either round-tripped badly or is not in
- * the snapshot at all -- and the second is the suspicion, since the snapshot
- * covers exactly three things (KDA conv, KDA recurrent, indexer tail) while the
- * graph holds a dozen more.
- *
- * Deliberately hashes the UNSNAPSHOTTED tensors too. Digesting only what we
- * save could only ever confirm that saving works, which is the hypothesis least
- * likely to be true given the restore already verifies its own hash.
- *
- * Sampled rather than exhaustive: these caches run to gigabytes at 131k, and a
- * stride-sampled FNV over each catches a changed tensor without making the
- * diagnostic itself a performance event. Sampling can miss a difference; it
- * cannot invent one, so a reported difference is real.
- *
- * DS4_GLM53_CKPT_VERIFY=1. Off by default -- it synchronises the GPU. */
-static int ds4_glm53_ckpt_verify_enabled(void) {
-    const char *e = getenv("DS4_GLM53_CKPT_VERIFY");
-    return e && (e[0] == '1' || e[0] == '2');
-}
-
-/* =2 adds a per-layer line for every kind. */
-static int ds4_glm53_ckpt_verify_verbose(void) {
-    const char *e = getenv("DS4_GLM53_CKPT_VERIFY");
-    return e && e[0] == '2';
-}
-
-/* `live_frac` bounds the digest to the leading fraction of the tensor that a
- * restore to `pos` must reproduce.
- *
- * The first cut of this hashed WHOLE tensors, and that over-reports. The
- * compact DSA caches are sized for the entire context and addressed by
- * position -- `pos + n > compact_cache_cap` is a hard refusal and
- * glm_graph_ensure_compact_cache() errors rather than recycling -- so at
- * restore time the rows ABOVE the restore point still hold the trajectory the
- * session had reached, and they differ from the capture legitimately. The
- * re-prefill overwrites exactly that span. Reporting it as a mismatch invents a
- * defect out of correct behaviour, which is the one thing a diagnostic must not
- * do; the first CKPTSTATE run named idx_key_cache and kv_lora on that basis and
- * the claim needs re-taking under this bound.
- *
- * Rows [0, pos) are the ones that must match, because nothing rewrites them. */
-static uint64_t ds4_glm53_tensor_digest_bounded(ds4_gpu_tensor *t,
-                                                double live_frac) {
-    if (!t) return 0;
-    uint64_t bytes = ds4_gpu_tensor_bytes(t);
-    if (bytes < 4) return 0;
-    if (live_frac > 0.0 && live_frac < 1.0) {
-        uint64_t b = (uint64_t)((double)bytes * live_frac);
-        b &= ~(uint64_t)3;                 /* whole words */
-        if (b >= 4) bytes = b;
-    }
-    const uint32_t *p = (const uint32_t *)ds4_gpu_tensor_contents(t);
-    if (!p) return 0;
-    const uint64_t words = bytes / 4u;
-    uint64_t stride = words / 4096u;
-    if (stride == 0) stride = 1;
-    uint64_t h = UINT64_C(1469598103934665603);
-    for (uint64_t i = 0; i < words; i += stride) {
-        h = (h ^ (uint64_t)p[i]) * UINT64_C(1099511628211);
-    }
-    h = (h ^ bytes) * UINT64_C(1099511628211);
-    return h;
-}
-
-static uint64_t ds4_glm53_tensor_digest(ds4_gpu_tensor *t) {
-    if (!t) return 0;
-    const uint64_t bytes = ds4_gpu_tensor_bytes(t);
-    if (bytes < 4) return 0;
-    const uint32_t *p = (const uint32_t *)ds4_gpu_tensor_contents(t);
-    if (!p) return 0;
-    const uint64_t words = bytes / 4u;
-    /* At most 4096 samples per tensor, evenly spread. */
-    uint64_t stride = words / 4096u;
-    if (stride == 0) stride = 1;
-    uint64_t h = UINT64_C(1469598103934665603);
-    for (uint64_t i = 0; i < words; i += stride) {
-        h = (h ^ (uint64_t)p[i]) * UINT64_C(1099511628211);
-    }
-    /* Length is part of the identity: a resized tensor is a different one. */
-    h = (h ^ bytes) * UINT64_C(1099511628211);
-    return h;
-}
-
-static void ds4_glm53_state_digest(ds4_session *s, const char *label, int pos) {
-    if (!s || !ds4_glm53_ckpt_verify_enabled()) return;
+bool ds4_session_glm53_rollback_capture(ds4_session *s) {
+    if (!ds4_session_glm53_rollback_supported(s)) return false;
+    if (!s->checkpoint_valid || s->checkpoint.len <= 0) return false;
     ds4_glm_gpu_graph *g = &s->glm_graph;
-    if (!s->glm_graph_ready || !g->glm53) return;
-    (void)ds4_gpu_synchronize();
-    /* Rows are position-indexed against compact_cache_cap (or ctx_cap when the
-     * compact path is off), so the fraction a restore must reproduce is
-     * pos/cap. Clamped to (0,1]; 0 or an unknown cap means digest everything. */
-    const int verbose = ds4_glm53_ckpt_verify_verbose();
-    const uint32_t cap = g->compact_cache_cap ? g->compact_cache_cap : g->ctx_cap;
-    double live_frac = 1.0;
-    if (cap > 0 && pos > 0 && (uint32_t)pos < cap) {
-        live_frac = (double)pos / (double)cap;
-    }
-    struct { const char *name; ds4_gpu_tensor **arr; } kinds[] = {
-        { "kda_conv",      g->layer_kda_conv_state },
-        { "kda_recur",     g->layer_kda_recurrent_state },
-        { "idx_tail_k",    g->layer_indexer_tail_k },
-        { "idx_tail_gate", g->layer_indexer_tail_gate },
-        { "idx_key_cache", g->layer_indexer_key_cache },
-        { "k_rope",        g->layer_k_rope_cache },
-        { "kv_lora",       g->layer_kv_lora_cache },
-        { "key_cache",     g->layer_key_cache },
-        { "value_cache",   g->layer_value_cache },
-    };
-    for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++) {
-        if (!kinds[k].arr) continue;
-        /* One digest per KIND, folded over layers: a per-layer table at 46
-         * layers x 15 kinds is 690 lines per call and unreadable in a log. The
-         * fold still names the kind, which is what picks the culprit; the layer
-         * only matters once a kind is implicated. */
-        uint64_t h = UINT64_C(1469598103934665603);
-        uint64_t hb = UINT64_C(1469598103934665603);
-        uint32_t n = 0, sized = 0;
-        for (uint32_t il = g->layer_start; il <= g->layer_end; il++) {
-            ds4_gpu_tensor *t = kinds[k].arr[il];
-            if (!t) continue;
-            if (ds4_gpu_tensor_bytes(t) >= 4) sized++;
-            const uint64_t dh = ds4_glm53_tensor_digest(t);
-            const uint64_t db = ds4_glm53_tensor_digest_bounded(t, live_frac);
-            h  = (h  ^ dh) * UINT64_C(1099511628211);
-            hb = (hb ^ db) * UINT64_C(1099511628211);
-            n++;
-            /* VERIFY=2: per layer, which is what a search INSIDE an accused
-             * kind needs. The fold names the kind; only the layer narrows it
-             * further, and by then there is one kind left so the volume is
-             * affordable. */
-            if (verbose) {
-                fprintf(stderr,
-                        "ds4: CKPTSTATE %-8s pos=%-7d %-14s L%02u full=%016llx "
-                        "bounded=%016llx\n",
-                        label, pos, kinds[k].name, il,
-                        (unsigned long long)dh, (unsigned long long)db);
-            }
-        }
-        if (n == 0) continue;
-        /* A kind whose every tensor is empty folds to a FIXED nonzero constant
-         * -- 11 zero digests fold to d8586981e924eca1 -- which reads exactly
-         * like a real hash that happens to match. That is how k_rope got cited
-         * as evidence in CKPTSTATE and CKPTSTATE2: GLM 5.3 Flash has n_rot=0,
-         * so the tensor is 1 byte, the digest returns 0, and "full == bounded,
-         * consistent with a position-determined tensor" was a reading of
-         * nothing at all. Say ABSENT instead. */
-        if (sized == 0) {
-            fprintf(stderr,
-                    "ds4: CKPTSTATE %-8s pos=%-7d %-14s n=%-3u ABSENT "
-                    "(all tensors zero-sized -- no evidence either way)\n",
-                    label, pos, kinds[k].name, n);
-            continue;
-        }
-        /* BOUNDED is the column that decides. FULL is kept beside it because a
-         * kind that differs in FULL and matches in BOUNDED is the signature of
-         * a position-addressed cache behaving correctly, and telling that apart
-         * from a real defect is the whole point of the pair. */
-        fprintf(stderr,
-                "ds4: CKPTSTATE %-8s pos=%-7d %-14s n=%-3u full=%016llx "
-                "bounded=%016llx\n",
-                label, pos, kinds[k].name, n,
-                (unsigned long long)h, (unsigned long long)hb);
-    }
-    /* Scalars the restore sets by hand rather than copying. dense_cache_len is
-     * reinstated from the snapshot; the graph's own frontier counters are not
-     * reinstated at all, and if the recurrence reads them a stale one is a
-     * candidate in its own right. */
-    fprintf(stderr,
-            "ds4: CKPTSTATE %-8s pos=%-7d %-14s dense_len=%u ctx_cap=%u "
-            "compact_cap=%u layers=%u..%u\n",
-            label, pos, "scalars", s->glm_dense_cache_len,
-            g->ctx_cap, g->compact_cache_cap, g->layer_start, g->layer_end);
-}
 
-/* Write the session's current GLM-5.3 state into `c`. Shared by the ring and
- * by the interrupt-recovery slot, which differ only in WHERE they store, never
- * in what a snapshot contains. */
-static bool ds4_session_glm53_ckpt_fill(ds4_session *s, glm53_ckpt_slot *c,
-                                        int pos) {
-    ds4_glm_gpu_graph *g = &s->glm_graph;
     const uint64_t kda_bytes = glm53_graph_kda_state_bytes(g);
     const uint64_t idx_bytes = glm53_graph_index_tail_bytes(g);
-    if (!c->kda) {
-        c->kda = ds4_gpu_tensor_alloc(kda_bytes);
-        if (!c->kda) {
-            ds4_glm53_capture_say("FAILED: kda slot alloc", pos);
+    if (kda_bytes == 0) return false;
+
+    if (!s->glm53_rollback_kda) {
+        s->glm53_rollback_kda = ds4_gpu_tensor_alloc(kda_bytes);
+        if (!s->glm53_rollback_kda) {
+            fprintf(stderr,
+                    "ds4: glm53 rollback: could not allocate %llu bytes of KDA "
+                    "snapshot; rewinds will re-prefill\n",
+                    (unsigned long long)kda_bytes);
             return false;
         }
     }
-    if (idx_bytes != 0 && !c->index) {
-        c->index = ds4_gpu_tensor_alloc(idx_bytes);
-        if (!c->index) {
-            ds4_session_glm53_ckpt_slot_drop(c);
-            ds4_glm53_capture_say("FAILED: index slot alloc", pos);
+    if (idx_bytes != 0 && !s->glm53_rollback_index) {
+        s->glm53_rollback_index = ds4_gpu_tensor_alloc(idx_bytes);
+        if (!s->glm53_rollback_index) {
+            fprintf(stderr,
+                    "ds4: glm53 rollback: could not allocate %llu bytes of "
+                    "indexer snapshot; rewinds will re-prefill\n",
+                    (unsigned long long)idx_bytes);
             return false;
         }
     }
-    if (!c->logits) {
-        c->logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
-        if (!c->logits) {
-            ds4_glm53_capture_say("FAILED: logits alloc", pos);
-            return false;
-        }
+    if (!s->glm53_rollback_logits) {
+        s->glm53_rollback_logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+        if (!s->glm53_rollback_logits) return false;
     }
-    if (!glm53_graph_copy_kda_state_to(g, c->kda, true)) {
-        /* A half-written slot must not be reachable: the restore that found it
-         * would apply a mixed state, which is worse than re-prefilling. */
-        ds4_session_glm53_ckpt_slot_drop(c);
-        ds4_glm53_capture_say("FAILED: copy_kda_state_to", pos);
-        return false;
-    }
-    if (idx_bytes != 0 && !glm53_graph_copy_index_tail(g, c->index, true)) {
-        ds4_session_glm53_ckpt_slot_drop(c);
-        ds4_glm53_capture_say("FAILED: copy_index_tail", pos);
+
+    if (!glm53_graph_copy_kda_state_to(g, s->glm53_rollback_kda, true) ||
+        (idx_bytes != 0 &&
+         !glm53_graph_copy_index_tail(g, s->glm53_rollback_index, true)))
+    {
+        ds4_session_glm53_rollback_drop(s);
         return false;
     }
     if (s->logits) {
-        memcpy(c->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+        memcpy(s->glm53_rollback_logits, s->logits,
+               (size_t)DS4_N_VOCAB * sizeof(float));
     }
-    c->pos = pos;
-    c->dense_len = s->glm_dense_cache_len;
-    c->token_hash = ds4_session_token_hash(&s->checkpoint, pos);
-    return true;
-}
-
-bool ds4_session_glm53_rollback_capture(ds4_session *s) {
-    const int pos = s ? s->checkpoint.len : -1;
-    if (!ds4_session_glm53_rollback_supported(s)) {
-        ds4_glm53_capture_say(
-            !s ? "skipped: no session"
-               : !s->glm_graph_ready ? "skipped: graph not ready"
-               : !s->glm_graph.glm53 ? "skipped: not GLM-5.3"
-               : "skipped: disabled by DS4_GLM_KDA_ROLLBACK=0", pos);
-        return false;
-    }
-    ds4_glm_gpu_graph *g = &s->glm_graph;
-    const uint64_t kda_bytes = glm53_graph_kda_state_bytes(g);
-    if (kda_bytes == 0) {
-        ds4_glm53_capture_say("FAILED: kda_state_bytes == 0 -- no KDA state "
-                              "tensors on this graph", pos);
-        return false;
-    }
-
-    /* Banded slot if this frontier is the first in its band, FIFO otherwise.
-     * See ds4_glm53_ckpt_banded_slot() for why the ring is split at all. */
-    const uint32_t banded_i = ds4_glm53_ckpt_banded_slot(pos);
-    const uint32_t recent_n = ds4_glm53_ckpt_recent_slots();
-    const glm53_ckpt_slot *bslot = &s->glm53_ckpt[banded_i];
-    const int band_taken =
-        bslot->pos >= 0 &&
-        (bslot->pos / DS4_GLM53_CKPT_BAND) == (pos / DS4_GLM53_CKPT_BAND) &&
-        bslot->pos != pos;
-    uint32_t slot_i;
-    if (!band_taken || recent_n == 0u) {
-        slot_i = banded_i;
-    } else {
-        slot_i = s->glm53_ckpt_recent_cursor % recent_n;
-        s->glm53_ckpt_recent_cursor =
-            (s->glm53_ckpt_recent_cursor + 1u) % recent_n;
-    }
-    glm53_ckpt_slot *c = &s->glm53_ckpt[slot_i];
-
-    /* An overwrite is the ring's one DESTRUCTIVE operation and it was silent.
-     * A production log lost a 655-second prefill to exactly this: four
-     * frontiers 39 tokens apart, one band, three silent evictions, and the sole
-     * survivor sat ABOVE the divergence. Not rate-limited by reason like the
-     * capture line -- each eviction names a different pair, and that pair is
-     * the whole diagnostic. */
-    if (c->pos >= 0 && c->pos != pos) {
-        fprintf(stderr,
-                "ds4: GLM checkpoint ring EVICT slot %u (%s): pos %d -> %d\n",
-                slot_i, slot_i < recent_n ? "recent" : "banded", c->pos, pos);
-    }
-
-    if (!ds4_session_glm53_ckpt_fill(s, c, pos)) return false;
-    ds4_glm53_state_digest(s, "capture", pos);
-    s->glm53_rollback_pos = pos;
+    s->glm53_rollback_pos = s->checkpoint.len;
+    s->glm53_rollback_dense_len = s->glm_dense_cache_len;
+    s->glm53_rollback_token_hash =
+        ds4_session_token_hash(&s->checkpoint, s->checkpoint.len);
     s->glm53_rollback_valid = true;
-    ds4_glm53_capture_say("ok", pos);
     return true;
 }
 
 /* Can a rewind to `pos` be served from the snapshot?  Pure predicate: the
  * leader evaluates it to choose the mirrored rewind mode. */
-/* The slot holding an exact, hash-matching snapshot for `pos`, or NULL.
- *
- * Same length is not the same history, which is why the hash is checked and
- * not just the position: a different prompt prefilled to the same length must
- * not be able to restore into someone else's recurrence. */
-static const glm53_ckpt_slot *ds4_session_glm53_ckpt_find(const ds4_session *s,
-                                                          int pos) {
-    if (!ds4_session_glm53_rollback_supported(s)) return NULL;
-    if (pos < 0 || pos > s->checkpoint.len) return NULL;
-    /* SCANS rather than indexing. With the split ring a position can live in
-     * either half depending on whether it was first in its band, so computing
-     * one slot would miss it -- and worse, a purely banded lookup would have to
-     * agree with the capture side's placement on BOTH ranks. Scanning by
-     * position removes that coupling entirely: the ranks no longer have to
-     * choose the same slot, only to hold the same position, which makes an
-     * un-exchanged DS4_GLM53_CKPT_SLOTS harmless rather than merely safe. */
-    for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
-        const glm53_ckpt_slot *c = &s->glm53_ckpt[i];
-        if (c->pos != pos || c->pos < 0) continue;
-        if (ds4_session_token_hash(&s->checkpoint, pos) != c->token_hash) continue;
-        return c;
-    }
-    return NULL;
-}
-
-/* The largest checkpoint at or below `limit`, or -1.
- *
- * This is what a prefix-cache miss wants: the prompt diverges at `limit`, and
- * anything below it is still the same history. Scans the ring, because the
- * best candidate need not live in any slot derivable from `limit`. */
-int ds4_session_glm53_ckpt_best_at_or_below(ds4_session *s, int limit) {
-    if (!ds4_session_glm53_rollback_supported(s)) return -1;
-    if (limit <= 0) return -1;
-    int best = -1;
-    for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
-        const glm53_ckpt_slot *c = &s->glm53_ckpt[i];
-        if (c->pos < 0 || c->pos > limit || c->pos <= best) continue;
-        if (!ds4_session_glm53_ckpt_find(s, c->pos)) continue;
-        best = c->pos;
-    }
-    return best;
-}
-
-/* Render the ring for the divergence diagnostic: which positions are actually
- * held, and how many.
- *
- * CKPTRING2 ran the gate twice and could not distinguish "the capture never
- * landed" from "the lookup rejected a capture that did" -- and those live on
- * opposite sides of the feature. Printing the ring alongside the lookup's
- * answer separates them in a single run: the ring holding 15591 while the
- * lookup returns -1 is the token_hash check in ckpt_find(), whereas a ring
- * without it is a capture-side failure after all.
- *
- * Caller buffer, no allocation: this runs on a diagnostic path that must not
- * be able to fail. */
-static void ds4_session_glm53_ckpt_describe(const ds4_session *s,
-                                            char *buf, size_t cap,
-                                            uint32_t *live_out) {
-    size_t off = 0;
-    uint32_t live = 0;
-    if (buf && cap) buf[0] = '\0';
-    if (s) {
-        for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
-            const int p = s->glm53_ckpt[i].pos;
-            if (p < 0) continue;
-            live++;
-            if (buf && cap > off + 24)
-                off += (size_t)snprintf(buf + off, cap - off, "[%u]=%d ", i, p);
-        }
-    }
-    if (live_out) *live_out = live;
-}
-
-/* Can a rewind to `pos` be served from a snapshot?  Pure predicate: the
- * leader evaluates it to choose the mirrored rewind mode. */
 static bool ds4_session_glm53_rollback_can_restore(const ds4_session *s, int pos) {
-    return ds4_session_glm53_ckpt_find(s, pos) != NULL;
+    if (!ds4_session_glm53_rollback_supported(s)) return false;
+    if (!s->glm53_rollback_valid || s->glm53_rollback_pos != pos) return false;
+    if (pos < 0 || pos > s->checkpoint.len) return false;
+    /* Same length is not the same history. */
+    return ds4_session_token_hash(&s->checkpoint, pos) ==
+           s->glm53_rollback_token_hash;
 }
 
 static bool ds4_session_glm53_rollback_restore(ds4_session *s, int pos) {
-    const glm53_ckpt_slot *c = ds4_session_glm53_ckpt_find(s, pos);
-    if (!c) return false;
+    if (!ds4_session_glm53_rollback_can_restore(s, pos)) return false;
     ds4_glm_gpu_graph *g = &s->glm_graph;
     const uint64_t idx_bytes = glm53_graph_index_tail_bytes(g);
-    if (!glm53_graph_copy_kda_state_to(g, c->kda, false) ||
-        (idx_bytes != 0 && !glm53_graph_copy_index_tail(g, c->index, false)))
+    if (!glm53_graph_copy_kda_state_to(g, s->glm53_rollback_kda, false) ||
+        (idx_bytes != 0 &&
+         !glm53_graph_copy_index_tail(g, s->glm53_rollback_index, false)))
     {
         /* A half-applied restore is worse than none: the caller must fall back
          * to invalidating. */
         ds4_session_glm53_rollback_drop(s);
         return false;
     }
-    if (s->logits && c->logits) {
-        memcpy(s->logits, c->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    if (s->logits && s->glm53_rollback_logits) {
+        memcpy(s->logits, s->glm53_rollback_logits,
+               (size_t)DS4_N_VOCAB * sizeof(float));
     }
-    s->glm_dense_cache_len = c->dense_len;
+    s->glm_dense_cache_len = s->glm53_rollback_dense_len;
     s->glm_graph.kda_state_exchange_pending = 0;
-    /* Diff this against the "capture" line at the same pos. Any kind that
-     * differs was either not restored or did not round-trip, and that is the
-     * answer CKPTRING3 could not get from text. */
-    ds4_glm53_state_digest(s, "restore", pos);
     return true;
 }
 
@@ -61285,47 +60816,6 @@ static int ds4_session_interrupt_rewind_target(ds4_session *s, int pre_sync_len)
     (void)s;
     return pre_sync_len;
 }
-#else
-/* CPU-build stubs.
- *
- * The GLM-5.3 rollback and checkpoint machinery is GPU-only -- its state lives
- * in ds4_gpu_tensors -- but three of its entry points are called from code that
- * is not itself GPU-guarded: the interrupt rewind target, the ring lookup in
- * the sync divergence branch, and the drop on invalidate. Without these,
- * `make cpu` and `make test-session-state` fail to build, which is how the
- * checkpoint ring shipped: it was only ever compiled one way.
- *
- * Semantics are the no-checkpoint ones the CPU path already assumes -- rewind
- * exactly where asked, no checkpoint below any divergence, nothing to drop --
- * so the CPU build behaves as it did before the ring existed. */
-static int ds4_session_interrupt_rewind_target(ds4_session *s, int pre_sync_len) {
-    (void)s;
-    return pre_sync_len;
-}
-
-int ds4_session_glm53_ckpt_best_at_or_below(ds4_session *s, int limit) {
-    (void)s; (void)limit;
-    return -1;
-}
-
-int ds4_glm53_restore_enabled(void) { return 0; }
-
-int ds4_session_glm53_try_restore(ds4_session *s, const ds4_tokens *prompt,
-                                  int common) {
-    (void)s; (void)prompt; (void)common;
-    return 0;
-}
-
-void ds4_session_glm53_rollback_drop(ds4_session *s) {
-    (void)s;
-}
-
-/* The server calls these around its internal syncs unconditionally. */
-void ds4_session_rollback_hold(ds4_session *s, bool hold) {
-    (void)s; (void)hold;
-}
-
-bool ds4_session_rollback_is_held(const ds4_session *s) { (void)s; return false; }
 #endif
 
 static uint32_t ds4_model_normal_layer_count(void) {
@@ -70513,24 +70003,6 @@ uint64_t ds4_glm53_rollback_session_bytes(void) {
     return total;
 }
 
-/* How many checkpoint-ring slots this process will use.
- *
- * Exported because the server's startup memory line reported only the single
- * rollback snapshot and said nothing about the ring -- which is the same size
- * again per slot, allocated lazily, and default-on. At the default 8 slots that
- * under-states a GLM-5.3 session's snapshot memory by 9x, and at
- * DS4_GLM53_CKPT_SLOTS=16 by 17x. Shipping a default-on feature whose memory
- * does not appear in the memory report is the kind of thing that surfaces as an
- * unexplained OOM on someone else's box. */
-uint32_t ds4_glm53_ckpt_slot_count(void) {
-#ifndef DS4_NO_GPU
-    if (!ds4_model_is_glm53() || !ds4_glm53_rollback_enabled()) return 0;
-    return ds4_glm53_ckpt_slots();
-#else
-    return 0;
-#endif
-}
-
 int ds4_engine_embd_dim(ds4_engine *e) {
     (void)e;
     return (int)DS4_N_EMBD;
@@ -71718,14 +71190,6 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
         ds4_session *s = xcalloc(1, sizeof(*s));
-#ifndef DS4_NO_GPU
-    /* xcalloc leaves pos = 0, which reads as a VALID checkpoint at position
-     * zero -- an empty ring would advertise a restore point and hand back an
-     * uninitialised recurrence. Empty is -1. */
-    for (uint32_t ci = 0; ci < DS4_GLM53_CKPT_SLOTS; ci++) s->glm53_ckpt[ci].pos = -1;
-    s->glm53_ckpt_recent_cursor = 0;
-    s->glm53_rollback_pos = -1;
-#endif
         s->engine = e;
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
@@ -71748,14 +71212,6 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
-#ifndef DS4_NO_GPU
-    /* xcalloc leaves pos = 0, which reads as a VALID checkpoint at position
-     * zero -- an empty ring would advertise a restore point and hand back an
-     * uninitialised recurrence. Empty is -1. */
-    for (uint32_t ci = 0; ci < DS4_GLM53_CKPT_SLOTS; ci++) s->glm53_ckpt[ci].pos = -1;
-    s->glm53_ckpt_recent_cursor = 0;
-    s->glm53_rollback_pos = -1;
-#endif
     s->ctx_size = ctx_size;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const uint32_t normal_layers = glm_graph_normal_layer_count();
@@ -72113,11 +71569,9 @@ void ds4_session_free(ds4_session *s) {
 #ifndef DS4_NO_GPU
     free(s->glm_mtp_hc);
     free(s->glm_mtp_logits0);
-    for (uint32_t i = 0; i < DS4_GLM53_CKPT_SLOTS; i++) {
-        ds4_gpu_tensor_free(s->glm53_ckpt[i].kda);
-        ds4_gpu_tensor_free(s->glm53_ckpt[i].index);
-        free(s->glm53_ckpt[i].logits);
-    }
+    ds4_gpu_tensor_free(s->glm53_rollback_kda);
+    ds4_gpu_tensor_free(s->glm53_rollback_index);
+    free(s->glm53_rollback_logits);
 #endif
     free(s->mtp_logits);
 #ifndef DS4_NO_GPU
@@ -73593,104 +73047,6 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
     return true;
 }
 
-#ifndef DS4_NO_GPU
-/* Rescue a diverged prompt from the checkpoint ring, before any SYNC is sent.
- *
- * LEADER ONLY, and through ds4_session_rewind() rather than by hand. That
- * function mirrors: it sends REWIND with the KEEP flag, waits for the worker's
- * ack, and invalidates both ranks when the applied results differ. It also does
- * the bookkeeping an open-coded restore would skip -- compressor-window
- * alignment, the MTP draft, layer_n_comp -- any of which left stale would be a
- * wrong recurrence rather than a slow one.
- *
- * The worker must not run the lookup: it receives the mirrored REWIND and its
- * checkpoint is already valid at ck by the time its own sync arrives. Deriving
- * the position independently on both ranks is exactly the asymmetry
- * rewind_core exists to remove. */
-/* The one switch that turns OFF restoring from the ring without turning off the
- * rollback machinery itself.
- *
- * DS4_GLM_KDA_ROLLBACK=0 would also disable the single-snapshot rewind that
- * speculative decode and interrupt recovery depend on, so it is the wrong
- * instrument for backing out this feature specifically. This one leaves capture
- * and spec-decode rewind intact and only declines to resume a DIVERGED prompt,
- * which restores exactly the pre-ring behaviour: full re-prefill on any
- * mid-prefix divergence, slow but never wrong. */
-int ds4_glm53_restore_enabled(void) {
-    /* DEFAULT OFF as of CKPTRING3, which failed the gate on a live defect.
-     *
-     * A deep restore fires, hash-verifies (prefix_ok=1), lands exactly, keeps
-     * 66% of the prompt -- and then produces a DIFFERENT continuation from the
-     * one a full re-prefill produces. Fluent, plausible, wrong: precisely the
-     * failure the gate exists to catch, caught on code shipped ahead of it.
-     * The snapshot's state is not bit-faithful, and the error only surfaces
-     * once enough recurrence runs to cross an argmax boundary (faithful at 13
-     * tokens re-created, unfaithful at 7901).
-     *
-     * Not merely depth-capped, and that is deliberate. Both production misses
-     * this feature was shipped for needed 5206 and 7908 tokens of recurrence
-     * after the landing point -- squarely in or beside the known-bad region.
-     * A cap tight enough to be defensible would not rescue either, so it would
-     * trade a measured correctness defect for a benefit that does not arrive.
-     * A slow prefill is recoverable; a silently wrong answer is not.
-     *
-     * The near-head restore IS verified byte-faithful and saves 52.2 s of a
-     * 52.5 s re-prefill, so this comes back on -- behind DS4_GLM53_CKPT_RESTORE=1
-     * for anyone who wants it now, and by default once the state-faithfulness
-     * defect is found and the gate passes at depth. Capture stays on
-     * regardless: it is cheap now that it runs once per request, and the ring
-     * has to be populated for the fix to be testable. */
-    const char *e = getenv("DS4_GLM53_CKPT_RESTORE");
-    return e && e[0] == '1';
-}
-
-int ds4_session_glm53_try_restore(ds4_session *s, const ds4_tokens *prompt,
-                                  int common) {
-    if (!s || !prompt || prompt->len <= 0 || common <= 0) return 0;
-    if (!ds4_session_glm53_rollback_supported(s)) return 0;
-    if (!ds4_glm53_restore_enabled()) return 0;
-    if (ds4_session_tp_worker(s)) return 0;
-    /* A prompt that already extends the checkpoint is the cache-hit path and
-     * needs nothing from the ring. */
-    if (s->checkpoint_valid && prompt->len >= s->checkpoint.len &&
-        ds4_tokens_starts_with(prompt, &s->checkpoint)) return 0;
-
-    const int ck = ds4_session_glm53_ckpt_best_at_or_below(s, common);
-    if (ck > 0) ds4_session_rewind(s, ck);
-    /* Read the landing position back rather than assuming it: the rewind
-     * aligns down to a compressor window and reports 0 if it did not take. */
-    const int landed = ds4_session_reusable_pos(s);
-    const int prefix_ok = ds4_tokens_starts_with(prompt, &s->checkpoint) ? 1 : 0;
-    const int ok = (landed > 0 && landed <= common && prefix_ok);
-
-    /* Unconditional, and deliberately NOT routed through the capture side's
-     * reason-dedup -- that dedup is what hid the ring filling and turned two
-     * CKPTRING runs into "no restore, cause unknown". Every step between the
-     * lookup and the announce used to be silent, so an empty ring, a rejected
-     * token_hash and a rewind that did not take were indistinguishable. The
-     * ring's contents are printed because that is what separates a capture-side
-     * failure from a lookup-side one. One line per divergence is the right
-     * rate: divergences are rare by construction. */
-    char ring[256];
-    uint32_t live = 0;
-    ds4_session_glm53_ckpt_describe(s, ring, sizeof ring, &live);
-    fprintf(stderr,
-            "ds4: GLM checkpoint restore attempt: common=%d ck=%d landed=%d "
-            "prefix_ok=%d live=%u ring=%s-> %s\n",
-            common, ck, landed, prefix_ok, live, ring,
-            ok ? "RESTORE" : "re-prefill");
-    if (ok) {
-        s->mtp_draft_valid = false;
-        fprintf(stderr,
-                "ds4: GLM checkpoint restore: prompt diverged at %d, resuming "
-                "from %d instead of 0 (%d tokens kept)\n",
-                common, landed, landed);
-        return landed;
-    }
-    return 0;
-}
-#endif
-
 /* Under tensor parallelism the leader mirrors every public sync/eval to the
  * worker before doing the work itself, so both engines execute the same
  * graph sequence and the per-layer gates pair up.  The worker acks a sync
@@ -73703,21 +73059,6 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     }
 #ifndef DS4_NO_GPU
     ds4_session_dspark_scheduler_begin_request(s);
-    /* The checkpoint restore is NOT hooked here.
-     *
-     * It used to be, and the diagnostic caught it in production: this function
-     * is reached with the caller's chunk, not the request's whole prompt, so
-     * ds4_session_common_prefix() returned 4096 -- the chunk length -- while
-     * the server's own miss line had already computed the true divergence at
-     * 246200. The ring held a usable checkpoint at 245760 and the lookup was
-     * asked for one at or below 4096, so it found nothing and a 250966-token
-     * re-prefill went ahead.
-     *
-     * The restore belongs where the full prompt and the authoritative `common`
-     * both exist, which is the server's cache-miss path
-     * (ds4_session_glm53_try_restore, called from ds4_server.c). That is still
-     * before any SYNC is mirrored, so REWIND continues to reach the worker at
-     * top level rather than inside its in-prefill poll. */
 #endif
     const bool mirror = ds4_session_tp_leader(s);
     /* Only a SYNC that was actually mirrored may be cancelled: sending a CANCEL
@@ -73867,17 +73208,6 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                     s->engine->tp.ctx, s->tp_session_id, "rollback capture",
                     &wstatus, terr, sizeof(terr));
             if (!local_ok || !sent || !acked || wstatus != 0) {
-                /* Name which half failed. The leader's own !local_ok dropped
-                 * silently while the worker's refusal logged, so an empty
-                 * leader ring beside a populated worker ring -- which is
-                 * exactly what a leader-only capture failure produces, and
-                 * exactly what disables the restore -- looked identical to
-                 * "nothing was ever attempted". */
-                fprintf(stderr,
-                        "ds4: GLM checkpoint capture DROPPED at %d: local=%d "
-                        "sent=%d acked=%d worker_status=%d\n",
-                        s->checkpoint.len, local_ok ? 1 : 0, sent ? 1 : 0,
-                        acked ? 1 : 0, wstatus);
                 /* Either rank without a snapshot means neither may claim one:
                  * a later RESTORE the peer cannot serve costs a forced
                  * invalidate of both.  Drop ours and fall back to the old
@@ -73886,9 +73216,6 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                 if (!sent) ds4_tp_mark_failed(s->engine->tp.ctx);
             }
         } else if (!local_ok) {
-            fprintf(stderr, "ds4: GLM checkpoint capture DROPPED at %d "
-                            "(single rank, local capture failed)\n",
-                    s->checkpoint.len);
             ds4_session_glm53_rollback_drop(s);
         }
     }
@@ -74097,34 +73424,17 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             resumed_checkpoint = true;
             s->mtp_draft_valid = false;
         } else {
-            /* The prompt diverged and no checkpoint rescued it.
-             *
-             * The rescue itself no longer lives here. It ran at this point
-             * originally, which is AFTER the leader has already sent SYNC --
-             * so the mirrored REWIND arrived while the worker sat in its
-             * in-prefill poll, where a non-CANCEL frame is illegal
-             * (ds4_tp.c). That is a deadlock or a corrupted control stream
-             * rather than a slow path, and it could only ever have fired on a
-             * run where a restore actually happened -- which is to say, it was
-             * latent for exactly as long as the restore was broken for other
-             * reasons. It is now done before the SYNC goes out, in
-             * ds4_session_glm53_try_restore() from the server's miss path,
-             * and a successful
-             * restore reaches this function as an ordinary append that takes
-             * the branch above. */
-            s->mtp_draft_valid = false;
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
-            /* Re-prefilling a different history invalidates any snapshot
-             * taken against the old one, even at the same length.
-             * Unconditional for the same reason as ds4_session_invalidate():
-             * both ranks must reach the same state, and the worker has no
-             * hold. */
+            s->mtp_draft_valid = false;
+            /* Re-prefilling a different history invalidates any snapshot taken
+             * against the old one, even at the same length.  Unconditional for
+             * the same reason as ds4_session_invalidate(): both ranks must
+             * reach the same state, and the worker has no hold. */
             ds4_session_glm53_rollback_drop(s);
             ds4_session_glm_reset_dense_cache(s);
             if (!ds4_session_glm_reset_kda_state(s)) {
-                snprintf(err, errlen, "%s GLM KDA state reset failed",
-                         backend_name);
+                snprintf(err, errlen, "%s GLM KDA state reset failed", backend_name);
                 return 1;
             }
         }
