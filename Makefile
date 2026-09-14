@@ -499,8 +499,13 @@ tests/probe_ane_handoff: tests/probe_ane_handoff.c ds4_metal.o ds4_ane.o ds4_gpu
 # routed-MoE overlap window? No GPU, no GGUF -- bandwidth at production shapes.
 # Exactness gate for the packed-key GPU top-1 (TOP1-GPU). No GGUF needed: a
 # disagreeing tie-break changes a generated token and nothing downstream sees it.
+# -ffast-math is FILTERED OUT here deliberately. This probe's whole job is the
+# value classes where the GPU packing and the CPU sampler could disagree --
+# NaN, +-0, infinities -- and under fast-math the compiler is licensed to assume
+# they never occur, so the CPU reference stops testing them and the probe passes
+# by not looking. clang says so directly: -Wnan-infinity-disabled.
 tests/probe_top1: tests/probe_top1.c ds4_metal.o ds4_gpu.h
-	$(CC) $(CFLAGS) -I. -o $@ tests/probe_top1.c ds4_metal.o $(METAL_LDLIBS)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ tests/probe_top1.c ds4_metal.o $(METAL_LDLIBS)
 
 # Byte-identity gate for the sliced q_b projection. No GGUF needed.
 tests/probe_qb_slice: tests/probe_qb_slice.c ds4_metal.o ds4_gpu.h

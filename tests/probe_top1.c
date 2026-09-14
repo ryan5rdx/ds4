@@ -18,13 +18,21 @@
  *
  * No GGUF and no model: this is a reducer over a float row.
  *
- *   probe_top1 [--impl 0|1] [--groups N]
+ *   probe_top1 [--impl 0|1] [--groups N] [--shards N]
+ *   probe_top1 --sweep          the U64TOP1-CAP timing sweep
+ *
+ * The first version of this was exactness-only, with no clocks anywhere, and
+ * the campaign gate is a TIMING claim -- "the atomic beats the two-pass reducer
+ * INCLUDING reset and merge". So the rig could confirm the capability and prove
+ * exactness and then not run the sweep it had been sent to run. --sweep closes
+ * that.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
+#include <time.h>
 #include "ds4_gpu.h"
 
 int ds4_log_is_tty(void) { return 0; }
@@ -67,17 +75,108 @@ static void check(const char *what, uint32_t n_cols, uint32_t base,
     else          printf(", gpu index OUT OF RANGE)\n");
 }
 
+static double now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1e3 + (double)t.tv_nsec * 1e-6;
+}
+
+static int cmp_dbl(const void *a, const void *b) {
+    const double x = *(const double *)a, y = *(const double *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+/* One timed configuration. Every dispatch the implementation makes is inside
+ * the measured region -- for the atomic that is reset + atomic + shard merge,
+ * because the gate requires it to win with those included and leaving the reset
+ * outside is exactly how a primitive gets undeserved credit. */
+static double time_top1(ds4_gpu_tensor *out, ds4_gpu_tensor *lg,
+                        ds4_gpu_tensor *scr, uint32_t n, uint32_t rows,
+                        uint32_t groups, uint32_t shards, int impl,
+                        int iters, int cold, double *p50) {
+    double *samp = (double *)malloc((size_t)iters * sizeof(double));
+    if (!samp) return -1.0;
+    /* Warm: the first dispatch pays pipeline binding, which is not what the
+     * sweep is comparing. `cold` skips it so the difference is visible. */
+    if (!cold) {
+        ds4_gpu_top1(out, lg, scr, n, n, 0, rows, groups, shards, impl);
+        ds4_gpu_synchronize();
+    }
+    for (int i = 0; i < iters; i++) {
+        const double t0 = now_ms();
+        const int ok = ds4_gpu_top1(out, lg, scr, n, n, 0, rows, groups, shards, impl);
+        ds4_gpu_synchronize();
+        samp[i] = ok ? now_ms() - t0 : -1.0;
+    }
+    qsort(samp, (size_t)iters, sizeof(double), cmp_dbl);
+    *p50 = samp[iters / 2];
+    const double best = samp[0];
+    free(samp);
+    return best;
+}
+
+static void sweep(ds4_gpu_tensor *out, ds4_gpu_tensor *lg, ds4_gpu_tensor *scr,
+                  float *lp) {
+    const uint32_t widths[] = { 77440, 154880 };
+    const uint32_t groupset[] = { 16, 32, 64, 128, 256, 512 };
+    const uint32_t shardset[] = { 1, 2, 4, 8, 16 };
+    const uint32_t rowset[] = { 1, 8 };
+    const int iters = 50;
+
+    printf("\n=== U64TOP1-CAP timing sweep ===\n");
+    printf("u64_atomic_available=%d  (impl=1 silently falls back when 0, so a\n"
+           "flat twopass/u64 comparison there means the fallback, not a tie)\n",
+           ds4_gpu_top1_u64_available());
+    printf("\n%-7s %-5s %-7s %-7s %-9s %-9s %-9s\n",
+           "n_cols", "rows", "groups", "shards", "twopass", "u64", "ratio");
+
+    for (size_t wi = 0; wi < sizeof(widths)/sizeof(*widths); wi++) {
+        const uint32_t n = widths[wi];
+        for (uint32_t c = 0; c < n * 8; c++)
+            lp[c] = (float)((int32_t)(rnd() >> 8) - 8388608) * 1e-4f;
+        for (size_t ri = 0; ri < sizeof(rowset)/sizeof(*rowset); ri++) {
+            const uint32_t rows = rowset[ri];
+            for (size_t gi = 0; gi < sizeof(groupset)/sizeof(*groupset); gi++) {
+                const uint32_t g = groupset[gi];
+                double p50a = 0;
+                time_top1(out, lg, scr, n, rows, g, 1, 0, iters, 0, &p50a);
+                for (size_t si = 0; si < sizeof(shardset)/sizeof(*shardset); si++) {
+                    const uint32_t sh = shardset[si];
+                    double p50b = 0;
+                    time_top1(out, lg, scr, n, rows, g, sh, 1, iters, 0, &p50b);
+                    printf("%-7u %-5u %-7u %-7u %-9.4f %-9.4f %-9.3f\n",
+                           n, rows, g, sh, p50a, p50b,
+                           p50b > 0 ? p50a / p50b : 0.0);
+                }
+            }
+        }
+    }
+    /* Cold is reported separately rather than folded in: a rotating buffer is a
+     * different question from steady state and mixing them hides both. */
+    double p50c = 0, p50w = 0;
+    time_top1(out, lg, scr, 77440, 1, 64, 1, 0, 20, 1, &p50c);
+    time_top1(out, lg, scr, 77440, 1, 64, 1, 0, 20, 0, &p50w);
+    printf("\ncold-first vs warm (twopass, 77440, groups 64): %.4f / %.4f ms\n",
+           p50c, p50w);
+    printf("\nGate: the atomic must beat twopass INCLUDING its reset and shard\n"
+           "merge, both of which are inside the timed region above.\n");
+}
+
 int main(int argc, char **argv) {
-    int impl = 0;
-    uint32_t groups = 64;
+    int impl = 0, do_sweep = 0;
+    uint32_t groups = 64, shards = 1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--impl") && i + 1 < argc) impl = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--groups") && i + 1 < argc)
             groups = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--shards") && i + 1 < argc)
+            shards = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--sweep")) do_sweep = 1;
     }
     if (!ds4_gpu_init()) { puts("VOID: no GPU"); return 1; }
-    printf("impl=%s groups=%u  u64_atomic_available=%d\n",
-           impl ? "u64-atomic" : "twopass", groups, ds4_gpu_top1_u64_available());
+    printf("impl=%s groups=%u shards=%u  u64_atomic_available=%d\n",
+           impl ? "u64-atomic" : "twopass", groups, shards,
+           ds4_gpu_top1_u64_available());
     if (impl == 1 && !ds4_gpu_top1_u64_available()) {
         puts("NOTE: the native atomic is unavailable here (expected on Apple7);"
              " ds4_gpu_top1 falls back to two-pass, which is the fail-open"
@@ -111,7 +210,7 @@ int main(int argc, char **argv) {
                     for (uint32_t c = 0; c < n; c++)
                         row[c] = (float)((int32_t)(rnd() >> 8) - 8388608) * 1e-4f;
                 }
-                if (!ds4_gpu_top1(out, lg, scr, n, n, base, rows, groups, 1, impl)) {
+                if (!ds4_gpu_top1(out, lg, scr, n, n, base, rows, groups, shards, impl)) {
                     printf("  FAIL dispatch refused n=%u rows=%u\n", n, rows);
                     failures++; continue;
                 }
@@ -154,7 +253,7 @@ int main(int argc, char **argv) {
         } else if (!strcmp(nm, "all-nan")) {
             for (uint32_t c = 0; c < n; c++) lp[c] = NAN;
         }
-        if (!ds4_gpu_top1(out, lg, scr, n, n, 0, 1, groups, 1, impl)) {
+        if (!ds4_gpu_top1(out, lg, scr, n, n, 0, 1, groups, shards, impl)) {
             printf("  FAIL dispatch refused (%s)\n", nm); failures++; continue;
         }
         ds4_gpu_synchronize();
@@ -166,7 +265,7 @@ int main(int argc, char **argv) {
     for (uint32_t c = 0; c < maxw; c++) lp[c] = -5.0f;
     lp[4095] = 7.0f;                      /* the answer, inside  */
     lp[4096] = 99.0f;                     /* a trap, just outside */
-    if (ds4_gpu_top1(out, lg, scr, 4096, maxw, 0, 1, groups, 1, impl)) {
+    if (ds4_gpu_top1(out, lg, scr, 4096, maxw, 0, 1, groups, shards, impl)) {
         ds4_gpu_synchronize();
         const uint64_t *ok = ds4_gpu_tensor_contents(out);
         const uint32_t got = key_to_idx(ok[0]);
@@ -176,6 +275,9 @@ int main(int argc, char **argv) {
             failures++;
         }
     }
+
+    if (do_sweep && !failures) sweep(out, lg, scr, lp);
+    else if (do_sweep) puts("\nsweep SKIPPED: exactness failed, so timing is meaningless");
 
     printf("\n%s\n", failures ? "FAIL: the GPU top-1 does not match the CPU sampler"
                               : "PASS: GPU top-1 matches sample_argmax on every "
