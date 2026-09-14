@@ -4666,7 +4666,12 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_impl(
  * compiles in a prefix bounds check that zeroes and flags instead, for the
  * probe's negative control.
  */
-template <bool assume_valid_heads>
+/* SGASYNC target 1b (PREFILL grouped-LORA, ~0.278 ms/token). Same 16-row x 512
+ * KV stage as the decode partial and the same contiguity property, so the same
+ * arms apply. Built after the isolated sweep showed the decode half carrying a
+ * positive signal while the prefill INDEXER target was flat -- this is the
+ * prefill target in the family that did move, which the sweep never engaged. */
+template <bool assume_valid_heads, int ASYNC_STAGE = 0>
 kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl(
         constant ds4_metal_args_glm_attention_indexed_batch & args,
         device const char *q,
@@ -4753,13 +4758,53 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl(
          * online-softmax sequence -- or byte identity goes, which the probe
          * checks on every shape. */
         if (stage_all_valid) {
-            for (uint off = tid; off < stage_rows * kv_vecs; off += 256u) {
-                const uint rr = off / kv_vecs;
-                const uint vv = off - rr * kv_vecs;
-                device const half4 *src =
-                    (device const half4 *)((device const half *)kv_lora_cache +
-                        (uint64_t)token_selected[base + rr] * args.kv_lora_dim);
-                kv_shared[off] = src[vv];
+            bool kv_async = false;
+#ifdef DS4_PRIVATE_CLONE
+            if (ASYNC_STAGE != 0) {
+                /* Each simdgroup owns one contiguous run end to end -- copy it
+                 * or fill it -- so there is no cross-simdgroup verdict, no
+                 * extra storage and no extra barrier, and a mixed stage is safe
+                 * because each writes only its own disjoint slice. Same shape
+                 * as the decode partial; see that kernel for why validating
+                 * per-run rather than per-thread matters (4096 lane-checks per
+                 * stage otherwise). */
+                const uint run_rows = (uint)(16 / ASYNC_STAGE);
+                const uint n_runs = (uint)ASYNC_STAGE;
+                const uint sg_idx = (uint)sg_u;
+                const uint r0 = sg_idx * run_rows;
+                if (sg_idx < n_runs) {
+                    if (ds4_sgasync_run_is_contiguous(token_selected, base + r0,
+                                                      run_rows, args.cache_cap)) {
+                        device const half4 *src =
+                            (device const half4 *)((device const half *)kv_lora_cache +
+                                (uint64_t)token_selected[base + r0] * args.kv_lora_dim);
+                        simdgroup_future<void> c = simdgroup_async_copy(
+                            kv_shared + r0 * kv_vecs, src,
+                            (ulong)run_rows * kv_vecs);
+                        c.wait();
+                    } else {
+                        for (uint off = lane; off < run_rows * kv_vecs; off += 32u) {
+                            const uint rr = r0 + off / kv_vecs;
+                            const uint vv = off - (off / kv_vecs) * kv_vecs;
+                            device const half4 *src =
+                                (device const half4 *)((device const half *)kv_lora_cache +
+                                    (uint64_t)token_selected[base + rr] * args.kv_lora_dim);
+                            kv_shared[rr * kv_vecs + vv] = src[vv];
+                        }
+                    }
+                }
+                kv_async = true;
+            }
+#endif
+            if (!kv_async) {
+                for (uint off = tid; off < stage_rows * kv_vecs; off += 256u) {
+                    const uint rr = off / kv_vecs;
+                    const uint vv = off - rr * kv_vecs;
+                    device const half4 *src =
+                        (device const half4 *)((device const half *)kv_lora_cache +
+                            (uint64_t)token_selected[base + rr] * args.kv_lora_dim);
+                    kv_shared[off] = src[vv];
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             for (uint rr = 0u; rr < stage_rows; rr++) {
@@ -4860,6 +4905,19 @@ kernel void kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl(
 template [[host_name("kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_padded")]]
 kernel decltype(kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl<true>)
 kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl<true>;
+
+#ifdef DS4_PRIVATE_CLONE
+/* SGASYNC target 1b arms. The plain names above, recompiled by the 14.2
+ * frontend into the same private library, are the compiler control. */
+typedef decltype(kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl<true, 4>)
+        glm_attn_idx_batch_lora_g8_a_t;
+template [[host_name("kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_padded_sgasync4")]]
+kernel glm_attn_idx_batch_lora_g8_a_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl<true, 4>;
+template [[host_name("kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_padded_sgasync8")]]
+kernel glm_attn_idx_batch_lora_g8_a_t
+kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_impl<true, 8>;
+#endif
 
 typedef decltype(kernel_glm_attention_indexed_batch_lora_group8_vec_impl<false, false>)
         glm_attention_indexed_batch_lora_group8_vec_t;

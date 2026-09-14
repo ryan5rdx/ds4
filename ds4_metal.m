@@ -41610,9 +41610,19 @@ static int ds4_gpu_glm_attention_indexed_batch_lora_layout_tensor(
              * harness was claiming exactly that.  Count dispatches per phase
              * and report at teardown so the claim is evidence. */
             ds4_gpu_dsa_lora_count_dispatch();
-            pipeline = ds4_gpu_hot_pipeline(
-                g_glm_attention_indexed_batch_lora_group8_vec_glm53_padded_pipeline,
-                "kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_padded");
+            /* SGASYNC target "lora" -- the PREFILL half of the same family as
+             * the decode partial. Built after the isolated sweep found the
+             * decode half positive and the prefill INDEXER flat: this is the
+             * prefill target that shares the shape that moved. */
+            pipeline =
+                (ds4_gpu_sgasync_arm() != 0 &&
+                 ds4_gpu_sgasync_target_selected("lora")) ?
+                    ds4_gpu_get_sgasync_pipeline(
+                        "kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_padded",
+                        "lora") :
+                    ds4_gpu_hot_pipeline(
+                        g_glm_attention_indexed_batch_lora_group8_vec_glm53_padded_pipeline,
+                        "kernel_glm_attention_indexed_batch_lora_group8_vec_glm53_padded");
         } else if (use_vec_lora && selected_rows_valid && full_head_groups) {
             pipeline = ds4_gpu_hot_pipeline(
                     g_glm_attention_indexed_batch_lora_group8_vec_valid_fullheads_pipeline,
