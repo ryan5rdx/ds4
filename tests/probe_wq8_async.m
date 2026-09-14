@@ -82,6 +82,11 @@ int main(int argc, const char **argv) { @autoreleasepool {
         { "kernel_mul_mv_q8_0_f32",            priv, 0 },
         { "kernel_mul_mv_q8_0_f32",            mod,  (size_t)2*NSG*NR0*2*(8*BLK) },
         { "kernel_mul_mv_q8_0_f32",            mod,  (size_t)2*NSG*NR0*4*(8*BLK) },
+        /* The PIVOT: device -> register, no threadgroup memory, shipping
+         * corpus. Separate flags so the four-arm run attributes the gain. */
+        { "kernel_mul_mv_q8_0_f32_packed",     mod,  0 },
+        { "kernel_mul_mv_q8_0_f32_spec",       mod,  0 },
+        { "kernel_mul_mv_q8_0_f32_both",       mod,  0 },
         /* 2 buffers x NSG simdgroups x NR0 rows x C runs x (NQ blocks x 34 B).
          * Getting this wrong by a factor of two is what hung the GPU the first
          * time -- the kernel wrote past the end of the threadgroup allocation.
@@ -91,8 +96,9 @@ int main(int argc, const char **argv) { @autoreleasepool {
     };
     const char *label[] = { "shipping (modern)", "14.2 clone, non-async",
                             "shipping +4352 B unused", "shipping +8704 B unused",
+                            "packed loads", "shape-specialised", "packed+spec",
                             "async C=2", "async C=4" };
-    const int n_arms = 6;
+    const int n_arms = 9;
     float *ref = malloc((size_t)ne01 * sizeof(float));
     double ref_ms = 0.0;
     int fails = 0;
@@ -105,19 +111,24 @@ int main(int argc, const char **argv) { @autoreleasepool {
      * result -- the first version of this probe did exactly that and reported
      * the staged arms both 150% slower and 24% FASTER on consecutive runs.
      * Round-robin puts every arm in every thermal position. */
-    id<MTLComputePipelineState> pso[8];
-    NSUInteger smem[8];
+    id<MTLComputePipelineState> pso[12];
+    NSUInteger smem[12];
     for (int arm = 0; arm < n_arms; arm++) {
         pso[arm] = mk(dev, arms[arm].lib, arms[arm].name, NSG);
         smem[arm] = ((32u*2u*sizeof(float) + arms[arm].extra) + 15) & ~(NSUInteger)15;
         if (!pso[arm]) { printf("  %-24s MISSING\n", label[arm]); fails++; }
     }
-    static double t[8][REPS];
-    float *got[8];
+    static double t[12][REPS];
+    float *got[12];
     for (int arm = 0; arm < n_arms; arm++) got[arm] = malloc((size_t)ne01 * sizeof(float));
 
     for (int r = 0; r < REPS; r++) {
-        for (int arm = 0; arm < n_arms; arm++) {
+        /* CYCLIC, not merely interleaved. Round-robin in a fixed order still
+         * pins each arm to the same position within every repetition, so a
+         * within-rep ramp lands on the same arm each time. Rotating the start
+         * puts every arm in every position. */
+        for (int k = 0; k < n_arms; k++) {
+            const int arm = (k + r) % n_arms;
             if (!pso[arm]) { t[arm][r] = 1e9; continue; }
             memset(o.contents, 0, (size_t)ne01 * sizeof(float));
             id<MTLCommandBuffer> cb = [q commandBuffer];

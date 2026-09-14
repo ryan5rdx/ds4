@@ -199,7 +199,36 @@ static inline float ds4_wq8_staged_dot(threadgroup const uchar *blk,
 }
 #endif
 
-template<short NR0, typename args_t, int WQ8_ASYNC_C = 0>
+/* WIDE-Q8 DIRECT-PATH VARIANTS (the pivot after async staging closed).
+ *
+ * Both keep weights on the device -> register path. Neither uses threadgroup
+ * memory, so neither costs residency, and neither needs the private metallib --
+ * they are ordinary kernels in the shipping corpus.
+ *
+ *   WQ8_PACKED     the inner product loads `qs` as two packed_char4 instead of
+ *                  eight scalar int8. `qs` sits at +2 inside a 34-byte block
+ *                  stride, so it is only 2-byte aligned -- plain char4 (align 4)
+ *                  would be illegal and packed_char4 (align 1) is the correct
+ *                  tool. The scalar accumulation order is untouched, so this is
+ *                  bit-identical; only the load width changes.
+ *
+ *   WQ8_SPEC_NB    pins nb and NSG to the production geometry (K = 4096 -> 128
+ *                  blocks, NSG 2) so the block loop's trip count is a compile
+ *                  time 8 and the bound test disappears.
+ *
+ * EXPLICIT SOFTWARE PREFETCH IS NOT HERE, and that is a finding rather than an
+ * omission. MSL gives no way to say "issue this load and discard it": written
+ * naturally the compiler eliminates it, and forced to survive (a `volatile`
+ * sink) it becomes real work -- the measured version cost 153%. The compiler's
+ * own scheduling across this loop IS the prefetch, which is consistent with the
+ * two flags below measuring null.
+ *
+ * They are separate flags rather than one variant so a four-arm run can say
+ * which of the two is responsible, instead of reporting a combined number that
+ * cannot be decomposed afterwards -- the mistake the async arm's "78 pp" made.
+ */
+template<short NR0, typename args_t, int WQ8_ASYNC_C = 0,
+         bool WQ8_PACKED = false, bool WQ8_SPEC_NB = false>
 void kernel_mul_mv_q8_0_f32_impl(
         args_t args,
         device const char * src0,
@@ -214,7 +243,11 @@ void kernel_mul_mv_q8_0_f32_impl(
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = 8;
 
-    const int nb = args.ne00/QK8_0;
+    /* Pinned when WQ8_SPEC_NB: the production wide shape is K = 4096, so
+     * nb = 128 and the loop trip count becomes a compile-time 8. The host only
+     * selects this variant when the runtime shape matches, and the assert makes
+     * a mismatch a build-visible fact rather than silent wrong output. */
+    const int nb = WQ8_SPEC_NB ? 128 : args.ne00/QK8_0;
 
     const int r0 = tgpig.x*NR0;
     const int r1 = tgpig.y;
@@ -347,8 +380,27 @@ void kernel_mul_mv_q8_0_f32_impl(
                 device const int8_t * qs = ax[row][ib].qs + il*NQ;
 
                 float sumq = 0.f;
-                FOR_UNROLL (short i = 0; i < NQ; ++i) {
-                    sumq += qs[i] * yl[i];
+                if (WQ8_PACKED) {
+                    /* Two packed loads instead of eight. Same terms, same
+                     * left-to-right order -- a dot() would reassociate and
+                     * lose bit-identity, which is why this stays scalar
+                     * arithmetic over vector-loaded operands. */
+                    device const packed_char4 *q4 =
+                        (device const packed_char4 *)qs;
+                    const packed_char4 a0 = q4[0];
+                    const packed_char4 a1 = q4[1];
+                    sumq += (float)a0[0] * yl[0];
+                    sumq += (float)a0[1] * yl[1];
+                    sumq += (float)a0[2] * yl[2];
+                    sumq += (float)a0[3] * yl[3];
+                    sumq += (float)a1[0] * yl[4];
+                    sumq += (float)a1[1] * yl[5];
+                    sumq += (float)a1[2] * yl[6];
+                    sumq += (float)a1[3] * yl[7];
+                } else {
+                    FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                        sumq += qs[i] * yl[i];
+                    }
                 }
 
                 sumf[row] += sumq*ax[row][ib].d;
@@ -377,6 +429,28 @@ kernel void kernel_mul_mv_q8_0_f32(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
+
+/* Direct-path variants. Shipping corpus, no private metallib, no threadgroup
+ * memory -- selected by DS4_WQ8_DIRECT=packed|spec|both. */
+#define DS4_WQ8_DIRECT_VARIANT(SUFFIX, PACKED, SPEC)                          \
+kernel void kernel_mul_mv_q8_0_f32_##SUFFIX(                                  \
+        constant ds4_metal_args_mul_mv & args,                                \
+        device const char * src0,                                             \
+        device const char * src1,                                             \
+        device       char * dst,                                              \
+        threadgroup  char * shmem [[threadgroup(0)]],                         \
+        uint3  tgpig[[threadgroup_position_in_grid]],                         \
+        ushort tiisg[[thread_index_in_simdgroup]],                            \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {                     \
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &,  \
+                                0, PACKED, SPEC>(                             \
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);                   \
+}
+
+DS4_WQ8_DIRECT_VARIANT(packed, true,  false)
+DS4_WQ8_DIRECT_VARIANT(spec,   false, true)
+DS4_WQ8_DIRECT_VARIANT(both,   true,  true)
+
 
 #ifdef DS4_PRIVATE_CLONE
 /* WQ8 async arms. C = runs per chunk; the ping-pong footprint is
