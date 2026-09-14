@@ -904,22 +904,6 @@ static void chat_msgs_free(chat_msgs *msgs) {
     memset(msgs, 0, sizeof(*msgs));
 }
 
-/* Insert at the FRONT. The Anthropic `system` parameter is parsed after the
- * messages array and would otherwise be appended last -- which was harmless
- * while every system message was hoisted to the front, and became a serious
- * bug the moment late system messages started rendering in situ: the main
- * system prompt would have landed AFTER the whole conversation. It belongs
- * where the client put it, which is before the messages. */
-static void chat_msgs_push_front(chat_msgs *msgs, chat_msg msg) {
-    if (msgs->len == msgs->cap) {
-        msgs->cap = msgs->cap ? msgs->cap * 2 : 8;
-        msgs->v = xrealloc(msgs->v, (size_t)msgs->cap * sizeof(msgs->v[0]));
-    }
-    memmove(&msgs->v[1], &msgs->v[0], (size_t)msgs->len * sizeof(msgs->v[0]));
-    msgs->v[0] = msg;
-    msgs->len++;
-}
-
 static void chat_msgs_push(chat_msgs *msgs, chat_msg msg) {
     if (msgs->len == msgs->cap) {
         msgs->cap = msgs->cap ? msgs->cap * 2 : 8;
@@ -3053,44 +3037,7 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
         }
         buf_free(&tools);
     }
-    /* Hoist only the LEADING system messages.
-     *
-     * Every system message used to be moved to the front. Claude Code appends
-     * a system block when something happens mid-turn -- a background command
-     * finishing, or the user typing while the assistant works -- which is a
-     * cache-friendly APPEND. Hoisting relocated it ahead of the entire
-     * conversation, so every token after it shifted and a 175k prefix was
-     * discarded to prefill ~200 new ones: 25,245 matched, 149,323 thrown away,
-     * about six and a half minutes. Four misses were diagnosed to this, all
-     * reporting the same diverge=2610/785 because it is always the same
-     * structural boundary.
-     *
-     * GLM 5.3 makes it unrecoverable rather than merely expensive: prefix
-     * reuse is append-only, because the KDA recurrence cannot rewind, so there
-     * is no splicing the shifted tail back the way a pure-attention KV cache
-     * could.
-     *
-     * Rendering them where the client put them is also the more faithful
-     * reading. A notice about something that just happened belongs at its
-     * conversation position, not beside the tool definitions.
-     *
-     * DS4_SERVER_SYSTEM_HOIST_ALL=1 restores the old behaviour. */
-    int sys_inline_from = msgs ? msgs->len : 0;
-    {
-        static int hoist_all = -1;
-        if (hoist_all < 0) {
-            const char *e = getenv("DS4_SERVER_SYSTEM_HOIST_ALL");
-            hoist_all = (e && e[0] && e[0] != '0') ? 1 : 0;
-        }
-        if (!hoist_all) {
-            sys_inline_from = 0;
-            for (int i = 0; msgs && i < msgs->len; i++) {
-                if (!role_is_system(msgs->v[i].role)) break;
-                sys_inline_from = i + 1;
-            }
-        }
-    }
-    for (int i = 0; msgs && i < sys_inline_from; i++) {
+    for (int i = 0; msgs && i < msgs->len; i++) {
         const chat_msg *m = &msgs->v[i];
         if (!role_is_system(m->role)) continue;
         buf_puts(&out, "<|system|>");
@@ -3103,10 +3050,6 @@ static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
         const chat_msg *m = &msgs->v[i];
         if (role_is_system(m->role)) {
             observation_open = false;
-            if (i >= sys_inline_from) {
-                buf_puts(&out, "<|system|>");
-                buf_puts(&out, m->content ? m->content : "");
-            }
             continue;
         } else if (chat_msg_is_glm_tool_result(m)) {
             if (!observation_open) buf_puts(&out, "<|observation|>");
@@ -4003,7 +3946,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
         msg.role = xstrdup("system");
         msg.content = system;
         system = NULL;
-        chat_msgs_push_front(&msgs, msg);
+        chat_msgs_push(&msgs, msg);
     }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
@@ -11994,30 +11937,6 @@ static int server_session_sync(server *s, server_slot *slot,
     int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
 
-    /* Batched mode rebuilds the prompt ONE QUANTUM AT A TIME, so this loop
-     * calls ds4_session_sync() dozens of times for one request -- and
-     * ds4_session_sync() takes the GLM-5.3 rollback snapshot at its end,
-     * believing itself to be at a request frontier.
-     *
-     * It cost a production TP pair. A 250966-token prefill ran ~61 syncs, each
-     * copying ~146 MiB of KDA state and mirroring a ROLLBACK_CAPTURE with an
-     * ack round-trip: roughly 8.9 GB of GPU copies and 61 control round-trips
-     * threaded through the prefill. The worker's command buffers hit
-     * kIOGPUCommandBufferCallbackErrorTimeout sixteen times and it exited,
-     * which failed the transport and took both ranks down.
-     *
-     * It also poisoned the ring it was trying to fill. Every slot ended up
-     * holding a mid-prefill position from the request in flight -- 147456,
-     * 151552, 155648 ... -- having evicted every genuine request frontier. Those
-     * positions are worthless: the next request carries the whole prompt, so a
-     * checkpoint from the middle of prefilling it can never be the thing a
-     * future divergence needs.
-     *
-     * So capture only on the LAST quantum, which is the only one that lands on
-     * a real frontier. Preserves an outer hold rather than clobbering it: the
-     * flag is a plain bool and the server nests these. */
-    const bool outer_hold = ds4_session_rollback_is_held(slot->session);
-
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (!called || done < prompt->len)) {
         int quantum = server_prefill_quantum(s);
@@ -12027,15 +11946,9 @@ static int server_session_sync(server *s, server_slot *slot,
 
         ds4_tokens prefix = *prompt;
         prefix.len = target;
-        if (!server_prefill_enter(s, slot)) {
-            ds4_session_rollback_hold(slot->session, outer_hold);
-            return DS4_SESSION_SYNC_INTERRUPTED;
-        }
-        ds4_session_rollback_hold(slot->session,
-                                  outer_hold || target < prompt->len);
+        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
-        ds4_session_rollback_hold(slot->session, outer_hold);
         server_prefill_leave(s);
         called = true;
         if (rc != 0) return rc;
@@ -12093,7 +12006,6 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
                                             images, image_count);
     pthread_mutex_unlock(&s->inference_mu);
     bool called = false;
-    const bool mm_outer_hold = ds4_session_rollback_is_held(slot->session);
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (!called || done < prompt->len)) {
         int quantum = server_prefill_quantum(s);
@@ -12117,19 +12029,11 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
         }
         ds4_tokens prefix = *prompt;
         prefix.len = target;
-        if (!server_prefill_enter(s, slot)) {
-            ds4_session_rollback_hold(slot->session, mm_outer_hold);
-            return DS4_SESSION_SYNC_INTERRUPTED;
-        }
-        /* Same defect as the text loop: one sync per quantum, and the capture
-         * lives at the end of ds4_session_sync(). See there for what it cost. */
-        ds4_session_rollback_hold(slot->session,
-                                  mm_outer_hold || target < prompt->len);
+        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync_multimodal(slot->session, &prefix,
                                              images, prefix_images,
                                              err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
-        ds4_session_rollback_hold(slot->session, mm_outer_hold);
         server_prefill_leave(s);
         called = true;
         if (rc != 0) return rc;
@@ -13059,16 +12963,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * assistant turn -- a stripped think block, a re-rendered tool call --
          * that turns a full re-prefill into one of the generated tail. */
         const bool is_glm53 = ds4_engine_is_glm53(s->engine);
-        /* Honour DS4_GLM53_CKPT_RESTORE here too.
-         *
-         * The switch was added to back out GLM-5.3 snapshot restores after
-         * CKPTRING3 showed a deep one producing different text, and it was
-         * documented as restoring "full re-prefill on any divergence". That was
-         * false: it gated only the ring lookup in ds4.c, while this path
-         * obtains the rollback frontier and rewinds to it unconditionally. A
-         * kill switch that leaves a second restore path live is worse than no
-         * kill switch, because the guarantee gets believed. */
-        const int rollback_frontier = (is_glm53 && ds4_glm53_restore_enabled()) ?
+        const int rollback_frontier = is_glm53 ?
             ds4_session_rollback_frontier(slot->session) : -1;
         const uint32_t raw_budget = is_glm ? 0 : ds4_session_raw_rewind_budget(slot->session);
         /* Budget against the tail actually discarded, old_pos - common, not
@@ -13205,33 +13100,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
-        }
-    }
-    /* Last resort before a full re-prefill: GLM-5.3's checkpoint ring.
-     *
-     * Every cache source above needs the live prefix to still BE a prefix. This
-     * one does not -- it rewinds the recurrence to a snapshot at or below the
-     * divergence, which is the only way GLM-5.3 can recover a mid-prefix miss
-     * at all, its KDA state being append-only. A production log lost 655 s here
-     * at common=246200 of prompt=250966: 98% of the work was reusable and all
-     * of it was redone.
-     *
-     * `common` rather than a chunk length, and that distinction is the whole
-     * bug this replaced: hooking the restore inside ds4_session_sync() handed
-     * it 4096 (the prefill chunk) as the divergence and the lookup found
-     * nothing. Here `common` is the same number the miss line prints.
-     *
-     * prompt_for_sync stays the FULL prompt. The session now holds a valid
-     * checkpoint that the prompt extends, so ds4_session_sync() takes its
-     * ordinary append path and prefills only [landed, prompt.len). And this
-     * runs before any SYNC is mirrored, so the REWIND it sends reaches the TP
-     * worker at top level rather than inside its in-prefill poll. */
-    if (cached == 0 && common > 0) {
-        const int landed = ds4_session_glm53_try_restore(
-                slot->session, prompt_for_sync, common);
-        if (landed > 0) {
-            cached = landed;
-            cache_source = "glm53-checkpoint";
         }
     }
     const bool responses_reasoning_state_preserved =
@@ -15316,24 +15184,14 @@ static void log_context_memory(ds4_backend backend, int ctx_size,
      * folding it in, because it appears only after traffic. */
     const uint64_t rb = ds4_glm53_rollback_session_bytes();
     if (rb != 0) {
-        /* "slots" meant SESSION slots here while the checkpoint ring also has
-         * slots, and a reviewer reasonably read "across 1 slots" as the ring
-         * being misconfigured. Say which, and count the ring: it is the same
-         * snapshot size again per slot, lazily allocated and default-on, so the
-         * old line under-stated a GLM-5.3 session by 9x at the default 8. */
-        const uint32_t ring = ds4_glm53_ckpt_slot_count();
-        const int sess = session_count > 0 ? session_count : 1;
-        const double per_session = (double)rb * (double)(1u + ring);
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: glm53 rollback snapshot %.2f MiB + checkpoint "
-                   "ring %u x %.2f MiB = %.2f GiB per session, up to %.2f GiB "
-                   "across %d session slots once warmed (DS4_GLM_KDA_ROLLBACK=0 "
-                   "to disable, DS4_GLM53_CKPT_SLOTS=1 to shrink the ring)",
+                   "ds4-server: glm53 rollback snapshot %.2f MiB per session, "
+                   "up to %.2f GiB across %d slots once warmed "
+                   "(DS4_GLM_KDA_ROLLBACK=0 to disable)",
                    (double)rb / (1024.0 * 1024.0),
-                   ring, (double)rb / (1024.0 * 1024.0),
-                   per_session / (1024.0 * 1024.0 * 1024.0),
-                   per_session * (double)sess / (1024.0 * 1024.0 * 1024.0),
-                   sess);
+                   (double)rb * (double)(session_count > 0 ? session_count : 1) /
+                       (1024.0 * 1024.0 * 1024.0),
+                   session_count > 0 ? session_count : 1);
     }
 }
 /* Leader-side tensor-parallel transport. File scope so every exit path in
@@ -17728,93 +17586,6 @@ static void test_render_glm_chat_prompt_text(void) {
 
     free(prompt);
     tool_schema_orders_free(&orders);
-    chat_msgs_free(&msgs);
-}
-
-/* A system message appended mid-conversation must render WHERE IT IS.
- *
- * Hoisting it to the front is what turned Claude Code's cache-friendly append
- * into a mid-prefix insertion: 149,323 tokens discarded and ~6.5 minutes of
- * re-prefill, four times over, each reporting the same diverge=2610/785. The
- * leading system messages still hoist, because the main system prompt belongs
- * at the front; anything after the first user turn does not. */
-/* The Anthropic `system` parameter must lead the prompt, not trail it.
- *
- * It is parsed after the messages array, so it was appended LAST. That was
- * invisible while every system message was hoisted to the front, and became a
- * severe bug the moment late system messages rendered in situ: the main system
- * prompt would have been emitted after the entire conversation. Inserted at
- * the front now, and this test is the guard. */
-static void test_anthropic_system_param_leads_the_prompt(void) {
-    const char *hoist = getenv("DS4_SERVER_SYSTEM_HOIST_ALL");
-    if (hoist && hoist[0] && hoist[0] != '0') return;
-    chat_msgs msgs = {0};
-    chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("Hello");
-    chat_msgs_push(&msgs, user);
-    chat_msg remind = {0};                    /* an injected reminder, late */
-    remind.role = xstrdup("system");
-    remind.content = xstrdup("The task tools haven't been used recently.");
-    chat_msgs_push(&msgs, remind);
-    chat_msg sys = {0};                       /* the `system` parameter */
-    sys.role = xstrdup("system");
-    sys.content = xstrdup("You are Claude Code.");
-    chat_msgs_push_front(&msgs, sys);
-
-    char *prompt = render_chat_prompt_text_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, DS4_THINK_NONE);
-    TEST_ASSERT(prompt != NULL);
-    const char *expected =
-        "[gMASK]<sop>"
-        "<|system|>You are Claude Code."
-        "<|user|>Hello"
-        "<|system|>The task tools haven't been used recently."
-        "<|assistant|><think></think>";
-    if (strcmp(prompt, expected)) {
-        fprintf(stderr, "got:      %s\nexpected: %s\n", prompt, expected);
-    }
-    TEST_ASSERT(!strcmp(prompt, expected));
-    free(prompt);
-    chat_msgs_free(&msgs);
-}
-
-static void test_glm_prompt_late_system_message_renders_in_situ(void) {
-    /* The escape hatch restores the behaviour this test exists to forbid. */
-    const char *hoist = getenv("DS4_SERVER_SYSTEM_HOIST_ALL");
-    if (hoist && hoist[0] && hoist[0] != '0') return;
-    chat_msgs msgs = {0};
-    chat_msg lead = {0};
-    lead.role = xstrdup("system");
-    lead.content = xstrdup("You are terse.");
-    chat_msgs_push(&msgs, lead);
-    chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("Hello");
-    chat_msgs_push(&msgs, user);
-    chat_msg late = {0};
-    late.role = xstrdup("system");
-    late.content = xstrdup("Background job finished.");
-    chat_msgs_push(&msgs, late);
-
-    char *prompt = render_chat_prompt_text_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, DS4_THINK_NONE);
-    TEST_ASSERT(prompt != NULL);
-    const char *expected =
-        "[gMASK]<sop>"
-        "<|system|>You are terse."
-        "<|user|>Hello"
-        "<|system|>Background job finished."
-        "<|assistant|><think></think>";
-    if (strcmp(prompt, expected)) {
-        fprintf(stderr, "got:      %s\nexpected: %s\n", prompt, expected);
-    }
-    TEST_ASSERT(!strcmp(prompt, expected));
-    /* The whole point: the prefix through the user turn is untouched, so a
-     * cache holding it stays valid. */
-    TEST_ASSERT(!strncmp(prompt, "[gMASK]<sop><|system|>You are terse.<|user|>Hello",
-                         strlen("[gMASK]<sop><|system|>You are terse.<|user|>Hello")));
-    free(prompt);
     chat_msgs_free(&msgs);
 }
 
@@ -21887,8 +21658,6 @@ static void ds4_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
     test_render_glm_chat_prompt_text();
-    test_glm_prompt_late_system_message_renders_in_situ();
-    test_anthropic_system_param_leads_the_prompt();
     test_render_glm_drops_old_reasoning_without_tools();
     test_render_glm_preserves_reasoning_with_tools();
     test_render_glm_groups_tool_results();
