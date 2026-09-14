@@ -3682,8 +3682,19 @@ static id<MTLLibrary> ds4_gpu_private_library(void) {
     id<MTLLibrary> lib = [g_device newLibraryWithURL:[NSURL fileURLWithPath:p]
                                                error:&error];
     if (!lib) {
-        fprintf(stderr, "ds4: private clone metallib %s failed to load: %s\n",
-                path, [[error localizedDescription] UTF8String]);
+        /* THE failure mode the dependency is exposed to: a macOS update that
+         * stops executing Xcode-14.2 AIR. It degrades to the shipping kernels
+         * rather than failing the run -- but it must be unmistakable in the
+         * log, because the symptom is otherwise "the optimisation quietly
+         * stopped helping". */
+        NSOperatingSystemVersion os =
+            [[NSProcessInfo processInfo] operatingSystemVersion];
+        fprintf(stderr, "ds4: private clone metallib %s FAILED TO LOAD on macOS "
+                        "%ld.%ld.%ld: %s\n  If this machine used to load it, "
+                        "the OS has stopped executing Xcode-14.2 AIR and every "
+                        "SGASYNC arm is now the shipping kernel.\n",
+                path, (long)os.majorVersion, (long)os.minorVersion,
+                (long)os.patchVersion, [[error localizedDescription] UTF8String]);
         return nil;
     }
     /* ABI guard. A metallib built against different kernel signatures loads and
@@ -3705,8 +3716,16 @@ static id<MTLLibrary> ds4_gpu_private_library(void) {
     /* Say it out loud on success. A private artifact that silently failed to
      * load looks exactly like one that loaded and did not help -- the same
      * distinction the TP protocol line exists for. */
-    fprintf(stderr, "ds4: private clone metallib loaded from %s (ABI %d)\n",
-            path, DS4_PRIVATE_CLONE_ABI);
+    /* Record the OS version with the load. The whole dependency rests on
+     * current runtimes still executing old AIR, which is Apple's to change in
+     * any update -- so when it eventually stops, the run that first failed
+     * should say which OS it was, not leave it to be reconstructed. */
+    NSOperatingSystemVersion os =
+        [[NSProcessInfo processInfo] operatingSystemVersion];
+    fprintf(stderr, "ds4: private clone metallib loaded from %s (ABI %d, "
+                    "macOS %ld.%ld.%ld executes Xcode-14.2 AIR)\n",
+            path, DS4_PRIVATE_CLONE_ABI,
+            (long)os.majorVersion, (long)os.minorVersion, (long)os.patchVersion);
     return lib;
 }
 
