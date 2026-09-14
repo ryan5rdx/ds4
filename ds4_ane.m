@@ -9,6 +9,7 @@
 #include <pthread.h>
 
 #include "ds4_ane.h"
+#include "ds4_aneproc.h"
 
 /*
  * The Core ML half of the shared-expert sidecar. Metal, IOSurface and the
@@ -26,6 +27,7 @@ void ds4_gpu_ane_stage_free(void);
 volatile uint32_t *ds4_gpu_ane_sync_words(void);
 int  ds4_gpu_ane_sync_timed_out(void);
 int  ds4_gpu_synchronize(void);
+int  ds4_gpu_aneproc_active(void);
 
 #define DS4_ANE_MAX_LAYERS 64
 
@@ -360,7 +362,10 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
         }
 
         g_queue = dispatch_queue_create("ds4.ane.shexp", DISPATCH_QUEUE_SERIAL);
-        if (ds4_ane_mode() >= DS4_ANE_FAST && !g_fast_running) {
+        /* No in-process consumer under ANEPROC: the helper owns the ring, and
+         * a second consumer would race it for the same release words. */
+        if (ds4_ane_mode() >= DS4_ANE_FAST && !g_fast_running &&
+            !ds4_gpu_aneproc_active()) {
             __atomic_store_n(&g_fast_stop, 0, __ATOMIC_RELEASE);
             g_ring_head = g_ring_tail = 0; g_backpressure = 0;
             g_ring_sem = dispatch_semaphore_create(0);
@@ -554,6 +559,27 @@ int ds4_ane_begin_layer(uint32_t il) {
         g_skipped++; return 0;
     }
 
+    if (ds4_ane_mode() >= DS4_ANE_FAST && ds4_gpu_aneproc_active()) {
+        /* ANEPROC: the request IS the shared ring entry. Publish the layer for
+         * this seq and return -- there is no local queue, no semaphore and no
+         * thread on this side, because the consumer is another process spinning
+         * on the release word the GPU is about to store.
+         *
+         * The layer must be visible before READY is, and it is: this is a host
+         * store, and the GPU's READY store cannot be observed until the command
+         * buffer carrying it is committed, which happens later in program
+         * order. The helper acquire-loads READY and only then reads the ring. */
+        volatile uint32_t *cw = ds4_gpu_ane_sync_words();
+        if (!cw) { g_skipped++; return 0; }
+        __atomic_store_n(&cw[DS4_ANEPROC_W_RING + (g_seq % DS4_ANEPROC_RING)],
+                         il, __ATOMIC_RELEASE);
+        if (ds4_ane_sched_trace() && il < DS4_ANE_MAX_LAYERS) {
+            g_tl[il].enq = ds4_ane_now_ns();
+        }
+        g_started[il] = 1;
+        return 1;
+    }
+
     if (ds4_ane_mode() >= DS4_ANE_FAST) {
         /* Enqueue. Backpressure rather than overwrite: the ring holds 128 and
          * a chunk is 42 layers, so this should never spin -- if it does, the
@@ -620,11 +646,19 @@ int ds4_ane_begin_layer(uint32_t il) {
  * rewind and cannot race anything. */
 void ds4_ane_commit_layer(void) {
     if (!g_ready || ds4_ane_mode() < DS4_ANE_FAST) return;
+    /* Nothing to wake under ANEPROC: the helper is already spinning on the
+     * release word, and there is no local consumer to signal. */
+    if (ds4_gpu_aneproc_active()) return;
     dispatch_semaphore_signal(g_ring_sem);
 }
 
 void ds4_ane_cancel_layer(uint32_t il) {
     if (!g_ready || ds4_ane_mode() < DS4_ANE_FAST) return;
+    /* Under ANEPROC the enqueue published only a ring entry, and the helper
+     * never acts on it until the GPU stores READY for that seq. A publish that
+     * was not encoded therefore releases nothing and needs no undo -- the
+     * entry is simply overwritten when the seq wraps. */
+    if (ds4_gpu_aneproc_active()) { g_cancelled++; g_started[il] = 0; return; }
     const uint64_t h = __atomic_load_n(&g_ring_head, __ATOMIC_ACQUIRE);
     if (h == __atomic_load_n(&g_ring_tail, __ATOMIC_ACQUIRE)) return;
     __atomic_store_n(&g_ring_head, h - 1u, __ATOMIC_RELEASE);

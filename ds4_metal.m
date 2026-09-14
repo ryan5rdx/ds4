@@ -20,11 +20,16 @@
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
+#include <spawn.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <stdatomic.h>
 #include <mach-o/dyld.h>
 #include <objc/runtime.h>
 
 #include "ds4.h"
 #include "ds4_gpu.h"
+#include "ds4_aneproc.h"
 #include "ds4_top1_key.h"
 #include "ds4_image.h"
 
@@ -52713,17 +52718,166 @@ static int ds4_gpu_ane_pipelines(void) {
     return 1;
 }
 
+/* ---- ANEPROC: the sidecar as a separate process -------------------------
+ * See ds4_aneproc.h for why, and for what the runtime cost is (nothing: the
+ * handoff is a store to a shared IOSurface word, 0.07 us measured). */
+static IOSurfaceRef g_ane_ctl_surface;
+static id<MTLBuffer> g_ane_ctl_buf;
+static pid_t g_ane_helper_pid;
+
+int ds4_gpu_aneproc_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_ANE_PROC");
+        v = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return v;
+}
+
+static const char *ds4_gpu_aneproc_helper_path(void) {
+    const char *e = getenv("DS4_ANE_HELPER");
+    if (e && e[0]) return e;
+    /* Next to the binary, not the working directory -- the same mistake the
+     * private-clone metallib path made, where a run started elsewhere silently
+     * got no helper and the arm quietly became the in-process one. */
+    static char resolved[PATH_MAX];
+    static int tried;
+    if (!tried) {
+        tried = 1;
+        uint32_t n = (uint32_t)sizeof(resolved);
+        char exe[PATH_MAX], real[PATH_MAX];
+        if (_NSGetExecutablePath(exe, &n) == 0 && realpath(exe, real)) {
+            char *slash = strrchr(real, '/');
+            if (slash) {
+                *slash = '\0';
+                snprintf(resolved, sizeof(resolved), "%s/ds4-ane-helper", real);
+            }
+        }
+    }
+    return resolved[0] ? resolved : "./ds4-ane-helper";
+}
+
+/* Requested AND actually serving. The distinction matters: a requested-but-
+ * failed helper must fall back to the in-process sidecar, and an arm that
+ * silently became the in-process one is the null-vs-negative confusion this
+ * campaign keeps paying for -- so the fallback is announced, loudly. */
+int ds4_gpu_aneproc_active(void) {
+    if (!g_ane_helper_pid || !g_ane_ctl_buf) return 0;
+    _Atomic uint32_t *w = (_Atomic uint32_t *)g_ane_ctl_buf.contents;
+    return atomic_load_explicit(&w[DS4_ANEPROC_W_ALIVE], memory_order_acquire) != 0;
+}
+
+void ds4_gpu_aneproc_stop(void) {
+    if (!g_ane_helper_pid) return;
+    if (g_ane_ctl_buf) {
+        _Atomic uint32_t *w = (_Atomic uint32_t *)g_ane_ctl_buf.contents;
+        atomic_store_explicit(&w[DS4_ANEPROC_W_STOP], 1u, memory_order_release);
+    }
+    /* Give it the 50 ms its backoff can sleep for, then insist. A helper that
+     * will not drain is not worth blocking a shutdown on. */
+    for (int i = 0; i < 200; i++) {
+        int st = 0;
+        if (waitpid(g_ane_helper_pid, &st, WNOHANG) == g_ane_helper_pid) {
+            g_ane_helper_pid = 0;
+            return;
+        }
+        usleep(1000);
+    }
+    kill(g_ane_helper_pid, SIGKILL);
+    waitpid(g_ane_helper_pid, NULL, 0);
+    g_ane_helper_pid = 0;
+}
+
+/* Publish the geometry, spawn the helper, and wait for it to say it is serving.
+ * Returns 0 on any failure, which the caller must treat as "use the in-process
+ * sidecar" -- never as a reason to fail the prefill. */
+static int ds4_gpu_aneproc_start(uint32_t dim, uint32_t n_tok, uint32_t n_layers) {
+    if (!g_ane_ctl_buf || !g_ane_in_surface || !g_ane_out_surface ||
+        !g_ane_ctl_surface) {
+        return 0;
+    }
+    _Atomic uint32_t *w = (_Atomic uint32_t *)g_ane_ctl_buf.contents;
+    memset((void *)w, 0, DS4_ANEPROC_CTL_BYTES);
+    atomic_store_explicit(&w[DS4_ANEPROC_W_DIM], dim, memory_order_relaxed);
+    atomic_store_explicit(&w[DS4_ANEPROC_W_NTOK], n_tok, memory_order_relaxed);
+    atomic_store_explicit(&w[DS4_ANEPROC_W_NLAYERS], n_layers, memory_order_relaxed);
+    atomic_store_explicit(&w[DS4_ANEPROC_W_NULLMODE],
+                          getenv("DS4_ANE_PROC_NULL") != NULL ? 1u : 0u,
+                          memory_order_relaxed);
+    atomic_store_explicit(&w[DS4_ANEPROC_W_VERSION], DS4_ANEPROC_VERSION,
+                          memory_order_relaxed);
+    /* Magic LAST and with release ordering: the helper validates on it, so it
+     * must not be able to see a valid magic over a half-written header. */
+    atomic_store_explicit(&w[DS4_ANEPROC_W_MAGIC], DS4_ANEPROC_MAGIC,
+                          memory_order_release);
+
+    char in_id[16], out_id[16], ctl_id[16];
+    snprintf(in_id, sizeof(in_id), "%u", (unsigned)IOSurfaceGetID(g_ane_in_surface));
+    snprintf(out_id, sizeof(out_id), "%u", (unsigned)IOSurfaceGetID(g_ane_out_surface));
+    snprintf(ctl_id, sizeof(ctl_id), "%u", (unsigned)IOSurfaceGetID(g_ane_ctl_surface));
+    const char *models = getenv("DS4_ANE_MODEL_DIR");
+    const char *path = ds4_gpu_aneproc_helper_path();
+    const char *argv[] = { path, "--in", in_id, "--out", out_id, "--ctl", ctl_id,
+                           models ? "--models" : NULL, models, NULL };
+    extern char **environ;
+    pid_t pid = 0;
+    if (posix_spawn(&pid, path, NULL, NULL, (char *const *)argv, environ) != 0) {
+        fprintf(stderr, "ds4: ANEPROC could not spawn %s: %s\n",
+                path, strerror(errno));
+        return 0;
+    }
+    g_ane_helper_pid = pid;
+    /* Model loading is seconds, deliberately outside any timed region. Wait
+     * generously, but bound it: a helper that never says ALIVE must fall back
+     * rather than hang the prefill. */
+    const int budget_ms = (int)ds4_gpu_env_u64("DS4_ANE_PROC_START_MS",
+                                               120000ull, 1000ull, 600000ull);
+    for (int i = 0; i < budget_ms; i++) {
+        if (atomic_load_explicit(&w[DS4_ANEPROC_W_ALIVE], memory_order_acquire)) {
+            fprintf(stderr, "ds4: ANEPROC helper pid %d serving "
+                            "(in=%s out=%s ctl=%s)\n", (int)pid, in_id, out_id, ctl_id);
+            return 1;
+        }
+        const uint32_t fault = atomic_load_explicit(&w[DS4_ANEPROC_W_FAULT],
+                                                    memory_order_acquire);
+        if (fault) {
+            fprintf(stderr, "ds4: ANEPROC helper reported fault %u; falling "
+                            "back to the in-process sidecar\n", fault);
+            ds4_gpu_aneproc_stop();
+            return 0;
+        }
+        int st = 0;
+        if (waitpid(pid, &st, WNOHANG) == pid) {
+            fprintf(stderr, "ds4: ANEPROC helper exited before serving "
+                            "(status %d)\n", st);
+            g_ane_helper_pid = 0;
+            return 0;
+        }
+        usleep(1000);
+    }
+    fprintf(stderr, "ds4: ANEPROC helper did not start within %d ms\n", budget_ms);
+    ds4_gpu_aneproc_stop();
+    return 0;
+}
+
 static id<MTLBuffer> ds4_gpu_ane_surface(size_t bytes, IOSurfaceRef *surf_out,
                                          void **base_out) {
     const size_t bpr = (bytes + 4095u) & ~(size_t)4095u;
-    NSDictionary *props = @{
+    /* kIOSurfaceIsGlobal only when ANEPROC is actually in use. It is what lets
+     * the helper attach by ID, and it is deprecated and lets any process of
+     * this user do the same -- so it is not paid for by runs that do not need
+     * it. See the security note in ds4_aneproc.h. */
+    NSMutableDictionary *props = [@{
         (id)kIOSurfaceWidth:            @(bytes / 2),
         (id)kIOSurfaceHeight:           @1,
         (id)kIOSurfaceBytesPerElement:  @2,
         (id)kIOSurfaceBytesPerRow:      @(bpr),
         (id)kIOSurfaceAllocSize:        @(bpr),
         (id)kIOSurfacePixelFormat:      @(0x4C303136),   /* 'L016' */
-    };
+    } mutableCopy];
+    if (ds4_gpu_aneproc_enabled()) {
+        props[(id)kIOSurfaceIsGlobal] = @YES;
+    }
     IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
     if (!s) return nil;
     /* Lock only long enough to take the address. Holding the lock pins a
@@ -52743,6 +52897,10 @@ static id<MTLBuffer> ds4_gpu_ane_surface(size_t bytes, IOSurfaceRef *surf_out,
 }
 
 void ds4_gpu_ane_stage_free(void) {
+    /* The helper holds pointers into these surfaces; stop it before they go. */
+    ds4_gpu_aneproc_stop();
+    if (g_ane_ctl_surface) { CFRelease(g_ane_ctl_surface); g_ane_ctl_surface = NULL; }
+    g_ane_ctl_buf = nil;
     g_ane_sync_buffer = nil; g_ane_sync_words = NULL;
     g_ane_sync_timeout_buffer = nil; g_ane_sync_stats_buffer = nil;
     if (g_ane_scratch) { ds4_gpu_tensor_free(g_ane_scratch); g_ane_scratch = NULL; }
@@ -52772,15 +52930,29 @@ int ds4_gpu_ane_stage_alloc(uint32_t dim, uint32_t n_tok,
         g_ane_cmp_buf = [g_device newBufferWithLength:3 * sizeof(uint32_t)
                                               options:MTLResourceStorageModeShared];
         g_ane_scratch = ds4_gpu_tensor_alloc((uint64_t)dim * n_tok * sizeof(float));
-        g_ane_sync_buffer = [g_device newBufferWithLength:4 * sizeof(uint32_t)
-                                                  options:MTLResourceStorageModeShared];
+        /* The sync words move into an IOSurface when ANEPROC is on, so the
+         * helper sees the SAME words the GPU publish and fence kernels use.
+         * Words 0 and 1 keep their existing meanings and offsets, so nothing on
+         * the GPU side changes -- the buffer it is handed is simply backed
+         * differently. Off, it stays a plain shared buffer. */
+        if (ds4_gpu_aneproc_enabled()) {
+            void *ctl_base = NULL;
+            g_ane_ctl_buf = ds4_gpu_ane_surface(DS4_ANEPROC_CTL_BYTES,
+                                                &g_ane_ctl_surface, &ctl_base);
+            g_ane_sync_buffer = g_ane_ctl_buf;
+        } else {
+            g_ane_sync_buffer = [g_device newBufferWithLength:4 * sizeof(uint32_t)
+                                                      options:MTLResourceStorageModeShared];
+        }
         g_ane_sync_timeout_buffer = [g_device newBufferWithLength:sizeof(uint32_t)
                                                           options:MTLResourceStorageModeShared];
         g_ane_sync_stats_buffer = [g_device newBufferWithLength:
                                        DS4_TP_FENCE_SPIN_WORDS * sizeof(uint32_t)
                                                         options:MTLResourceStorageModeShared];
         if (g_ane_sync_buffer) {
-            memset(g_ane_sync_buffer.contents, 0, 4 * sizeof(uint32_t));
+            memset(g_ane_sync_buffer.contents, 0,
+                   ds4_gpu_aneproc_enabled() ? DS4_ANEPROC_CTL_BYTES
+                                             : 4 * sizeof(uint32_t));
             g_ane_sync_words = (volatile uint32_t *)g_ane_sync_buffer.contents;
         }
         if (g_ane_sync_timeout_buffer) memset(g_ane_sync_timeout_buffer.contents, 0, sizeof(uint32_t));
@@ -52788,6 +52960,15 @@ int ds4_gpu_ane_stage_alloc(uint32_t dim, uint32_t n_tok,
             memset(g_ane_sync_stats_buffer.contents, 0, DS4_TP_FENCE_SPIN_WORDS * sizeof(uint32_t));
         /* ~15 ms of spin, not the gate's ~500 us. Dedicated budget, dedicated
          * words: see the comment at the declarations. */
+        if (ds4_gpu_aneproc_enabled() && g_ane_in_surface && g_ane_out_surface) {
+            /* n_layers is not known here -- the ring is indexed by seq, and the
+             * helper only needs an upper bound for its model table. 64 matches
+             * DS4_ANE_MAX_LAYERS on the sidecar side. */
+            if (!ds4_gpu_aneproc_start(dim, n_tok, 64u)) {
+                fprintf(stderr, "ds4: ANEPROC unavailable; the in-process "
+                                "sidecar remains in charge\n");
+            }
+        }
         g_ane_fence_max_iters = (uint32_t)ds4_gpu_env_u64(
                 "DS4_ANE_FENCE_MAX_ITERS", 2000000000ull, 1000ull, 4000000000ull);
         const char *sched = getenv("DS4_ANE_SCHED_TRACE");

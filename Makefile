@@ -74,7 +74,7 @@ ifeq ($(UNAME_S),Darwin)
 .PHONY: rig check-threadgroup-memory metal-decode-schedule-bench metal-prefill-variant-bench metal-flash-attn-decode-bench check-mxfp4-half-lut check-dispatch-count
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp
 
-all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
+all: ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4-ane-helper
 
 help:
 	@echo "DS4 build targets:"
@@ -724,6 +724,23 @@ else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
+# ANEPROC sidecar helper. Its own process on purpose -- two Core ML processes
+# get two ANE dies, two streams in one process serialise. Links CoreML and
+# IOSurface but deliberately NOT Metal: a separate scheduling context is the
+# point, and a second GPU client would be a cost with no benefit.
+ds4-ane-helper: ds4_ane_helper.m ds4_aneproc.h
+	$(CC) $(CFLAGS) -fobjc-arc -o $@ ds4_ane_helper.m \
+	      -framework Foundation -framework CoreML -framework IOSurface
+
+# Cross-process ring probe. The sidecar's VALUE needs the rig; its CORRECTNESS
+# and handoff cost do not, and --null mode means no Core ML and no models.
+tests/probe_aneproc_ring: tests/probe_aneproc_ring.m ds4_aneproc.h
+	$(CC) $(CFLAGS) -fobjc-arc -I. -o $@ tests/probe_aneproc_ring.m \
+	      -framework Foundation -framework IOSurface
+
+test-aneproc-ring: tests/probe_aneproc_ring ds4-ane-helper
+	./tests/probe_aneproc_ring ./ds4-ane-helper
+
 # SGASYNC private clone library. Needs Xcode 14.2 (XCODE14_APP), so it is
 # dev-box-only and NEVER part of `all`: the rig consumes the committed artifact.
 # The script derives which definitions the old frontend cannot compile, so this
@@ -768,7 +785,7 @@ test-single-knob-readers:
 test-top1-merge: tests/test_top1_merge
 	./tests/test_top1_merge
 
-test-session-state: tests/test_session_state tests/test_tp_commands tests/test_top1_merge test-single-knob-readers
+test-session-state: tests/test_session_state tests/test_tp_commands tests/test_top1_merge test-single-knob-readers test-aneproc-ring
 	./tests/test_session_state
 	./tests/test_tp_commands
 	./tests/test_top1_merge
@@ -924,6 +941,6 @@ clean:
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
 	rm -f tests/test_ssd_cache
-	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands tests/test_top1_merge tests/probe_dq_q4k_equiv ds4_private_clone.metallib
+	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands tests/test_top1_merge tests/probe_dq_q4k_equiv ds4_private_clone.metallib ds4-ane-helper tests/probe_aneproc_ring
 	rm -f tests/test_metal_tp_spec
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/metal_flash_attn_decode_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
