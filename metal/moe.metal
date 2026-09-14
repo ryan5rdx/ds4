@@ -2328,6 +2328,47 @@ kernel void kernel_glm_q4_K_down_simd_f32(
     glm_q4_K_down_simd_spec_impl<0>(args, down, selected, mid, out, tgpig, tiisg, sgitg);
 }
 
+/* MOETGOCC down probe clones.
+ *
+ * Identical bodies with one UNUSED threadgroup(0) argument, which is the only
+ * way to reserve threadgroup memory for a kernel that does not declare any --
+ * doing it without the argument is undefined, not merely wasteful.
+ *
+ * Their purpose is to be compared against the shipping kernels AT ZERO BYTES
+ * first. If clone-at-zero does not match shipping, the extra argument perturbed
+ * codegen and the whole sweep is measuring that rather than residency. Only
+ * once that holds does 2304 / 4608 mean anything.
+ *
+ * Pair needs no clone: it already takes a threadgroup(0) argument it does not
+ * use at the current zero-byte allocation. */
+kernel void kernel_glm_q4_K_down_simd_f32_tgprobe(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *down,
+        device const int32_t *selected,
+        device const float *mid,
+        device float *out,
+        threadgroup float *tgprobe [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    (void)tgprobe;
+    glm_q4_K_down_simd_spec_impl<0>(args, down, selected, mid, out, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_glm_q4_K_down_simd_f32_spec_tgprobe(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *down,
+        device const int32_t *selected,
+        device const float *mid,
+        device float *out,
+        threadgroup float *tgprobe [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    (void)tgprobe;
+    glm_q4_K_down_simd_spec_impl<DM3_SPEC>(args, down, selected, mid, out, tgpig, tiisg, sgitg);
+}
+
 /* SPEC (down) */
 kernel void kernel_glm_q4_K_down_simd_f32_spec(
         constant ds4_metal_glm_routed_moe_args &args,

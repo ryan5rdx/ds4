@@ -3883,48 +3883,113 @@ static id<MTLComputePipelineState> ds4_gpu_get_sgasync_pipeline(
 
 /* ROUTED-MoE DECODE OCCUPANCY PROBE.
  *
- * The proposed async pipeline for the decode pair/down kernels would introduce
- * a ping-pong staging buffer where there is currently NONE -- pair and
- * down_simd both dispatch with threadgroup memory 0 at 64 threads. Corrected
- * for N_R0_Q4_K == 2 (two rows per simdgroup, not four), the buffers are
- * 9 KiB for the pair kernel and 4.5 KiB for down.
+ * An async pipeline for the decode pair/down kernels would introduce a staging
+ * buffer where there is currently NONE -- both dispatch with threadgroup memory
+ * 0 at 64 threads. This prices that before any staging code exists.
  *
- * At 32 KiB per core that caps residency at 3 and 7 threadgroups respectively,
- * against an effectively unbounded count today -- and GLM decode runs at 44%
- * of the matvec roof, i.e. LATENCY bound, which is precisely the regime where
- * occupancy is what supplies the memory-level parallelism. The proposal would
- * trade many threadgroups each with loads in flight for three with two buffers
- * each.
+ * FOOTPRINTS. Production runs kernel_glm_q4_K_pair_swiglu4_f32[_spec], which
+ * instantiates N_R0_GLM_Q4_PAIR_K = 4. An earlier version of this comment used
+ * N_R0_Q4_K = 2 -- that is the swiglu2 kernel's constant, and the "4" in
+ * swiglu4 IS the row count. Everything below was a factor of two out.
  *
- * This prices that trade WITHOUT writing the pipeline: it declares the buffer
- * and never touches it, so the arithmetic is bit-identical and the only thing
- * that changes is residency. If 9 KiB already costs more than the async arm
- * could plausibly return, the whole direction closes before any staging code
- * exists -- the same discipline as MoE arm B, which priced manual staging
- * before the async variant was built.
+ *   pair, one buffer   2 SIMD x 4 rows x 4 blocks x 144 B x (gate+up) =  9216 B -> 3 TG/core
+ *   pair, ping-pong                                            x2     = 18432 B -> 1 TG/core
+ *   down, one buffer   2 SIMD x 2 rows x 4 blocks x 144 B               = 2304 B -> 14 TG/core
+ *   down, ping-pong                                            x2     =  4608 B -> 7 TG/core
  *
- * Only the PAIR kernel is instrumented, and that is deliberate: it already
- * takes a threadgroup(0) parameter, so raising the length changes nothing but
- * residency. down_simd has no such parameter, and reserving memory a function
- * never declares is undefined rather than merely unused -- so instead of
- * touching it, the pair sweep covers down's 4.5 KiB point directly. One curve
- * over 0 / 4.5 / 9 / 18 KiB at the same 64 threads and 2 simdgroups answers
- * both kernels, and is more informative than two isolated points.
+ * WHICH POINT ANSWERS WHICH QUESTION. 9216 prices an IMMEDIATE-wait
+ * single-buffer pair stage; 18432 prices the ping-pong pipeline that was
+ * actually proposed. Since the kernel has no reuse -- every weight byte is read
+ * exactly once -- immediate-wait is structurally a loss and only the ping-pong
+ * design is worth anything, so **the pair direction is decided by the 18432
+ * point, not the 9216 one**. A 9 KiB ping-pong would need two-block tiles,
+ * which doubles the event count and shrinks each copy below the geometry that
+ * was measured: a different design, not this one.
  *
- * DS4_MOE_TG_PROBE_PAIR, in bytes. Unset = shipping. */
+ * Against 32 KiB per core, ping-pong takes the pair kernel to ONE resident
+ * threadgroup. GLM decode runs at 44% of the matvec roof -- latency bound,
+ * which is exactly the regime where occupancy supplies the memory-level
+ * parallelism -- so this is the trade the probe exists to price.
+ *
+ * PAIR DOES NOT ANSWER DOWN, and an earlier version of this claimed it did.
+ * The two differ in register pressure, rows per simdgroup (4 vs 2), weight
+ * streams (2 vs 1), loop structure and grid shape. A reservation that is free
+ * for pair because registers already cap occupancy could still cost down, or
+ * the reverse. down_simd therefore gets its OWN probe clone below, and its
+ * clone-at-zero must be shown to match shipping before its sweep means
+ * anything.
+ *
+ * The buffer is declared and never touched, so arithmetic is bit-identical and
+ * residency is the only variable. Same discipline as MoE arm B: price the cost
+ * before building the benefit.
+ *
+ * DS4_MOE_TG_PROBE_PAIR / DS4_MOE_TG_PROBE_DOWN, in bytes. */
+static NSUInteger ds4_gpu_moe_tg_probe_bytes(const char *env, const char *what,
+                                             const NSUInteger *allowed,
+                                             size_t n_allowed) {
+    const char *e = getenv(env);
+    /* Whitelist, not strtol. strtol("9k") is 9 and strtol("oops") is 0, so a
+     * typo silently became a different arm -- or the control -- with nothing in
+     * the log to say so. And the ZERO arm announces itself too: otherwise a
+     * missing variable and the intended control are indistinguishable. */
+    NSUInteger v = 0;
+    int ok = (e == NULL || e[0] == '\0');
+    if (!ok) {
+        char *end = NULL;
+        const long raw = strtol(e, &end, 10);
+        if (end && *end == '\0' && raw >= 0) {
+            for (size_t i = 0; i < n_allowed; i++) {
+                if ((NSUInteger)raw == allowed[i]) { v = (NSUInteger)raw; ok = 1; break; }
+            }
+        }
+    }
+    if (!ok) {
+        fprintf(stderr, "ds4: FATAL -- %s=\"%s\" is not one of the permitted "
+                        "%s probe sizes (", env, e, what);
+        for (size_t i = 0; i < n_allowed; i++) {
+            fprintf(stderr, "%s%lu", i ? ", " : "", (unsigned long)allowed[i]);
+        }
+        fprintf(stderr, "). Refusing rather than silently running a different "
+                        "arm.\n");
+        abort();
+    }
+    fprintf(stderr, "ds4: MoE decode occupancy probe -- %s reserves %lu B of "
+                    "UNUSED threadgroup memory (arithmetic unchanged; residency "
+                    "is the variable)\n", what, (unsigned long)v);
+    return v;
+}
+
 static NSUInteger ds4_gpu_moe_tg_probe_pair(void) {
     static long v = -1;
     if (v < 0) {
-        const char *e = getenv("DS4_MOE_TG_PROBE_PAIR");
-        v = (e && e[0]) ? strtol(e, NULL, 0) : 0;
-        if (v > 0) {
-            fprintf(stderr, "ds4: MoE decode occupancy probe -- pair kernel "
-                            "reserves %ld B of UNUSED threadgroup memory "
-                            "(arithmetic unchanged; residency is the variable)\n", v);
-        }
+        static const NSUInteger allowed[] = { 0u, 4608u, 9216u, 18432u };
+        v = (long)ds4_gpu_moe_tg_probe_bytes("DS4_MOE_TG_PROBE_PAIR", "pair",
+                                             allowed, 4);
     }
-    return (NSUInteger)(v > 0 ? v : 0);
+    return (NSUInteger)v;
 }
+
+static NSUInteger ds4_gpu_moe_tg_probe_down(void) {
+    static long v = -1;
+    if (v < 0) {
+        static const NSUInteger allowed[] = { 0u, 2304u, 4608u };
+        v = (long)ds4_gpu_moe_tg_probe_bytes("DS4_MOE_TG_PROBE_DOWN", "down",
+                                             allowed, 3);
+    }
+    return (NSUInteger)v;
+}
+
+/* The down clone exists ONLY so this probe has somewhere to put the bytes:
+ * kernel_glm_q4_K_down_simd_f32[_spec] has no threadgroup(0) argument, and
+ * reserving memory a function never declares is undefined rather than unused.
+ * The clone is the same body with an unused argument added -- so the FIRST
+ * thing its sweep must establish is that clone-at-zero matches shipping. If it
+ * does not, the extra argument perturbed codegen and every later point is
+ * measuring that instead of residency. */
+static int ds4_gpu_moe_tg_probe_down_active(void) {
+    return getenv("DS4_MOE_TG_PROBE_DOWN") != NULL;
+}
+
 
 
 static int ds4_gpu_disable_hot_pipeline_statics(void) {
@@ -42747,7 +42812,10 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                                   "kernel_glm_q2_K_down_f32") :
              down_scalar_q4 ?
              (dm_spec_ok
-              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_f32_spec")
+              ? ds4_gpu_get_pipeline(
+                    ds4_gpu_moe_tg_probe_down_active()
+                        ? "kernel_glm_q4_K_down_simd_f32_spec_tgprobe"
+                        : "kernel_glm_q4_K_down_simd_f32_spec")
               : ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
                                      "kernel_glm_q4_K_down_f32")) :
              down_simd_q5 ?
@@ -42869,7 +42937,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             down_simd_q6 ? (NSUInteger)((out_dim + 3u) / 4u) :
             (NSUInteger)out_dim;
         const NSUInteger down_threadgroup_bytes =
-            (down_scalar_q2 || down_simd) ? 0u : 256u * sizeof(float);
+            (down_scalar_q2 || down_simd) ? ds4_gpu_moe_tg_probe_down()
+                                          : 256u * sizeof(float);
         const NSUInteger down_threads =
             (down_scalar_q2 || down_simd) ? 64u : 256u;
         if (use_stream_expert_addr_table &&
@@ -43959,7 +44028,10 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                                  "kernel_glm_q2_K_down_f32") :
             down_scalar_q4 ?
             (dm_spec_ok
-              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_f32_spec")
+              ? ds4_gpu_get_pipeline(
+                    ds4_gpu_moe_tg_probe_down_active()
+                        ? "kernel_glm_q4_K_down_simd_f32_spec_tgprobe"
+                        : "kernel_glm_q4_K_down_simd_f32_spec")
               : ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
                                      "kernel_glm_q4_K_down_f32")) :
             down_simd_q5 ?
