@@ -6126,6 +6126,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
         @[@"DS4_METAL_ANE_BRIDGE_SOURCE", @"metal/ane_bridge.metal"],
         @[@"DS4_METAL_TOP1_SOURCE",       @"metal/top1.metal"],
+        @[@"DS4_METAL_CMPSEL_SOURCE",     @"metal/cmpsel.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
@@ -52590,6 +52591,41 @@ static void ds4_gpu_top1_probe(void) {
             "u64_atomic=%d\n",
             g_top1_scan != nil, g_top1_merge != nil, g_top1_reset != nil,
             g_top1_shard_merge != nil, g_top1_atomic != nil);
+}
+
+/* CMPSEL-AUDIT driver. Timed with the whole dispatch in one command buffer so
+ * the submission cost does not swamp the ALU difference being measured -- the
+ * same mistake the U64TOP1 sweep made. */
+int ds4_gpu_cmpsel_run(const char *name, uint32_t n_iter, uint32_t divergent,
+                       uint32_t threads, double *ms_out) {
+    id<MTLComputePipelineState> pipe = ds4_gpu_get_pipeline(name);
+    if (!pipe) return 0;
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)threads * 8u);
+    if (!out) return 0;
+    struct { uint32_t n_iter, divergent; } a = { n_iter, divergent };
+    double best = 1e30;
+    for (int rep = 0; rep < 7; rep++) {
+        const double t0 = ds4_gpu_now_ms();
+        @autoreleasepool {
+            if (!ds4_gpu_begin_commands()) { ds4_gpu_tensor_free(out); return 0; }
+            int owned = 0;
+            id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            DS4_SET_PIPE(enc, pipe);
+            [enc setBytes:&a length:sizeof(a) atIndex:0];
+            [enc setBuffer:ds4_gpu_tensor_buffer(out) offset:0 atIndex:1];
+            [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(threads / 256u, 1, 1)
+                          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            ds4_gpu_end_commands();
+        }
+        ds4_gpu_synchronize();
+        const double dt = ds4_gpu_now_ms() - t0;
+        if (rep > 1 && dt < best) best = dt;
+    }
+    ds4_gpu_tensor_free(out);
+    *ms_out = best;
+    return 1;
 }
 
 int ds4_gpu_top1_u64_available(void) {
