@@ -184,15 +184,11 @@ static unsigned amx_z_written_vectors(uint64_t op_is_vecfp, uint64_t operand) {
 }
 
 static bool canary_vecfp_multi(void) {
-    const unsigned single = amx_z_written_vectors(1, 0);
-    const unsigned multi  = amx_z_written_vectors(1, 1ull << 31);
-    return multi > single;
-}
-
-static bool canary_extr_multi(void) {
-    const unsigned single = amx_z_written_vectors(0, 0);
-    const unsigned multi  = amx_z_written_vectors(0, 1ull << 26);
-    return multi > single;
+    /* Both arms do a real f32 z + x*y; they differ only in bit 31. */
+    const unsigned single = amx_z_written_vectors(1, DS4_AMX_VECFP_F32_ONE);
+    const unsigned two    = amx_z_written_vectors(1, DS4_AMX_VECFP_F32_TWO);
+    const unsigned four   = amx_z_written_vectors(1, DS4_AMX_VECFP_F32_FOUR);
+    return two > single || four > single;
 }
 
 /* ---- availability, established without risking the process --------------
@@ -237,7 +233,10 @@ const ds4_amx_caps *ds4_amx_probe(void) {
     g_caps.genlut4     = canary_genlut4();
     g_caps.bf16        = canary_bf16();
     g_caps.vecfp_multi = canary_vecfp_multi();
-    g_caps.extr_multi  = canary_extr_multi();
+    /* -1, not 0: the EXTRH/EXTRV operand layout is unconfirmed, and a guessed
+     * encoding reported as a measured absence is exactly how bf16 and
+     * vecfp_multi were wrongly closed. */
+    g_caps.extr_multi  = -1;
     return &g_caps;
 }
 
@@ -248,12 +247,18 @@ bool ds4_amx_can_run(const char *kernel) {
     /* Each kernel names every primitive it needs. A partial M2 selects a
      * simpler arm; it never aborts and never runs a kernel whose primitives
      * were not individually confirmed. */
+    /* extr_multi is required by the brief's predeq-f16 pipeline (mixed-width
+     * EXTRH packs the F32 result to the F16 vector MATFP consumes), and it is
+     * currently UNVERIFIED rather than absent -- so this stays ineligible, but
+     * for a reason the log distinguishes from "the hardware lacks it". */
     if (!strcmp(kernel, "q4-predeq-f16"))
-        return c->matfp_f16 && c->genlut4 && c->load4 && c->vecfp_multi;
+        return c->matfp_f16 && c->genlut4 && c->load4 && c->vecfp_multi &&
+               c->extr_multi > 0;
     if (!strcmp(kernel, "q4-postscale"))
         return c->matfp_f16 && c->genlut4;
     if (!strcmp(kernel, "q4-bf16"))
-        return c->bf16 && c->genlut4 && c->load4 && c->vecfp_multi;
+        return c->bf16 && c->genlut4 && c->load4 && c->vecfp_multi &&
+               c->extr_multi > 0;
     if (!strcmp(kernel, "q8-shexp"))
         return c->matint_i8;
     return false;
@@ -263,9 +268,11 @@ void ds4_amx_log_caps(void) {
     const ds4_amx_caps *c = ds4_amx_probe();
     fprintf(stderr,
             "ds4: AMX cpu=\"%s\" buildable=%d available=%d load4=%d matfp_f16=%d "
-            "matint_i8=%d genlut4=%d bf16=%d vecfp_multi=%d extr_multi=%d\n",
+            "matint_i8=%d genlut4=%d bf16=%d vecfp_multi=%d extr_multi=%s\n",
             c->cpu, c->buildable, c->available, c->load4, c->matfp_f16,
-            c->matint_i8, c->genlut4, c->bf16, c->vecfp_multi, c->extr_multi);
+            c->matint_i8, c->genlut4, c->bf16, c->vecfp_multi,
+            c->extr_multi < 0 ? "UNVERIFIED" :
+            (c->extr_multi ? "1" : "0"));
 }
 
 #endif /* DS4_AMX_BUILDABLE */

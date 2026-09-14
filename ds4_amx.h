@@ -103,6 +103,18 @@
 #define DS4_AMX_MATFP_F16_F32  (3ull << 42)   /* f16  x f16  -> f32           */
 #define DS4_AMX_MATFP_BF16_F32 (1ull << 42)   /* bf16 x bf16 -> f32, M2 only  */
 
+/* VECFP: bits 42-45 lane width (4 = f32 X/Y, f32 Z one row), bits 47-52 ALU
+ * mode (0 = z + x*y), bit 31 multiple-vector enable -- "M2 only, always reads
+ * as 0 on M1" -- and bit 25 picks four vectors (1) over two (0) when 31 is set.
+ *
+ * The first version compared operand 0 against (1 << 31) and never set the lane
+ * width at all, so neither arm performed a meaningful f32 operation and the
+ * differential saw no difference. That reported vecfp_multi=0 on an M2 Ultra
+ * that has it. */
+#define DS4_AMX_VECFP_F32_ONE  (4ull << 42)
+#define DS4_AMX_VECFP_F32_TWO  ((4ull << 42) | (1ull << 31))
+#define DS4_AMX_VECFP_F32_FOUR ((4ull << 42) | (1ull << 31) | (1ull << 25))
+
 #endif /* DS4_AMX_BUILDABLE */
 
 /* What a given host actually supports, established behaviourally. Every field
@@ -116,7 +128,12 @@ typedef struct {
     bool genlut4;        /* 4-bit indexed load expands a 16-entry table      */
     bool bf16;           /* M2: BF16 multiplicands, distinguished from F16   */
     bool vecfp_multi;    /* M2: two/four-vector VECFP                        */
-    bool extr_multi;     /* M2: two/four-vector EXTRH/EXTRV                  */
+    /* Tri-state: 1 present, 0 measured absent, -1 NOT VERIFIABLE by this probe.
+     * extr_multi is -1 because the EXTRH/EXTRV operand layout is not in a
+     * corsix doc I could locate, and reporting an unverified guess as a
+     * measured 0 is what made bf16 and vecfp_multi look absent on hardware
+     * that has them. Callers treat -1 as ineligible, but the log says which. */
+    int  extr_multi;
     char cpu[64];
 } ds4_amx_caps;
 

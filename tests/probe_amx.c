@@ -220,7 +220,7 @@ int main(int argc, char **argv) {
     }
 
     /* M2-only primitives cannot be exercised here; say so rather than pass. */
-    if (!c->load4 || !c->bf16 || !c->vecfp_multi) {
+    if (!c->load4 || !c->bf16 || !c->vecfp_multi || c->extr_multi < 0) {
         printf("\nNOTE: load4=%d bf16=%d vecfp_multi=%d extr_multi=%d on this "
                "host.\n  The M2-specific arms (predeq-f16, bf16) are therefore "
                "UNTESTED here, not passing.\n  Only an M2 Ultra run can "
