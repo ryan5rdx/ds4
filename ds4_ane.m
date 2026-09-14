@@ -28,6 +28,10 @@ volatile uint32_t *ds4_gpu_ane_sync_words(void);
 int  ds4_gpu_ane_sync_timed_out(void);
 int  ds4_gpu_synchronize(void);
 int  ds4_gpu_aneproc_active(void);
+int  ds4_gpu_aneproc_enabled(void);
+int  ds4_gpu_aneproc_start(uint32_t dim, uint32_t n_tok, uint32_t n_layers);
+uint32_t ds4_gpu_aneproc_fault(void);
+void ds4_gpu_aneproc_counters(uint32_t *served, uint32_t *failed);
 
 #define DS4_ANE_MAX_LAYERS 64
 
@@ -40,6 +44,8 @@ static dispatch_queue_t g_queue;
 static dispatch_semaphore_t g_done[DS4_ANE_MAX_LAYERS];
 static int       g_started[DS4_ANE_MAX_LAYERS];
 static uint32_t  g_seq;
+/* Requests the parent published under ANEPROC; the helper's SERVED must match. */
+static uint32_t  g_aneproc_enqueued;
 static int       g_fast_stop;
 static pthread_t g_fast_thread;
 static int       g_fast_running;
@@ -269,8 +275,28 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
          * fast-null vs off is the fixed cost and fast vs fast-null is Core ML.
          * ANESIDE5B could not separate those and the k2 projection depends
          * entirely on which one the 4.8 ms/layer belongs to. */
+        /* Start the helper here, with the REAL layer count -- it used to be
+         * spawned from stage_alloc with a hard-coded 64. */
+        if (ds4_gpu_aneproc_enabled() && ds4_ane_mode() >= DS4_ANE_FAST) {
+            /* A fresh helper starts at seq 0. The parent's g_seq survives
+             * teardown, so without this the first request after a rebuild
+             * carries a seq the helper has already passed and the GPU fences on
+             * a DONE that will never come. */
+            g_seq = 0;
+            if (!ds4_gpu_aneproc_start(dim, n_tokens, n_layers)) {
+                fprintf(stderr, "ds4: ANEPROC requested but unavailable -- the "
+                                "in-process sidecar remains in charge, so this "
+                                "is NOT an ANEPROC measurement\n");
+            }
+        }
+        /* The helper owns the models under ANEPROC. Loading them here as well
+         * doubled residency -- two full copies of every shared expert -- and
+         * made the process-isolation A/B meaningless, since the parent held
+         * everything it was supposed to have handed off and never predicted
+         * with any of it. */
         if (ds4_ane_mode() >= DS4_ANE_SHADOW &&
-            ds4_ane_mode() != DS4_ANE_FASTNULL && !ds4_ane_test_hook()) {
+            ds4_ane_mode() != DS4_ANE_FASTNULL && !ds4_ane_test_hook() &&
+            !ds4_gpu_aneproc_active()) {
             const char *dir = getenv("DS4_ANE_MODEL_DIR");
             if (!dir || !dir[0]) {
                 ds4_ane_teardown();
@@ -554,11 +580,9 @@ static void *ds4_ane_sidecar_thread(void *ud) {
 int ds4_ane_begin_layer(uint32_t il) {
     if (!g_ready || il >= g_n_layers) return 0;
     if (ds4_ane_mode() < DS4_ANE_SHADOW) return 0;
-    MLModel *m = g_models[il];
-    if (!m && !ds4_ane_test_hook() && ds4_ane_mode() != DS4_ANE_FASTNULL) {
-        g_skipped++; return 0;
-    }
-
+    /* BEFORE the g_models[] guard: under ANEPROC the parent holds no models at
+     * all, so requiring one here skipped every layer and the sidecar served
+     * nothing while looking enabled. */
     if (ds4_ane_mode() >= DS4_ANE_FAST && ds4_gpu_aneproc_active()) {
         /* ANEPROC: the request IS the shared ring entry. Publish the layer for
          * this seq and return -- there is no local queue, no semaphore and no
@@ -573,11 +597,17 @@ int ds4_ane_begin_layer(uint32_t il) {
         if (!cw) { g_skipped++; return 0; }
         __atomic_store_n(&cw[DS4_ANEPROC_W_RING + (g_seq % DS4_ANEPROC_RING)],
                          il, __ATOMIC_RELEASE);
+        g_aneproc_enqueued++;
         if (ds4_ane_sched_trace() && il < DS4_ANE_MAX_LAYERS) {
             g_tl[il].enq = ds4_ane_now_ns();
         }
         g_started[il] = 1;
         return 1;
+    }
+
+    MLModel *m = g_models[il];
+    if (!m && !ds4_ane_test_hook() && ds4_ane_mode() != DS4_ANE_FASTNULL) {
+        g_skipped++; return 0;
     }
 
     if (ds4_ane_mode() >= DS4_ANE_FAST) {
@@ -658,7 +688,13 @@ void ds4_ane_cancel_layer(uint32_t il) {
      * never acts on it until the GPU stores READY for that seq. A publish that
      * was not encoded therefore releases nothing and needs no undo -- the
      * entry is simply overwritten when the seq wraps. */
-    if (ds4_gpu_aneproc_active()) { g_cancelled++; g_started[il] = 0; return; }
+    if (ds4_gpu_aneproc_active()) {
+        /* The enqueue counted; a cancel means the GPU publish was never
+         * encoded, so the helper will never serve this seq and the validation
+         * must not expect it. */
+        if (g_aneproc_enqueued) g_aneproc_enqueued--;
+        g_cancelled++; g_started[il] = 0; return;
+    }
     const uint64_t h = __atomic_load_n(&g_ring_head, __ATOMIC_ACQUIRE);
     if (h == __atomic_load_n(&g_ring_tail, __ATOMIC_ACQUIRE)) return;
     __atomic_store_n(&g_ring_head, h - 1u, __ATOMIC_RELEASE);
@@ -684,6 +720,29 @@ void ds4_ane_reset(void) {
      * run-level faults, and a per-chunk reset would let one bad chunk vanish
      * from the record. */
     g_ns_predict = 0.0; g_engaged = g_skipped = g_failed = 0;
+}
+
+/* The per-chunk validation ANEPROC would otherwise silently drop.
+ *
+ * The parent's engaged/failed/skipped counters are incremented by the
+ * IN-PROCESS prediction, which does not run here -- so every assertion built on
+ * them evaporated the moment the helper took over, and a run that served
+ * nothing looked identical to one that served everything. These are the
+ * helper's own counters, checked against what the parent enqueued. */
+
+void ds4_ane_aneproc_validate(const char *where) {
+    if (!ds4_gpu_aneproc_active() && !ds4_gpu_aneproc_fault()) return;
+    uint32_t served = 0, failed = 0;
+    ds4_gpu_aneproc_counters(&served, &failed);
+    const uint32_t fault = ds4_gpu_aneproc_fault();
+    const int timed_out = ds4_gpu_ane_sync_timed_out();
+    const int bad = (served != g_aneproc_enqueued) || failed != 0 ||
+                    fault != 0 || timed_out != 0;
+    fprintf(stderr,
+            "ds4: ANEPROC %s -- enqueued %u served %u failed %u fault %u "
+            "fence_timeout %d%s\n",
+            where, g_aneproc_enqueued, served, failed, fault, timed_out,
+            bad ? "   *** RUN INVALID ***" : "");
 }
 
 void ds4_ane_report(void) {

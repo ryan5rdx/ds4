@@ -39695,6 +39695,7 @@ static bool metal_graph_prefill_chunked_range(
          * and the harness's grep for them could not fire. Once per completed
          * chunk is the right cadence: per layer would perturb what it
          * measures, per run would hide which chunk went wrong. */
+        ds4_ane_aneproc_validate("chunk");
         ds4_ane_report();
         ds4_ane_reset();
         if (progress) {

@@ -75,10 +75,20 @@ enum {
      * the seq -> layer mapping is untested -- and an off-by-one there runs the
      * wrong layer's model in production, silently. Also useful live. */
     DS4_ANEPROC_W_LAST_LAYER,
+    DS4_ANEPROC_W_FAILED,      /* helper -> parent: predictions that did not run */
     DS4_ANEPROC_W_HDR_END,
     /* The seq -> layer ring starts here, 16-word aligned. */
     DS4_ANEPROC_W_RING = 32,
 };
+
+/* Null-mode arms. The first version had one, and it did a production-sized
+ * memcpy -- so "the handoff alone" included 16 MiB of copying that the real
+ * path does not do. Split so each prices one thing:
+ *   NOOP  control words and the GPU fence, nothing else.
+ *   ECHO  NOOP plus a copy, which is what proves the surfaces are shared.  */
+#define DS4_ANEPROC_NULL_OFF   0u
+#define DS4_ANEPROC_NULL_NOOP  1u
+#define DS4_ANEPROC_NULL_ECHO  2u
 
 #define DS4_ANEPROC_CTL_WORDS (DS4_ANEPROC_W_RING + DS4_ANEPROC_RING)
 #define DS4_ANEPROC_CTL_BYTES (DS4_ANEPROC_CTL_WORDS * 4u)

@@ -62,12 +62,17 @@ static IOSurfaceRef attach(const char *what, uint32_t id, void **base) {
  * allocator time in the in-process sidecar and there is no reason to repeat it
  * here. */
 static MLMultiArray *wrap(void *base, uint32_t dim, uint32_t n_tok) {
+    /* [1, dim, 1, n_tok], NOT [1, n_tok, dim]. This must match what
+     * ane-gen-io.py converts and what ds4_ane_wrap() uses in-process; the first
+     * version here had it transposed, which real models reject at shape
+     * validation and which null mode -- copying bytes -- could not notice. */
     NSError *e = nil;
     MLMultiArray *a = [[MLMultiArray alloc]
         initWithDataPointer:base
-                      shape:@[@1, @(n_tok), @(dim)]
+                      shape:@[@1, @(dim), @1, @(n_tok)]
                    dataType:MLMultiArrayDataTypeFloat16
-                    strides:@[@(n_tok * dim), @(dim), @1]
+                    strides:@[@((NSInteger)dim * n_tok), @((NSInteger)n_tok),
+                              @((NSInteger)n_tok), @1]
                 deallocator:nil
                       error:&e];
     if (!a) {
@@ -138,6 +143,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
      * region -- 0.3675 s/model, R^2 0.9954 against model count, which voided
      * the whole ANEI8 projection. A separate process makes that structural:
      * nothing is timed until loading is finished. */
+    const size_t bytes_for_gate = (size_t)dim * n_tok * sizeof(uint16_t);
     NSMutableArray *models = [NSMutableArray array];
     uint32_t loaded = 0;
     if (!null_mode) {
@@ -148,7 +154,12 @@ int main(int argc, const char **argv) { @autoreleasepool {
             return 2;
         }
         MLModelConfiguration *cfg = [[MLModelConfiguration alloc] init];
-        cfg.computeUnits = MLComputeUnitsAll;
+        /* CPUAndNeuralEngine, matching the in-process control. MLComputeUnitsAll
+         * lets Core ML fall back to the GPU, which would contaminate exactly
+         * the GPU-contention measurement this whole arm exists to make -- the
+         * sidecar would be competing with the routed MoE it is supposed to run
+         * beside. */
+        cfg.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
         const uint64_t t0 = now_ns();
         for (uint32_t il = 0; il < n_layers; il++) {
             char path[1024];
@@ -157,19 +168,70 @@ int main(int argc, const char **argv) { @autoreleasepool {
             NSError *e = nil;
             NSURL *c = [MLModel compileModelAtURL:u error:&e];
             MLModel *m = c ? [MLModel modelWithContentsOfURL:c configuration:cfg error:&e] : nil;
-            [models addObject:(m ? (id)m : (id)[NSNull null])];
-            if (m) loaded++;
+            if (!m) {
+                /* EVERY model, or none. A partially loaded set means some
+                 * layers silently do nothing while DONE still advances, which
+                 * makes FAST look cheap because no computation happened. */
+                fprintf(stderr, "ds4-ane-helper: layer %u failed to load (%s): %s\n",
+                        il, path, e.localizedDescription.UTF8String);
+                atomic_store_explicit(&w[DS4_ANEPROC_W_FAULT], 5u, memory_order_release);
+                return 2;
+            }
+            [models addObject:m];
+            loaded++;
         }
         fprintf(stderr, "ds4-ane-helper: %u/%u models loaded in %.2f s "
                         "(OUTSIDE any timed region, by construction)\n",
                 loaded, n_layers, (double)(now_ns() - t0) / 1e9);
-        if (loaded == 0) {
-            atomic_store_explicit(&w[DS4_ANEPROC_W_FAULT], 5u, memory_order_release);
-            return 2;
+
+        /* WARM EVERY MODEL, AND GATE ZERO-COPY ON POINTER EQUALITY.
+         *
+         * Both in one pass, because both have to be true before the first
+         * timed prediction. The first call per model carries initialisation
+         * that would otherwise land inside the measurement -- the defect that
+         * voided ANEI8 -- and if Core ML declines the output backing it
+         * allocates its own buffer, which at 4096x2048 is a 16 MiB copy per
+         * layer and 672 MiB per 42-layer chunk. That is not a warning to print
+         * and then memcpy past; it is the premise of the design, so it is a
+         * startup gate. */
+        const uint64_t tw = now_ns();
+        for (uint32_t il = 0; il < n_layers; il++) {
+            @autoreleasepool {
+                MLModel *m = models[il];
+                NSError *e = nil;
+                MLDictionaryFeatureProvider *fp = [[MLDictionaryFeatureProvider alloc]
+                    initWithDictionary:@{ @"x": [MLFeatureValue featureValueWithMultiArray:in] }
+                                 error:&e];
+                MLPredictionOptions *o = [[MLPredictionOptions alloc] init];
+                NSString *okey = m.modelDescription.outputDescriptionsByName.allKeys.firstObject;
+                if (okey) o.outputBackings = @{ okey: out };
+                id<MLFeatureProvider> r = fp ? [m predictionFromFeatures:fp options:o error:&e] : nil;
+                if (!r) {
+                    fprintf(stderr, "ds4-ane-helper: layer %u warm prediction "
+                            "failed: %s\n", il, e.localizedDescription.UTF8String);
+                    atomic_store_explicit(&w[DS4_ANEPROC_W_FAULT], 6u, memory_order_release);
+                    return 2;
+                }
+                MLMultiArray *ov = [r featureValueForName:okey].multiArrayValue;
+                if (!ov || ov.dataPointer != out_base) {
+                    fprintf(stderr, "ds4-ane-helper: layer %u did NOT honour the "
+                            "output backing (%p vs %p). Zero copy is the premise "
+                            "of ANEPROC -- refusing rather than copying %zu bytes "
+                            "per layer.\n", il, ov ? ov.dataPointer : NULL,
+                            out_base, bytes_for_gate);
+                    atomic_store_explicit(&w[DS4_ANEPROC_W_FAULT], 7u, memory_order_release);
+                    return 2;
+                }
+            }
         }
+        fprintf(stderr, "ds4-ane-helper: %u models warmed in %.2f s; output "
+                        "backing honoured by all (zero copy confirmed)\n",
+                n_layers, (double)(now_ns() - tw) / 1e9);
     } else {
-        fprintf(stderr, "ds4-ane-helper: NULL MODE -- no Core ML, input copied "
-                        "to output. This prices the handoff alone.\n");
+        fprintf(stderr, "ds4-ane-helper: NULL MODE %u (%s) -- no Core ML.\n",
+                null_mode,
+                null_mode == DS4_ANEPROC_NULL_NOOP ? "noop: control/fence only"
+                                                   : "echo: shared-surface correctness");
     }
 
     const size_t bytes = (size_t)dim * n_tok * sizeof(uint16_t);
@@ -206,44 +268,68 @@ int main(int argc, const char **argv) { @autoreleasepool {
                 &w[DS4_ANEPROC_W_RING + (seq % DS4_ANEPROC_RING)],
                 memory_order_acquire);
             const uint64_t t0 = now_ns();
-            if (!null_mode && il < n_layers) {
-                id entry = models[il];
-                if (entry != [NSNull null]) {
-                    MLModel *m = (MLModel *)entry;
+            int ok = 1;
+            /* Per-prediction pool. The process-lifetime pool was retaining
+             * every Core ML temporary for the whole run -- at this size that is
+             * not a leak you notice at the end, it is memory pressure during
+             * the measurement. */
+            @autoreleasepool {
+                if (null_mode == DS4_ANEPROC_NULL_ECHO) {
+                    memcpy(out_base, in_base, bytes);
+                } else if (null_mode == DS4_ANEPROC_NULL_NOOP) {
+                    /* Nothing at all: control and fence overhead alone. */
+                } else if (il >= n_layers) {
+                    fprintf(stderr, "ds4-ane-helper: seq %u published layer %u "
+                            ">= %u\n", seq, il, n_layers);
+                    ok = 0;
+                } else {
+                    MLModel *m = models[il];
                     NSError *e = nil;
-                    NSString *ikey = m.modelDescription.inputDescriptionsByName.allKeys.firstObject;
+                    MLDictionaryFeatureProvider *fp = [[MLDictionaryFeatureProvider alloc]
+                        initWithDictionary:@{ @"x": [MLFeatureValue
+                                                      featureValueWithMultiArray:in] }
+                                     error:&e];
+                    MLPredictionOptions *o = [[MLPredictionOptions alloc] init];
                     NSString *okey = m.modelDescription.outputDescriptionsByName.allKeys.firstObject;
-                    MLDictionaryFeatureProvider *fp =
-                        [[MLDictionaryFeatureProvider alloc]
-                            initWithDictionary:@{ ikey: in } error:&e];
+                    /* The output backing, which the first version omitted --
+                     * Core ML then allocated its own buffer and the result was
+                     * memcpy'd, 16 MiB per layer. Startup already proved every
+                     * model honours it. */
+                    if (okey) o.outputBackings = @{ okey: out };
                     id<MLFeatureProvider> r = fp ? [m predictionFromFeatures:fp
-                                                                     options:popt
+                                                                     options:o
                                                                        error:&e] : nil;
-                    MLMultiArray *ov = r ? [r featureValueForName:okey].multiArrayValue : nil;
-                    if (ov && ov.dataPointer != out_base) {
-                        /* Core ML returned its own buffer rather than writing
-                         * in place. Copying is correct but it is exactly the
-                         * cost this design exists to avoid, so say so once. */
-                        static int warned;
-                        if (!warned) {
-                            warned = 1;
-                            fprintf(stderr, "ds4-ane-helper: prediction is NOT "
-                                    "writing in place; copying %zu bytes per "
-                                    "layer. The zero-copy path is not engaged.\n",
-                                    bytes);
-                        }
-                        memcpy(out_base, ov.dataPointer, bytes);
+                    if (!r) {
+                        fprintf(stderr, "ds4-ane-helper: seq %u layer %u "
+                                "prediction failed: %s\n", seq, il,
+                                e.localizedDescription.UTF8String);
+                        ok = 0;
                     }
                 }
-            } else if (null_mode) {
-                memcpy(out_base, in_base, bytes);
             }
             atomic_store_explicit(&w[DS4_ANEPROC_W_PREDICT_NS],
                                   (uint32_t)(now_ns() - t0), memory_order_relaxed);
-            /* Echo the resolved layer so the ring mapping is observable even in
-             * null mode, where nothing else depends on it. */
             atomic_store_explicit(&w[DS4_ANEPROC_W_LAST_LAYER], il,
                                   memory_order_relaxed);
+            if (!ok) {
+                /* DO NOT publish DONE. The first version stored it
+                 * unconditionally, so a missing model or a failed prediction
+                 * looked like a completed one: FAST measured a handoff with no
+                 * computation behind it and PERFONLY consumed stale output,
+                 * with nothing in the run able to tell success from failure.
+                 *
+                 * There is no safe fallback at this point either -- the GPU is
+                 * already fenced on this seq and the output surface holds the
+                 * previous layer's values. The run is invalid; say so and let
+                 * the fence time out against a FAULT the parent can report. */
+                atomic_fetch_add_explicit(&w[DS4_ANEPROC_W_FAILED], 1u,
+                                          memory_order_relaxed);
+                atomic_store_explicit(&w[DS4_ANEPROC_W_FAULT], 8u,
+                                      memory_order_release);
+                fprintf(stderr, "ds4-ane-helper: FATAL at seq %u -- not "
+                        "publishing DONE; this run is invalid\n", seq);
+                goto drained;
+            }
             served_seq = seq;
             served++;
             /* RELEASE: the output bytes must be visible before DONE is. */

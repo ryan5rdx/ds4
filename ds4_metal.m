@@ -52764,7 +52764,42 @@ static const char *ds4_gpu_aneproc_helper_path(void) {
 int ds4_gpu_aneproc_active(void) {
     if (!g_ane_helper_pid || !g_ane_ctl_buf) return 0;
     _Atomic uint32_t *w = (_Atomic uint32_t *)g_ane_ctl_buf.contents;
-    return atomic_load_explicit(&w[DS4_ANEPROC_W_ALIVE], memory_order_acquire) != 0;
+    if (!atomic_load_explicit(&w[DS4_ANEPROC_W_ALIVE], memory_order_acquire)) return 0;
+    /* A CRASHED helper leaves ALIVE set in shared memory, and the GPU would
+     * then spin on a DONE nobody will ever write until the fence times out.
+     * Reap here so the parent notices, and leave a FAULT behind: this is not a
+     * condition to fall back from -- the run is already wrong -- it is one to
+     * report and invalidate. */
+    int st = 0;
+    if (waitpid(g_ane_helper_pid, &st, WNOHANG) == g_ane_helper_pid) {
+        fprintf(stderr, "ds4: ANEPROC helper pid %d DIED (status %d) with "
+                        "ALIVE still set; this run is invalid\n",
+                (int)g_ane_helper_pid, st);
+        atomic_store_explicit(&w[DS4_ANEPROC_W_ALIVE], 0u, memory_order_release);
+        if (!atomic_load_explicit(&w[DS4_ANEPROC_W_FAULT], memory_order_acquire)) {
+            atomic_store_explicit(&w[DS4_ANEPROC_W_FAULT], 9u, memory_order_release);
+        }
+        g_ane_helper_pid = 0;
+        return 0;
+    }
+    return 1;
+}
+
+/* Nonzero once anything has gone wrong in the helper. The caller must treat a
+ * nonzero value as "this run's numbers are void", not as a reason to retry. */
+uint32_t ds4_gpu_aneproc_fault(void) {
+    if (!g_ane_ctl_buf) return 0;
+    _Atomic uint32_t *w = (_Atomic uint32_t *)g_ane_ctl_buf.contents;
+    return atomic_load_explicit(&w[DS4_ANEPROC_W_FAULT], memory_order_acquire);
+}
+
+/* served, failed -- the helper's own counters, for the per-chunk assertion the
+ * parent used to make against its in-process ones. */
+void ds4_gpu_aneproc_counters(uint32_t *served, uint32_t *failed) {
+    if (!g_ane_ctl_buf) { if (served) *served = 0; if (failed) *failed = 0; return; }
+    _Atomic uint32_t *w = (_Atomic uint32_t *)g_ane_ctl_buf.contents;
+    if (served) *served = atomic_load_explicit(&w[DS4_ANEPROC_W_SERVED], memory_order_acquire);
+    if (failed) *failed = atomic_load_explicit(&w[DS4_ANEPROC_W_FAILED], memory_order_acquire);
 }
 
 void ds4_gpu_aneproc_stop(void) {
@@ -52791,7 +52826,11 @@ void ds4_gpu_aneproc_stop(void) {
 /* Publish the geometry, spawn the helper, and wait for it to say it is serving.
  * Returns 0 on any failure, which the caller must treat as "use the in-process
  * sidecar" -- never as a reason to fail the prefill. */
-static int ds4_gpu_aneproc_start(uint32_t dim, uint32_t n_tok, uint32_t n_layers) {
+/* Called from ds4_ane_init(), which is the only place the REAL layer count is
+ * known. It used to be called from stage_alloc with a hard-coded 64, so the
+ * helper built a 64-entry model table for a 42-layer model and any layer index
+ * in between would have loaded nothing while DONE still advanced. */
+int ds4_gpu_aneproc_start(uint32_t dim, uint32_t n_tok, uint32_t n_layers) {
     if (!g_ane_ctl_buf || !g_ane_in_surface || !g_ane_out_surface ||
         !g_ane_ctl_surface) {
         return 0;
@@ -52960,15 +52999,6 @@ int ds4_gpu_ane_stage_alloc(uint32_t dim, uint32_t n_tok,
             memset(g_ane_sync_stats_buffer.contents, 0, DS4_TP_FENCE_SPIN_WORDS * sizeof(uint32_t));
         /* ~15 ms of spin, not the gate's ~500 us. Dedicated budget, dedicated
          * words: see the comment at the declarations. */
-        if (ds4_gpu_aneproc_enabled() && g_ane_in_surface && g_ane_out_surface) {
-            /* n_layers is not known here -- the ring is indexed by seq, and the
-             * helper only needs an upper bound for its model table. 64 matches
-             * DS4_ANE_MAX_LAYERS on the sidecar side. */
-            if (!ds4_gpu_aneproc_start(dim, n_tok, 64u)) {
-                fprintf(stderr, "ds4: ANEPROC unavailable; the in-process "
-                                "sidecar remains in charge\n");
-            }
-        }
         g_ane_fence_max_iters = (uint32_t)ds4_gpu_env_u64(
                 "DS4_ANE_FENCE_MAX_ITERS", 2000000000ull, 1000ull, 4000000000ull);
         const char *sched = getenv("DS4_ANE_SCHED_TRACE");

@@ -128,6 +128,14 @@ void ds4_ane_cancel_layer(uint32_t il);
  * a cancel before the wake cannot race the consumer. */
 void ds4_ane_commit_layer(void);
 
+/* ANEPROC only: assert the helper served exactly what the parent enqueued, with
+ * no failures, no fault and no fence timeout. The parent's own counters are not
+ * incremented under ANEPROC -- the prediction happens in another process -- so
+ * without this every per-chunk assertion silently disappears. Prints one line;
+ * marks the run invalid rather than throwing, because the numbers are already
+ * spent by the time it can be called. */
+void ds4_ane_aneproc_validate(const char *where);
+
 /* TEST HOOK only (DS4_ANE_TEST_HOOK=1). Sequence numbers the sidecar actually
  * served, in order. Returns the total count, which may exceed `max`. */
 uint32_t ds4_ane_test_served(uint32_t *out, uint32_t max);

@@ -80,7 +80,12 @@ static pid_t spawn_helper(const char *path, IOSurfaceRef in, IOSurfaceRef out,
 
 int main(int argc, const char **argv) { @autoreleasepool {
     const char *helper = argc > 1 ? argv[1] : "./ds4-ane-helper";
-    const uint32_t dim = 256, n_tok = 8, n_layers = 8, n_iter = 400;
+    /* Past TWO full ring wraps. 400 was under the 512-slot ring, so slot reuse --
+     * the one thing the ring index can get wrong at scale -- was never
+     * exercised. n_layers is deliberately not a divisor of the ring size, so a
+     * wrapped slot holding a stale layer shows up as a mismatch. */
+    const uint32_t dim = 256, n_tok = 8, n_layers = 7;
+    const uint32_t n_iter = DS4_ANEPROC_RING * 2 + 37;
     const size_t bytes = (size_t)dim * n_tok * sizeof(uint16_t);
 
     void *in_base = NULL, *out_base = NULL, *ctl_base = NULL;
@@ -103,7 +108,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     atomic_store(&w[DS4_ANEPROC_W_DIM], dim);
     atomic_store(&w[DS4_ANEPROC_W_NTOK], n_tok);
     atomic_store(&w[DS4_ANEPROC_W_NLAYERS], n_layers);
-    atomic_store(&w[DS4_ANEPROC_W_NULLMODE], 1u);
+    atomic_store(&w[DS4_ANEPROC_W_NULLMODE], DS4_ANEPROC_NULL_ECHO);
     pid_t bad = spawn_helper(helper, si, so, sc);
     if (!bad) return 2;
     int st = 0;
@@ -125,7 +130,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     atomic_store(&w[DS4_ANEPROC_W_DIM], dim);
     atomic_store(&w[DS4_ANEPROC_W_NTOK], n_tok);
     atomic_store(&w[DS4_ANEPROC_W_NLAYERS], n_layers);
-    atomic_store(&w[DS4_ANEPROC_W_NULLMODE], 1u);
+    atomic_store(&w[DS4_ANEPROC_W_NULLMODE], DS4_ANEPROC_NULL_ECHO);
     atomic_store_explicit(&w[DS4_ANEPROC_W_MAGIC], DS4_ANEPROC_MAGIC,
                           memory_order_release);
 
