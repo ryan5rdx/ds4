@@ -52556,6 +52556,121 @@ static int ds4_gpu_ane_bridge_dispatch(id<MTLComputePipelineState> pipe,
     return ds4_gpu_finish_command_buffer(cb, owned, label);
 }
 
+/* ================= exact GPU top-1 (TOP1-GPU / U64TOP1) ==================
+ *
+ * See metal/top1.metal. `impl` selects the publication mechanism only: both
+ * share one comparator and one local reducer, so an A/B isolates the mechanism
+ * rather than comparing two algorithms.
+ *
+ * Fail-open by construction. The atomic pipeline is nil on any device that
+ * rejects it -- which on Apple7 is discovered at pipeline creation, NOT from
+ * the build-time macro -- and this returns 0 so the caller uses the ordinary
+ * path. Nothing here may fail startup.
+ */
+typedef struct {
+    uint32_t n_cols, row_stride, global_base, n_rows, n_groups, n_shards;
+} ds4_top1_args;
+
+static id<MTLComputePipelineState> g_top1_scan, g_top1_merge, g_top1_reset;
+static id<MTLComputePipelineState> g_top1_atomic, g_top1_shard_merge;
+static int g_top1_probed;
+
+static void ds4_gpu_top1_probe(void) {
+    if (g_top1_probed) return;
+    g_top1_probed = 1;
+    g_top1_scan        = ds4_gpu_get_pipeline("kernel_ds4_top1_scan");
+    g_top1_merge       = ds4_gpu_get_pipeline("kernel_ds4_top1_merge");
+    g_top1_reset       = ds4_gpu_get_pipeline("kernel_ds4_top1_reset");
+    g_top1_shard_merge = ds4_gpu_get_pipeline("kernel_ds4_top1_shard_merge");
+    /* Layer 2 of the capability probe, and the only layer that discriminates.
+     * Expected to be nil on Apple7 and to log its own pipeline error there. */
+    g_top1_atomic      = ds4_gpu_get_pipeline("kernel_ds4_top1_atomic");
+    fprintf(stderr,
+            "ds4: TOP1 pipelines scan=%d merge=%d reset=%d shard_merge=%d "
+            "u64_atomic=%d\n",
+            g_top1_scan != nil, g_top1_merge != nil, g_top1_reset != nil,
+            g_top1_shard_merge != nil, g_top1_atomic != nil);
+}
+
+int ds4_gpu_top1_u64_available(void) {
+    ds4_gpu_top1_probe();
+    return g_top1_atomic != nil;
+}
+
+static int ds4_gpu_top1_dispatch(id<MTLComputePipelineState> pipe,
+                                 id<MTLBuffer> b1, uint64_t o1,
+                                 id<MTLBuffer> b2, uint64_t o2,
+                                 ds4_top1_args args,
+                                 NSUInteger gx, NSUInteger gy,
+                                 NSUInteger nt, const char *label) {
+    int owned = 0;
+    id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+    if (!cb) return 0;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    DS4_SET_PIPE(enc, pipe);
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:b1 offset:o1 atIndex:1];
+    if (b2) [enc setBuffer:b2 offset:o2 atIndex:2];
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(gx, gy, 1)
+                  threadsPerThreadgroup:MTLSizeMake(nt, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return ds4_gpu_finish_command_buffer(cb, owned, label);
+}
+
+/* impl: 0 = conventional two-pass, 1 = UInt64 atomic (falls back to two-pass
+ * when unavailable, which is the fail-open contract). */
+int ds4_gpu_top1(ds4_gpu_tensor *out_keys,
+                 const ds4_gpu_tensor *logits,
+                 ds4_gpu_tensor *scratch,
+                 uint32_t n_cols, uint32_t row_stride, uint32_t global_base,
+                 uint32_t n_rows, uint32_t n_groups, uint32_t n_shards,
+                 int impl) {
+    ds4_gpu_top1_probe();
+    if (!out_keys || !logits || !scratch || n_cols == 0u || n_rows == 0u) return 0;
+    if (n_groups == 0u) n_groups = 64u;
+    if (n_shards == 0u) n_shards = 1u;
+    const NSUInteger NT = 256u;
+    const int use_atomic = (impl == 1) && (g_top1_atomic != nil) &&
+                           (g_top1_shard_merge != nil) && (g_top1_reset != nil);
+    if (!g_top1_scan || !g_top1_merge) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> lb = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)logits);
+        id<MTLBuffer> ob = ds4_gpu_tensor_buffer(out_keys);
+        id<MTLBuffer> sb = ds4_gpu_tensor_buffer(scratch);
+        if (!lb || !ob || !sb) return 0;
+        const uint64_t lo = ds4_gpu_tensor_offset((ds4_gpu_tensor *)logits);
+        const uint64_t oo = ds4_gpu_tensor_offset(out_keys);
+        const uint64_t so = ds4_gpu_tensor_offset(scratch);
+        ds4_top1_args a = { n_cols, row_stride, global_base, n_rows,
+                            n_groups, use_atomic ? n_shards : 1u };
+        /* Scratch holds partials (two-pass) or winner shards (atomic); both are
+         * n_rows * n per-row ulongs. */
+        const uint64_t need = (uint64_t)n_rows *
+                              (use_atomic ? n_shards : n_groups) * sizeof(uint64_t);
+        if (ds4_gpu_tensor_bytes(scratch) < need) return 0;
+        if (ds4_gpu_tensor_bytes(out_keys) < (uint64_t)n_rows * sizeof(uint64_t))
+            return 0;
+
+        if (use_atomic) {
+            /* Reset is inside the timed region deliberately: the gate requires
+             * the atomic path to win INCLUDING reset and merge. */
+            if (!ds4_gpu_top1_dispatch(g_top1_reset, sb, so, nil, 0, a,
+                                       (n_rows * n_shards + NT - 1u) / NT, 1,
+                                       NT, "TOP1 reset")) return 0;
+            if (!ds4_gpu_top1_dispatch(g_top1_atomic, lb, lo, sb, so, a,
+                                       n_groups, n_rows, NT, "TOP1 atomic"))
+                return 0;
+            return ds4_gpu_top1_dispatch(g_top1_shard_merge, sb, so, ob, oo, a,
+                                         1, n_rows, NT, "TOP1 shard merge");
+        }
+        if (!ds4_gpu_top1_dispatch(g_top1_scan, lb, lo, sb, so, a,
+                                   n_groups, n_rows, NT, "TOP1 scan")) return 0;
+        return ds4_gpu_top1_dispatch(g_top1_merge, sb, so, ob, oo, a,
+                                     1, n_rows, NT, "TOP1 merge");
+    }
+}
+
 int ds4_gpu_ane_pack(const ds4_gpu_tensor *src, uint32_t dim, uint32_t n_tok) {
     if (!g_ane_in_buf || !src || dim != g_ane_dim || n_tok != g_ane_ntok) return 0;
     @autoreleasepool {

@@ -93,6 +93,19 @@ int ds4_gpu_matmul_q8_0_cols_tensor(ds4_gpu_tensor *out, const void *model_map,
                                     uint64_t in_dim, uint64_t out_rows,
                                     uint64_t dst_stride, uint64_t dst_col0,
                                     const ds4_gpu_tensor *x, uint64_t n_tok);
+/* Exact GPU top-1 as a packed (score desc, index asc) key per row, matching
+ * sample_argmax bit for bit. `impl` selects only the publication mechanism:
+ * 0 = conventional two-pass, 1 = Apple8 UInt64 atomic. Returns 0 and changes
+ * nothing when unavailable -- never a startup failure. `global_base` is added
+ * to the column index BEFORE packing, so a TP rank's key already carries the
+ * global token id and no offset may be applied afterwards. */
+int ds4_gpu_top1(ds4_gpu_tensor *out_keys, const ds4_gpu_tensor *logits,
+                 ds4_gpu_tensor *scratch,
+                 uint32_t n_cols, uint32_t row_stride, uint32_t global_base,
+                 uint32_t n_rows, uint32_t n_groups, uint32_t n_shards,
+                 int impl);
+/* Nonzero only when the native atomic pipeline actually created. */
+int ds4_gpu_top1_u64_available(void);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 
 /* GPU-side fill of a sub-range, in elements. Unlike ds4_gpu_tensor_fill_f32
