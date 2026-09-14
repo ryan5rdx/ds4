@@ -65,8 +65,87 @@ static uint64_t rank_key(const float *v, uint32_t base, uint32_t n) {
     return ds4_top1_pack_key(best_v, best);
 }
 
+/* ---- the shipping exchange: UNFLOORED local top-2, floor applied at the
+ * consumer. What ds4_session_glm_top2_keys() and the rank-0 merge do. ---- */
+static void rank_top2(const float *v, uint32_t base, uint32_t n, uint64_t o[2]) {
+    o[0] = 0; o[1] = 0;
+    for (uint32_t i = base; i < base + n; i++) {
+        const uint64_t k = ds4_top1_pack_key(v[i], i);
+        if (k > o[0])      { o[1] = o[0]; o[0] = k; }
+        else if (k > o[1]) { o[1] = k; }
+    }
+}
+static void merge_top2(const float *v, uint64_t g[2]) {
+    uint64_t a[2], b[2];
+    rank_top2(v, 0, VHALF, a);
+    rank_top2(v, VHALF, VHALF, b);
+    const uint64_t all[4] = {a[0], a[1], b[0], b[1]};
+    g[0] = 0; g[1] = 0;
+    for (int i = 0; i < 4; i++) {
+        if (all[i] > g[0])      { g[1] = g[0]; g[0] = all[i]; }
+        else if (all[i] > g[1]) { g[1] = all[i]; }
+    }
+}
+/* ds4_session_argmax on the compact path: the key is unfloored, sample_argmax
+ * is not, so the floor is applied here. */
+static uint32_t compact_argmax(const float *v) {
+    uint64_t g[2]; merge_top2(v, g);
+    const uint64_t fl = ds4_top1_seed_key(0);
+    return (g[0] >> 32) <= (fl >> 32) ? 0u : ds4_top1_key_index(g[0]);
+}
+/* ds4_session_argmax_excluding on the compact path. */
+static int compact_excluding(const float *v, int ex) {
+    uint64_t g[2]; merge_top2(v, g);
+    const int first = (ex == 0) ? 1 : 0;
+    if (isnan(v[first])) return first;      /* the reference's seed quirk */
+    const int t1 = (int)ds4_top1_key_index(g[0]);
+    const int t2 = (int)ds4_top1_key_index(g[1]);
+    return t1 != ex ? t1 : t2;
+}
+/* argmax_f32_excluding_unrolled8, transcribed. Note best_v seeds from a REAL
+ * element -- there is no floor, and a NaN there poisons the whole scan. */
+static int ref_excluding(const float *v, uint32_t n, int ex) {
+    const uint32_t first = (ex == 0) ? 1u : 0u;
+    if (first >= n) return -1;
+    int best = (int)first;
+    float best_v = v[first];
+    for (uint32_t i = first + 1u; i < n; i++) {
+        if ((int)i == ex) continue;
+        if (v[i] > best_v) { best_v = v[i]; best = (int)i; }
+    }
+    return best;
+}
+
+/* The shipping path must agree with BOTH references, not just the argmax one.
+ * Exclusions are swept over every structurally interesting index plus a sample
+ * of the rest -- the boundary ids are where a base-offset or runner-up bug
+ * lands. */
+static void check_excluding(const char *name, const float *v) {
+    const uint32_t ex_spots[] = {0, 1, 2, VHALF - 1, VHALF, VHALF + 1,
+                                 VOCAB - 2, VOCAB - 1};
+    for (size_t i = 0; i < sizeof(ex_spots) / sizeof(ex_spots[0]); i++) {
+        const int ex = (int)ex_spots[i];
+        const int got = compact_excluding(v, ex);
+        const int want = ref_excluding(v, VOCAB, ex);
+        if (got != want) {
+            fails++;
+            printf("FAIL %-28s excluding %u: compact %d != reference %d\n",
+                   name, (unsigned)ex, got, want);
+            return;
+        }
+    }
+}
+
 static void check(const char *name, const float *v) {
     const uint32_t want = ref_argmax(v, VOCAB);
+    /* The shipping unfloored-top-2 path, against the same reference. */
+    const uint32_t got_c = compact_argmax(v);
+    if (got_c != want) {
+        fails++;
+        printf("FAIL %-28s top-2 argmax %u != reference %u\n",
+               name, got_c, want);
+    }
+    check_excluding(name, v);
     const uint64_t k0 = rank_key(v, 0, VHALF);
     const uint64_t k1 = rank_key(v, VHALF, VHALF);
     const uint64_t merged = k0 > k1 ? k0 : k1;   /* rank 0's unsigned max */

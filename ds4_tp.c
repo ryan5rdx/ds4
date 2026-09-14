@@ -62,8 +62,15 @@
  * bump rather than a capability flag, for the reason 12 exists: the frame
  * numbering is what a mixed pair gets wrong, and a peer that does not know 24
  * would read it as an unknown frame mid-decode rather than refusing at
- * bring-up. */
-#define DS4_TP_PROTOCOL_VERSION 13u
+ * bring-up.
+ *
+ * 14 makes that frame carry TWO keys instead of one. The frame number is
+ * unchanged and the length is checked exactly, so a 13/14 pair would fail
+ * loudly on the size rather than silently -- but it would fail every token
+ * mid-decode instead of once at bring-up, which is the whole argument for
+ * versioning this. Two keys because a single exclusion (argmax_excluding, what
+ * ds4-bench decodes with) needs the runner-up. */
+#define DS4_TP_PROTOCOL_VERSION 14u
 
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in

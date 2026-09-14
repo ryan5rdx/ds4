@@ -898,6 +898,37 @@ int main(int argc, char **argv) {
             cuda_profile_start = -1;
             cuda_profile_tokens = 0;
         }
+        /* Arm the compact top-1 TP exchange for this generation run.
+         *
+         * This call is why the first A/B was a NULL: ds4_session_set_raw_argmax_ctx()
+         * had exactly one caller, in ds4_server.c, and ds4-bench is a separate
+         * binary that never made it -- so compact_top1_request stayed false and
+         * the path could not arm no matter what the request looked like. The
+         * previous review found the eligibility predicate unreachable by the
+         * production request; this is the same failure one level out, the
+         * measurement harness never setting the predicate at all.
+         *
+         * The bench decodes greedily with no filtering, and its token choice is
+         * ds4_session_argmax_excluding(eos) -- which the exchange serves from
+         * the runner-up key. Two things must disarm it:
+         *   - --dump-frontier-logits, which calls ds4_session_copy_logits() and
+         *     is refused on a carrier (correctly: there are no real values);
+         *   - the DSpark / speculative paths, which need real logit values.
+         * DS4_TP_COMPACT_TOP1=0 is the A/B control and is honoured by the
+         * session layer, so it is deliberately not re-checked here. */
+        {
+            ds4_raw_argmax_ctx rax = {
+                .temperature = 0.0f,
+                .top_k       = 0,
+                .top_p       = 0.0f,
+                .min_p       = 0.0f,
+                .wants_logprobs = cfg.dump_frontier_logits_dir != NULL,
+                .speculative = cfg.dspark ||
+                               ds4_engine_mtp_draft_tokens(engine) > 1,
+            };
+            ds4_session_set_raw_argmax_ctx(session, &rax);
+        }
+
         bool generation_stop = false;
         while (gen_done < cfg.gen_tokens && !generation_stop) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {

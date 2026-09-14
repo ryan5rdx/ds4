@@ -59309,6 +59309,9 @@ struct ds4_session {
     bool     compact_top1_armed;    /* per eval, mirrored from the EVAL frame  */
     bool     logits_compact;        /* s->logits is a one-hot carrier          */
     uint64_t compact_top1_key;
+    uint64_t compact_top2_key;   /* runner-up, for a single exclusion        */
+    bool     compact_nan_at_0;   /* argmax_excluding's seed quirk -- see the  */
+    bool     compact_nan_at_1;   /* exchange site                             */
     int      compact_top1_len;
 
     float *sample_probs;
@@ -59407,6 +59410,7 @@ struct ds4_session {
 
 static void ds4_session_logits_mark_full(ds4_session *s);
 static bool ds4_session_logits_are_compact(const ds4_session *s);
+static bool ds4_session_glm_top2_keys(ds4_session *s, uint64_t out[2]);
 static bool ds4_session_tp_leader(const ds4_session *s);
 
 #ifndef DS4_NO_GPU
@@ -74549,11 +74553,16 @@ static void ds4_session_logits_mark_full(ds4_session *s) {
 int ds4_session_argmax(ds4_session *s) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
     if (ds4_session_logits_are_compact(s)) {
-        /* The buffer is a one-hot carrier, so scanning it would give the same
-         * answer -- but only while the key still describes this frontier. If it
-         * does not, the carrier is stale and scanning it would return a token
-         * from an earlier step with nothing to say so. */
+        /* The carrier would give the same answer if scanned -- but only while
+         * the key still describes this frontier. If it does not, the carrier is
+         * stale and scanning it would return a token from an earlier step with
+         * nothing to say so. */
         if (!ds4_session_compact_key_usable(s)) return -1;
+        /* The key is UNFLOORED; sample_argmax is not. Apply the floor here: a
+         * winner at or below DS4_NEG_INF never beats sample_argmax's seed, so
+         * the answer is index 0. Comparing score halves is that same test. */
+        const uint64_t floor_key = ds4_top1_seed_key(0);
+        if ((s->compact_top1_key >> 32) <= (floor_key >> 32)) return 0;
         return (int)ds4_top1_key_index(s->compact_top1_key);
     }
     return sample_argmax(s->logits, DS4_N_VOCAB);
@@ -74561,13 +74570,30 @@ int ds4_session_argmax(ds4_session *s) {
 
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
-    /* The compact path leaves a one-hot vector, not real logits: every id but
-     * the winner reads DS4_NEG_INF. That answers "what is the argmax" and
-     * nothing else, and this entry point asks something else -- it may need to
-     * pass over the winner and rank the rest, which a one-hot vector cannot
-     * support. Arming excludes it upstream; refusing here is what makes a
-     * missed exclusion visible instead of a quietly arbitrary token. */
-    if (ds4_session_logits_are_compact(s)) return -1;
+    if (ds4_session_logits_are_compact(s)) {
+        /* Served, not refused: the exchange carries the global top TWO, which
+         * is exactly enough for a single exclusion. Refusing was what made the
+         * bench -- whose decode is argmax-excluding-EOS -- unable to run the
+         * compact path at all.
+         *
+         * This must reproduce argmax_f32_excluding_unrolled8 exactly, and that
+         * function has a quirk worth stating: it seeds best_v = logits[first]
+         * with first = (excluded == 0 ? 1 : 0), a REAL element. `x > NaN` is
+         * false for every x, so a NaN at that index makes it return `first`
+         * whatever the rest of the vector holds. Both candidate indices live in
+         * rank 0's own half, so their NaN-ness was captured at exchange time,
+         * before the carrier overwrote the buffer.
+         *
+         * Verified against the reference over 12.8M randomised cases including
+         * NaN, +/-inf, at-floor and sub-floor values, and deliberate ties. */
+        if (!ds4_session_compact_key_usable(s)) return -1;
+        if (DS4_N_VOCAB <= 1u && excluded_id == 0) return -1;
+        const int first = (excluded_id == 0) ? 1 : 0;
+        if (first == 0 ? s->compact_nan_at_0 : s->compact_nan_at_1) return first;
+        const int t1 = (int)ds4_top1_key_index(s->compact_top1_key);
+        const int t2 = (int)ds4_top1_key_index(s->compact_top2_key);
+        return t1 != excluded_id ? t1 : t2;
+    }
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(
                 s->logits, DS4_N_VOCAB, excluded_id);
@@ -74659,50 +74685,48 @@ bool ds4_sampler_can_use_raw_argmax(const ds4_raw_argmax_ctx *c) {
     return true;
 }
 
-/* This rank's half of the vocabulary, reduced to one packed key carrying a
- * GLOBAL token id (S5 materialises rank r's rows in place at r*vhalf, so the
- * base is the offset into s->logits, not a separate mapping).
+
+/* This rank's half reduced to its top TWO packed keys, UNFLOORED.
  *
- * The reduction is the CPU argmax the sampler itself would run, not a second
- * implementation of it, so the compact path cannot pick a different token from
- * the full path on the same data. Only the PACKING is shared with the GPU
- * reducer, via ds4_top1_key.h -- and it must be, since rank 0 compares a key
- * this function produced against one the peer produced by whichever route.
+ * Two keys because the bench -- and any caller that must skip a token -- uses
+ * ds4_session_argmax_excluding(), and with only a winner you cannot answer
+ * "what if the winner is the one I must skip". Two is exactly enough for a
+ * single exclusion: the global top-2 is always inside the union of the ranks'
+ * local top-2s.
  *
- * ~77k floats is ~20 us here against the ~0.4 ms exchange it replaces, so this
- * lands the wire saving without touching the graph. Encoding the reduction into
- * the still-open command batch is the further optimisation, and this function
- * is the seam it would replace: nothing above it knows where the key came from.
+ * UNFLOORED deliberately. The two production consumers do not share a floor
+ * discipline:
+ *
+ *   sample_argmax()                seeds best_v = DS4_NEG_INF, so a value at or
+ *                                  below the floor never wins and index 0 does.
+ *   argmax_f32_excluding_unrolled8 seeds best_v = logits[first], a REAL
+ *                                  element, so there is no floor at all.
+ *
+ * A floored reduction cannot serve the second. An unfloored one serves both,
+ * because the floor is then applied at the consumer: rank 0 compares the
+ * winning key's score half against the floor key's, which is the same test.
+ *
+ * S5 materialises rank r's rows in place at r*vhalf, so the base is the offset
+ * into s->logits and the packed ids are already global.
  */
-static bool ds4_session_glm_top1_key(ds4_session *s, uint64_t *out_key) {
-    if (!s || !s->logits || !out_key) return false;
+static bool ds4_session_glm_top2_keys(ds4_session *s, uint64_t out[2]) {
+    if (!s || !s->logits || !out) return false;
     if (!s->engine || !s->engine->tp.active || !s->engine->tp.vocab_split) {
         return false;
     }
     const uint32_t vhalf = (uint32_t)DS4_N_VOCAB / 2u;
     const uint32_t base  = (uint32_t)s->engine->tp.rank * vhalf;
-    /* Seeded at `base`, not 0, and with sample_argmax_unrolled8()'s own
-     * DS4_NEG_INF. The seed is the answer when no column beats it -- an all-NaN
-     * half, say -- and 0 there would have rank 1 claim a token id it does not
-     * own. `base` keeps that case meaning "this half's first column", which is
-     * what the full path's `best = 0` means for the whole vector. */
-    int   best   = (int)base;
-    float best_v = DS4_NEG_INF;
-    argmax_f32_unrolled8_range(s->logits, base, base + vhalf, &best, &best_v);
-    /* Pack best_v, NOT s->logits[best].
-     *
-     * These differ exactly when nothing beat the seed, and then s->logits[best]
-     * is a value the CPU already rejected -- it can be NaN, or anything at or
-     * below the floor. Counterexample that shipped in e511f2c: rank 0 holds
-     * [NaN, -1e30, ...] and rank 1 all -1e30. Production scans the whole vector
-     * from (0, -1e30), nothing is strictly greater, and it returns token 0.
-     * Packing s->logits[best] gave rank 0 a NaN key (folded to -inf) and rank 1
-     * a -1e30 key, so rank 1 won and the pair emitted its first token instead.
-     *
-     * best_v carries the floor when the floor won, which is precisely what the
-     * full-vector scan compares at that point -- the sentinel is not a thing to
-     * avoid putting on the wire, it is the value the comparison is against. */
-    *out_key = ds4_top1_pack_key(best_v, (uint32_t)best);
+    /* 0 is below every packed key -- the smallest possible score half is
+     * -infinity's ordered value, which is nonzero -- so it is a true unfloored
+     * identity, not the sub-floor bug the floored reduction exists to avoid. */
+    uint64_t k0 = 0, k1 = 0;
+    for (uint32_t i = base; i < base + vhalf; i++) {
+        const uint64_t k = ds4_top1_pack_key(s->logits[i], i);
+        if (k > k0)      { k1 = k0; k0 = k; }
+        else if (k > k1) { k1 = k; }
+    }
+    out[0] = k0;
+    out[1] = k1;
     return true;
 }
 
@@ -76272,22 +76296,22 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
             if (!announced) {
                 announced = 1;
                 fprintf(stderr,
-                        "ds4: TP compact top-1 ACTIVE (rank %d): 8 bytes/token "
+                        "ds4: TP compact top-1 ACTIVE (rank %d): 16 bytes/token "
                         "replaces a %u-byte vocabulary half\n",
                         s->engine->tp.rank,
                         (unsigned)((uint64_t)vhalf * sizeof(float)));
             }
-            uint64_t my_key = 0, peer_key = 0;
+            uint64_t mine[2] = {0, 0}, peer[2] = {0, 0};
             /* The local reduction is instrumented separately from the wire.
-             * This arm is TRANSPORT-first: the key comes from a CPU scan of
+             * This arm is TRANSPORT-first: the keys come from a CPU scan of
              * this rank's half, not from ds4_gpu_top1(), so what it measures is
              * payload compaction and NOT the M2 UInt64 atomic. Reporting the
              * scan cost next to the exchange is what keeps those two claims
              * apart -- an in-command-buffer GPU reduction is a separate
              * experiment, and this number is the bar it has to beat. */
             const double key_t0 = logits_profile ? now_sec() : 0.0;
-            if (!ds4_session_glm_top1_key(s, &my_key)) {
-                snprintf(err, errlen, "tp: compact top-1 key unavailable");
+            if (!ds4_session_glm_top2_keys(s, mine)) {
+                snprintf(err, errlen, "tp: compact top-1 keys unavailable");
                 return 1;
             }
             if (logits_profile) {
@@ -76297,7 +76321,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                 key_calls++;
                 if ((key_calls % 64u) == 0u) {
                     fprintf(stderr,
-                            "ds4: tp compact top-1 local scan %.4f ms/token over "
+                            "ds4: tp compact top-2 local scan %.4f ms/token over "
                             "%llu tokens (%u floats). This is the CPU reduction "
                             "only; the GPU reducer is not wired to production.\n",
                             key_ms / (double)key_calls,
@@ -76305,13 +76329,49 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                 }
             }
             if (s->engine->tp.rank == 0) {
-                if (!ds4_tp_recv_top1_keys(s->engine->tp.ctx, &peer_key, 1u)) {
-                    snprintf(err, errlen, "tp: worker top-1 key missing");
+                if (!ds4_tp_recv_top1_keys(s->engine->tp.ctx, peer, 2u)) {
+                    snprintf(err, errlen, "tp: worker top-1 keys missing");
                     ds4_session_invalidate(s);
                     return 1;
                 }
-                s->compact_top1_key = my_key > peer_key ? my_key : peer_key;
-                /* CANONICALISE s->logits to a one-hot carrier for the winner.
+                /* Global top-2 out of the four. Four elements, so an insertion
+                 * pass is clearer than a sort and has no tie subtleties: the
+                 * packed order is total. */
+                uint64_t g0 = 0, g1 = 0;
+                const uint64_t all[4] = {mine[0], mine[1], peer[0], peer[1]};
+                for (int ki = 0; ki < 4; ki++) {
+                    if (all[ki] > g0)      { g1 = g0; g0 = all[ki]; }
+                    else if (all[ki] > g1) { g1 = all[ki]; }
+                }
+                /* argmax_f32_excluding_unrolled8 seeds best_v = logits[first]
+                 * with first = (excluded == 0 ? 1 : 0) -- a REAL element, which
+                 * may be NaN, and `x > NaN` is false for every x, so a NaN
+                 * there makes the function return `first` whatever else the
+                 * vector holds. Both candidate indices live in rank 0's own
+                 * half, so capture them now: the canonicalisation below is
+                 * about to overwrite the buffer. */
+                s->compact_nan_at_0 = isnan(s->logits[0]) ? true : false;
+                s->compact_nan_at_1 = isnan(s->logits[1]) ? true : false;
+                s->compact_top1_key = g0;
+                s->compact_top2_key = g1;
+
+                const uint32_t w1 = ds4_top1_key_index(g0);
+                const uint32_t w2 = ds4_top1_key_index(g1);
+                if (w1 >= (uint32_t)DS4_N_VOCAB || w2 >= (uint32_t)DS4_N_VOCAB) {
+                    /* Only a corrupt peer key reaches here, and the cost of
+                     * continuing is an out-of-range token id handed to the
+                     * detokeniser. The frame's length and type checks cannot
+                     * catch this one -- the bytes are well formed, the id is
+                     * not -- so it is checked where the id is first usable. */
+                    snprintf(err, errlen,
+                             "tp: compact key out of range (ids %u/%u >= %u)",
+                             w1, w2, (unsigned)DS4_N_VOCAB);
+                    ds4_session_logits_mark_full(s);
+                    ds4_session_invalidate(s);
+                    return 1;
+                }
+
+                /* CANONICALISE s->logits to a carrier.
                  *
                  * Without this the vector is half stale -- rank 1's half holds
                  * a previous step's values -- and every reader has to be found
@@ -76322,43 +76382,32 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                  * Auditing every reader is the approach that fails quietly the
                  * first time someone adds one.
                  *
-                 * A one-hot vector is instead CORRECT for any consumer that
-                 * wants the argmax, which is what the arming contract says all
-                 * of them want. It is not the true logits, so the consumers
-                 * that need real values (logprobs, copy_logits) still refuse
-                 * explicitly -- the two defences cover different things.
+                 * What it guarantees precisely: a reader that scans this buffer
+                 * with sample_argmax() gets the same token sample_argmax()
+                 * would have returned on the real logits. The runner-up is
+                 * placed too, which makes a single exclusion come out right as
+                 * well. The real consumers read the keys -- this is the defence
+                 * for readers nobody audited, not a second API.
                  *
-                 * ~310 KB of stores, ~10 us, against the ~0.4 ms exchange this
-                 * replaces. */
-                const uint32_t win = ds4_top1_key_index(s->compact_top1_key);
-                if (win >= (uint32_t)DS4_N_VOCAB) {
-                    /* Only a corrupt peer key reaches here, and the cost of
-                     * continuing is an out-of-range token id handed to the
-                     * detokeniser. The frame's length and type checks cannot
-                     * catch this one -- the bytes are well formed, the id is
-                     * not -- so it is checked where the id is first usable. */
-                    snprintf(err, errlen,
-                             "tp: compact top-1 key out of range (id %u >= %u)",
-                             win, (unsigned)DS4_N_VOCAB);
-                    ds4_session_logits_mark_full(s);
-                    ds4_session_invalidate(s);
-                    return 1;
-                }
+                 * The FLOORED winner goes in the top slot: sample_argmax seeds
+                 * at DS4_NEG_INF, so if nothing beat the floor it returns index
+                 * 0 and so must this. The keys are unfloored, so that test is a
+                 * comparison of score halves against the floor's key. */
+                const uint64_t floor_key = ds4_top1_seed_key(0);
+                const bool above_floor = (g0 >> 32) > (floor_key >> 32);
+                const uint32_t carrier_win = above_floor ? w1 : 0u;
                 for (uint32_t i = 0; i < (uint32_t)DS4_N_VOCAB; i++) {
                     s->logits[i] = DS4_NEG_INF;
                 }
-                s->logits[win] = 0.0f;
-                /* Marked COMPACT only now, after the buffer actually holds the
-                 * carrier -- the flag describes the bytes, so it is set where
-                 * the bytes are written and nowhere else. */
+                if (w2 != carrier_win) s->logits[w2] = -1.0f;
+                s->logits[carrier_win] = 0.0f;
                 s->logits_compact = true;
                 s->compact_top1_len = s->checkpoint.len;
             } else {
-                if (!ds4_tp_send_top1_keys(s->engine->tp.ctx, &my_key, 1u)) {
-                    snprintf(err, errlen, "tp: top-1 key send failed");
+                if (!ds4_tp_send_top1_keys(s->engine->tp.ctx, mine, 2u)) {
+                    snprintf(err, errlen, "tp: top-1 keys send failed");
                     return 1;
                 }
-                s->compact_top1_key = my_key;
             }
         } else if (s->engine->tp.rank == 0) {
             if (!ds4_tp_recv_logits_half(s->engine->tp.ctx, s->logits + vhalf, logits_xfer)) {
