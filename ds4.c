@@ -38773,7 +38773,7 @@ static bool metal_graph_prefill_pipeline_stage_major(
     return ok;
 }
 
-static bool metal_graph_prefill_layer_major(
+static bool metal_graph_prefill_layer_major_inner(
         ds4_gpu_graph *g,
         const ds4_model       *model,
         const ds4_weights     *weights,
@@ -39492,6 +39492,28 @@ static bool metal_graph_prefill_layer_major(
     if (metal_graph_gpu_stage_timestamps()) ds4_gpu_stage_report("prefill", start, n_tokens);
     return ok;
 }
+/* Every prefill path converges here, which is why the ANEPROC validation
+ * lives at this boundary rather than in metal_graph_prefill_chunked_range().
+ * It was in the chunked path only, and the four direct callers of
+ * layer_major bypassed it -- recreating the "no telemetry on the alternate
+ * path" failure this codebase has already documented once. */
+static bool metal_graph_prefill_layer_major(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const token_vec       *prompt,
+        uint32_t               start,
+        uint32_t               n_tokens,
+        float                 *logits,
+        bool                   show_progress,
+        ds4_imatrix_collector *imatrix,
+        ds4_session_progress_fn display_progress,
+        void                  *display_progress_ud) {
+    const bool ok = metal_graph_prefill_layer_major_inner(g, model, weights, prompt, start, n_tokens, logits, show_progress, imatrix, display_progress, display_progress_ud);
+    ds4_ane_aneproc_validate("prefill");
+    return ok;
+}
+
 
 static bool metal_graph_prefill_raw_swa(
         ds4_gpu_graph *g,

@@ -283,10 +283,31 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
              * carries a seq the helper has already passed and the GPU fences on
              * a DONE that will never come. */
             g_seq = 0;
+            /* Reset with g_seq, not separately: the validation compares the
+             * helper's SERVED against this, and a fresh helper starts both its
+             * counters at zero. Surviving a rebuild made every later chunk
+             * report a shortfall that had already been served. */
+            g_aneproc_enqueued = 0;
             if (!ds4_gpu_aneproc_start(dim, n_tokens, n_layers)) {
-                fprintf(stderr, "ds4: ANEPROC requested but unavailable -- the "
-                                "in-process sidecar remains in charge, so this "
-                                "is NOT an ANEPROC measurement\n");
+                /* FATAL by default. Falling back leaves a run that looks like
+                 * ANEPROC, reports ANEPROC timings and is actually the
+                 * in-process sidecar -- the null-vs-negative confusion this
+                 * campaign keeps paying for, and it has already cost two rig
+                 * runs on the U64 arm. Someone who genuinely wants the
+                 * fallback can say so. */
+                if (getenv("DS4_ANE_OPTIONAL") == NULL) {
+                    fprintf(stderr,
+                            "ds4: FATAL -- DS4_ANE_PROC=1 but the helper could "
+                            "not start. Refusing to run the in-process sidecar "
+                            "under an ANEPROC label. Set DS4_ANE_OPTIONAL=1 to "
+                            "allow the fallback.\n");
+                    ds4_ane_teardown();
+                    return 0;
+                }
+                fprintf(stderr, "ds4: ANEPROC requested but unavailable; "
+                                "DS4_ANE_OPTIONAL=1 so the in-process sidecar "
+                                "remains in charge -- this is NOT an ANEPROC "
+                                "measurement\n");
             }
         }
         /* The helper owns the models under ANEPROC. Loading them here as well
@@ -378,6 +399,41 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
                 ds4_ane_teardown();
                 ds4_ane_required_abort(why);
                 return 0;
+            }
+            /* WARM every model, exactly as the ANEPROC helper does.
+             *
+             * Without this the control arm pays first-call Core ML
+             * initialisation inside the first timed chunk while the helper --
+             * which warms before announcing ALIVE -- does not. That is a
+             * warm-helper vs cold-control comparison, and at 0.3675 s/model it
+             * is the same defect that voided ANEI8, just moved into the
+             * baseline instead of the experiment. */
+            {
+                const double tw = ds4_ane_now_ns();
+                uint32_t warmed = 0;
+                for (uint32_t il = 0; il < n_layers; il++) {
+                    @autoreleasepool {
+                        NSError *werr = nil;
+                        MLDictionaryFeatureProvider *inp =
+                            [[MLDictionaryFeatureProvider alloc]
+                                initWithDictionary:@{ @"x": [MLFeatureValue
+                                    featureValueWithMultiArray:g_in_array] }
+                                             error:&werr];
+                        MLPredictionOptions *wo = [[MLPredictionOptions alloc] init];
+                        NSString *on = g_models[il].modelDescription
+                                        .outputDescriptionsByName.allKeys.firstObject;
+                        if (on) wo.outputBackings = @{ on: g_out_array };
+                        if (inp && [g_models[il] predictionFromFeatures:inp
+                                                                options:wo
+                                                                  error:&werr]) {
+                            warmed++;
+                        }
+                    }
+                }
+                fprintf(stderr, "ds4: ANE warmed %u/%u models in %.2f s before "
+                                "any timed region (matches the ANEPROC helper, "
+                                "so the control is not cold)\n",
+                        warmed, n_layers, (ds4_ane_now_ns() - tw) / 1.0e9);
             }
             fprintf(stderr,
                     "ds4: ANE READY loaded=%u/%u variant=%s repeat=%u M=%u dir=%s\n",

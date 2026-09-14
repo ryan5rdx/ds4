@@ -48,7 +48,15 @@
  * kernels are untouched: the buffer they were handed is now simply backed by an
  * IOSurface instead of a private allocation. */
 #define DS4_ANEPROC_MAGIC    0x414E4550u   /* 'ANEP' */
-#define DS4_ANEPROC_VERSION  1u
+/* 2: added W_LAST_LAYER and W_FAILED, and split null mode into NOOP/ECHO.
+ *
+ * Bumped because a helper built at 6de2755 validates against version 1, would
+ * be ACCEPTED by this parent, and would then reintroduce exactly the defects
+ * that version fixed -- the transposed [1,n_tok,dim] shape, the 16 MiB/layer
+ * output copy, and DONE published on a failed prediction. A stale helper is the
+ * one failure the ABI field exists to catch, so it has to move whenever the
+ * block or the semantics do. */
+#define DS4_ANEPROC_VERSION  2u
 #define DS4_ANEPROC_RING     512u          /* power of two; seq % RING -> layer */
 
 /* Word indices inside the control surface. */
@@ -69,6 +77,7 @@ enum {
     DS4_ANEPROC_W_FAULT,       /* helper -> parent: nonzero = gave up, see stderr */
     DS4_ANEPROC_W_NULLMODE,    /* parent -> helper: skip Core ML (handoff-only) */
     DS4_ANEPROC_W_HELPER_IDX,  /* which helper this is; 0 today */
+    DS4_ANEPROC_W_PARENT_PID,  /* parent -> helper: exit if this pid disappears */
     DS4_ANEPROC_W_PREDICT_NS,  /* helper -> parent: last prediction, nanoseconds */
     /* helper -> parent: the layer index the helper resolved for the last seq.
      * Exists because null mode does not USE the layer, so without echoing it

@@ -124,6 +124,8 @@ int main(int argc, const char **argv) { @autoreleasepool {
     const uint32_t n_tok    = atomic_load_explicit(&w[DS4_ANEPROC_W_NTOK], memory_order_relaxed);
     const uint32_t n_layers = atomic_load_explicit(&w[DS4_ANEPROC_W_NLAYERS], memory_order_relaxed);
     const uint32_t null_mode = atomic_load_explicit(&w[DS4_ANEPROC_W_NULLMODE], memory_order_relaxed);
+    const pid_t parent_pid = (pid_t)atomic_load_explicit(&w[DS4_ANEPROC_W_PARENT_PID],
+                                                         memory_order_relaxed);
     if (!dim || !n_tok || !n_layers || n_layers > 256u) {
         fprintf(stderr, "ds4-ane-helper: implausible geometry dim=%u n_tok=%u "
                         "n_layers=%u\n", dim, n_tok, n_layers);
@@ -237,8 +239,17 @@ int main(int argc, const char **argv) { @autoreleasepool {
     const size_t bytes = (size_t)dim * n_tok * sizeof(uint16_t);
     MLPredictionOptions *popt = [[MLPredictionOptions alloc] init];
 
-    fprintf(stderr, "ds4-ane-helper: serving dim=%u n_tok=%u n_layers=%u%s\n",
-            dim, n_tok, n_layers, null_mode ? " (null)" : "");
+    if (parent_pid == 0) {
+        /* Not fatal, but said out loud: a parent that does not publish its pid
+         * gets no orphan detection, and an orphaned helper holds every model
+         * and polls forever. Silently skipping the check would be the worse
+         * half of both options. */
+        fprintf(stderr, "ds4-ane-helper: parent published no pid -- ORPHAN "
+                        "DETECTION DISABLED for this run\n");
+    }
+    fprintf(stderr, "ds4-ane-helper: serving dim=%u n_tok=%u n_layers=%u%s "
+                    "(parent %d)\n",
+            dim, n_tok, n_layers, null_mode ? " (null)" : "", (int)parent_pid);
     atomic_store_explicit(&w[DS4_ANEPROC_W_ALIVE], 1u, memory_order_release);
 
     uint32_t served_seq = 0, served = 0;
@@ -254,6 +265,17 @@ int main(int argc, const char **argv) { @autoreleasepool {
                                                         memory_order_acquire);
             if ((int32_t)(ready - served_seq) > 0) break;
             if (++spins < 2000u) continue;
+            /* ORPHAN CHECK, on the backoff path only -- never in the spin, so
+             * it costs nothing while serving. Neither GPU cleanup nor the
+             * harness's `pkill ds4-bench` stops this process, so without it a
+             * killed parent leaves a helper holding every model and polling
+             * forever, and the next arm measures against it. */
+            if (parent_pid != 0 && getppid() != parent_pid) {
+                fprintf(stderr, "ds4-ane-helper: parent %d is gone (now %d); "
+                        "exiting rather than orphaning\n",
+                        (int)parent_pid, (int)getppid());
+                goto drained;
+            }
             struct timespec ts = { 0, 20000 };   /* 20 us */
             nanosleep(&ts, NULL);
         }
@@ -332,9 +354,15 @@ int main(int argc, const char **argv) { @autoreleasepool {
             }
             served_seq = seq;
             served++;
-            /* RELEASE: the output bytes must be visible before DONE is. */
-            atomic_store_explicit(&w[DS4_ANEPROC_W_DONE], seq, memory_order_release);
+            /* EVERY telemetry store BEFORE the DONE release.
+             *
+             * SERVED used to be written after it, and DONE is what unblocks the
+             * GPU fence -- so the parent could complete the chunk and run its
+             * validation while SERVED still held the previous value, reporting
+             * a shortfall that never happened. DONE is the release store and
+             * nothing may follow it. */
             atomic_store_explicit(&w[DS4_ANEPROC_W_SERVED], served, memory_order_relaxed);
+            atomic_store_explicit(&w[DS4_ANEPROC_W_DONE], seq, memory_order_release);
         }
     }
 

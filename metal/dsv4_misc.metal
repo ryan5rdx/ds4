@@ -9063,6 +9063,25 @@ kernel void kernel_dspark_markov_argmax_reduce(
 }
 
 
+/* The DEFAULT instantiation of each small-stage kernel, under its ORIGINAL
+ * name. Turning a plain `kernel void NAME(...)` into a template removes the
+ * unmangled symbol, so the shipping corpus lost all four and every lookup
+ * failed at pipeline creation -- caught by probe_dsalora, not by the build.
+ * These must sit OUTSIDE the DS4_PRIVATE_CLONE guard: the modern library needs
+ * them. */
+template [[host_name("kernel_dsv4_indexer_score_one_direct")]]
+kernel decltype(kernel_dsv4_indexer_score_one_direct<false>)
+kernel_dsv4_indexer_score_one_direct<false>;
+template [[host_name("kernel_glm_k_b_project_q8_0")]]
+kernel decltype(kernel_glm_k_b_project_q8_0<false>)
+kernel_glm_k_b_project_q8_0<false>;
+template [[host_name("kernel_glm_value_project_q8_0")]]
+kernel decltype(kernel_glm_value_project_q8_0<false>)
+kernel_glm_value_project_q8_0<false>;
+template [[host_name("kernel_glm_value_project_q8_0_batch_heads")]]
+kernel decltype(kernel_glm_value_project_q8_0_batch_heads<false>)
+kernel_glm_value_project_q8_0_batch_heads<false>;
+
 #ifdef DS4_PRIVATE_CLONE
 /* SGASYNC target "small": the 512 B - 2 KiB same-type stages the corpus sweep
  * found. ONE target for all of them rather than one arm each -- the expected

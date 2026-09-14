@@ -109,6 +109,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     atomic_store(&w[DS4_ANEPROC_W_NTOK], n_tok);
     atomic_store(&w[DS4_ANEPROC_W_NLAYERS], n_layers);
     atomic_store(&w[DS4_ANEPROC_W_NULLMODE], DS4_ANEPROC_NULL_ECHO);
+    atomic_store(&w[DS4_ANEPROC_W_PARENT_PID], (uint32_t)getpid());
     pid_t bad = spawn_helper(helper, si, so, sc);
     if (!bad) return 2;
     int st = 0;
@@ -131,6 +132,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     atomic_store(&w[DS4_ANEPROC_W_NTOK], n_tok);
     atomic_store(&w[DS4_ANEPROC_W_NLAYERS], n_layers);
     atomic_store(&w[DS4_ANEPROC_W_NULLMODE], DS4_ANEPROC_NULL_ECHO);
+    atomic_store(&w[DS4_ANEPROC_W_PARENT_PID], (uint32_t)getpid());
     atomic_store_explicit(&w[DS4_ANEPROC_W_MAGIC], DS4_ANEPROC_MAGIC,
                           memory_order_release);
 

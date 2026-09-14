@@ -2223,6 +2223,7 @@ static id<MTLComputePipelineState> ds4_gpu_get_pipeline(const char *function_nam
 static id<MTLComputePipelineState> ds4_gpu_new_pipeline(id<MTLFunction> fn,
                                                         NSError **error);
 static int ds4_gpu_warm_model_views(void);
+void ds4_gpu_aneproc_stop(void);
 static double ds4_gpu_gib(uint64_t bytes);
 
 static double ds4_gpu_now_ms(void) {
@@ -14294,6 +14295,11 @@ int ds4_gpu_synchronize(void) {
 }
 
 void ds4_gpu_cleanup(void) {
+    /* BEFORE anything releases GPU or surface state: the helper holds pointers
+     * into the staging IOSurfaces, and nothing else in the shutdown path stops
+     * it. A surviving helper keeps every model resident and polls continuously,
+     * so the next run measures against it. */
+    ds4_gpu_aneproc_stop();
     if (!g_initialized) return;
     ds4_gpu_queue_keepalive_stop_thread();
 
@@ -52907,6 +52913,8 @@ int ds4_gpu_aneproc_start(uint32_t dim, uint32_t n_tok, uint32_t n_layers) {
                           getenv("DS4_ANE_PROC_NULL") != NULL ? 1u : 0u,
                           memory_order_relaxed);
     atomic_store_explicit(&w[DS4_ANEPROC_W_VERSION], DS4_ANEPROC_VERSION,
+                          memory_order_relaxed);
+    atomic_store_explicit(&w[DS4_ANEPROC_W_PARENT_PID], (uint32_t)getpid(),
                           memory_order_relaxed);
     /* Magic LAST and with release ordering: the helper validates on it, so it
      * must not be able to see a valid magic over a half-written header. */
