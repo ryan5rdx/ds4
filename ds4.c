@@ -75099,6 +75099,42 @@ int ds4_session_argmax_ignoring_eos(ds4_session *s,
     return best;
 }
 
+/* Is one raw argmax over the raw logits sufficient for THIS request?
+ *
+ * The compact TP top-1 sends an 8-byte key instead of a vocabulary half, which
+ * means the full logit vector never reaches the host. That is only sound where
+ * nothing downstream needs it, and "temperature == 0" does not establish that.
+ * sample_top_p_min_p() short-circuits to sample_argmax() at temperature <= 0
+ * and ignores top_k/top_p/min_p there -- but penalties, logit bias and grammar
+ * masks are applied to the vector BEFORE the sampler ever sees it, and a
+ * logprobs response reads it afterwards. Any of those and the compact path
+ * silently returns the pre-transform argmax: a different token, with nothing
+ * downstream able to detect the substitution.
+ *
+ * So every condition is a field the caller must state, rather than something
+ * inferred here. A zeroed struct is INELIGIBLE by construction, because
+ * `peer_negotiated` must be affirmatively true -- a new call site that forgets
+ * to fill this in gets the safe answer, which is the opposite of what defaulting
+ * the flags to "absent" would give.
+ */
+bool ds4_sampler_can_use_raw_argmax(const ds4_raw_argmax_ctx *c) {
+    if (!c) return false;
+    if (!c->peer_negotiated) return false;      /* zeroed struct lands here */
+    if (!(c->temperature <= 0.0f)) return false;
+    /* Belt and braces: the sampler ignores these at temperature <= 0, but a
+     * caller passing them is describing an intent the compact path cannot
+     * honour if that short-circuit is ever narrowed. */
+    if (c->top_k > 0) return false;
+    if (c->top_p > 0.0f && c->top_p < 1.0f) return false;
+    if (c->min_p > 0.0f) return false;
+    if (c->wants_logprobs) return false;
+    if (c->has_logit_bias) return false;
+    if (c->has_penalties) return false;
+    if (c->has_grammar_mask) return false;
+    if (c->speculative) return false;
+    return true;
+}
+
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!logits || n_vocab <= 0) return 0;
