@@ -51,12 +51,36 @@ static inline uint32_t ds4_top1_bits(float v) {
 #define DS4_TOP1_BITS(v) ds4_top1_bits(v)
 #endif
 
+/* THE SAMPLER FLOOR. sample_argmax_unrolled8() seeds best_v with DS4_NEG_INF
+ * and only replaces it on a strict `>`, so a value at or below the floor never
+ * wins -- the seed index does. This is a FINITE sentinel, not -inf, and the
+ * difference is observable: a half whose values are all <= -1e30 must yield the
+ * seed, not the largest of them.
+ *
+ * Every producer of a key must therefore start from this floor, or it will
+ * disagree with the CPU sampler on exactly the inputs a masked vocabulary
+ * produces. Defined here rather than read from ds4.c because the Metal reducer
+ * needs the same number and cannot include ds4.c; a static assert in ds4.c ties
+ * the two together. */
+#define DS4_TOP1_NEG_INF (-1.0e30f)
+
 DS4_TOP1_INLINE DS4_TOP1_U64 ds4_top1_pack_key(float v, DS4_TOP1_U32 idx) {
     DS4_TOP1_U32 u = DS4_TOP1_BITS(v);
     if ((u & 0x7fffffffu) == 0u) u = 0u;                    /* -0.0 -> +0.0 */
     if ((u & 0x7fffffffu) > 0x7f800000u) u = 0xff800000u;   /* NaN -> -inf  */
     const DS4_TOP1_U32 ordered = (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
     return ((DS4_TOP1_U64)ordered << 32) | (DS4_TOP1_U64)(0xffffffffu - idx);
+}
+
+/* The key a reduction must START from: the floor paired with the first column
+ * it is responsible for. Reducing from 0 instead -- which is below every packed
+ * key including -inf's -- makes the winner the largest actual value even when
+ * every value is beneath the floor, and the CPU would have returned the seed
+ * index there. Under the vocabulary split `base` is the rank's first global id,
+ * so a rank that sees nothing above the floor claims its own first column and
+ * never a column it does not own. */
+DS4_TOP1_INLINE DS4_TOP1_U64 ds4_top1_seed_key(DS4_TOP1_U32 base) {
+    return ds4_top1_pack_key(DS4_TOP1_NEG_INF, base);
 }
 
 /* The index a key decodes to. The score half is deliberately NOT recoverable as

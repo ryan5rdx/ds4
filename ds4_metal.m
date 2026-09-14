@@ -24,6 +24,7 @@
 
 #include "ds4.h"
 #include "ds4_gpu.h"
+#include "ds4_top1_key.h"
 #include "ds4_image.h"
 
 /*

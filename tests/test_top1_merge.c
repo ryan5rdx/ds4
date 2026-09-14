@@ -25,15 +25,25 @@
 
 #include "ds4_top1_key.h"
 
+/* The floor must be the sampler's, and the header is where both key producers
+ * read it from -- so the test reads it from there too rather than restating it. */
+_Static_assert(DS4_TOP1_NEG_INF == -1.0e30f, "floor moved; update the sub-floor cases");
+
 #define VOCAB  2048u
 #define VHALF  (VOCAB / 2u)
 
 static int fails;
 
-/* The CPU sampler's rule, verbatim in intent: seed (0, -inf), strict `>`. */
+/* The CPU sampler's rule, verbatim: seed (0, DS4_NEG_INF), strict `>`.
+ *
+ * The floor is FINITE (-1e30), not -infinity, and this test used -INFINITY
+ * until 2026-09-14. That made the reference agree with a merge that had no
+ * floor at all, so it certified the sub-floor bug rather than catching it. The
+ * floor now comes from the shared header, the same constant both key producers
+ * use, so the three cannot drift independently. */
 static uint32_t ref_argmax(const float *v, uint32_t n) {
     uint32_t best = 0;
-    float best_v = -INFINITY;
+    float best_v = DS4_TOP1_NEG_INF;
     for (uint32_t i = 0; i < n; i++) {
         if (v[i] > best_v) { best_v = v[i]; best = i; }
     }
@@ -41,14 +51,18 @@ static uint32_t ref_argmax(const float *v, uint32_t n) {
 }
 
 /* What ds4_session_glm_top1_key() does for one rank: argmax over [base, base+n)
- * seeded at `base`, then pack the logit AT the winner with its global id. */
+ * seeded at (base, DS4_NEG_INF), then pack BEST_V with the global id.
+ *
+ * best_v, not v[best]. They differ exactly when nothing beat the floor, and
+ * then v[best] is a value the CPU already rejected -- see the "sub-floor" cases
+ * below, which is the family that shipped broken in e511f2c. */
 static uint64_t rank_key(const float *v, uint32_t base, uint32_t n) {
     uint32_t best = base;
-    float best_v = -INFINITY;
+    float best_v = DS4_TOP1_NEG_INF;
     for (uint32_t i = base; i < base + n; i++) {
         if (v[i] > best_v) { best_v = v[i]; best = i; }
     }
-    return ds4_top1_pack_key(v[best], best);
+    return ds4_top1_pack_key(best_v, best);
 }
 
 static void check(const char *name, const float *v) {
@@ -156,6 +170,43 @@ int main(void) {
         snprintf(name, sizeof(name), "sparse[%d]", trial);
         check(name, v);
     }
+
+    /* 8b. THE SAMPLER FLOOR. Everything at or below DS4_NEG_INF loses to the
+     *     seed, so production returns the seed index -- a reducer without the
+     *     floor returns the largest value instead. This whole family was absent
+     *     while the reference used -INFINITY, and the first case is the exact
+     *     counterexample that shipped in e511f2c. */
+    for (uint32_t i = 0; i < VOCAB; i++) v[i] = DS4_TOP1_NEG_INF;
+    v[0] = NAN;
+    check("nan-then-all-floor", v);                /* production: 0, was: VHALF */
+    for (uint32_t i = 0; i < VOCAB; i++) v[i] = DS4_TOP1_NEG_INF;
+    check("all-at-floor", v);
+    for (uint32_t i = 0; i < VOCAB; i++) v[i] = -2.0e30f;        /* below it */
+    check("all-below-floor", v);
+    for (uint32_t i = 0; i < VOCAB; i++) v[i] = -2.0e30f;
+    v[VHALF + 9] = -1.5e30f;   /* larger, but still below the floor: loses */
+    check("sub-floor-max-in-rank1", v);
+    for (uint32_t i = 0; i < VOCAB; i++) v[i] = -2.0e30f;
+    v[9] = -1.5e30f;
+    check("sub-floor-max-in-rank0", v);
+    for (uint32_t i = 0; i < VOCAB; i++) v[i] = DS4_TOP1_NEG_INF;
+    v[VHALF + 4] = -9.0e29f;   /* just ABOVE the floor: this one wins */
+    check("just-above-floor-rank1", v);
+    for (uint32_t i = 0; i < VHALF; i++) v[i] = NAN;
+    for (uint32_t i = VHALF; i < VOCAB; i++) v[i] = -2.0e30f;
+    check("rank0-nan-rank1-subfloor", v);
+    for (uint32_t i = 0; i < VOCAB; i++) v[i] = -2.0e30f;
+    v[0] = NAN; v[VHALF] = NAN;
+    check("nan-at-both-bases", v);
+    /* A floor value in one half against a real logit in the other: the floor
+     * must lose, which is what packing best_v rather than avoiding the sentinel
+     * gets right. */
+    for (uint32_t i = 0; i < VHALF; i++) v[i] = DS4_TOP1_NEG_INF;
+    for (uint32_t i = VHALF; i < VOCAB; i++) v[i] = -50.0f;
+    check("floor-vs-real-rank1", v);
+    for (uint32_t i = 0; i < VHALF; i++) v[i] = -50.0f;
+    for (uint32_t i = VHALF; i < VOCAB; i++) v[i] = DS4_TOP1_NEG_INF;
+    check("floor-vs-real-rank0", v);
 
     /* 9. The index term must survive the full production id range: 77440 is
      *    GLM's per-rank half, so rank 1's ids run to 154879. */

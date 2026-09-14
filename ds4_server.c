@@ -17380,6 +17380,56 @@ static void test_request_defaults_use_min_p_filtering(void) {
     request_free(&r);
 }
 
+/* The exact request an A/B would send: server defaults plus "temperature": 0,
+ * and nothing else. It must be eligible for the compact top-1 exchange.
+ *
+ * This is the test that would have caught e511f2c shipping a feature that could
+ * never arm. request_init() sets min_p = 0.05 and top_p = DS4_DEFAULT_TOP_P on
+ * every request, and the first version of ds4_sampler_can_use_raw_argmax()
+ * rejected any positive min_p as a "belt and braces" precaution -- so the arm
+ * would have reported a clean null and looked like a real negative result. */
+static void test_compact_top1_eligible_on_default_temperature_zero(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.temperature_set = true;
+    r.temperature = 0.0f;
+
+    ds4_raw_argmax_ctx c = {
+        .temperature = r.temperature,
+        .top_k       = r.top_k,
+        .top_p       = r.top_p,      /* DS4_DEFAULT_TOP_P, left alone */
+        .min_p       = r.min_p,      /* DS4_DEFAULT_MIN_P = 0.05, left alone */
+        .peer_negotiated = true,
+    };
+    TEST_ASSERT(r.min_p > 0.0f);     /* the default really is positive */
+    TEST_ASSERT(ds4_sampler_can_use_raw_argmax(&c));
+
+    /* Above zero it must NOT be eligible, defaults or not -- otherwise the
+     * check above would pass for the wrong reason. */
+    c.temperature = 0.7f;
+    TEST_ASSERT(!ds4_sampler_can_use_raw_argmax(&c));
+
+    /* And the transport condition is still load-bearing on its own. */
+    c.temperature = 0.0f;
+    c.peer_negotiated = false;
+    TEST_ASSERT(!ds4_sampler_can_use_raw_argmax(&c));
+
+    /* Everything the compact path genuinely cannot serve still refuses, at
+     * temperature zero, with default filtering knobs in place. */
+    const ds4_raw_argmax_ctx base = {
+        .temperature = 0.0f, .top_k = r.top_k, .top_p = r.top_p,
+        .min_p = r.min_p, .peer_negotiated = true,
+    };
+    ds4_raw_argmax_ctx v;
+    v = base; v.wants_logprobs  = true; TEST_ASSERT(!ds4_sampler_can_use_raw_argmax(&v));
+    v = base; v.has_logit_bias  = true; TEST_ASSERT(!ds4_sampler_can_use_raw_argmax(&v));
+    v = base; v.has_penalties   = true; TEST_ASSERT(!ds4_sampler_can_use_raw_argmax(&v));
+    v = base; v.has_grammar_mask= true; TEST_ASSERT(!ds4_sampler_can_use_raw_argmax(&v));
+    v = base; v.speculative     = true; TEST_ASSERT(!ds4_sampler_can_use_raw_argmax(&v));
+
+    request_free(&r);
+}
+
 static void test_chat_ignore_eos_contract(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -21700,6 +21750,7 @@ static void ds4_server_unit_tests_run(void) {
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
+    test_compact_top1_eligible_on_default_temperature_zero();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
