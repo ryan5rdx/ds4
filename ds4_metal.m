@@ -6125,6 +6125,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_BIN_SOURCE",        @"metal/bin.metal"],
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
         @[@"DS4_METAL_ANE_BRIDGE_SOURCE", @"metal/ane_bridge.metal"],
+        @[@"DS4_METAL_TOP1_SOURCE",       @"metal/top1.metal"],
     ];
 
     NSMutableString *source = [NSMutableString stringWithString:base];
