@@ -3979,15 +3979,26 @@ static NSUInteger ds4_gpu_moe_tg_probe_down(void) {
     return (NSUInteger)v;
 }
 
-/* The down clone exists ONLY so this probe has somewhere to put the bytes:
- * kernel_glm_q4_K_down_simd_f32[_spec] has no threadgroup(0) argument, and
- * reserving memory a function never declares is undefined rather than unused.
- * The clone is the same body with an unused argument added -- so the FIRST
- * thing its sweep must establish is that clone-at-zero matches shipping. If it
- * does not, the extra argument perturbed codegen and every later point is
- * measuring that instead of residency. */
+/* BOTH kernels need a clone, and the reason is not the one the first version of
+ * this probe assumed.
+ *
+ * Declaring a threadgroup(0) argument is necessary but NOT sufficient: an
+ * argument the kernel cannot reach is eliminated, and Metal then silently
+ * ignores setThreadgroupMemoryLength for that index. The shipping pair kernel
+ * declares `scratch` and the impl does `(void)scratch`, so pointing the probe
+ * at it reserved exactly nothing -- which is why the 2026-09-14 rig sweep came
+ * back flat through 18432 B. tests/probe_tg_residency_census.m measures this
+ * directly by counting co-resident threadgroups instead of inferring occupancy
+ * from timing. Both clones now keep the pointer live.
+ *
+ * The FIRST thing either sweep must establish is that clone-at-zero matches
+ * shipping; only then does a nonzero point mean residency rather than codegen. */
 static int ds4_gpu_moe_tg_probe_down_active(void) {
     return getenv("DS4_MOE_TG_PROBE_DOWN") != NULL;
+}
+
+static int ds4_gpu_moe_tg_probe_pair_active(void) {
+    return getenv("DS4_MOE_TG_PROBE_PAIR") != NULL;
 }
 
 
@@ -42876,7 +42887,12 @@ int ds4_gpu_glm_routed_moe_one_tensor(
               * scaling it up. */
              (use_pair4 ?
               (dm_spec_ok
-              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu4_f32_spec")
+              ? ds4_gpu_get_pipeline(
+                    ds4_gpu_moe_tg_probe_pair_active()
+                        ? "kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe"
+                        : "kernel_glm_q4_K_pair_swiglu4_f32_spec")
+              : ds4_gpu_moe_tg_probe_pair_active()
+              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu4_f32_tgprobe")
               : ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
                                      "kernel_glm_q4_K_pair_swiglu4_f32")) :
               ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
@@ -44094,7 +44110,12 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
               ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
                                    "kernel_glm_q4_K_pair_swiglu2_f32") :
               (dm_spec_ok
-              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu4_f32_spec")
+              ? ds4_gpu_get_pipeline(
+                    ds4_gpu_moe_tg_probe_pair_active()
+                        ? "kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe"
+                        : "kernel_glm_q4_K_pair_swiglu4_f32_spec")
+              : ds4_gpu_moe_tg_probe_pair_active()
+              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu4_f32_tgprobe")
               : ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
                                      "kernel_glm_q4_K_pair_swiglu4_f32")));
         id<MTLComputePipelineState> down_pipeline =

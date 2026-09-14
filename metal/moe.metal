@@ -454,6 +454,12 @@ static inline bool ds4_tp_owns_expert(int expert, int n_total,
     return expert >= first && expert < last;
 }
 
+static inline void ds4_tg_probe_keepalive(threadgroup float *tg,
+                                          uint guard,
+                                          ushort lane) {
+    if (guard == 0xFFFFFFFFu) tg[lane] = 0.0f;
+}
+
 struct ds4_metal_dsv4_moe_swiglu_weight_args {
     uint32_t width;
     uint32_t rows;
@@ -1496,6 +1502,62 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_spec(
         expert - args.tp_expert_base, tiisg, sgitg);
 }
 
+/* MOETGOCC pair probe clones. See ds4_tg_probe_keepalive for why the shipping
+ * pair kernels cannot serve as their own probe: they declare `scratch` and then
+ * the impl does `(void)scratch`, so the argument is eliminated and every
+ * reservation against them is discarded. */
+kernel void kernel_glm_q4_K_pair_swiglu4_f32_tgprobe(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *gate,
+        device const char *up,
+        device const float *x,
+        device const int32_t *selected,
+        device const float *weights,
+        device float *mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    ds4_tg_probe_keepalive(scratch, args.n_tokens, tiisg);
+    const uint slot = tgpig.y;
+    const uint token = tgpig.z;
+    if (slot >= args.n_expert_used || token >= args.n_tokens) return;
+    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
+    const int expert = selected[selected_off];
+    if (!ds4_tp_owns_expert(expert, args.n_total_expert,
+                            args.tp_rank, args.tp_world)) return;
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 0>(
+        args, gate, up, x, weights, mid, scratch,
+        tgpig, slot, token, selected_off,
+        expert - args.tp_expert_base, tiisg, sgitg);
+}
+
+kernel void kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *gate,
+        device const char *up,
+        device const float *x,
+        device const int32_t *selected,
+        device const float *weights,
+        device float *mid,
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    ds4_tg_probe_keepalive(scratch, args.n_tokens, tiisg);
+    const uint slot = tgpig.y;
+    const uint token = tgpig.z;
+    if (slot >= args.n_expert_used || token >= args.n_tokens) return;
+    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
+    const int expert = selected[selected_off];
+    if (!ds4_tp_owns_expert(expert, args.n_total_expert,
+                            args.tp_rank, args.tp_world)) return;
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, DM3_SPEC>(
+        args, gate, up, x, weights, mid, scratch,
+        tgpig, slot, token, selected_off,
+        expert - args.tp_expert_base, tiisg, sgitg);
+}
+
 kernel void kernel_glm_q4_K_pair_swiglu2_mapped_f32(
         constant ds4_metal_glm_routed_moe_args &args,
         device const char *gate,
@@ -2328,19 +2390,39 @@ kernel void kernel_glm_q4_K_down_simd_f32(
     glm_q4_K_down_simd_spec_impl<0>(args, down, selected, mid, out, tgpig, tiisg, sgitg);
 }
 
-/* MOETGOCC down probe clones.
+/* MOETGOCC probe clones.
  *
- * Identical bodies with one UNUSED threadgroup(0) argument, which is the only
- * way to reserve threadgroup memory for a kernel that does not declare any --
- * doing it without the argument is undefined, not merely wasteful.
+ * A threadgroup(0) argument is the only way to reserve threadgroup memory for a
+ * kernel that does not declare any -- doing it without the argument is
+ * undefined, not merely wasteful. But DECLARING it is not enough:
  *
- * Their purpose is to be compared against the shipping kernels AT ZERO BYTES
- * first. If clone-at-zero does not match shipping, the extra argument perturbed
- * codegen and the whole sweep is measuring that rather than residency. Only
- * once that holds does 2304 / 4608 mean anything.
+ *   A threadgroup argument the kernel cannot reach is eliminated, and Metal
+ *   then SILENTLY IGNORES setThreadgroupMemoryLength for that index.
  *
- * Pair needs no clone: it already takes a threadgroup(0) argument it does not
- * use at the current zero-byte allocation. */
+ * That is measured, not assumed. tests/probe_tg_residency_census.m counts
+ * co-resident threadgroups directly (atomic census rather than inferred from
+ * timing) for two kernels in one library that differ only in whether `scratch`
+ * is reachable. With `(void)scratch;` residency is pinned at ~850 threadgroups
+ * at every reservation from 0 to 32768 B; with it reachable the same kernel
+ * walks 906 -> 384 -> 240 -> 144 -> 96 -> 72 -> 48 and its runtime rises from
+ * 337 ms to 512 ms.
+ *
+ * The first version of these clones wrote `(void)tgprobe;`, and the pair path
+ * had no clone at all because the shipping kernel "already takes a
+ * threadgroup(0) argument" -- which it also never touches. So every arm of the
+ * 2026-09-14 rig sweep reserved nothing, and its flat dose-response through
+ * 4608/9216/18432 was the signature of a disconnected knob rather than a
+ * residency-insensitive kernel. Hence the keepalive below.
+ *
+ * The guard is never true at runtime -- n_tokens cannot be UINT32_MAX, and the
+ * kernels above already early-out on `token >= args.n_tokens` -- so the hot
+ * loop is untouched and the clone stays byte-identical to the shipping kernel.
+ * Only LIVENESS is required: the census probe's cliff is identical whether the
+ * touch executes or is merely reachable.
+ *
+ * Clone-at-zero versus shipping remains the gate. It now tests something real:
+ * previously the argument was deleted, so the comparison was trivially equal.
+ */
 kernel void kernel_glm_q4_K_down_simd_f32_tgprobe(
         constant ds4_metal_glm_routed_moe_args &args,
         device const char *down,
@@ -2351,7 +2433,7 @@ kernel void kernel_glm_q4_K_down_simd_f32_tgprobe(
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    (void)tgprobe;
+    ds4_tg_probe_keepalive(tgprobe, args.n_tokens, tiisg);
     glm_q4_K_down_simd_spec_impl<0>(args, down, selected, mid, out, tgpig, tiisg, sgitg);
 }
 
@@ -2365,7 +2447,7 @@ kernel void kernel_glm_q4_K_down_simd_f32_spec_tgprobe(
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
-    (void)tgprobe;
+    ds4_tg_probe_keepalive(tgprobe, args.n_tokens, tiisg);
     glm_q4_K_down_simd_spec_impl<DM3_SPEC>(args, down, selected, mid, out, tgpig, tiisg, sgitg);
 }
 
