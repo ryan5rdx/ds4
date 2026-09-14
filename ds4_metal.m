@@ -7160,6 +7160,45 @@ typedef struct {
     NSUInteger  smem;
 } ds4_gpu_mv_dispatch;
 
+/* WIDE-Q8 DECODE OCCUPANCY PROBE (WQ8TGOCC).
+ *
+ * Same question as MOETGOCC, on the other large decode target: the wide Q8
+ * matvec (KDA f_b/g_b, ~4.78 ms/token of the 5.50 ms q8-mv row). An async
+ * pipeline there would stage raw Q8_0 weight tiles into threadgroup memory,
+ * and this prices that residency change before any staging exists.
+ *
+ * WHY IT IS THE SAME CLASS. The inner loop reads `ax[row][ib].qs + il*NQ` once
+ * per lane per block and never revisits it -- every weight byte is read exactly
+ * ONCE. Only the activations `yl[]` are reused, NR0-fold. So staging the
+ * weights adds a threadgroup write and a read for zero reuse, and the entire
+ * case rests on deferred-wait overlap, exactly as in routed-MoE decode.
+ *
+ * FOOTPRINT. The kernel already takes a threadgroup argument, but only 256 B of
+ * it (32 x 2 floats for helper_mv_reduce_and_write), which places no residency
+ * limit. Adding a weight tile does:
+ *
+ *   256 B today                  -> 128 threadgroups/core (i.e. unbounded)
+ *   +2304 (per-SIMD tile)        ->  12
+ *   +4608 (double-buffered)      ->   6
+ *   +8704 (the full 2-row pair)  ->   3
+ *
+ * At nsg 2 that is 64 threads per threadgroup, so the thread budget alone would
+ * allow far more than 3. Same trade as MOETGOCC: many threadgroups each with
+ * loads in flight, against a few with two buffers each.
+ *
+ * Zero kernel change -- the argument already exists and the extra bytes are
+ * never touched, so the arithmetic is bit-identical and residency is the only
+ * variable. */
+static NSUInteger ds4_gpu_wq8_tg_probe(void) {
+    static long v = -1;
+    if (v < 0) {
+        static const NSUInteger allowed[] = { 0u, 2304u, 4608u, 8704u };
+        v = (long)ds4_gpu_moe_tg_probe_bytes("DS4_WQ8_TG_PROBE",
+                                             "wide-Q8 matvec", allowed, 4);
+    }
+    return (NSUInteger)v;
+}
+
 static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     const uint64_t default_nsg = ds4_gpu_tp_world_is_two() ? 2u : 4u;
     const int16_t nsg =
@@ -7168,7 +7207,7 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
         .function_name = "kernel_mul_mv_q8_0_f32",
         .nsg = nsg,
         .nr0 = 2,
-        .smem = 32u * 2u * sizeof(float),
+        .smem = 32u * 2u * sizeof(float) + ds4_gpu_wq8_tg_probe(),
     };
 }
 
@@ -7182,7 +7221,7 @@ static void ds4_gpu_mv_dispatch_pin_nr2(ds4_gpu_mv_dispatch *d) {
     if (!d || d->nr0 == 2) return;
     d->function_name = "kernel_mul_mv_q8_0_f32";
     d->nr0 = 2;
-    d->smem = 32u * 2u * sizeof(float);
+    d->smem = 32u * 2u * sizeof(float) + ds4_gpu_wq8_tg_probe();
 }
 
 static ds4_gpu_mv_dispatch ds4_gpu_make_plain_mv_dispatch(
