@@ -74,7 +74,7 @@ ifeq ($(UNAME_S),Darwin)
 .PHONY: rig check-threadgroup-memory metal-decode-schedule-bench metal-prefill-variant-bench metal-flash-attn-decode-bench check-mxfp4-half-lut check-dispatch-count
 .PHONY: test-metal-moe-prefill test-metal-dense-mpp
 
-all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
+all: ds4 ds4-server ds4-bench ds4-eval ds4-agent private-clone-if-available
 
 help:
 	@echo "DS4 build targets:"
@@ -693,6 +693,35 @@ ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+endif
+
+# SGASYNC private clone library. Needs Xcode 14.2 (XCODE14_APP), so it is
+# dev-box-only and NEVER part of `all`: the rig consumes the committed artifact.
+# The script derives which definitions the old frontend cannot compile, so this
+# does not go stale against the shipping sources.
+ds4_private_clone.metallib: $(wildcard metal/*.metal) ds4_metal.m tests/make_private_clone_source.py
+	python3 tests/make_private_clone_source.py /tmp/ds4_private_clone.metal \
+	        --manifest /tmp/ds4_private_clone.json
+	cp /tmp/ds4_private_clone.metallib $@
+
+private-clone: ds4_private_clone.metallib
+
+# The private clone is a SHIPPING artifact now, not a dev-box experiment: the
+# decision is to carry the Xcode 14.2 dependency because the primitives are
+# worth it. So `all` builds it WHEN THE TOOLCHAIN IS PRESENT and says so when it
+# is not -- a silently absent artifact turns every private arm into the shipping
+# one, which is the null-vs-negative confusion this campaign keeps paying for.
+#
+# It is not a hard prerequisite of `all`: a machine without Xcode 14.2 must
+# still build a working ds4, it just cannot build this.
+XCODE14_METAL := $(firstword $(wildcard     $(XCODE14_APP)/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/metal/macos/bin/metal     /Users/rschu/p/xcode-14.2-extract/expanded/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/metal/macos/bin/metal     /Applications/Xcode_14.2.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/metal/macos/bin/metal))
+
+private-clone-if-available:
+ifeq ($(XCODE14_METAL),)
+	@echo "ds4: no Xcode 14.2 toolchain -- skipping ds4_private_clone.metallib."
+	@echo "     SGASYNC arms will fall back to the shipping kernels."
+else
+	@$(MAKE) --no-print-directory ds4_private_clone.metallib
 endif
 
 tests/test_tp_commands.o: tests/test_tp_commands.c ds4_tp.c ds4_tp.h ds4.h
