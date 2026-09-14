@@ -112,6 +112,12 @@ tests/test_metal_session_batch.o: tests/test_metal_session_batch.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_metal_session_batch.c
 
 # Byte-identity gate for the sliced q_b projection. No GGUF needed.
+# AMX Track A: behavioural capability canaries, derived Z mapping, SET/CLR
+# discipline. No model and no GPU -- a CPU instruction probe, so it builds and
+# runs anywhere the encodings assemble.
+tests/probe_amx: tests/probe_amx.c ds4_amx.c ds4_amx.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/probe_amx.c ds4_amx.c
+
 tests/probe_qb_slice: tests/probe_qb_slice.c ds4_metal.o ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -o $@ tests/probe_qb_slice.c ds4_metal.o $(METAL_LDLIBS)
 
