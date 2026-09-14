@@ -52627,6 +52627,25 @@ int ds4_gpu_top1(ds4_gpu_tensor *out_keys,
                  int impl) {
     ds4_gpu_top1_probe();
     if (!out_keys || !logits || !scratch || n_cols == 0u || n_rows == 0u) return 0;
+    /* ALL dispatches go in ONE command buffer.
+     *
+     * Without this the two-pass path costs 2 command-buffer round trips and the
+     * atomic path costs 3, because each ds4_gpu_top1_dispatch() opens and
+     * commits its own when no batch is open. The U64TOP1-CAP sweep then
+     * measured the atomic 1.3-1.5x slower at EVERY configuration -- and the
+     * giveaway was that the gap was a FLAT 0.12-0.145 ms while the width
+     * doubled and the row count went 1 to 8. A slower instruction costs more
+     * when there is more work; a constant offset is a fixed per-call overhead.
+     * One round trip measures 0.176 ms on an M1 Max, which is the whole gap.
+     *
+     * So that sweep compared 2 command buffers against 3, not a two-pass
+     * reducer against a native atomic. Batching is also what production would
+     * do -- the sidecar encodes into the open batch -- so this is the
+     * representative shape as well as the fair one.
+     *
+     * If the caller already has a batch open we join it and do not close it;
+     * begin_commands() returning 0 in that case is how we tell. */
+    const int own_batch = ds4_gpu_begin_commands();
     if (n_groups == 0u) n_groups = 64u;
     if (n_shards == 0u) n_shards = 1u;
     const NSUInteger NT = 256u;
@@ -52638,7 +52657,7 @@ int ds4_gpu_top1(ds4_gpu_tensor *out_keys,
         id<MTLBuffer> lb = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)logits);
         id<MTLBuffer> ob = ds4_gpu_tensor_buffer(out_keys);
         id<MTLBuffer> sb = ds4_gpu_tensor_buffer(scratch);
-        if (!lb || !ob || !sb) return 0;
+        if (!lb || !ob || !sb) { if (own_batch) (void)ds4_gpu_end_commands(); return 0; }
         const uint64_t lo = ds4_gpu_tensor_offset((ds4_gpu_tensor *)logits);
         const uint64_t oo = ds4_gpu_tensor_offset(out_keys);
         const uint64_t so = ds4_gpu_tensor_offset(scratch);
@@ -52648,26 +52667,32 @@ int ds4_gpu_top1(ds4_gpu_tensor *out_keys,
          * n_rows * n per-row ulongs. */
         const uint64_t need = (uint64_t)n_rows *
                               (use_atomic ? n_shards : n_groups) * sizeof(uint64_t);
-        if (ds4_gpu_tensor_bytes(scratch) < need) return 0;
-        if (ds4_gpu_tensor_bytes(out_keys) < (uint64_t)n_rows * sizeof(uint64_t))
+        if (ds4_gpu_tensor_bytes(scratch) < need) { if (own_batch) (void)ds4_gpu_end_commands(); return 0; }
+        if (ds4_gpu_tensor_bytes(out_keys) < (uint64_t)n_rows * sizeof(uint64_t)) {
+            if (own_batch) (void)ds4_gpu_end_commands();
             return 0;
-
-        if (use_atomic) {
-            /* Reset is inside the timed region deliberately: the gate requires
-             * the atomic path to win INCLUDING reset and merge. */
-            if (!ds4_gpu_top1_dispatch(g_top1_reset, sb, so, nil, 0, a,
-                                       (n_rows * n_shards + NT - 1u) / NT, 1,
-                                       NT, "TOP1 reset")) return 0;
-            if (!ds4_gpu_top1_dispatch(g_top1_atomic, lb, lo, sb, so, a,
-                                       n_groups, n_rows, NT, "TOP1 atomic"))
-                return 0;
-            return ds4_gpu_top1_dispatch(g_top1_shard_merge, sb, so, ob, oo, a,
-                                         1, n_rows, NT, "TOP1 shard merge");
         }
-        if (!ds4_gpu_top1_dispatch(g_top1_scan, lb, lo, sb, so, a,
-                                   n_groups, n_rows, NT, "TOP1 scan")) return 0;
-        return ds4_gpu_top1_dispatch(g_top1_merge, sb, so, ob, oo, a,
-                                     1, n_rows, NT, "TOP1 merge");
+
+        int ok;
+        if (use_atomic) {
+            /* Reset stays inside the measured region: the gate requires the
+             * atomic path to win INCLUDING reset and merge. It is now one more
+             * KERNEL in the shared buffer rather than one more round trip. */
+            ok = ds4_gpu_top1_dispatch(g_top1_reset, sb, so, nil, 0, a,
+                                       (n_rows * n_shards + NT - 1u) / NT, 1,
+                                       NT, "TOP1 reset") &&
+                 ds4_gpu_top1_dispatch(g_top1_atomic, lb, lo, sb, so, a,
+                                       n_groups, n_rows, NT, "TOP1 atomic") &&
+                 ds4_gpu_top1_dispatch(g_top1_shard_merge, sb, so, ob, oo, a,
+                                       1, n_rows, NT, "TOP1 shard merge");
+        } else {
+            ok = ds4_gpu_top1_dispatch(g_top1_scan, lb, lo, sb, so, a,
+                                       n_groups, n_rows, NT, "TOP1 scan") &&
+                 ds4_gpu_top1_dispatch(g_top1_merge, sb, so, ob, oo, a,
+                                       1, n_rows, NT, "TOP1 merge");
+        }
+        if (own_batch) { if (!ds4_gpu_end_commands()) ok = 0; }
+        return ok;
     }
 }
 
