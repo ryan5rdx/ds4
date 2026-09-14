@@ -383,6 +383,11 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 #endif
 
 #define DS4_NEG_INF (-1.0e30f)
+/* The Metal reducer cannot include this file, so ds4_top1_key.h carries its own
+ * copy of the floor for the shared packer. If they ever diverge the two key
+ * producers disagree on masked vocabularies and nothing downstream can see it. */
+_Static_assert(DS4_NEG_INF == DS4_TOP1_NEG_INF,
+               "sampler floor and packed-key floor must be the same number");
 #define DS4_POS_INF ( 1.0e30f)
 #define DS4_DEFAULT_RMS_EPS ( 1.0e-6f)
 #define DS4_DEFAULT_HC_EPS  ( 1.0e-6f)
@@ -59287,13 +59292,24 @@ struct ds4_session {
     size_t sync_image_count;
     token_vec greedy_splitkv_segment;
     float *logits;
-    /* Compact greedy top-1 (U64TOP1-TP). `armed` is per request and must be
-     * identical on both ranks; `key` holds the merged winner after the
-     * exchange, and `valid` says the sampler may read it instead of logits. */
+    /* Compact greedy top-1 (U64TOP1-TP).
+     *
+     * `logits_compact` is a property of the BUFFER, not of a request: it says
+     * s->logits holds a one-hot carrier for compact_top1_key rather than real
+     * logit values. It is cleared only by an operation that genuinely
+     * materialises a full vector (ds4_session_logits_mark_full), because
+     * clearing it on a request boundary would leave the carrier in place and
+     * hand it to the next reader as if it were logits.
+     *
+     * `compact_top1_len` is the checkpoint length the key describes. It is a
+     * second, independent guard: an operation that moved the frontier without
+     * going through mark_full still invalidates the key. An exact no-op sync
+     * leaves the length alone and correctly preserves it. */
     bool     compact_top1_request;  /* leader: this request's sampler allows it */
-    bool     compact_top1_armed;
-    bool     compact_top1_valid;
+    bool     compact_top1_armed;    /* per eval, mirrored from the EVAL frame  */
+    bool     logits_compact;        /* s->logits is a one-hot carrier          */
     uint64_t compact_top1_key;
+    int      compact_top1_len;
 
     float *sample_probs;
     float *mtp_logits;
@@ -59368,6 +59384,10 @@ struct ds4_session {
     ds4_gpu_tensor *glm53_rollback_kda;
     ds4_gpu_tensor *glm53_rollback_index;
     float *glm53_rollback_logits;
+    /* The captured buffer's representation, saved and restored with it. */
+    bool     glm53_rollback_logits_compact;
+    uint64_t glm53_rollback_top1_key;
+    int      glm53_rollback_top1_len;
     int glm53_rollback_pos;
     uint32_t glm53_rollback_dense_len;
     /* Hash of checkpoint tokens [0, pos) at capture.  A snapshot is only valid
@@ -59385,6 +59405,8 @@ struct ds4_session {
 #endif
 };
 
+static void ds4_session_logits_mark_full(ds4_session *s);
+static bool ds4_session_logits_are_compact(const ds4_session *s);
 static bool ds4_session_tp_leader(const ds4_session *s);
 
 #ifndef DS4_NO_GPU
@@ -60778,6 +60800,13 @@ bool ds4_session_glm53_rollback_capture(ds4_session *s) {
         memcpy(s->glm53_rollback_logits, s->logits,
                (size_t)DS4_N_VOCAB * sizeof(float));
     }
+    /* The representation travels with the bytes. Capturing a one-hot carrier
+     * and restoring it later would otherwise reinstate the carrier with the
+     * buffer marked FULL -- the restore is a write, so the frontier-length
+     * guard alone would not catch it. */
+    s->glm53_rollback_logits_compact = s->logits_compact;
+    s->glm53_rollback_top1_key = s->compact_top1_key;
+    s->glm53_rollback_top1_len = s->compact_top1_len;
     s->glm53_rollback_pos = s->checkpoint.len;
     s->glm53_rollback_dense_len = s->glm_dense_cache_len;
     s->glm53_rollback_token_hash =
@@ -60813,6 +60842,11 @@ static bool ds4_session_glm53_rollback_restore(ds4_session *s, int pos) {
     if (s->logits && s->glm53_rollback_logits) {
         memcpy(s->logits, s->glm53_rollback_logits,
                (size_t)DS4_N_VOCAB * sizeof(float));
+        s->logits_compact    = s->glm53_rollback_logits_compact;
+        s->compact_top1_key  = s->glm53_rollback_top1_key;
+        s->compact_top1_len  = s->glm53_rollback_top1_len;
+    } else {
+        ds4_session_logits_mark_full(s);
     }
     s->glm_dense_cache_len = s->glm53_rollback_dense_len;
     s->glm_graph.kda_state_exchange_pending = 0;
@@ -62036,6 +62070,35 @@ int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
 }
 
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen) {
+    /* A one-hot carrier must not be serialized. The payload has no field
+     * saying which representation its logits are, and adding one means bumping
+     * DS4_SESSION_PAYLOAD_VERSION -- checked with a strict != , so every
+     * payload on disk would be invalidated at once. Refusing costs a
+     * best-effort KV-cache store (the server's store path ignores the return),
+     * which is a bounded and visible cost; writing an untagged carrier that a
+     * later load -- possibly under a non-TP topology, where nothing would even
+     * suspect it -- reads back as logits is neither.
+     *
+     * Say it once. A store that silently stops happening looks like a cache
+     * that is merely not helping. */
+    if (ds4_session_logits_are_compact(s)) {
+        static int announced = 0;
+        if (!announced) {
+            announced = 1;
+            fprintf(stderr,
+                    "ds4: session payload not written while logits are a "
+                    "compact top-1 carrier (DS4_TP_COMPACT_TOP1). Prefix-cache "
+                    "stores are skipped for greedy TP requests; set "
+                    "DS4_TP_COMPACT_TOP1=0 to restore them.\n");
+        }
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "session payload unavailable: logits are a compact top-1 "
+                     "carrier, not a distribution");
+        }
+        return 1;
+    }
+
     if (!s || !fp || !s->checkpoint_valid) {
         payload_set_err(err, errlen, "session has no valid checkpoint to save");
         return 1;
@@ -62376,6 +62439,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
 }
 
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen) {
+    ds4_session_logits_mark_full(s);
     if (!s || !fp) {
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
@@ -63044,6 +63108,7 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 }
 
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen) {
+    ds4_session_logits_mark_full(s);
     if (!s || !snap || !snap->ptr || snap->len == 0) {
         payload_set_err(err, errlen, "invalid session snapshot load");
         return 1;
@@ -73114,6 +73179,7 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+    ds4_session_logits_mark_full(s);
     if (s && !ds4_session_vision_prefix_matches(
                      s, s->sync_images, s->sync_image_count)) {
         ds4_session_invalidate(s);
@@ -73291,6 +73357,7 @@ int ds4_session_sync_multimodal(
         size_t image_count,
         char *err,
         size_t errlen) {
+    ds4_session_logits_mark_full(s);
     if (!s || !prompt || (image_count != 0 && !images)) {
         snprintf(err, errlen, "invalid multimodal prompt");
         return 1;
@@ -74449,13 +74516,44 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
     return i;
 }
 
+/* s->logits is a one-hot carrier, not logit values. Any reader that needs real
+ * values must refuse; a reader that only needs the argmax may use the key. */
+static bool ds4_session_logits_are_compact(const ds4_session *s) {
+    return s && s->logits_compact;
+}
+
+/* The key is usable only if the buffer is still compact AND still describes the
+ * current frontier. The length check catches operations that moved the frontier
+ * without routing through mark_full -- a rollback that reinstates a captured
+ * buffer, say. An exact no-op sync does not move it, and correctly keeps the
+ * key. */
+static inline bool ds4_session_compact_key_usable(const ds4_session *s) {
+    return ds4_session_logits_are_compact(s) && s->checkpoint_valid &&
+           s->checkpoint.len == s->compact_top1_len;
+}
+
+/* Declare the buffer to hold real logits again. Called by every operation that
+ * materialises a full vector -- NOT on a request boundary, because the carrier
+ * outlives the request that produced it and clearing the flag without
+ * overwriting the buffer is exactly how a stale winner reaches a later reader.
+ * A site that forgets to call this leaves readers refusing, which is loud; a
+ * site that calls it without writing logits is the silent failure, so the call
+ * belongs next to the write. */
+static void ds4_session_logits_mark_full(ds4_session *s) {
+    if (!s) return;
+    s->logits_compact = false;
+    s->compact_top1_key = 0;
+    s->compact_top1_len = -1;
+}
+
 int ds4_session_argmax(ds4_session *s) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
-    /* Compact path. s->logits was canonicalised to a one-hot carrier for the
-     * winner, so scanning it would give the right answer anyway -- this returns
-     * the key directly to skip a 154880-element scan for a value already known.
-     * The correctness of the compact path does not rest on this branch. */
-    if (s->compact_top1_valid) {
+    if (ds4_session_logits_are_compact(s)) {
+        /* The buffer is a one-hot carrier, so scanning it would give the same
+         * answer -- but only while the key still describes this frontier. If it
+         * does not, the carrier is stale and scanning it would return a token
+         * from an earlier step with nothing to say so. */
+        if (!ds4_session_compact_key_usable(s)) return -1;
         return (int)ds4_top1_key_index(s->compact_top1_key);
     }
     return sample_argmax(s->logits, DS4_N_VOCAB);
@@ -74469,7 +74567,7 @@ int ds4_session_argmax_excluding(ds4_session *s, int excluded_id) {
      * pass over the winner and rank the rest, which a one-hot vector cannot
      * support. Arming excludes it upstream; refusing here is what makes a
      * missed exclusion visible instead of a quietly arbitrary token. */
-    if (s->compact_top1_valid) return -1;
+    if (ds4_session_logits_are_compact(s)) return -1;
     if (getenv("DS4_CPU_DISABLE_UNROLLED_ARGMAX") == NULL) {
         return argmax_f32_excluding_unrolled8(
                 s->logits, DS4_N_VOCAB, excluded_id);
@@ -74496,7 +74594,7 @@ int ds4_session_argmax_ignoring_eos(ds4_session *s,
      * pass over the winner and rank the rest, which a one-hot vector cannot
      * support. Arming excludes it upstream; refusing here is what makes a
      * missed exclusion visible instead of a quietly arbitrary token. */
-    if (s->compact_top1_valid) return -1;
+    if (ds4_session_logits_are_compact(s)) return -1;
     int best = -1;
     float best_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -74535,12 +74633,24 @@ bool ds4_sampler_can_use_raw_argmax(const ds4_raw_argmax_ctx *c) {
     if (!c) return false;
     if (!c->peer_negotiated) return false;      /* zeroed struct lands here */
     if (!(c->temperature <= 0.0f)) return false;
-    /* Belt and braces: the sampler ignores these at temperature <= 0, but a
-     * caller passing them is describing an intent the compact path cannot
-     * honour if that short-circuit is ever narrowed. */
-    if (c->top_k > 0) return false;
-    if (c->top_p > 0.0f && c->top_p < 1.0f) return false;
-    if (c->min_p > 0.0f) return false;
+    /* top_k / top_p / min_p are deliberately NOT consulted past this point.
+     *
+     * sample_top_p_min_p()'s first line is `if (temperature <= 0.0f) return
+     * sample_argmax(...)`, so at temperature <= 0 those three knobs have no
+     * effect on the token -- matching that is what makes the compact path
+     * equivalent rather than approximate.
+     *
+     * Rejecting them anyway was not the conservative choice it looked like. The
+     * server's request_init() sets min_p = DS4_DEFAULT_MIN_P = 0.05 on every
+     * request, so an ordinary `{"temperature": 0}` carried a positive min_p and
+     * was refused. The feature could not arm on the exact request an A/B would
+     * use, and the A/B would have measured nothing while looking like a clean
+     * negative. A guard that cannot be reached by the traffic it guards is not
+     * caution, it is a silent off switch.
+     *
+     * If that short-circuit is ever narrowed, this function must change with
+     * it; ds4_session_sample() re-checks against the live parameters, so the
+     * two would disagree loudly rather than sample the wrong distribution. */
     if (c->wants_logprobs) return false;
     if (c->has_logit_bias) return false;
     if (c->has_penalties) return false;
@@ -74579,11 +74689,20 @@ static bool ds4_session_glm_top1_key(ds4_session *s, uint64_t *out_key) {
     int   best   = (int)base;
     float best_v = DS4_NEG_INF;
     argmax_f32_unrolled8_range(s->logits, base, base + vhalf, &best, &best_v);
-    /* Pack the logit AT the winner, never best_v: best_v may still be the
-     * DS4_NEG_INF seed, and rank 0's unsigned max compares score halves across
-     * ranks. A sentinel on one side and a real logit on the other would order
-     * by the sentinel's value rather than by the data. */
-    *out_key = ds4_top1_pack_key(s->logits[best], (uint32_t)best);
+    /* Pack best_v, NOT s->logits[best].
+     *
+     * These differ exactly when nothing beat the seed, and then s->logits[best]
+     * is a value the CPU already rejected -- it can be NaN, or anything at or
+     * below the floor. Counterexample that shipped in e511f2c: rank 0 holds
+     * [NaN, -1e30, ...] and rank 1 all -1e30. Production scans the whole vector
+     * from (0, -1e30), nothing is strictly greater, and it returns token 0.
+     * Packing s->logits[best] gave rank 0 a NaN key (folded to -inf) and rank 1
+     * a -1e30 key, so rank 1 won and the pair emitted its first token instead.
+     *
+     * best_v carries the floor when the floor won, which is precisely what the
+     * full-vector scan compares at that point -- the sentinel is not a thing to
+     * avoid putting on the wire, it is the value the comparison is against. */
+    *out_key = ds4_top1_pack_key(best_v, (uint32_t)best);
     return true;
 }
 
@@ -74600,7 +74719,8 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
     if (!s || !s->checkpoint_valid || !s->logits) return -1;
-    if (s->compact_top1_valid) {
+    if (ds4_session_logits_are_compact(s)) {
+        if (!ds4_session_compact_key_usable(s)) return -1;
         /* Re-check against the parameters of THIS call, not the ones recorded
          * when the request armed. The two can differ -- the server drops
          * temperature to 0 mid-stream for tool syntax, and any future path that
@@ -74627,7 +74747,7 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
      * here is a contradiction. The one-hot vector would produce a confident
      * ranking -- 1.0 for the winner and nothing else -- which is exactly the
      * kind of plausible output a caller would never question. */
-    if (s->compact_top1_valid) return 0;
+    if (ds4_session_logits_are_compact(s)) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
     for (int i = 0; i < k; i++) {
         out[i].id = -1;
@@ -74665,6 +74785,13 @@ int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
 
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out) {
     if (!s || !out || token < 0 || token >= (int)DS4_N_VOCAB) return 0;
+    if (!s->checkpoint_valid) return 0;
+    /* The one-hot carrier would softmax to exactly 1.0 for the winner and 0 for
+     * everything else -- a confident, well-formed, entirely fabricated
+     * probability. This guard was missing while top_logprobs and copy_logits
+     * had it, which is the worst arrangement: the two entry points that refuse
+     * make the one that answers look deliberate. */
+    if (ds4_session_logits_are_compact(s)) return 0;
 
     float max_logit = DS4_NEG_INF;
     for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
@@ -74690,12 +74817,13 @@ int ds4_session_copy_logits(ds4_session *s, float *out, int cap) {
     /* Handing out the one-hot vector is the worst case: it looks like logits,
      * the caller cannot tell, and every consumer of the copy inherits the
      * fault. See ds4_session_argmax. */
-    if (s->compact_top1_valid) return 0;
+    if (ds4_session_logits_are_compact(s)) return 0;
     memcpy(out, s->logits, (size_t)DS4_N_VOCAB * sizeof(out[0]));
     return (int)DS4_N_VOCAB;
 }
 
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
+    ds4_session_logits_mark_full(s);
     if (!s || !logits || n != (int)DS4_N_VOCAB) return 1;
     memcpy(s->logits, logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     return 0;
@@ -75850,6 +75978,9 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+    /* Every eval path funnels here, so this is where the buffer stops being a
+     * compact carrier -- the graph is about to write a full vector over it. */
+    ds4_session_logits_mark_full(s);
     if (s->distributed) {
         if (!s->checkpoint_valid) {
             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
@@ -76073,7 +76204,6 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         return 1;
     }
     s->compact_top1_armed = compact_ok;
-    s->compact_top1_valid = false;
     if (is_leader) {
         ds4_engine *e = s->engine;
         /* Plain eval: no speculative cycle announced, so the worker must not
@@ -76148,9 +76278,31 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                         (unsigned)((uint64_t)vhalf * sizeof(float)));
             }
             uint64_t my_key = 0, peer_key = 0;
+            /* The local reduction is instrumented separately from the wire.
+             * This arm is TRANSPORT-first: the key comes from a CPU scan of
+             * this rank's half, not from ds4_gpu_top1(), so what it measures is
+             * payload compaction and NOT the M2 UInt64 atomic. Reporting the
+             * scan cost next to the exchange is what keeps those two claims
+             * apart -- an in-command-buffer GPU reduction is a separate
+             * experiment, and this number is the bar it has to beat. */
+            const double key_t0 = logits_profile ? now_sec() : 0.0;
             if (!ds4_session_glm_top1_key(s, &my_key)) {
                 snprintf(err, errlen, "tp: compact top-1 key unavailable");
                 return 1;
+            }
+            if (logits_profile) {
+                static double key_ms;
+                static uint64_t key_calls;
+                key_ms += (now_sec() - key_t0) * 1000.0;
+                key_calls++;
+                if ((key_calls % 64u) == 0u) {
+                    fprintf(stderr,
+                            "ds4: tp compact top-1 local scan %.4f ms/token over "
+                            "%llu tokens (%u floats). This is the CPU reduction "
+                            "only; the GPU reducer is not wired to production.\n",
+                            key_ms / (double)key_calls,
+                            (unsigned long long)key_calls, vhalf);
+                }
             }
             if (s->engine->tp.rank == 0) {
                 if (!ds4_tp_recv_top1_keys(s->engine->tp.ctx, &peer_key, 1u)) {
@@ -76159,7 +76311,6 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                     return 1;
                 }
                 s->compact_top1_key = my_key > peer_key ? my_key : peer_key;
-                s->compact_top1_valid = true;
                 /* CANONICALISE s->logits to a one-hot carrier for the winner.
                  *
                  * Without this the vector is half stale -- rank 1's half holds
@@ -76189,7 +76340,7 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                     snprintf(err, errlen,
                              "tp: compact top-1 key out of range (id %u >= %u)",
                              win, (unsigned)DS4_N_VOCAB);
-                    s->compact_top1_valid = false;
+                    ds4_session_logits_mark_full(s);
                     ds4_session_invalidate(s);
                     return 1;
                 }
@@ -76197,6 +76348,11 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
                     s->logits[i] = DS4_NEG_INF;
                 }
                 s->logits[win] = 0.0f;
+                /* Marked COMPACT only now, after the buffer actually holds the
+                 * carrier -- the flag describes the bytes, so it is set where
+                 * the bytes are written and nowhere else. */
+                s->logits_compact = true;
+                s->compact_top1_len = s->checkpoint.len;
             } else {
                 if (!ds4_tp_send_top1_keys(s->engine->tp.ctx, &my_key, 1u)) {
                     snprintf(err, errlen, "tp: top-1 key send failed");
@@ -76242,8 +76398,11 @@ void ds4_session_set_tp_eval_spec(ds4_session *s, int on) {
 
 void ds4_session_set_compact_top1(ds4_session *s, int on) {
     if (!s) return;
+    /* Arming only. It must NOT clear logits_compact: disarming a request does
+     * not overwrite a carrier left by the previous one, and clearing the flag
+     * there would hand that carrier to the next reader as if it were logits.
+     * Only a real full write clears it. */
     s->compact_top1_armed = on ? true : false;
-    if (!on) s->compact_top1_valid = false;
 }
 
 void ds4_session_set_raw_argmax_ctx(ds4_session *s,
@@ -77793,6 +77952,13 @@ int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
         if (err && errlen) snprintf(err, errlen, "empty decode batch");
         return 1;
     }
+    /* The coalesced path writes every session's full logit vector directly,
+     * bypassing ds4_session_eval_internal. Alternating singletons with a
+     * two-session batch is exactly how a carrier from the singleton survived
+     * into a batch-produced vector, so the batch entry points clear it too. */
+    for (int bi = 0; bi < count; bi++) {
+        ds4_session_logits_mark_full(items[bi].session);
+    }
     if (count == 1) {
         return ds4_session_eval(items[0].session, items[0].token, err, errlen);
     }
@@ -77873,6 +78039,14 @@ int ds4_sessions_eval_batch_with_prefill(
         if (err && errlen) snprintf(err, errlen, "invalid mixed model batch");
         return 1;
     }
+    /* The coalesced path writes every session's full logit vector directly,
+     * bypassing ds4_session_eval_internal. Alternating singletons with a
+     * two-session batch is exactly how a carrier from the singleton survived
+     * into a batch-produced vector, so the batch entry points clear it too. */
+    for (int bi = 0; bi < count; bi++) {
+        ds4_session_logits_mark_full(items[bi].session);
+    }
+    ds4_session_logits_mark_full(prefill_session);
     if (!prefill_session->checkpoint_valid ||
         prefill_prompt->len <= prefill_session->checkpoint.len ||
         prefill_prompt->len > prefill_session->ctx_size ||
@@ -83158,6 +83332,11 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 }
 
 void ds4_session_invalidate(ds4_session *s) {
+    /* Deliberately NOT mark_full. Invalidation materialises nothing, so the
+     * buffer still holds whatever it held -- claiming FULL here would hand a
+     * carrier to any reader that does not also check checkpoint_valid. Leaving
+     * it COMPACT makes those readers refuse, which is the correct answer for an
+     * invalidated session anyway. */
     if (!s) return;
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {

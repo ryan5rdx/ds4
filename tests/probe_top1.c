@@ -34,16 +34,24 @@
 #include <math.h>
 #include <time.h>
 #include "ds4_gpu.h"
+#include "ds4_top1_key.h"
 
 int ds4_log_is_tty(void) { return 0; }
 int ds4_deepseek4_attention_bounds(void *a, void *b, void *c, void *d) {
     (void)a; (void)b; (void)c; (void)d; return 0;
 }
 
-/* The CPU rule, transcribed. */
+/* The CPU rule, transcribed -- including its FLOOR.
+ *
+ * sample_argmax_unrolled8() seeds best_v with DS4_NEG_INF (-1e30), a finite
+ * sentinel, not -infinity. The difference is only visible when every value is
+ * at or below it, and then the CPU returns the seed index while a reduction
+ * from -inf returns the largest of them. This reference used -INFINITY and so
+ * could not have caught a reducer that started from zero -- which is what the
+ * GPU did until the floor was added to ds4_top1_key.h. */
 static uint32_t cpu_argmax(const float *v, uint32_t n) {
     uint32_t best = 0;
-    float best_v = -INFINITY;
+    float best_v = DS4_TOP1_NEG_INF;
     for (uint32_t i = 0; i < n; i++) if (v[i] > best_v) { best_v = v[i]; best = i; }
     return best;
 }
@@ -239,6 +247,13 @@ int main(int argc, char **argv) {
         { "plus-minus-0",  NULL }, { "infinities",       NULL },
         { "all-neg-inf",   NULL }, { "nan-mixed",        NULL },
         { "all-nan",       NULL },
+        /* Sub-floor: every value at or below DS4_NEG_INF, but NOT all equal.
+         * The CPU returns its seed index because nothing is strictly greater
+         * than the floor; a reducer that starts from zero returns the largest
+         * of them instead. `all-neg-inf` cannot catch that -- the values tie,
+         * so the index tie-break lands on 0 either way. These do not tie. */
+        { "sub-floor-ramp",   NULL }, { "sub-floor-spike",  NULL },
+        { "at-floor-spike",   NULL }, { "floor-plus-one",   NULL },
     };
     for (size_t ci = 0; ci < sizeof(cases)/sizeof(*cases); ci++) {
         const char *nm = cases[ci].name;
@@ -261,6 +276,20 @@ int main(int argc, char **argv) {
             lp[10] = NAN; lp[11] = 4.0f; lp[12] = NAN;
         } else if (!strcmp(nm, "all-nan")) {
             for (uint32_t c = 0; c < n; c++) lp[c] = NAN;
+        } else if (!strcmp(nm, "sub-floor-ramp")) {
+            /* Strictly increasing and entirely below the floor: an unfloored
+             * reducer picks the last column, the CPU picks 0. */
+            for (uint32_t c = 0; c < n; c++)
+                lp[c] = -2.0e30f + (float)c * 1.0e22f;
+        } else if (!strcmp(nm, "sub-floor-spike")) {
+            for (uint32_t c = 0; c < n; c++) lp[c] = -9.0e30f;
+            lp[n - 7] = -1.5e30f;              /* biggest, still below floor */
+        } else if (!strcmp(nm, "at-floor-spike")) {
+            for (uint32_t c = 0; c < n; c++) lp[c] = -9.0e30f;
+            lp[n / 3] = DS4_TOP1_NEG_INF;      /* exactly AT the floor: loses */
+        } else if (!strcmp(nm, "floor-plus-one")) {
+            for (uint32_t c = 0; c < n; c++) lp[c] = -9.0e30f;
+            lp[n / 3] = -9.9e29f;              /* just above the floor: wins */
         }
         if (!ds4_gpu_top1(out, lg, scr, n, n, 0, 1, groups, shards, impl, 0)) {
             printf("  FAIL dispatch refused (%s)\n", nm); failures++; continue;

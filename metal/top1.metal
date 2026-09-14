@@ -55,7 +55,11 @@ static inline ulong ds4_top1_scan_slice(device const float *logits,
                                         uint row, uint gx, uint tid) {
     const ulong row_off = (ulong)row * (ulong)args.row_stride;
     const uint  stride  = DS4_TOP1_NT * args.n_groups;
-    ulong best = 0ul;   /* below every packed key, including -inf's */
+    /* Seed at the SAMPLER FLOOR, not 0. Reducing from 0 makes the winner the
+     * largest actual value even when every value is at or below DS4_NEG_INF,
+     * where sample_argmax returns its seed index instead -- a masked vocabulary
+     * is exactly that shape. See ds4_top1_seed_key(). */
+    ulong best = ds4_top1_seed_key(args.global_base);
     for (uint col = gx * DS4_TOP1_NT + tid; col < args.n_cols; col += stride) {
         const ulong k = ds4_top1_pack_key(logits[row_off + col],
                                           args.global_base + col);
@@ -86,7 +90,7 @@ kernel void kernel_ds4_top1_merge(
         uint3 tg  [[threadgroup_position_in_grid]]) {
     threadgroup ulong scratch[DS4_TOP1_NT];
     const ulong base = (ulong)tg.y * args.n_groups;
-    ulong mine = 0ul;
+    ulong mine = ds4_top1_seed_key(args.global_base);
     for (uint i = tid; i < args.n_groups; i += DS4_TOP1_NT) {
         const ulong k = partials[base + i];
         if (k > mine) mine = k;
@@ -155,7 +159,7 @@ kernel void kernel_ds4_top1_shard_merge(
         uint3 tg [[threadgroup_position_in_grid]]) {
     if (tid != 0u) return;
     const ulong base = (ulong)tg.y * args.n_shards;
-    ulong best = 0ul;
+    ulong best = ds4_top1_seed_key(args.global_base);
     for (uint i = 0u; i < args.n_shards; ++i) {
         const ulong k = winners[base + i];
         if (k > best) best = k;
@@ -163,12 +167,20 @@ kernel void kernel_ds4_top1_shard_merge(
     out[tg.y] = best;
 }
 
-/* Reset as a kernel, so the sweep can price it against a CPU zero and a blit
- * without any of the three sitting outside the timed region. */
+/* Reset as a kernel, so the sweep can price it against a CPU write and a blit
+ * without any of the three sitting outside the timed region.
+ *
+ * The slots reset to the SEED KEY, not to zero. atomic_max against a zeroed
+ * slot lets the largest actual value win even when every value is at or below
+ * the sampler floor, where the CPU returns its seed index -- so a zeroed slot
+ * is not a neutral starting point, it is a different algorithm. This is also
+ * why reset mode 2 ("slots already clear, skip the reset") is no longer
+ * available: "clear" now means a specific nonzero value that depends on
+ * global_base, and a recycled buffer does not have it. */
 kernel void kernel_ds4_top1_reset(
         constant ds4_metal_args_top1 & args,
         device ulong * slots [[buffer(1)]],
         uint gid [[thread_position_in_grid]]) {
     const uint n = args.n_rows * (args.n_shards > 0u ? args.n_shards : 1u);
-    if (gid < n) slots[gid] = 0ul;
+    if (gid < n) slots[gid] = ds4_top1_seed_key(args.global_base);
 }

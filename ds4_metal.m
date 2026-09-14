@@ -25,6 +25,7 @@
 
 #include "ds4.h"
 #include "ds4_gpu.h"
+#include "ds4_top1_key.h"
 #include "ds4_image.h"
 
 /*
@@ -52733,24 +52734,37 @@ int ds4_gpu_top1(ds4_gpu_tensor *out_keys,
             const uint64_t wo = one_shard ? oo : so;
             /* Reset stays inside the measured region: the gate requires the
              * atomic path to win INCLUDING reset and merge. Which reset is the
-             * cheapest correct one is the question -- a kernel, a CPU write, or
-             * nothing at all if the caller recycles pre-zeroed slots. */
+             * cheapest correct one is the question -- a kernel or a host write.
+             *
+             * The slots reset to the SEED KEY, not to zero. A zeroed slot lets
+             * the largest actual value win even when every value is at or below
+             * the sampler floor, where sample_argmax returns its seed index
+             * instead. Zero is not a neutral starting point, it is a different
+             * algorithm -- and a masked vocabulary is exactly the shape that
+             * exposes it. That also retires reset mode 2: "already clear" now
+             * means a specific nonzero value that depends on global_base, which
+             * no recycled buffer has. Mode 2 is accepted and treated as the
+             * host write rather than silently skipping, because the caller that
+             * asked for it was asserting something that is no longer true. */
+            const uint64_t seed = ds4_top1_seed_key(global_base);
             ok = 1;
             if (reset == 0) {
                 ok = ds4_gpu_top1_dispatch(g_top1_reset, wb, wo, nil, 0, a,
                                            (n_rows * n_shards + NT - 1u) / NT, 1,
                                            NT, "TOP1 reset");
-            } else if (reset == 1) {
-                /* The slots are coherent shared memory, so the host can clear
+            } else {
+                /* The slots are coherent shared memory, so the host can write
                  * them directly. Encoded work has not been committed yet, so
-                 * this write cannot race a kernel reading them. */
-                void *wp = (uint8_t *)[wb contents] + wo;
-                if (wp) memset(wp, 0, (size_t)n_rows * n_shards * sizeof(uint64_t));
-                else ok = 0;
+                 * this write cannot race a kernel reading them. A loop, not a
+                 * memset: the seed is a 64-bit value, not a repeated byte. */
+                uint64_t *wp = (uint64_t *)((uint8_t *)[wb contents] + wo);
+                if (wp) {
+                    const uint64_t n = (uint64_t)n_rows * n_shards;
+                    for (uint64_t i = 0; i < n; i++) wp[i] = seed;
+                } else {
+                    ok = 0;
+                }
             }
-            /* reset == 2: none. The caller asserts the slots are already zero;
-             * a packed key is never 0, so a stale nonzero slot would win
-             * silently and that is the caller's contract to keep. */
             ok = ok && ds4_gpu_top1_dispatch(g_top1_atomic, lb, lo, wb, wo, a,
                                              n_groups, n_rows, NT, "TOP1 atomic");
             if (ok && !one_shard)

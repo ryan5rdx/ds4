@@ -99,13 +99,19 @@ int ds4_gpu_matmul_q8_0_cols_tensor(ds4_gpu_tensor *out, const void *model_map,
  * nothing when unavailable -- never a startup failure. `global_base` is added
  * to the column index BEFORE packing, so a TP rank's key already carries the
  * global token id and no offset may be applied afterwards. */
-/* `reset` selects how the atomic path clears its winner slots, which the gate
- * requires to be inside the measured region. 0 = a reset KERNEL, 1 = a CPU
- * write to the coherent shared buffer before encoding, 2 = NONE, for
- * pre-zeroed / recycled slots where the caller guarantees they are clear. The
- * brief asks for all three because the cheapest correct one decides whether the
- * atomic's fixed overhead is one kernel, a memset, or nothing at all. Ignored
- * by the two-pass path, which overwrites its partials unconditionally. */
+/* `reset` selects how the atomic path initialises its winner slots, which the
+ * gate requires to be inside the measured region. 0 = a reset KERNEL, anything
+ * else = a host write to the coherent shared buffer before encoding.
+ *
+ * Slots initialise to ds4_top1_seed_key(global_base), NOT to zero: a zeroed
+ * slot lets the largest actual value win even when every value is at or below
+ * the sampler floor, where sample_argmax returns its seed index. Mode 2
+ * ("nothing at all, the slots are already clear") is therefore gone -- clear
+ * now means a specific nonzero value that depends on global_base, which a
+ * recycled buffer does not have. It is accepted and treated as the host write
+ * rather than ignored, because a caller passing 2 is asserting something that
+ * is no longer true. Ignored by the two-pass path, which overwrites its
+ * partials unconditionally. */
 int ds4_gpu_top1(ds4_gpu_tensor *out_keys, const ds4_gpu_tensor *logits,
                  ds4_gpu_tensor *scratch,
                  uint32_t n_cols, uint32_t row_stride, uint32_t global_base,
