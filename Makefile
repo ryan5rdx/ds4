@@ -724,6 +724,19 @@ else
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 endif
 
+# Q4_K device-vs-threadgroup dequantiser equivalence (SGASYNC-MOE arm B).
+# Assembles the runtime shader corpus the same way ds4_gpu_full_source() does,
+# appends the probe kernel, and compares the two address-space variants on
+# identical random bytes. Verified to have teeth: flipping one index in
+# ds4_get_scale_min_k4_just2_tg produces ~225k mismatches.
+tests/probe_dq_q4k_equiv: tests/probe_dq_q4k_equiv.m tests/probe_dq_q4k_equiv.metal tests/make_full_metal_source.py metal/moe.metal
+	xcrun clang -fobjc-arc -O2 -framework Foundation -framework Metal $< -o $@
+
+test-dq-q4k-equiv: tests/probe_dq_q4k_equiv
+	python3 tests/make_full_metal_source.py /tmp/ds4_full_probe.metal
+	cat tests/probe_dq_q4k_equiv.metal >> /tmp/ds4_full_probe.metal
+	./tests/probe_dq_q4k_equiv /tmp/ds4_full_probe.metal
+
 # -ffast-math filtered out: the NaN and signed-zero cases ARE the test, and
 # fast-math is licensed to assume they do not occur.
 tests/test_top1_merge: tests/test_top1_merge.c ds4_top1_key.h
@@ -895,6 +908,6 @@ clean:
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
 	rm -f tests/test_ssd_cache
-	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands tests/test_top1_merge
+	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands tests/test_top1_merge tests/probe_dq_q4k_equiv
 	rm -f tests/test_metal_tp_spec
 	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/metal_flash_attn_decode_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_metal_moe_prefill tests/test_metal_dense_mpp tests/test_glm53_kda tests/test_glm53_kda_rocm tests/test_glm53_vision_engine tests/test_glm53_vision_prompt tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

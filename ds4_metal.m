@@ -36713,6 +36713,25 @@ static int ds4_gpu_encode_mul_mm_id_addr_mapped_tile(
     return 1;
 }
 
+/* SGASYNC-MOE arm B: stage each 64-row Q4_K superblock tile in threadgroup
+ * memory once and dequantise it across the 8 k-steps it covers, instead of
+ * re-reading device memory every step. OFF by default -- this is an experiment
+ * that raises threadgroup use from 16 KiB to 28 KiB and halves residency, and
+ * it has to earn that before it becomes the shipping path. DS4_MOE_RAW_STAGE=1.
+ *
+ * It is also the GATE for the private async-copy work: arm C replaces this
+ * manual stage with simdgroup_async_copy, so if staging itself loses to the
+ * shipping direct read here, no copy speed can rescue it and Track B's
+ * production target closes without any toolchain work. */
+static int ds4_moe_raw_stage_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_MOE_RAW_STAGE");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
         id<MTLCommandBuffer>        cb,
         id<MTLComputePipelineState> pipeline,
@@ -36770,8 +36789,15 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
     [enc setBuffer:weights offset:weights_off atIndex:8];
     [enc setBuffer:g_moe_id_map_buffer offset:work_offset atIndex:9];
     const NSUInteger tile_m = compact_tile ? 32u : 64u;
-    [enc setThreadgroupMemoryLength:DS4_TG16(compact_tile ? 8192u : 16384u)
-                                 atIndex:0];
+    /* 16384 is the EPILOGUE's requirement (two NR0*NR1 float tiles), not the
+     * k-loop's 10240. The raw stage adds 2 x 64 x sizeof(block_q4_K) = 18432 at
+     * offset 10240, so the k-loop needs 28672 and the epilogue aliases the
+     * bottom 16384 of the same allocation -- they are separated by a barrier.
+     * 28672 is under Apple's 32 KiB, but it takes residency from two
+     * threadgroups per core to one, which is the cost being priced. */
+    const NSUInteger pair_tg_bytes =
+        compact_tile ? 8192u : (ds4_moe_raw_stage_enabled() ? 28672u : 16384u);
+    [enc setThreadgroupMemoryLength:DS4_TG16(pair_tg_bytes) atIndex:0];
     [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)work_cap,
                                           ((NSUInteger)mm_args->ne0 + tile_m - 1u) / tile_m,
                                           1)
@@ -47711,7 +47737,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                 pair_swiglu_mm_pipeline =
                     ds4_gpu_get_pipeline(
                         gate_type == DS4_METAL_TENSOR_Q4_K ?
-                            "kernel_mul_mm_id_q4_K_pair_swiglu_f16" :
+                            (ds4_moe_raw_stage_enabled() ?
+                                "kernel_mul_mm_id_q4_K_pair_swiglu_f16_raw_stage" :
+                                "kernel_mul_mm_id_q4_K_pair_swiglu_f16") :
                         gate_type == DS4_METAL_TENSOR_MXFP4 ?
                             (use_mxfp4_mm_id_pair_swiglu_compact_tile ?
                                 (use_mxfp4_mm_id_pair_half_scale ?

@@ -2561,6 +2561,44 @@ void dequantize_q4_K(device const block_q4_K *xb, short il, thread type4x4 &reg)
     }
 }
 
+/* SGASYNC-MOE arm B/C: the same dequantiser reading a THREADGROUP-resident raw
+ * superblock instead of device memory.
+ *
+ * Metal address spaces are part of the type, so a staged block cannot be fed to
+ * the device-pointer overload -- this duplication is the language, not a design
+ * choice. The arithmetic is copied verbatim and must stay that way: arm B has
+ * to be bit-identical to the shipping kernel, or the A/B measures two different
+ * numerics rather than two staging strategies. get_scale_min_k4_just2 needs a
+ * threadgroup overload for the same reason. */
+static inline uchar2 ds4_get_scale_min_k4_just2_tg(int j, int k,
+                                                   threadgroup const uchar *q) {
+    return j < 4 ? uchar2{uchar(q[j+0+k] & 63), uchar(q[j+4+k] & 63)}
+                 : uchar2{uchar((q[j+4+k] & 0xF) | ((q[j-4+k] & 0xc0) >> 2)),
+                          uchar((q[j+4+k] >>  4) | ((q[j-0+k] & 0xc0) >> 2))};
+}
+
+template <typename type4x4>
+void dequantize_q4_K_tg(threadgroup const block_q4_K *xb, short il,
+                        thread type4x4 &reg) {
+    threadgroup const uchar *q = xb->qs;
+
+    short is = (il / 4) * 2;
+    q = q + (il / 4) * 32 + 16 * (il & 1);
+    il = il & 3;
+    const uchar2 sc = ds4_get_scale_min_k4_just2_tg(is, il / 2, xb->scales);
+    const float d = il < 2 ?
+        (float)xb->d :
+        (float)xb->d * (1.0f / 16.0f);
+    const float min = (float)xb->dmin;
+    const float dl = d * sc[0];
+    const float ml = min * sc[1];
+
+    const ushort mask = il < 2 ? 0x0F : 0xF0;
+    for (int i = 0; i < 16; ++i) {
+        reg[i / 4][i % 4] = dl * (q[i] & mask) - ml;
+    }
+}
+
 template <typename type4x4>
 void dequantize_mxfp4(device const block_mxfp4 *xb, short il, thread type4x4 &reg) {
     const float d = ds4_metal_e8m0_to_f32(xb->e);
@@ -8670,7 +8708,28 @@ kernel void kernel_mul_mm_id_addr(
 // each output keeps the exact MMA accumulation order of the separate GEMMs,
 // and the epilogue matches kernel_dsv4_moe_swiglu_weight_f16, so the fused
 // result is bit-identical to the unfused path.
-template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool CULL_TAIL_SIMDGROUPS = false>
+/* SGASYNC-MOE arm B: RAW_STAGE stages each 64-row tile of Q4_K superblocks into
+ * threadgroup memory once and dequantises from there across the 8 k-steps that
+ * one superblock covers, instead of re-reading device memory every step.
+ *
+ * This is the MANUAL control for the private async copy, and it is the arm that
+ * decides whether the whole direction is worth anything: the copy being 1.5x
+ * faster is irrelevant if staging itself loses to the shipping kernel's direct
+ * read. It answers that with no private toolchain involved.
+ *
+ * THREADGROUP BUDGET. The kernel is dispatched with 16384 B today -- the
+ * epilogue's two NR0*NR1 float tiles, not the k-loop's 10240 B, is what sets
+ * that. The raw stage adds 2 x 9216 B at offset 10240, so the k-loop needs
+ * 28672 B and the epilogue still needs 16384 B of the same allocation. They are
+ * separated by a threadgroup barrier and may alias, so the dispatch grows to
+ * 28672 B rather than 34816 B. Under Apple's 32 KiB limit, but residency drops
+ * from two threadgroups per core to one -- which is exactly the cost this arm
+ * exists to price.
+ *
+ * Q4_K only: nl == 16, so `il` walks 0,2,..,14 and the block pointer advances
+ * once per 8 k-steps. RAW_STAGE is rejected at instantiation for anything else.
+ */
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool CULL_TAIL_SIMDGROUPS = false, bool RAW_STAGE = false>
 kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
         constant ds4_metal_args_mul_mm_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
@@ -8690,6 +8749,14 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
     threadgroup half *sa_gate = (threadgroup half *)(shmem);
     threadgroup half *sa_up   = (threadgroup half *)(shmem + 4096);
     threadgroup half *sb      = (threadgroup half *)(shmem + 8192);
+    /* Raw stage lives above the k-loop tiles and aliases the epilogue region,
+     * which is dead by the time the epilogue runs. See the header comment. */
+    threadgroup block_q *raw_gate = (threadgroup block_q *)(shmem + 10240);
+    threadgroup block_q *raw_up   =
+        (threadgroup block_q *)(shmem + 10240 + 64 * sizeof(block_q));
+
+    static_assert(!RAW_STAGE || nl == 16,
+                  "RAW_STAGE assumes one block per 8 k-steps (Q4_K, nl == 16)");
 
     constexpr int NR0 = 64;
     constexpr int NR1 = 32;
@@ -8767,9 +8834,50 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
 
     for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
         half4x4 temp_gate;
-        dequantize_func(xg, il, temp_gate);
         half4x4 temp_up;
-        dequantize_func(xu, il, temp_up);
+        if constexpr (RAW_STAGE) {
+            /* Refill on the UNIFORM loop counter, not on `il`.
+             *
+             * il starts at il0 = tiitg % NL0, so half the threadgroup runs the
+             * odd sequence and half the even one -- `if (il == 0)` is divergent
+             * and a threadgroup_barrier inside divergent control flow is
+             * undefined behaviour, which on this hardware means a hang rather
+             * than a wrong answer. loop_k is the same for every thread, and one
+             * Q4_K superblock is QK_K columns = 8 steps of NK.
+             *
+             * The barrier before the copy waits for the previous iteration's
+             * readers -- of both the raw tile and sa_* -- since nothing else
+             * separates the MMA from the next iteration's top. The one after
+             * publishes the new tile. */
+            if ((loop_k % QK_K) == 0) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                threadgroup uchar *dg = (threadgroup uchar *)raw_gate;
+                threadgroup uchar *du = (threadgroup uchar *)raw_up;
+                device const uchar *sg0 =
+                    (device const uchar *)(src0_gate + args.nb01*r0 + offset0);
+                device const uchar *su0 =
+                    (device const uchar *)(src0_up   + args.nb01*r0 + offset0);
+                const uint blk = (uint)sizeof(block_q);
+                const uint rows = (uint)nr0;
+                /* Source rows are nb01 apart; the staged copy is dense. This is
+                 * the 2D lift the async primitive would perform in one call. */
+                for (uint e = tiitg; e < rows * blk; e += 128u) {
+                    const uint rr = e / blk;
+                    const uint bb = e - rr * blk;
+                    const uint64_t off =
+                        (uint64_t)rr * args.nb01 +
+                        (uint64_t)(loop_k / QK_K) * blk + bb;
+                    dg[rr * blk + bb] = sg0[off];
+                    du[rr * blk + bb] = su0[off];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            dequantize_q4_K_tg(raw_gate + lr0, il, temp_gate);
+            dequantize_q4_K_tg(raw_up   + lr0, il, temp_up);
+        } else {
+            dequantize_func(xg, il, temp_gate);
+            dequantize_func(xu, il, temp_up);
+        }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -9111,6 +9219,11 @@ typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_compact_tail_impl<block_mxfp4,
 // Host-visible fused routed pair matmuls for the DS4 expert quant formats.
 template [[host_name("kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_iq2 kernel_mul_mm_id_pair_swiglu_f16_impl<block_iq2_xxs, QK_NL, dequantize_iq2_xxs>;
 template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_q4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K>;
+/* SGASYNC-MOE arm B. Same numerics as the line above -- the only difference is
+ * where the Q4_K bytes are read from -- so a text divergence between the two is
+ * a bug in the staging, not a tuning choice. Selected by DS4_MOE_RAW_STAGE=1. */
+typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K, false, true>) mul_mm_id_pair_swiglu_f16_q4_raw;
+template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_f16_raw_stage")]] kernel mul_mm_id_pair_swiglu_f16_q4_raw kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K, false, true>;
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4>;
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16_half_scale")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4_half_scale>;
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16_tail_cull_half_scale")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4_tail_cull kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4_half_scale, true>;
