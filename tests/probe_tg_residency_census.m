@@ -109,8 +109,12 @@ int main(void) { @autoreleasepool {
     printf("\n--- %s ---\n", kk == 0
            ? "census_dead: `(void)scratch;` -- what the shipping MoE kernels do"
            : "census_live: the same kernel, scratch reachable");
-    printf("%10s  %14s  %14s  %10s\n",
-           "reserved", "predicted TG/core", "PEAK resident", "ms");
+    /* No "predicted TG/core" column. maxThreadgroupMemoryLength is the
+     * per-THREADGROUP maximum, not the per-core pool, so 32768/bytes is not a
+     * residency prediction -- this probe measures 72 simultaneous threadgroups
+     * at 18432 B on a part where that arithmetic says one per core. The
+     * measured peak is the only honest number here. */
+    printf("%10s  %14s  %10s\n", "reserved", "PEAK resident", "ms");
 
     for (unsigned i = 0; i < sizeof(bytes)/sizeof(bytes[0]); i++) {
         *(uint32_t *)cur.contents = 0;
@@ -132,11 +136,7 @@ int main(void) { @autoreleasepool {
                    cb.error.localizedDescription.UTF8String);
             continue;
         }
-        char pred[16];
-        if (bytes[i]) snprintf(pred, sizeof(pred), "%lu",
-                               (unsigned long)(dev.maxThreadgroupMemoryLength / bytes[i]));
-        else          snprintf(pred, sizeof(pred), "unbounded");
-        printf("%10lu  %14s  %14u  %10.2f\n", (unsigned long)bytes[i], pred,
+        printf("%10lu  %14u  %10.2f\n", (unsigned long)bytes[i],
                *(uint32_t *)peak.contents,
                (cb.GPUEndTime - cb.GPUStartTime) * 1000.0);
     }

@@ -28,8 +28,8 @@
  * reading out of bounds, so every buffer is sized from the same expressions
  * ds4_metal.m uses.
  *
- * MEASUREMENT. Arms are cyclically rotated (arm = (k + r) % n_arms), never run
- * in blocks: the isolated wide-Q8 sweep reported the same kernel 150% slower and
+ * MEASUREMENT. Arms are SERPENTINE -- rotated, and reversed on alternate reps
+ * so no arm keeps a fixed predecessor -- never run in blocks: the isolated wide-Q8 sweep reported the same kernel 150% slower and
  * 24% faster on consecutive arm-at-a-time runs, and interleaving was what fixed
  * it. Timing is GPU-side (GPUEndTime - GPUStartTime), so host scheduling is out.
  */
@@ -140,7 +140,7 @@ int main(int argc, const char **argv) { @autoreleasepool {
     printf("device: %s\n", dev.name.UTF8String);
     printf("max threadgroup memory: %lu B\n",
            (unsigned long)dev.maxThreadgroupMemoryLength);
-    printf("reps per arm: %d (cyclically rotated)\n\n", reps);
+    printf("reps per arm: %d (serpentine: rotated, reversed on alternate reps)\n\n", reps);
 
     /* GLM 5.3 Flash routed-MoE decode geometry. */
     const uint32_t in_dim = 4096, mid_dim = 2048, out_dim = 4096;
@@ -208,27 +208,32 @@ int main(int argc, const char **argv) { @autoreleasepool {
 
     id<MTLCommandQueue> q = [dev newCommandQueue];
 
+    /* The clone control binds 128 B, NOT 0.
+     *
+     * Keeping the threadgroup pointer live is what makes the reservation bind,
+     * and it also makes the binding mandatory: setThreadgroupMemoryLength:0 is
+     * rejected, and omitting the call leaves a live argument unbound, which the
+     * debug layer reports as "missing Threadgroup Memory binding at index 0 for
+     * scratch[0]". An earlier version of this probe compared every point against
+     * exactly that invalid dispatch. 128 B is the smallest legal allocation and
+     * is the baseline every row below is measured against. */
     struct { const char *name; const char *kernel; NSUInteger tg; NSUInteger gx, gy; } arms[] = {
-        /* pair: grid (mid_dim+7)/8 x n_expert, 64 threads. The rig's sweep. */
-        { "pair      0 B", "kernel_glm_q4_K_pair_swiglu4_f32_spec",          0,     (mid_dim + 7) / 8, n_expert_used },
-        { "pair clone0 ", "kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe",      0,     (mid_dim + 7) / 8, n_expert_used },
-        { "pair   4608 B", "kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe",  4608,     (mid_dim + 7) / 8, n_expert_used },
-        { "pair   9216 B", "kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe",  9216,     (mid_dim + 7) / 8, n_expert_used },
-        { "pair  18432 B", "kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe", 18432,     (mid_dim + 7) / 8, n_expert_used },
-        /* down: grid (out_dim+3)/4 x 1, 64 threads; experts looped inside. */
-        { "down ship    ", "kernel_glm_q4_K_down_simd_f32_spec",         0,     (out_dim + 3) / 4, 1 },
-        { "down      0 B", "kernel_glm_q4_K_down_simd_f32_spec_tgprobe", 0,     (out_dim + 3) / 4, 1 },
-        { "down   2304 B", "kernel_glm_q4_K_down_simd_f32_spec_tgprobe", 2304,  (out_dim + 3) / 4, 1 },
-        { "down   4608 B", "kernel_glm_q4_K_down_simd_f32_spec_tgprobe", 4608,  (out_dim + 3) / 4, 1 },
-        /* positive control: must fall off a cliff if reservation binds at all */
-        { "ctl0 dead 0B", "ds4_occ_control",     0, 2048, 1 },
-        { "ctl0 dead4608", "ds4_occ_control",  4608, 2048, 1 },
-        { "ctl0 dead9216", "ds4_occ_control",  9216, 2048, 1 },
+        { "pair ship    ", "kernel_glm_q4_K_pair_swiglu4_f32_spec",             0, (mid_dim + 7) / 8, n_expert_used },
+        { "pair min128  ", "kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe",   128, (mid_dim + 7) / 8, n_expert_used },
+        { "pair   4608 B", "kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe",  4608, (mid_dim + 7) / 8, n_expert_used },
+        { "pair   9216 B", "kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe",  9216, (mid_dim + 7) / 8, n_expert_used },
+        { "pair  18432 B", "kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe", 18432, (mid_dim + 7) / 8, n_expert_used },
+        { "down ship    ", "kernel_glm_q4_K_down_simd_f32_spec",                0, (out_dim + 3) / 4, 1 },
+        { "down min128  ", "kernel_glm_q4_K_down_simd_f32_spec_tgprobe",      128, (out_dim + 3) / 4, 1 },
+        { "down   2304 B", "kernel_glm_q4_K_down_simd_f32_spec_tgprobe",     2304, (out_dim + 3) / 4, 1 },
+        { "down   4608 B", "kernel_glm_q4_K_down_simd_f32_spec_tgprobe",     4608, (out_dim + 3) / 4, 1 },
+        /* Negative control: `(void)scratch;`, the disconnected-knob signature. */
+        { "ctl0 dead128 ", "ds4_occ_control",   128, 2048, 1 },
         { "ctl0 dead18k ", "ds4_occ_control", 18432, 2048, 1 },
     };
     const int n_arms = (int)(sizeof(arms) / sizeof(arms[0]));
 
-    id<MTLComputePipelineState> pipes[16];
+    id<MTLComputePipelineState> pipes[24];
     for (int i = 0; i < n_arms; i++) {
         const BOOL is_ctl = arms[i].name[0] == 'c';
         id<MTLFunction> f = [(is_ctl ? ctl_lib : lib) newFunctionWithName:@(arms[i].kernel)];
@@ -242,7 +247,15 @@ int main(int argc, const char **argv) { @autoreleasepool {
 
     for (int r = 0; r < reps; r++) {
         for (int k = 0; k < n_arms; k++) {
-            const int a = (k + r) % n_arms;   /* cyclic, never blocked */
+            /* SERPENTINE, not cyclic. Rotating the start puts every arm in
+             * every position, but `(k + r) % n_arms` gives every arm the SAME
+             * predecessor in every repetition -- so whatever that neighbour
+             * leaves in cache and in the GPU's clock state is a fixed per-arm
+             * bias. Reversing on alternate reps gives each arm both
+             * neighbours. This is what dissolved an apparent 5% shipping-vs-
+             * clone gap that turned out to be pure ordering bias. */
+            const int fwd = (k + r) % n_arms;
+            const int a = (r & 1) ? (n_arms - 1 - fwd) : fwd;
             const int is_down = arms[a].name[0] == 'd';
             const int is_ctl  = arms[a].name[0] == 'c';
 
@@ -281,29 +294,38 @@ int main(int argc, const char **argv) { @autoreleasepool {
         }
     }
 
-    printf("%-14s %8s %8s %8s   %s\n", "arm", "median", "min", "p90", "vs first of group");
+    printf("%-14s %8s %8s %8s   %s\n", "arm", "median", "min", "p90",
+           "vs clone min128 of its group");
     double base_pair = 0, base_down = 0, base_ctl = 0;
-    for (int a = 0; a < n_arms; a++) {
-        double *v = samples + (size_t)a * reps;
-        qsort(v, reps, sizeof(double), cmp_d);
-        const double med = v[reps / 2], mn = v[0], p90 = v[(reps * 9) / 10];
-        const char c0 = arms[a].name[0];
-        if (c0 == 'p' && base_pair == 0) base_pair = med;
-        if (c0 == 'd' && base_down == 0) base_down = med;
-        if (c0 == 'c' && base_ctl  == 0) base_ctl  = med;
-        const double base = c0 == 'd' ? base_down : c0 == 'c' ? base_ctl : base_pair;
-        printf("%-14s %8.3f %8.3f %8.3f   %+7.2f%%\n",
-               arms[a].name, med, mn, p90, (med - base) / base * 100.0);
+    /* Two passes: the baselines are the min128 clones, which are not the first
+     * row of their group, so they must be resolved before anything is scored. */
+    for (int pass = 0; pass < 2; pass++) {
+        for (int a = 0; a < n_arms; a++) {
+            double *v = samples + (size_t)a * reps;
+            if (pass == 0) qsort(v, reps, sizeof(double), cmp_d);
+            const double med = v[reps / 2];
+            const char c0 = arms[a].name[0];
+            const int is_min = strstr(arms[a].name, "min128") != NULL ||
+                               strstr(arms[a].name, "dead128") != NULL;
+            if (pass == 0) {
+                if (is_min && c0 == 'p') base_pair = med;
+                if (is_min && c0 == 'd') base_down = med;
+                if (is_min && c0 == 'c') base_ctl  = med;
+                continue;
+            }
+            const double base = c0 == 'd' ? base_down : c0 == 'c' ? base_ctl : base_pair;
+            printf("%-14s %8.3f %8.3f %8.3f   %+7.2f%%\n",
+                   arms[a].name, med, v[0], v[(reps * 9) / 10],
+                   base > 0 ? (med - base) / base * 100.0 : 0.0);
+        }
     }
 
-    printf("\nPer-core residency implied by a %lu B limit:\n",
-           (unsigned long)dev.maxThreadgroupMemoryLength);
-    for (int a = 0; a < n_arms; a++) {
-        if (arms[a].tg == 0) continue;
-        printf("  %-14s -> %lu threadgroup(s)/core (%lu threads)\n", arms[a].name,
-               (unsigned long)(dev.maxThreadgroupMemoryLength / arms[a].tg),
-               (unsigned long)(dev.maxThreadgroupMemoryLength / arms[a].tg) * 64ul);
-    }
+    /* No "threadgroups per core" column. maxThreadgroupMemoryLength is the
+     * per-THREADGROUP maximum, not the per-core pool, so dividing by it gives a
+     * number that is simply wrong: tests/probe_tg_residency_census.m counted 72
+     * simultaneous threadgroups at 18432 B on this part, where that arithmetic
+     * predicts one per core. Footprint in bytes is the honest label; measured
+     * co-residency belongs to the census probe. */
     free(samples);
     return 0;
 } }

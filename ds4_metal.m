@@ -4006,6 +4006,49 @@ static int ds4_gpu_moe_tg_probe_pair_active(void) {
     return getenv("DS4_MOE_TG_PROBE_PAIR") != NULL;
 }
 
+/* The control arm cannot bind ZERO bytes.
+ *
+ * Keeping the threadgroup pointer live is what makes the reservation bind at
+ * all -- but it also makes the binding MANDATORY. `setThreadgroupMemoryLength:0`
+ * is rejected, and skipping the call entirely leaves the dispatch with a missing
+ * binding for a live argument, which the debug layer catches as
+ *
+ *     missing Threadgroup Memory binding at index 0 for scratch[0]
+ *
+ * and which is undefined rather than merely zero-sized when the layer is off.
+ * So the clone's control arm allocates the smallest legal amount instead: 128 B
+ * covers scratch[lane] for a 32-lane simdgroup and passes validation. Every
+ * probe point is then measured against THAT, not against a dispatch that was
+ * never valid. */
+#define DS4_MOE_TG_PROBE_MIN 128u
+
+/* Logs the EFFECTIVE binding, not the requested one. The whitelist announce
+ * upstream prints what the operator asked for; if the floor silently turned a
+ * requested 0 into 128 and only the request were logged, the run's own evidence
+ * would disagree with what the GPU did. */
+static NSUInteger ds4_gpu_moe_tg_probe_eff(NSUInteger v, const char *what) {
+    const NSUInteger eff = v > DS4_MOE_TG_PROBE_MIN ? v : DS4_MOE_TG_PROBE_MIN;
+    static const char *seen[4];
+    static int n_seen;
+    for (int i = 0; i < n_seen; i++) if (strcmp(seen[i], what) == 0) return eff;
+    if (n_seen < 4) seen[n_seen++] = what;
+    fprintf(stderr, "ds4: MoE decode occupancy probe -- %s clone BINDS %lu B "
+                    "(control floor %u B; a live threadgroup argument cannot "
+                    "bind zero)\n", what, (unsigned long)eff,
+                    DS4_MOE_TG_PROBE_MIN);
+    return eff;
+}
+
+static NSUInteger ds4_gpu_moe_tg_probe_pair_bytes(void) {
+    if (!ds4_gpu_moe_tg_probe_pair_active()) return 0u;
+    return ds4_gpu_moe_tg_probe_eff(ds4_gpu_moe_tg_probe_pair(), "pair");
+}
+
+static NSUInteger ds4_gpu_moe_tg_probe_down_bytes(void) {
+    if (!ds4_gpu_moe_tg_probe_down_active()) return 0u;
+    return ds4_gpu_moe_tg_probe_eff(ds4_gpu_moe_tg_probe_down(), "down");
+}
+
 
 
 static int ds4_gpu_disable_hot_pipeline_statics(void) {
@@ -43030,7 +43073,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         /* 0 in production. The probe raises it; the pair kernel already takes
          * a threadgroup(0) parameter it does not use at this size, so nothing
          * in the kernel changes -- only how many threadgroups fit on a core. */
-        const NSUInteger pair_threadgroup_bytes = ds4_gpu_moe_tg_probe_pair();
+        const NSUInteger pair_threadgroup_bytes = ds4_gpu_moe_tg_probe_pair_bytes();
         const NSUInteger pair_threads = 64u;
         const NSUInteger down_x_groups =
             down_scalar_q2 ? (NSUInteger)((out_dim + 7u) / 8u) :
@@ -43039,7 +43082,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             down_simd_q6 ? (NSUInteger)((out_dim + 3u) / 4u) :
             (NSUInteger)out_dim;
         const NSUInteger down_threadgroup_bytes =
-            (down_scalar_q2 || down_simd) ? ds4_gpu_moe_tg_probe_down()
+            (down_scalar_q2 || down_simd) ? ds4_gpu_moe_tg_probe_down_bytes()
                                           : 256u * sizeof(float);
         const NSUInteger down_threads =
             (down_scalar_q2 || down_simd) ? 64u : 256u;
@@ -44114,13 +44157,12 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
              q4_pair2 ?
               ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu2_f32_pipeline,
                                    "kernel_glm_q4_K_pair_swiglu2_f32") :
+              /* MOETGOCC is a single-token DECODE probe and is deliberately
+               * absent here: this path reserves no probe bytes, so selecting a
+               * live-argument clone would dispatch it with a missing
+               * threadgroup binding. */
               (dm_spec_ok
-              ? ds4_gpu_get_pipeline(
-                    ds4_gpu_moe_tg_probe_pair_active()
-                        ? "kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe"
-                        : "kernel_glm_q4_K_pair_swiglu4_f32_spec")
-              : ds4_gpu_moe_tg_probe_pair_active()
-              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu4_f32_tgprobe")
+              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu4_f32_spec")
               : ds4_gpu_hot_pipeline(g_glm_q4_k_pair_swiglu4_f32_pipeline,
                                      "kernel_glm_q4_K_pair_swiglu4_f32")));
         id<MTLComputePipelineState> down_pipeline =
@@ -44135,10 +44177,7 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                                  "kernel_glm_q2_K_down_f32") :
             down_scalar_q4 ?
             (dm_spec_ok
-              ? ds4_gpu_get_pipeline(
-                    ds4_gpu_moe_tg_probe_down_active()
-                        ? "kernel_glm_q4_K_down_simd_f32_spec_tgprobe"
-                        : "kernel_glm_q4_K_down_simd_f32_spec")
+              ? ds4_gpu_get_pipeline("kernel_glm_q4_K_down_simd_f32_spec")
               : ds4_gpu_hot_pipeline(g_glm_q4_k_down_f32_pipeline,
                                      "kernel_glm_q4_K_down_f32")) :
             down_simd_q5 ?
