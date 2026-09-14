@@ -3881,6 +3881,52 @@ static id<MTLComputePipelineState> ds4_gpu_get_sgasync_pipeline(
 }
 
 
+/* ROUTED-MoE DECODE OCCUPANCY PROBE.
+ *
+ * The proposed async pipeline for the decode pair/down kernels would introduce
+ * a ping-pong staging buffer where there is currently NONE -- pair and
+ * down_simd both dispatch with threadgroup memory 0 at 64 threads. Corrected
+ * for N_R0_Q4_K == 2 (two rows per simdgroup, not four), the buffers are
+ * 9 KiB for the pair kernel and 4.5 KiB for down.
+ *
+ * At 32 KiB per core that caps residency at 3 and 7 threadgroups respectively,
+ * against an effectively unbounded count today -- and GLM decode runs at 44%
+ * of the matvec roof, i.e. LATENCY bound, which is precisely the regime where
+ * occupancy is what supplies the memory-level parallelism. The proposal would
+ * trade many threadgroups each with loads in flight for three with two buffers
+ * each.
+ *
+ * This prices that trade WITHOUT writing the pipeline: it declares the buffer
+ * and never touches it, so the arithmetic is bit-identical and the only thing
+ * that changes is residency. If 9 KiB already costs more than the async arm
+ * could plausibly return, the whole direction closes before any staging code
+ * exists -- the same discipline as MoE arm B, which priced manual staging
+ * before the async variant was built.
+ *
+ * Only the PAIR kernel is instrumented, and that is deliberate: it already
+ * takes a threadgroup(0) parameter, so raising the length changes nothing but
+ * residency. down_simd has no such parameter, and reserving memory a function
+ * never declares is undefined rather than merely unused -- so instead of
+ * touching it, the pair sweep covers down's 4.5 KiB point directly. One curve
+ * over 0 / 4.5 / 9 / 18 KiB at the same 64 threads and 2 simdgroups answers
+ * both kernels, and is more informative than two isolated points.
+ *
+ * DS4_MOE_TG_PROBE_PAIR, in bytes. Unset = shipping. */
+static NSUInteger ds4_gpu_moe_tg_probe_pair(void) {
+    static long v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_MOE_TG_PROBE_PAIR");
+        v = (e && e[0]) ? strtol(e, NULL, 0) : 0;
+        if (v > 0) {
+            fprintf(stderr, "ds4: MoE decode occupancy probe -- pair kernel "
+                            "reserves %ld B of UNUSED threadgroup memory "
+                            "(arithmetic unchanged; residency is the variable)\n", v);
+        }
+    }
+    return (NSUInteger)(v > 0 ? v : 0);
+}
+
+
 static int ds4_gpu_disable_hot_pipeline_statics(void) {
     static int initialized;
     static int disabled;
@@ -42811,7 +42857,10 @@ int ds4_gpu_glm_routed_moe_one_tensor(
              * the wrong number of rows. */
             use_pair4 ? (NSUInteger)((expert_mid_dim + 7u) / 8u) :
             (NSUInteger)((expert_mid_dim + 1u) / 2u);
-        const NSUInteger pair_threadgroup_bytes = 0u;
+        /* 0 in production. The probe raises it; the pair kernel already takes
+         * a threadgroup(0) parameter it does not use at this size, so nothing
+         * in the kernel changes -- only how many threadgroups fit on a core. */
+        const NSUInteger pair_threadgroup_bytes = ds4_gpu_moe_tg_probe_pair();
         const NSUInteger pair_threads = 64u;
         const NSUInteger down_x_groups =
             down_scalar_q2 ? (NSUInteger)((out_dim + 7u) / 8u) :
