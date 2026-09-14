@@ -51283,6 +51283,14 @@ static bool glm_graph_encode_ffn_batch(
     const int ane_sidecar = ok && !shared_done && ds4_ane_mode() != DS4_ANE_OFF &&
                             ane_li < ane_sparse && ane_shape_ok &&
                             ds4_ane_init(ane_sparse, (uint32_t)DS4_N_EMBD, ane_rows);
+    /* PERFONLY replaces the GPU shared expert rather than shadowing it. This is
+     * the arm the review asked for: every other mode runs the GPU work AND the
+     * ANE work and discards the latter, so all of them price the cost and none
+     * measures the benefit. Only set once the sidecar actually engaged, so a
+     * shape mismatch or a failed init falls back to the GPU instead of
+     * dropping the shared expert entirely. */
+    const int ane_replaces_gpu = ane_sidecar &&
+                                 ds4_ane_mode() == DS4_ANE_PERFONLY;
     if (ok && !shared_done && ds4_ane_mode() != DS4_ANE_OFF &&
         ane_li < ane_sparse && !ane_shape_ok) {
         static int announced;
@@ -51479,7 +51487,10 @@ static bool glm_graph_encode_ffn_batch(
                                       il,
                                       pos0);
     }
-    if (ok && !shared_done) DS4_GLM_ENCODE_FFN_BATCH_SHARED();
+    /* PERFONLY skips the GPU shared expert; the ANE unpack below writes the
+     * destination instead. Every other mode still encodes it and keeps the GPU
+     * authoritative. */
+    if (ok && !shared_done && !ane_replaces_gpu) DS4_GLM_ENCODE_FFN_BATCH_SHARED();
     if (ane_sidecar) {
         /* ane_started gates only the RENDEZVOUS. Gating the unpack on it too
          * meant BRIDGE never unpacked at all -- ds4_ane_begin_layer() returns
@@ -51496,10 +51507,19 @@ static bool glm_graph_encode_ffn_batch(
         if (ane_started) ds4_ane_wait(ane_li);
         if (ds4_ane_mode() >= DS4_ANE_BRIDGE) {
             /* NULL destination = the bridge's own scratch. The GPU stays
-             * authoritative in every mode this file supports and the sidecar's
+             * authoritative in every mode except PERFONLY, and the sidecar's
              * weights are synthetic, so the result must not reach anything
-             * load-bearing -- that would produce fluent, wrong text. */
-            if (!ds4_gpu_ane_unpack(NULL, (uint32_t)DS4_N_EMBD, ane_rows, 0)) {
+             * load-bearing -- that would produce fluent, wrong text.
+             *
+             * PERFONLY is the deliberate exception: it accumulates the ANE
+             * output into the real destination and the GPU shared expert is
+             * skipped above, which is the only configuration that measures an
+             * end-to-end speedup rather than the sidecar's cost. Its text is
+             * wrong by construction and it says so at startup. */
+            ds4_gpu_tensor *ane_dst =
+                (ds4_ane_mode() == DS4_ANE_PERFONLY) ? g->batch_ffn_out : NULL;
+            if (!ds4_gpu_ane_unpack(ane_dst, (uint32_t)DS4_N_EMBD, ane_rows,
+                                    ane_dst ? 1 : 0)) {
                 fprintf(stderr, "ds4: ANE bridge unpack failed (layer %u)\n", il);
                 ok = 0;
             }
@@ -71279,6 +71299,38 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->prefill_cap = s->glm_graph.ctx_cap;
         ds4_gpu_enable_q8_dequant_gemm();
         s->glm_graph_ready = true;
+#ifndef DS4_NO_GPU
+        /* EAGERLY load the ANE models here, outside every timed region.
+         *
+         * ds4_ane_init() is otherwise first reached from inside the prefill
+         * layer loop, where it compiles and loads 42 Core ML packages while the
+         * prefill clock runs. ANEI8RES was measured that way and its costs fit
+         * MODEL COUNT at 0.3675 s/model with R^2=0.9954 -- so the residency
+         * elbow, the "free zone" and fasti8's +2.13% were all reading load time
+         * rather than inference. Warming here makes the cold cost a separate,
+         * reported number instead of a contaminant.
+         *
+         * The production shape is hardcoded because that is the only shape the
+         * sidecar engages at: M=2048 rows per rank under the S8 row split at a
+         * 4096-token chunk. A mismatch simply skips, exactly as the lazy path
+         * does, and warming cannot make the sidecar engage where it would not. */
+        if (ds4_ane_mode() != DS4_ANE_OFF && ds4_model_is_glm53()) {
+            const uint32_t warm_sparse =
+                (DS4_N_LAYER > DS4_N_LEADING_DENSE + 1u)
+                    ? (uint32_t)(DS4_N_LAYER - DS4_N_LEADING_DENSE - 1u) : 0u;
+            struct timespec tw0, tw1;
+            clock_gettime(CLOCK_MONOTONIC, &tw0);
+            const int warmed = warm_sparse &&
+                ds4_ane_init(warm_sparse, (uint32_t)DS4_N_EMBD, 2048u);
+            clock_gettime(CLOCK_MONOTONIC, &tw1);
+            const double warm_ms = (double)(tw1.tv_sec - tw0.tv_sec) * 1e3 +
+                                   (double)(tw1.tv_nsec - tw0.tv_nsec) * 1e-6;
+            fprintf(stderr,
+                    "ds4: ANE warm-load %s in %.0f ms (%u models) -- COLD COST, "
+                    "outside the prefill clock\n",
+                    warmed ? "ok" : "SKIPPED", warm_ms, warm_sparse);
+        }
+#endif
         s->glm_graph.quality = e->quality;
         s->glm_graph.ssd_streaming = e->ssd_streaming;
         s->glm_graph.ssd_streaming_cold = e->ssd_streaming_cold;

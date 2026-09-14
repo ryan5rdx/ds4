@@ -66,6 +66,22 @@ enum {
      * separate the two, and the whole k2 projection turns on which of them
      * owns the 4.8 ms/layer that did not hide. */
     DS4_ANE_FASTNULL = 5,
+    /* PERFONLY -- the authoritative arm, and the only one that measures an
+     * end-to-end speedup.
+     *
+     * Every mode above still runs the GPU shared expert and DISCARDS the ANE
+     * result, so all of them measure the sidecar's COST and none measures its
+     * benefit. fasti8's "+2.13% net" was a projection against the removable-work
+     * allowance, not a measurement, and the review was right to say so.
+     *
+     * PERFONLY skips the GPU shared expert and consumes the ANE output, which
+     * is the shape production would have. It is a PERFORMANCE ARM ONLY: the
+     * models carry SYNTHETIC weights, so the text it produces is fluent and
+     * wrong. It announces that loudly and refuses to be mistaken for `on`.
+     * There is still no `on` mode, and there will not be one until real
+     * converted weights exist -- which is the same reason SHADOW's divergence
+     * is expected to be enormous. */
+    DS4_ANE_PERFONLY = 6,
 };
 
 /* Parsed once from the environment. 0 when unset or when this build has no

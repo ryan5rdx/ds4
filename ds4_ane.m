@@ -143,6 +143,16 @@ int ds4_ane_mode(void) {
         if      (!strcmp(e, "probe"))  g_mode = DS4_ANE_PROBE;
         else if (!strcmp(e, "fast"))   g_mode = DS4_ANE_FAST;
         else if (!strcmp(e, "fastnull")) g_mode = DS4_ANE_FASTNULL;
+        else if (!strcmp(e, "perfonly")) {
+            g_mode = DS4_ANE_PERFONLY;
+            fprintf(stderr,
+                    "ds4: *** ANE PERFONLY: the GPU shared expert is SKIPPED and "
+                    "the ANE result is CONSUMED.\n"
+                    "ds4: *** The models carry SYNTHETIC weights. EVERY TOKEN "
+                    "THIS PRODUCES IS WRONG.\n"
+                    "ds4: *** This arm exists to measure end-to-end speed, which "
+                    "no other arm can. Do not read its output.\n");
+        }
         else if (!strcmp(e, "bridge")) g_mode = DS4_ANE_BRIDGE;
         else if (!strcmp(e, "shadow")) g_mode = DS4_ANE_SHADOW;
         else if (!strcmp(e, "0") || !strcmp(e, "off")) g_mode = DS4_ANE_OFF;
