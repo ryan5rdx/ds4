@@ -99,11 +99,18 @@ int ds4_gpu_matmul_q8_0_cols_tensor(ds4_gpu_tensor *out, const void *model_map,
  * nothing when unavailable -- never a startup failure. `global_base` is added
  * to the column index BEFORE packing, so a TP rank's key already carries the
  * global token id and no offset may be applied afterwards. */
+/* `reset` selects how the atomic path clears its winner slots, which the gate
+ * requires to be inside the measured region. 0 = a reset KERNEL, 1 = a CPU
+ * write to the coherent shared buffer before encoding, 2 = NONE, for
+ * pre-zeroed / recycled slots where the caller guarantees they are clear. The
+ * brief asks for all three because the cheapest correct one decides whether the
+ * atomic's fixed overhead is one kernel, a memset, or nothing at all. Ignored
+ * by the two-pass path, which overwrites its partials unconditionally. */
 int ds4_gpu_top1(ds4_gpu_tensor *out_keys, const ds4_gpu_tensor *logits,
                  ds4_gpu_tensor *scratch,
                  uint32_t n_cols, uint32_t row_stride, uint32_t global_base,
                  uint32_t n_rows, uint32_t n_groups, uint32_t n_shards,
-                 int impl);
+                 int impl, int reset);
 /* Nonzero only when the native atomic pipeline actually created. */
 int ds4_gpu_top1_u64_available(void);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);

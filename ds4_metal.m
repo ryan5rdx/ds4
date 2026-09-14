@@ -52660,7 +52660,7 @@ int ds4_gpu_top1(ds4_gpu_tensor *out_keys,
                  ds4_gpu_tensor *scratch,
                  uint32_t n_cols, uint32_t row_stride, uint32_t global_base,
                  uint32_t n_rows, uint32_t n_groups, uint32_t n_shards,
-                 int impl) {
+                 int impl, int reset) {
     ds4_gpu_top1_probe();
     if (!out_keys || !logits || !scratch || n_cols == 0u || n_rows == 0u) return 0;
     /* ALL dispatches go in ONE command buffer.
@@ -52681,13 +52681,17 @@ int ds4_gpu_top1(ds4_gpu_tensor *out_keys,
      *
      * If the caller already has a batch open we join it and do not close it;
      * begin_commands() returning 0 in that case is how we tell. */
-    const int own_batch = ds4_gpu_begin_commands();
     if (n_groups == 0u) n_groups = 64u;
     if (n_shards == 0u) n_shards = 1u;
     const NSUInteger NT = 256u;
     const int use_atomic = (impl == 1) && (g_top1_atomic != nil) &&
                            (g_top1_shard_merge != nil) && (g_top1_reset != nil);
+    /* Checked BEFORE opening a batch. It used to sit after, so a missing
+     * pipeline returned 0 while leaving an owned, empty command batch open --
+     * which the next caller would then join and close on our behalf. Harmless
+     * for the benchmark, wrong for anything that cares about batch lifetime. */
     if (!g_top1_scan || !g_top1_merge) return 0;
+    const int own_batch = ds4_gpu_begin_commands();
 
     @autoreleasepool {
         id<MTLBuffer> lb = ds4_gpu_tensor_buffer((ds4_gpu_tensor *)logits);
@@ -52703,6 +52707,8 @@ int ds4_gpu_top1(ds4_gpu_tensor *out_keys,
          * n_rows * n per-row ulongs. */
         const uint64_t need = (uint64_t)n_rows *
                               (use_atomic ? n_shards : n_groups) * sizeof(uint64_t);
+        /* out_keys is the atomic target when n_shards == 1, so it must be
+         * 8-byte aligned and one ulong per row -- already required below. */
         if (ds4_gpu_tensor_bytes(scratch) < need) { if (own_batch) (void)ds4_gpu_end_commands(); return 0; }
         if (ds4_gpu_tensor_bytes(out_keys) < (uint64_t)n_rows * sizeof(uint64_t)) {
             if (own_batch) (void)ds4_gpu_end_commands();
@@ -52711,16 +52717,40 @@ int ds4_gpu_top1(ds4_gpu_tensor *out_keys,
 
         int ok;
         if (use_atomic) {
+            /* ONE SHARD NEEDS NO MERGE. With n_shards == 1 every group atomics
+             * into the same word, so that word IS the row's answer and the
+             * atomic can publish straight into out_keys. Running shard_merge
+             * anyway charged the atomic path a third kernel the two-pass never
+             * pays -- a smaller version of the extra-command-buffer mistake
+             * this function was just fixed for. */
+            const int one_shard = (n_shards == 1u);
+            id<MTLBuffer> wb = one_shard ? ob : sb;
+            const uint64_t wo = one_shard ? oo : so;
             /* Reset stays inside the measured region: the gate requires the
-             * atomic path to win INCLUDING reset and merge. It is now one more
-             * KERNEL in the shared buffer rather than one more round trip. */
-            ok = ds4_gpu_top1_dispatch(g_top1_reset, sb, so, nil, 0, a,
-                                       (n_rows * n_shards + NT - 1u) / NT, 1,
-                                       NT, "TOP1 reset") &&
-                 ds4_gpu_top1_dispatch(g_top1_atomic, lb, lo, sb, so, a,
-                                       n_groups, n_rows, NT, "TOP1 atomic") &&
-                 ds4_gpu_top1_dispatch(g_top1_shard_merge, sb, so, ob, oo, a,
-                                       1, n_rows, NT, "TOP1 shard merge");
+             * atomic path to win INCLUDING reset and merge. Which reset is the
+             * cheapest correct one is the question -- a kernel, a CPU write, or
+             * nothing at all if the caller recycles pre-zeroed slots. */
+            ok = 1;
+            if (reset == 0) {
+                ok = ds4_gpu_top1_dispatch(g_top1_reset, wb, wo, nil, 0, a,
+                                           (n_rows * n_shards + NT - 1u) / NT, 1,
+                                           NT, "TOP1 reset");
+            } else if (reset == 1) {
+                /* The slots are coherent shared memory, so the host can clear
+                 * them directly. Encoded work has not been committed yet, so
+                 * this write cannot race a kernel reading them. */
+                void *wp = (uint8_t *)[wb contents] + wo;
+                if (wp) memset(wp, 0, (size_t)n_rows * n_shards * sizeof(uint64_t));
+                else ok = 0;
+            }
+            /* reset == 2: none. The caller asserts the slots are already zero;
+             * a packed key is never 0, so a stale nonzero slot would win
+             * silently and that is the caller's contract to keep. */
+            ok = ok && ds4_gpu_top1_dispatch(g_top1_atomic, lb, lo, wb, wo, a,
+                                             n_groups, n_rows, NT, "TOP1 atomic");
+            if (ok && !one_shard)
+                ok = ds4_gpu_top1_dispatch(g_top1_shard_merge, sb, so, ob, oo, a,
+                                           1, n_rows, NT, "TOP1 shard merge");
         } else {
             ok = ds4_gpu_top1_dispatch(g_top1_scan, lb, lo, sb, so, a,
                                        n_groups, n_rows, NT, "TOP1 scan") &&
