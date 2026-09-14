@@ -734,12 +734,21 @@ ds4-ane-helper: ds4_ane_helper.m ds4_aneproc.h
 
 # Cross-process ring probe. The sidecar's VALUE needs the rig; its CORRECTNESS
 # and handoff cost do not, and --null mode means no Core ML and no models.
-tests/probe_aneproc_ring: tests/probe_aneproc_ring.m ds4_aneproc.h
+tests/probe_aneproc_ring: tests/probe_aneproc_ring tests/probe_wq8_async.m ds4_aneproc.h
 	$(CC) $(CFLAGS) -fobjc-arc -I. -o $@ tests/probe_aneproc_ring.m \
 	      -framework Foundation -framework IOSurface
 
 test-aneproc-ring: tests/probe_aneproc_ring ds4-ane-helper
 	./tests/probe_aneproc_ring ./ds4-ane-helper
+
+# WQ8 async staging (10d) correctness + decomposition gate. Needs the private
+# clone, so dev-box only.
+tests/probe_wq8_async: tests/probe_wq8_async.m
+	xcrun clang -fobjc-arc -O2 -framework Foundation -framework Metal $< -o $@
+
+test-wq8-async: tests/probe_wq8_async ds4_private_clone.metallib
+	python3 tests/make_full_metal_source.py /tmp/ds4_wq8_modern.metal
+	./tests/probe_wq8_async /tmp/ds4_wq8_modern.metal ds4_private_clone.metallib
 
 # SGASYNC private clone library. Needs Xcode 14.2 (XCODE14_APP), so it is
 # dev-box-only and NEVER part of `all`: the rig consumes the committed artifact.

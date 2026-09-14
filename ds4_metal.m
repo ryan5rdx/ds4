@@ -4823,9 +4823,20 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mv_pipeline(
 
     NSError *error = nil;
     NSString *name = [NSString stringWithUTF8String:function_name];
-    id<MTLFunction> fn = [g_library newFunctionWithName:name
-                                         constantValues:constants
-                                                  error:&error];
+    /* The wide-Q8 async arms live in the private clone, and unlike every
+     * earlier SGASYNC target this kernel takes FUNCTION CONSTANTS -- so the
+     * private path has to go through newFunctionWithName:constantValues:
+     * rather than the plain lookup ds4_gpu_get_private_pipeline uses. Falling
+     * back to g_library on a miss keeps a missing artifact a degrade rather
+     * than a failure, as everywhere else. */
+    id<MTLLibrary> lib = g_library;
+    if (strstr(function_name, "_sgasync") != NULL) {
+        id<MTLLibrary> priv = ds4_gpu_private_library();
+        if (priv) lib = priv;
+    }
+    id<MTLFunction> fn = [lib newFunctionWithName:name
+                                   constantValues:constants
+                                            error:&error];
     if (!fn) {
         fprintf(stderr, "ds4: Metal %s function not found: %s\n",
                 function_name, [[error localizedDescription] UTF8String]);
@@ -7160,6 +7171,36 @@ typedef struct {
     NSUInteger  smem;
 } ds4_gpu_mv_dispatch;
 
+/* Which wide-Q8 kernel to run. Async arms are 10d; the occupancy probe below
+ * is 10c and prices their cost independently. DS4_WQ8_ASYNC=2|4 selects the
+ * runs-per-chunk; unset is the shipping kernel. */
+static const char *ds4_gpu_wq8_function(void) {
+    static const char *name;
+    if (!name) {
+        const char *e = getenv("DS4_WQ8_ASYNC");
+        if (e && e[0] == '2')      name = "kernel_mul_mv_q8_0_f32_sgasync2";
+        else if (e && e[0] == '4') name = "kernel_mul_mv_q8_0_f32_sgasync4";
+        else                       name = "kernel_mul_mv_q8_0_f32";
+        if (name[0] != 'k' || strstr(name, "sgasync")) {
+            fprintf(stderr, "ds4: wide-Q8 decode bound to %s\n", name);
+        }
+    }
+    return name;
+}
+
+/* The async arms carry their own staging buffer; the probe knob is for pricing
+ * residency WITHOUT them and the two must not both add bytes. */
+static NSUInteger ds4_gpu_wq8_async_stage_bytes(void) {
+    const char *e = getenv("DS4_WQ8_ASYNC");
+    const short nsg = (short)ds4_gpu_env_u64("DS4_METAL_Q8_MV_NSG",
+                                             ds4_gpu_tp_world_is_two() ? 2u : 4u,
+                                             1u, 8u);
+    const NSUInteger run = 8u * 34u;                 /* NQ blocks x block bytes */
+    if (e && e[0] == '2') return (NSUInteger)nsg * 2u * 2u * 2u * run;
+    if (e && e[0] == '4') return (NSUInteger)nsg * 2u * 4u * 2u * run;
+    return 0u;
+}
+
 /* WIDE-Q8 DECODE OCCUPANCY PROBE (WQ8TGOCC).
  *
  * Same question as MOETGOCC, on the other large decode target: the wide Q8
@@ -7204,10 +7245,11 @@ static ds4_gpu_mv_dispatch ds4_gpu_make_q8_0_mv_dispatch(void) {
     const int16_t nsg =
         (int16_t)ds4_gpu_env_u64("DS4_METAL_Q8_MV_NSG", default_nsg, 1u, 8u);
     return (ds4_gpu_mv_dispatch) {
-        .function_name = "kernel_mul_mv_q8_0_f32",
+        .function_name = ds4_gpu_wq8_function(),
         .nsg = nsg,
         .nr0 = 2,
-        .smem = 32u * 2u * sizeof(float) + ds4_gpu_wq8_tg_probe(),
+        .smem = 32u * 2u * sizeof(float) + ds4_gpu_wq8_tg_probe()
+                                         + ds4_gpu_wq8_async_stage_bytes(),
     };
 }
 

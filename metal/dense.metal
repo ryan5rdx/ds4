@@ -153,7 +153,53 @@ static inline void helper_mv_reduce_and_write(
     }
 }
 
-template<short NR0, typename args_t>
+/* WQ8 ASYNC STAGING (10d).
+ *
+ * WHAT CONSTRAINS THE DESIGN. The block partitioning is
+ * `ib0 = sgitg*NQ + ix`, stepping `NSG*NQ` -- so simdgroup s owns runs of NQ
+ * CONSECUTIVE blocks spaced NSG*NQ apart, and `helper_mv_reduce_and_write`
+ * sums the per-simdgroup partials afterwards. Re-splitting the blocks
+ * contiguously per simdgroup would give a far friendlier copy and a DIFFERENT
+ * fp32 summation grouping, so it is off the table: this must stay
+ * bit-identical. The copy therefore has to be the strided form the existing
+ * partition implies -- C runs of NQ*34 = 272 B at a 544 B pitch, which is
+ * exactly a 2D async copy and nothing else.
+ *
+ * WHAT IT CANNOT BUY. Every weight byte is read exactly once; only `yl[]` is
+ * reused, NR0-fold. So there is no reuse for a staging buffer to amortise
+ * against and an immediate-wait stage is strictly a loss -- the entire case is
+ * deferred-wait overlap, which is why only the double-buffered form is built.
+ *
+ * WHAT IT COSTS. Per buffer NSG*NR0*C*272 B on top of the 256 B the reduction
+ * already uses: C=2 -> 4352 B ping-pong (7 threadgroups/core), C=4 -> 8704
+ * (3), C=8 -> 17408 (1). The kernel is latency-bound at 44% of the matvec
+ * roof, where occupancy IS the memory-level parallelism, so C is a direct
+ * trade of copy size against the concurrency that currently hides the latency.
+ * DECODE-TGOCC 10c prices that half independently; this arm supplies the other
+ * half, and neither is interpretable without the other.
+ *
+ * `qs` is read as uchar to sidestep the 34-byte block stride, which is neither
+ * 4- nor 16-byte aligned.
+ */
+#ifdef DS4_PRIVATE_CLONE
+/* Same fields as block_q8_0, read from threadgroup. Metal address spaces are
+ * part of the type, so the device overload cannot serve a staged block; the
+ * arithmetic below is copied verbatim from the device path and must stay that
+ * way or the arm measures numerics rather than staging. */
+static inline float ds4_wq8_staged_dot(threadgroup const uchar *blk,
+                                       short il, short NQ,
+                                       thread const float *yl) {
+    threadgroup const int8_t *qs = (threadgroup const int8_t *)(blk + 2) + il * NQ;
+    float sumq = 0.f;
+    for (short i = 0; i < NQ; ++i) {
+        sumq += (float)qs[i] * yl[i];
+    }
+    threadgroup const half *d = (threadgroup const half *)blk;
+    return sumq * (float)(*d);
+}
+#endif
+
+template<short NR0, typename args_t, int WQ8_ASYNC_C = 0>
 void kernel_mul_mv_q8_0_f32_impl(
         args_t args,
         device const char * src0,
@@ -199,23 +245,117 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     device const float * yb = y + ib0*QK8_0 + il*NQ;
 
-    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
-        for (short i = 0; i < NQ; ++i) {
-            yl[i] = yb[i];
+    bool wq8_staged = false;
+#ifdef DS4_PRIVATE_CLONE
+    /* Eligibility. Everything the staged path assumes about the partition is
+     * checked, and anything unexpected falls through to the device loop rather
+     * than producing a different answer. */
+    constexpr short WQ8_RUN_B = NQ * (short)sizeof(block_q8_0);      /* 272 */
+    const short wq8_pitch_b = (short)(NSG * NQ * (short)sizeof(block_q8_0));
+    const int n_runs = (nb - ib0 + NSG*NQ - 1) / (NSG*NQ);
+    if (WQ8_ASYNC_C != 0 &&
+        nb % (NSG*NQ) == 0 &&                    /* every run is full         */
+        (n_runs % WQ8_ASYNC_C) == 0) {           /* every chunk is full       */
+        /* Layout, after the 256 B the reduction owns:
+         *   [buffer p][simdgroup s][row r][run j] -> WQ8_RUN_B bytes
+         * Each simdgroup writes only its own slices, so the copies never
+         * collide and no barrier is needed beyond the wait -- which is the
+         * point: a threadgroup barrier here would serialise the two
+         * simdgroups and give back the overlap this exists to gain. */
+        constexpr short WQ8_SLICE = WQ8_ASYNC_C * WQ8_RUN_B;
+        threadgroup uchar *stage = (threadgroup uchar *)shmem + 32*2*sizeof(float);
+        const short sg_off = (short)sgitg * NR0 * WQ8_SLICE;
+        const short buf_stride = (short)NSG * NR0 * WQ8_SLICE;
+
+        /* PEAK OUTSTANDING FUTURES = 2 * NR0 = 4. Between issuing the next
+         * chunk and waiting on the current one, both buffers are in flight and
+         * each carries one copy per output row. The two rows cannot be merged
+         * into one copy -- they are `args.nb01` apart, an arbitrary stride, and
+         * the 2D form has only a single pitch.
+         *
+         * Four concurrent futures is beyond anything the standalone probe has
+         * measured, so probe_sgasync_matrix gains an `outstanding` arm and this
+         * kernel must not be trusted on Apple8 until that arm says 4 is
+         * supported and correct. It is the one capability assumption here that
+         * is not already proven. */
+        simdgroup_future<void> fut[2][NR0];
+        bool have[2] = { false, false };
+
+        /* Prime chunk 0, then for each chunk: issue the NEXT one, wait on THIS
+         * one, consume it. The issue happens before the wait so the transfer
+         * overlaps the arithmetic -- with no reuse to amortise against, this
+         * ordering is the only thing the primitive can buy here. */
+        for (int c = 0; c < n_runs; c += WQ8_ASYNC_C) {
+            const short p = (short)((c / WQ8_ASYNC_C) & 1);
+            if (!have[p]) {
+                FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                    device const uchar *src =
+                        (device const uchar *)(ax[row] + ib0) +
+                        (uint64_t)(c) * wq8_pitch_b - (uint64_t)ix * sizeof(block_q8_0);
+                    fut[p][row] = simdgroup_async_copy(
+                        stage + p*buf_stride + sg_off + row*WQ8_SLICE,
+                        (ulong)WQ8_RUN_B, 1ul,
+                        src, (ulong)wq8_pitch_b, 1ul,
+                        ulong2(WQ8_RUN_B, WQ8_ASYNC_C));
+                }
+                have[p] = true;
+            }
+            const short pn = (short)(p ^ 1);
+            const int cn = c + WQ8_ASYNC_C;
+            if (cn < n_runs) {
+                FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                    device const uchar *src =
+                        (device const uchar *)(ax[row] + ib0) +
+                        (uint64_t)(cn) * wq8_pitch_b - (uint64_t)ix * sizeof(block_q8_0);
+                    fut[pn][row] = simdgroup_async_copy(
+                        stage + pn*buf_stride + sg_off + row*WQ8_SLICE,
+                        (ulong)WQ8_RUN_B, 1ul,
+                        src, (ulong)wq8_pitch_b, 1ul,
+                        ulong2(WQ8_RUN_B, WQ8_ASYNC_C));
+                }
+                have[pn] = true;
+            }
+            FOR_UNROLL (short row = 0; row < NR0; ++row) fut[p][row].wait();
+
+            for (short j = 0; j < WQ8_ASYNC_C; ++j) {
+                for (short i = 0; i < NQ; ++i) {
+                    yl[i] = yb[i];
+                }
+                /* SAME order as the device loop: row-major, NQ terms, then
+                 * scale. sumf[] must accumulate identically or the arm is
+                 * measuring numerics. */
+                FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                    threadgroup const uchar *blk =
+                        stage + p*buf_stride + sg_off + row*WQ8_SLICE +
+                        j*WQ8_RUN_B + (short)ix * (short)sizeof(block_q8_0);
+                    sumf[row] += ds4_wq8_staged_dot(blk, il, NQ, yl);
+                }
+                yb += NSG*NQ*QK8_0;
+            }
+            have[p] = false;
         }
-
-        for (short row = 0; row < NR0; row++) {
-            device const int8_t * qs = ax[row][ib].qs + il*NQ;
-
-            float sumq = 0.f;
-            FOR_UNROLL (short i = 0; i < NQ; ++i) {
-                sumq += qs[i] * yl[i];
+        wq8_staged = true;
+    }
+#endif
+    if (!wq8_staged) {
+        for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+            for (short i = 0; i < NQ; ++i) {
+                yl[i] = yb[i];
             }
 
-            sumf[row] += sumq*ax[row][ib].d;
-        }
+            for (short row = 0; row < NR0; row++) {
+                device const int8_t * qs = ax[row][ib].qs + il*NQ;
 
-        yb += NSG*NQ*QK8_0;
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    sumq += qs[i] * yl[i];
+                }
+
+                sumf[row] += sumq*ax[row][ib].d;
+            }
+
+            yb += NSG*NQ*QK8_0;
+        }
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
@@ -237,6 +377,39 @@ kernel void kernel_mul_mv_q8_0_f32(
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
+
+#ifdef DS4_PRIVATE_CLONE
+/* WQ8 async arms. C = runs per chunk; the ping-pong footprint is
+ * NSG*NR0*C*272 B, so C picks the point on the occupancy curve DECODE-TGOCC
+ * 10c is measuring: 2 -> 4352 B, 4 -> 8704 B. C = 8 is deliberately absent --
+ * 17408 B leaves ONE threadgroup per core, and there is no plausible overlap
+ * gain that survives that. */
+kernel void kernel_mul_mv_q8_0_f32_sgasync2(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, 2>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+kernel void kernel_mul_mv_q8_0_f32_sgasync4(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &, 4>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+#endif
 
 /* Narrow-k Q8_0 matvec: NR0 output rows per SIMD GROUP, no cross-simdgroup pass.
  *
