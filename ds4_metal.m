@@ -1154,6 +1154,7 @@ static uint32_t g_routed_moe_selected_override_n;
 static int g_moe_selected_trace_record_initialized;
 static FILE *g_moe_selected_trace_record_fp;
 static uint64_t g_moe_selected_trace_record_count;
+static uint32_t g_moe_selected_trace_record_stride;
 static int g_moe_selected_trace_replay_initialized;
 static int32_t *g_moe_selected_trace_replay_ids;
 static uint64_t g_moe_selected_trace_replay_count;
@@ -2451,8 +2452,10 @@ static void ds4_gpu_moe_selected_trace_record_close(void) {
         fclose(g_moe_selected_trace_record_fp);
         g_moe_selected_trace_record_fp = NULL;
         fprintf(stderr,
-                "ds4: recorded %" PRIu64 " routed-MoE selected-id entries to %s\n",
+                "ds4: recorded %" PRIu64 " routed-MoE selected-id entries "
+                "(%u int32 each, positional in execution order) to %s\n",
                 g_moe_selected_trace_record_count,
+                g_moe_selected_trace_record_stride,
                 path && path[0] ? path : "(unknown)");
     }
 }
@@ -2462,8 +2465,24 @@ static int ds4_gpu_moe_selected_trace_record(
         uint32_t      n_selected) {
     const char *path = getenv("DS4_MOE_RECORD_SELECTED_IDS");
     if (!path || !path[0]) return 1;
-    if (n_selected != 6) {
-        fprintf(stderr, "ds4: selected-id recording expects exactly 6 selected experts\n");
+    /* The top-k is the MODEL's, not a constant. This hard-coded 6 and silently
+     * recorded nothing on GLM-5.3-Flash, which routes 8 of 288 -- so HOTREP0's
+     * trace came back empty and the run was wasted. The stride is now taken
+     * from the caller, pinned on first use, and reported at exit, because the
+     * file is positional and a consumer that assumes the wrong width decodes
+     * garbage that still looks like expert ids. */
+    uint32_t rec_stride = g_moe_selected_trace_record_stride;
+    if (rec_stride == 0u) { rec_stride = n_selected; g_moe_selected_trace_record_stride = n_selected; }
+    if (n_selected != rec_stride) {
+        fprintf(stderr,
+                "ds4: selected-id recording saw %u experts after %u; the file "
+                "is positional and cannot carry two strides\n",
+                n_selected, rec_stride);
+        return 0;
+    }
+    if (n_selected == 0u || n_selected > 6u * 4u) {
+        fprintf(stderr, "ds4: selected-id recording: implausible top-k %u\n",
+                n_selected);
         return 0;
     }
 
@@ -2495,8 +2514,8 @@ static int ds4_gpu_moe_selected_trace_replay(
         uint32_t n_selected) {
     const char *path = getenv("DS4_MOE_REPLAY_SELECTED_IDS");
     if (!path || !path[0]) return 0;
-    if (n_selected != 6) {
-        fprintf(stderr, "ds4: selected-id replay expects exactly 6 selected experts\n");
+    if (n_selected == 0u || n_selected > 6u * 4u) {
+        fprintf(stderr, "ds4: selected-id replay: implausible top-k %u\n", n_selected);
         return -1;
     }
 
@@ -13130,11 +13149,17 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                             g_tp_stat_batch_exchange_ms * 1e3 / (double)g_tp_stat_batch_gates,
                             g_tp_stat_batch_release_ms * 1e3 / (double)g_tp_stat_batch_gates);
                 ds4_gpu_tp_fence_spin_report();
+                /* Guarded like the poll line below. g_tp_stat_gates stays zero
+                 * in configurations where only the batch counters advance, and
+                 * the three divisions then printed 0/0 -- a NaN that reads as
+                 * an uninitialised accumulator and cost a reviewer's time on
+                 * the 2026-09-15 diagnostic. */
+                const double gates_d = (double)g_tp_stat_gates;
                 fprintf(stderr,
                         "ds4: TP gates: encode lead %.2f gates; verify %.1f us; release %.1f us; poll hit line avg %.1f max %llu over %llu\n",
-                        (double)g_tp_stat_encode_lead / (double)g_tp_stat_gates,
-                        g_tp_stat_cbwait_ms / (double)g_tp_stat_gates * 1000.0,
-                        g_tp_stat_release_ms / (double)g_tp_stat_gates * 1000.0,
+                        g_tp_stat_gates ? (double)g_tp_stat_encode_lead / gates_d : 0.0,
+                        g_tp_stat_gates ? g_tp_stat_cbwait_ms / gates_d * 1000.0 : 0.0,
+                        g_tp_stat_gates ? g_tp_stat_release_ms / gates_d * 1000.0 : 0.0,
                         g_tp_stat_poll_count ?
                             (double)g_tp_stat_poll_lines / (double)g_tp_stat_poll_count : 0.0,
                         (unsigned long long)g_tp_stat_poll_max_line,
