@@ -33,6 +33,7 @@
 #include <unistd.h>
 
 #include "ds4_aneproc.h"
+#include "ds4_ane_compile.h"
 
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -168,7 +169,10 @@ int main(int argc, const char **argv) { @autoreleasepool {
             snprintf(path, sizeof(path), "%s/shexp_L%02u_fused.mlpackage", model_dir, il);
             NSURL *u = [NSURL fileURLWithPath:@(path)];
             NSError *e = nil;
-            NSURL *c = [MLModel compileModelAtURL:u error:&e];
+            /* Cached. The helper is the worse offender of the two: it compiles
+             * all 42 layers on every spawn, and the harness spawns it per arm
+             * per rep. */
+            NSURL *c = ds4_ane_compiled_model_url(u, &e);
             MLModel *m = c ? [MLModel modelWithContentsOfURL:c configuration:cfg error:&e] : nil;
             if (!m) {
                 /* EVERY model, or none. A partially loaded set means some
@@ -368,6 +372,10 @@ int main(int argc, const char **argv) { @autoreleasepool {
 
 drained:
     fprintf(stderr, "ds4-ane-helper: stopping after %u predictions\n", served);
+    /* Only removes builds that could not be installed in the cache; the cache
+     * itself persists on purpose. A SIGKILLed helper skips this, which is
+     * exactly why the cache -- not a delete-at-exit -- is the actual fix. */
+    ds4_ane_compile_cache_cleanup();
     atomic_store_explicit(&w[DS4_ANEPROC_W_ALIVE], 0u, memory_order_release);
     CFRelease(si); CFRelease(so); CFRelease(sc);
     return 0;

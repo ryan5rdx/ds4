@@ -745,9 +745,19 @@ ds4-ane-helper: ds4_ane_helper.m ds4_aneproc.h
 
 # Cross-process ring probe. The sidecar's VALUE needs the rig; its CORRECTNESS
 # and handoff cost do not, and --null mode means no Core ML and no models.
-tests/probe_aneproc_ring: tests/probe_aneproc_ring tests/probe_wq8_async.m ds4_aneproc.h
+# Was `tests/probe_aneproc_ring: tests/probe_aneproc_ring tests/probe_wq8_async.m`
+# -- a self-dependency plus an unrelated file, so editing the probe's OWN source
+# never rebuilt it and the binary could silently lag the test it claims to run.
+tests/probe_aneproc_ring: tests/probe_aneproc_ring.m ds4_aneproc.h
 	$(CC) $(CFLAGS) -fobjc-arc -I. -o $@ tests/probe_aneproc_ring.m \
 	      -framework Foundation -framework IOSurface
+
+tests/probe_ane_compile_cache: tests/probe_ane_compile_cache.m ds4_ane_compile.h
+	$(CC) $(CFLAGS) -fobjc-arc -I. -o $@ tests/probe_ane_compile_cache.m \
+	      -framework Foundation -framework CoreML
+
+test-ane-compile-cache: tests/probe_ane_compile_cache
+	./tests/probe_ane_compile_cache
 
 test-aneproc-ring: tests/probe_aneproc_ring ds4-ane-helper
 	./tests/probe_aneproc_ring ./ds4-ane-helper

@@ -10,6 +10,7 @@
 
 #include "ds4_ane.h"
 #include "ds4_aneproc.h"
+#include "ds4_ane_compile.h"
 
 /*
  * The Core ML half of the shared-expert sidecar. Metal, IOSurface and the
@@ -241,6 +242,7 @@ static void ds4_ane_teardown(void) {
     }
     g_in_array = nil; g_out_array = nil; g_queue = nil;
     ds4_gpu_ane_stage_free();
+    ds4_ane_compile_cache_cleanup();
     g_ready = 0; g_n_layers = 0; g_n_tok = 0; g_dim = 0;
 }
 
@@ -401,7 +403,9 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
                         @"%s/shexp_L%02u_%s.mlpackage", dir, il, variant];
                 NSURL *url = [NSURL fileURLWithPath:path];
                 NSError *err = nil;
-                NSURL *compiled = [MLModel compileModelAtURL:url error:&err];
+                /* Cached: compileModelAtURL: leaks a fresh temp build per call
+                 * and nothing here ever owned it. See ds4_ane_compile.h. */
+                NSURL *compiled = ds4_ane_compiled_model_url(url, &err);
                 if (!compiled) continue;
                 g_models[il] = [MLModel modelWithContentsOfURL:compiled
                                                  configuration:cfg
