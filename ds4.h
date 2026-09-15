@@ -402,6 +402,13 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                int min_expert_samples);
 void ds4_engine_dump_tokens(ds4_engine *e, const ds4_tokens *tokens);
 int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *fp);
+/* Export the real Q8_0 shared-expert weights as FP16 in Core ML conv
+ * orientation, plus a manifest. Returns the number of sparse layers written, 0
+ * on failure. Campaign rule: an ANE replacement is a speed probe until it runs
+ * these rather than synthetic weights. */
+int ds4_export_ane_shexp_from_path(const char *model_path, const char *outdir,
+                                   char *err, size_t errlen);
+
 int ds4_dump_chat_tokenization(const char *model_path,
                                const char *system,
                                const char *prompt,

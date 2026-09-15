@@ -7806,6 +7806,180 @@ static void embed_token_f16(const ds4_model *m, const ds4_weights *w, int token,
     }
 }
 
+/* ---- ANE shared-expert weight export -------------------------------------
+ *
+ * Campaign rule 8: no ANE replacement becomes a production feature until it
+ * runs weights derived from the actual GGUF. PERFONLY3's +3.19% was measured
+ * with random FP16 and deliberately produces wrong text; it is a speed result
+ * and nothing else until this path exists.
+ *
+ * The exporter lives HERE, in ds4, rather than in the Python generator, and
+ * that is the whole design decision: the campaign doc asks for "a reproducible
+ * exporter from the loaded GLM model rather than teaching Python a second,
+ * potentially divergent Q8 decoder". A second decoder that rounds one block
+ * edge differently would show up as a quality regression attributed to the ANE.
+ * So this reuses ds4's own tensor metadata and the same 34-byte block
+ * definition embed_token_q8_0() uses, and Python only wraps the bytes.
+ *
+ * Output per sparse layer, FP16 in Core ML convolution orientation (OIHW with
+ * H=W=1), which is what mb.conv wants and is the transpose of the GGUF row
+ * layout:
+ *
+ *   shexp_L%02u_gate.f16   [n_ff_exp, n_embd, 1, 1]
+ *   shexp_L%02u_up.f16     [n_ff_exp, n_embd, 1, 1]
+ *   shexp_L%02u_down.f16   [n_embd, n_ff_exp, 1, 1]
+ *
+ * plus manifest.json carrying the source GGUF hash, tensor names, offsets,
+ * shapes, converter version and a per-file digest, so a compiled model can
+ * always be traced back to the bytes it came from.
+ */
+#define DS4_ANE_EXPORT_VERSION 1u
+
+static uint64_t ds4_ane_export_digest(const void *p, size_t n) {
+    /* FNV-1a. Not a security hash -- this exists so a manifest entry can be
+     * matched against a file, and so a truncated or half-written export is
+     * caught before it becomes a model. */
+    const uint8_t *b = (const uint8_t *)p;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+/* Dequantize a Q8_0 or F16 2D tensor into FP16, TRANSPOSED into OIHW.
+ *
+ * GGUF stores [dim0=in, dim1=out] row-major by output row; Core ML conv wants
+ * [out, in, 1, 1]. Doing the transpose here rather than in Python keeps the
+ * only reader of the quantised bytes in one place. */
+static bool ds4_ane_export_tensor(const ds4_model *m, const ds4_tensor *t,
+                                  uint64_t n_in, uint64_t n_out,
+                                  uint16_t *out_f16, char *err, size_t errlen) {
+    if (!t || t->ndim != 2 || t->dim[0] != n_in || t->dim[1] != n_out) {
+        snprintf(err, errlen, "tensor %.*s is not [%llu,%llu]",
+                 (int)t->name.len, t->name.ptr,
+                 (unsigned long long)n_in, (unsigned long long)n_out);
+        return false;
+    }
+    const uint8_t *base = (const uint8_t *)tensor_data(m, t);
+    if (!base) { snprintf(err, errlen, "tensor data unavailable"); return false; }
+
+    if (t->type == DS4_TENSOR_F16) {
+        const uint16_t *src = (const uint16_t *)base;
+        for (uint64_t o = 0; o < n_out; o++)
+            for (uint64_t i = 0; i < n_in; i++)
+                out_f16[o * n_in + i] = src[o * n_in + i];
+        return true;
+    }
+    if (t->type != DS4_TENSOR_Q8_0) {
+        snprintf(err, errlen, "tensor %.*s is type %u, expected q8_0 or f16",
+                 (int)t->name.len, t->name.ptr, t->type);
+        return false;
+    }
+    /* The SAME block definition as embed_token_q8_0: 34 bytes, f16 scale then
+     * 32 int8, value = scale * q. Stated as one loop rather than reused from a
+     * helper because there is no helper -- and if one is ever added, this must
+     * move to it rather than drift beside it. */
+    const uint64_t blocks = (n_in + 31) / 32;
+    for (uint64_t o = 0; o < n_out; o++) {
+        const uint8_t *row = base + o * blocks * 34;
+        for (uint64_t b = 0; b < blocks; b++) {
+            uint16_t sb;
+            memcpy(&sb, row + b * 34, sizeof(sb));
+            const float scale = f16_to_f32(sb);
+            const int8_t *qs = (const int8_t *)(row + b * 34 + 2);
+            const uint64_t i0 = b * 32;
+            const uint64_t bn = (n_in - i0 < 32) ? (n_in - i0) : 32;
+            for (uint64_t i = 0; i < bn; i++) {
+                out_f16[o * n_in + i0 + i] = f32_to_f16(scale * (float)qs[i]);
+            }
+        }
+    }
+    return true;
+}
+
+static bool ds4_ane_export_write(const char *dir, const char *name,
+                                 const void *p, size_t n, uint64_t *digest,
+                                 char *err, size_t errlen) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    FILE *f = fopen(path, "wb");
+    if (!f) { snprintf(err, errlen, "cannot write %s", path); return false; }
+    const size_t wrote = fwrite(p, 1, n, f);
+    const int closed = fclose(f);
+    if (wrote != n || closed != 0) {
+        snprintf(err, errlen, "short write on %s (%zu of %zu)", path, wrote, n);
+        return false;
+    }
+    *digest = ds4_ane_export_digest(p, n);
+    return true;
+}
+
+int ds4_export_ane_shexp(const ds4_model *m, const ds4_weights *w,
+                         const char *outdir, char *err, size_t errlen) {
+    if (!m || !w || !outdir) { snprintf(err, errlen, "null argument"); return 0; }
+    const uint64_t n_embd = (uint64_t)DS4_N_EMBD;
+    const uint64_t n_ff   = (uint64_t)DS4_N_FF_EXP;
+    const uint32_t n_layer = (uint32_t)DS4_N_LAYER;
+
+    uint16_t *buf = (uint16_t *)malloc(n_embd * n_ff * sizeof(uint16_t));
+    if (!buf) { snprintf(err, errlen, "out of memory"); return 0; }
+
+    char mpath[1024];
+    snprintf(mpath, sizeof(mpath), "%s/manifest.json", outdir);
+    FILE *mf = fopen(mpath, "w");
+    if (!mf) { free(buf); snprintf(err, errlen, "cannot write %s", mpath); return 0; }
+    fprintf(mf, "{\n  \"converter_version\": %u,\n", DS4_ANE_EXPORT_VERSION);
+    fprintf(mf, "  \"kind\": \"real\",\n");
+    fprintf(mf, "  \"n_embd\": %llu,\n  \"n_ff_exp\": %llu,\n",
+            (unsigned long long)n_embd, (unsigned long long)n_ff);
+    fprintf(mf, "  \"layers\": [\n");
+
+    int emitted = 0, ok = 1;
+    for (uint32_t il = 0; il < n_layer && ok; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!l->ffn_gate_shexp || !l->ffn_up_shexp || !l->ffn_down_shexp) continue;
+
+        const struct { const ds4_tensor *t; uint64_t in, out; const char *sfx; } parts[3] = {
+            { l->ffn_gate_shexp, n_embd, n_ff,   "gate" },
+            { l->ffn_up_shexp,   n_embd, n_ff,   "up"   },
+            { l->ffn_down_shexp, n_ff,   n_embd, "down" },
+        };
+        if (emitted) fprintf(mf, ",\n");
+        fprintf(mf, "    { \"layer\": %u, \"files\": [", il);
+        for (int k = 0; k < 3 && ok; k++) {
+            if (!ds4_ane_export_tensor(m, parts[k].t, parts[k].in, parts[k].out,
+                                       buf, err, errlen)) { ok = 0; break; }
+            char fname[128];
+            snprintf(fname, sizeof(fname), "shexp_L%02u_%s.f16", il, parts[k].sfx);
+            uint64_t dg = 0;
+            const size_t bytes = (size_t)(parts[k].in * parts[k].out * sizeof(uint16_t));
+            if (!ds4_ane_export_write(outdir, fname, buf, bytes, &dg, err, errlen)) {
+                ok = 0; break;
+            }
+            fprintf(mf, "%s{ \"name\": \"%s\", \"tensor\": \"%.*s\", "
+                        "\"shape\": [%llu, %llu, 1, 1], \"bytes\": %zu, "
+                        "\"fnv1a64\": \"%016llx\" }",
+                    k ? ", " : "", fname,
+                    (int)parts[k].t->name.len, parts[k].t->name.ptr,
+                    (unsigned long long)parts[k].out, (unsigned long long)parts[k].in,
+                    bytes, (unsigned long long)dg);
+        }
+        fprintf(mf, "] }");
+        emitted++;
+    }
+    fprintf(mf, "\n  ],\n  \"sparse_layers\": %d\n}\n", emitted);
+    fclose(mf);
+    free(buf);
+    if (!ok) return 0;
+    if (emitted == 0) {
+        snprintf(err, errlen, "no sparse layers carry shared-expert tensors");
+        return 0;
+    }
+    fprintf(stderr, "ds4: exported %d sparse layers of real shared-expert "
+                    "weights to %s (converter v%u)\n",
+            emitted, outdir, DS4_ANE_EXPORT_VERSION);
+    return emitted;
+}
+
 static void embed_token_q8_0(const ds4_model *m, const ds4_weights *w, int token, float *out) {
     ds4_tensor *te = w->token_embd;
     if (te->type != DS4_TENSOR_Q8_0 || te->ndim != 2) {
@@ -63332,6 +63506,21 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     vocab_free(&vocab);
     model_close(&model);
     return 0;
+}
+
+/* Public entry: open the model, bind weights, export, close. Standalone so the
+ * rig can produce the model set without starting a server, and so the export is
+ * reproducible from a GGUF path alone. */
+int ds4_export_ane_shexp_from_path(const char *model_path, const char *outdir,
+                                   char *err, size_t errlen) {
+    ds4_model model;
+    ds4_weights weights;
+    model_open(&model, model_path, false, false);
+    config_validate_model(&model);
+    weights_bind(&weights, &model, false, 0, 0, false, true);
+    const int n = ds4_export_ane_shexp(&model, &weights, outdir, err, errlen);
+    model_close(&model);
+    return n;
 }
 
 int ds4_dump_chat_tokenization(const char *model_path,

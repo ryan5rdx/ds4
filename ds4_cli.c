@@ -102,6 +102,9 @@ typedef struct {
      * Resolved post-parse via parse_gpu_vram_arg(). */
     const char *gpu_vram_arg;
     const char *gpu_devices_arg;
+    /* --export-ane-shexp <dir>: dump real shared-expert weights and exit,
+     * without starting an engine. */
+    const char *export_ane_shexp_dir;
 } cli_config;
 
 static volatile sig_atomic_t cli_interrupted;
@@ -1953,6 +1956,13 @@ static cli_config parse_options(int argc, char **argv) {
     bool directional_steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
+        if (!strcmp(arg, "--export-ane-shexp")) {
+            /* Standalone: needs only -m and an output directory, and exits
+             * without starting an engine. The ANE campaign gates production on
+             * real weights, and this is the only producer of them. */
+            c.export_ane_shexp_dir = need_arg(&i, argc, argv, arg);
+            continue;
+        }
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
             const char *topic = (i + 1 < argc && argv[i + 1][0] != '-') ?
                 argv[i + 1] : NULL;
@@ -2259,6 +2269,22 @@ static cli_config parse_options(int argc, char **argv) {
 
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
+    if (cfg.export_ane_shexp_dir) {
+        char eerr[512] = {0};
+        const int n = ds4_export_ane_shexp_from_path(cfg.engine.model_path,
+                                                     cfg.export_ane_shexp_dir,
+                                                     eerr, sizeof(eerr));
+        if (n <= 0) {
+            fprintf(stderr, "ds4: ANE shared-expert export failed: %s\n",
+                    eerr[0] ? eerr : "unknown error");
+            ds4_dist_options_free(cfg.dist);
+            free(cfg.prompt_owned);
+            return 1;
+        }
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return 0;
+    }
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prefix.count != 0) {
             fprintf(stderr, "ds4: --dump-tokens does not support --prefix-file\n");
