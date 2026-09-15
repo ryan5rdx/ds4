@@ -167,6 +167,30 @@ def main():
             for a, b in merged:
                 head = next((lines[i] for i in range(a, b + 1)
                              if lines[i].strip()), "")
+                body = "\n".join(lines[a:b + 1])
+                # REFUSE to elide the async primitive itself.
+                #
+                # Eliding a definition the old frontend cannot compile is the
+                # point of this pass -- for device atomics and the like, whose
+                # absence is inert. It is the opposite for anything containing
+                # simdgroup_async_copy: removing that silently turns an ASYNC
+                # arm into its own manual control, and the run then reports a
+                # null for the primitive while never having used it. That
+                # happened once, to the routed-MoE staging arms, and it is
+                # exactly the class of failure this campaign keeps paying for.
+                #
+                # A genuine compile error in async code is a bug to fix in the
+                # source, not to route around here.
+                if "simdgroup_async_copy" in body or "simdgroup_future" in body:
+                    print("VOID: the elision pass tried to remove code "
+                          "containing the async primitive:", file=sys.stderr)
+                    print(f"      lines {a + 1}-{b + 1}: {head[:120]}",
+                          file=sys.stderr)
+                    print("      Eliding this would silently downgrade an async "
+                          "arm to its manual control.", file=sys.stderr)
+                    print("      Fix the source; do not route around it.",
+                          file=sys.stderr)
+                    return 1
                 elided.append({"first_line": a + 1, "last_line": b + 1,
                                "head": head[:120]})
                 for i in range(a, b + 1):

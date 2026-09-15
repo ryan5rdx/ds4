@@ -8845,6 +8845,100 @@ kernel void kernel_mul_mm_id_addr(
 // each output keeps the exact MMA accumulation order of the separate GEMMs,
 // and the epilogue matches kernel_dsv4_moe_swiglu_weight_f16, so the fused
 // result is bit-identical to the unfused path.
+/* The staging fill, shared by every arm so the arms differ ONLY in the thing
+ * they are named for.
+ *
+ * MANUAL: a flattened cooperative uint4 loop over all 128 threads. The previous
+ * version was a scalar uchar loop, which is 16x the iterations and -- per the
+ * corrected SGASYNC production-shape probe -- a materially different result.
+ * A scalar fallback is kept for an unaligned origin or row pitch, because an
+ * unaligned nb01 is representable and a uint4 load on it faults.
+ *
+ * ASYNC: one 2D copy per tensor, issued by a DIFFERENT simdgroup for gate and
+ * up so the two are independent and overlap, each waiting on its own future.
+ * simdgroup_future<void>::wait() orders only the issuing simdgroup's lanes --
+ * it is NOT a threadgroup publication barrier -- so the caller's barrier after
+ * this call is load-bearing and must not be removed on the grounds that the
+ * copy "already waited".
+ *
+ * Gate and up are separate tensors with separate destinations; they are never
+ * presented as one synthetic 18 KiB contiguous source.
+ */
+template<typename block_q, int RAW_STAGE, bool RAW_ASYNC>
+static inline void ds4_moe_raw_fill(
+        threadgroup block_q *raw_gate,
+        threadgroup block_q *raw_up,
+        device const char   *gsrc,
+        device const char   *usrc,
+        uint                 src_pitch_u4,
+        uint                 rows,
+        uint                 blk_u4,
+        bool                 vec_ok,
+        ushort               tiitg,
+        ushort               sgitg) {
+#ifdef DS4_PRIVATE_CLONE
+    if (RAW_ASYNC && vec_ok) {
+        /* 2D, ragged: rows x blk_u4 uint4 from a src_pitch_u4 pitch into a
+         * dense blk_u4 destination. Exactly the lift the manual loop performs. */
+        /* The full 2D form, as probed in sgasync_2d.metal: dst pitch, dst
+         * element stride, dst tile, then the same three for src, then the
+         * offset and the clamp mode. An abbreviated overload does not exist --
+         * writing one is how the first version of this silently lost its async
+         * path to the clone's error-elision pass. The tiles are exact, so the
+         * clamp mode is never reached; clamp_to_zero is the safe choice if a
+         * ragged tail is ever introduced. */
+        if (sgitg == 0) {
+            simdgroup_future<void> f = simdgroup_async_copy(
+                    (threadgroup uint4 *)raw_gate,
+                    (ulong)blk_u4, (ulong)1, ulong2(blk_u4, rows),
+                    (device const uint4 *)gsrc,
+                    (ulong)src_pitch_u4, (ulong)1, ulong2(blk_u4, rows),
+                    long2(0, 0),
+                    simdgroup_async_copy_clamp_mode::clamp_to_zero);
+            f.wait();
+        }
+        if (RAW_STAGE == 2 && sgitg == 1) {
+            simdgroup_future<void> f = simdgroup_async_copy(
+                    (threadgroup uint4 *)raw_up,
+                    (ulong)blk_u4, (ulong)1, ulong2(blk_u4, rows),
+                    (device const uint4 *)usrc,
+                    (ulong)src_pitch_u4, (ulong)1, ulong2(blk_u4, rows),
+                    long2(0, 0),
+                    simdgroup_async_copy_clamp_mode::clamp_to_zero);
+            f.wait();
+        }
+        return;
+    }
+#endif
+    if (vec_ok) {
+        threadgroup uint4 *dg = (threadgroup uint4 *)raw_gate;
+        threadgroup uint4 *du = (threadgroup uint4 *)raw_up;
+        device const uint4 *sg = (device const uint4 *)gsrc;
+        device const uint4 *su = (device const uint4 *)usrc;
+        for (uint e = tiitg; e < rows * blk_u4; e += 128u) {
+            const uint rr = e / blk_u4;
+            const uint cc = e - rr * blk_u4;
+            const uint64_t off = (uint64_t)rr * src_pitch_u4 + cc;
+            dg[e] = sg[off];
+            if (RAW_STAGE == 2) du[e] = su[off];
+        }
+    } else {
+        threadgroup uchar *dg = (threadgroup uchar *)raw_gate;
+        threadgroup uchar *du = (threadgroup uchar *)raw_up;
+        device const uchar *sg = (device const uchar *)gsrc;
+        device const uchar *su = (device const uchar *)usrc;
+        const uint blk = blk_u4 * (uint)sizeof(uint4);
+        const uint pitch = src_pitch_u4 * (uint)sizeof(uint4);
+        for (uint e = tiitg; e < rows * blk; e += 128u) {
+            const uint rr = e / blk;
+            const uint bb = e - rr * blk;
+            const uint64_t off = (uint64_t)rr * pitch + bb;
+            dg[e] = sg[off];
+            if (RAW_STAGE == 2) du[e] = su[off];
+        }
+    }
+}
+
 /* SGASYNC-MOE arm B: RAW_STAGE stages each 64-row tile of Q4_K superblocks into
  * threadgroup memory once and dequantises from there across the 8 k-steps that
  * one superblock covers, instead of re-reading device memory every step.
@@ -8868,7 +8962,19 @@ kernel void kernel_mul_mm_id_addr(
  * Q4_K only: nl == 16, so `il` walks 0,2,..,14 and the block pointer advances
  * once per 8 k-steps. RAW_STAGE is rejected at instantiation for anything else.
  */
-template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool CULL_TAIL_SIMDGROUPS = false, bool RAW_STAGE = false>
+/* RAW_STAGE is a MODE, not a flag: 0 off, 1 gate only, 2 gate+up.
+ *
+ * The gate-only arm is the whole reason the decomposition can separate reuse
+ * from residency. Staging both tensors takes the k-loop allocation from 16384 B
+ * to 28672 B; staging only gate takes it to 19456 B. If gate-only wins, the
+ * second staged tensor costs more residency than its reuse saves, and a bool
+ * could never have shown that.
+ *
+ * RAW_ASYNC selects the private simdgroup_async_copy for the staging fill. It
+ * is only instantiable under DS4_PRIVATE_CLONE; the modern corpus compiles the
+ * manual fill for the same modes, which is what makes C1/C2 and D1/D2 matched
+ * pairs rather than a comparison across two different kernels. */
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &), bool CULL_TAIL_SIMDGROUPS = false, int RAW_STAGE = 0, bool RAW_ASYNC = false>
 kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
         constant ds4_metal_args_mul_mm_id & args,
         constant ds4_metal_dsv4_moe_swiglu_weight_args & act,
@@ -8894,8 +9000,14 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
     threadgroup block_q *raw_up   =
         (threadgroup block_q *)(shmem + 10240 + 64 * sizeof(block_q));
 
-    static_assert(!RAW_STAGE || nl == 16,
+    static_assert(RAW_STAGE == 0 || nl == 16,
                   "RAW_STAGE assumes one block per 8 k-steps (Q4_K, nl == 16)");
+    static_assert(!RAW_ASYNC || RAW_STAGE != 0,
+                  "RAW_ASYNC without RAW_STAGE stages nothing asynchronously");
+    /* 144 == 9 * sizeof(uint4). The vectorised fill and the 2D async copy both
+     * depend on it, so it is checked rather than assumed. */
+    static_assert(RAW_STAGE == 0 || sizeof(block_q) == 9 * sizeof(uint4),
+                  "raw staging assumes a 144-byte block, 9 uint4 wide");
 
     constexpr int NR0 = 64;
     constexpr int NR1 = 32;
@@ -8989,30 +9101,49 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
              * separates the MMA from the next iteration's top. The one after
              * publishes the new tile. */
             if ((loop_k % QK_K) == 0) {
+                /* Waits for the PREVIOUS iteration's readers of both the raw
+                 * tile and sa_*; nothing else separates the MMA from the next
+                 * iteration's top. */
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                threadgroup uchar *dg = (threadgroup uchar *)raw_gate;
-                threadgroup uchar *du = (threadgroup uchar *)raw_up;
-                device const uchar *sg0 =
-                    (device const uchar *)(src0_gate + args.nb01*r0 + offset0);
-                device const uchar *su0 =
-                    (device const uchar *)(src0_up   + args.nb01*r0 + offset0);
-                const uint blk = (uint)sizeof(block_q);
-                const uint rows = (uint)nr0;
-                /* Source rows are nb01 apart; the staged copy is dense. This is
-                 * the 2D lift the async primitive would perform in one call. */
-                for (uint e = tiitg; e < rows * blk; e += 128u) {
-                    const uint rr = e / blk;
-                    const uint bb = e - rr * blk;
-                    const uint64_t off =
-                        (uint64_t)rr * args.nb01 +
-                        (uint64_t)(loop_k / QK_K) * blk + bb;
-                    dg[rr * blk + bb] = sg0[off];
-                    du[rr * blk + bb] = su0[off];
-                }
+
+                const uint blk_u4 = (uint)(sizeof(block_q) / sizeof(uint4));
+                const uint rows   = (uint)nr0;
+                const uint64_t byte_off =
+                    (uint64_t)(loop_k / QK_K) * (uint64_t)sizeof(block_q);
+                device const char *gsrc =
+                    src0_gate + args.nb01*r0 + offset0 + byte_off;
+                device const char *usrc =
+                    src0_up   + args.nb01*r0 + offset0 + byte_off;
+
+                /* uint4 only where the origin AND the row pitch are both
+                 * 16-aligned. The scalar path is not dead code for symmetry --
+                 * an unaligned nb01 is representable and would fault, and the
+                 * corrected SGASYNC production-shape probe showed the element
+                 * type materially changes the result, so the fast path must be
+                 * taken when it is legal and never when it is not. */
+                const bool vec_ok =
+                    ((uintptr_t)gsrc % sizeof(uint4)) == 0 &&
+                    ((uintptr_t)usrc % sizeof(uint4)) == 0 &&
+                    (args.nb01 % sizeof(uint4)) == 0;
+
+                ds4_moe_raw_fill<block_q, RAW_STAGE, RAW_ASYNC>(
+                        raw_gate, raw_up, gsrc, usrc,
+                        (uint)(args.nb01 / sizeof(uint4)), rows, blk_u4,
+                        vec_ok, tiitg, sgitg);
+
+                /* Publishes the new tile to every consuming simdgroup. Under
+                 * RAW_ASYNC the issuing simdgroup's wait() orders only its own
+                 * lanes, so this barrier is what the other simdgroups rely on
+                 * -- it is not redundant with the wait. */
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
             ds4_moe_raw_dequant(raw_gate + lr0, il, temp_gate);
-            ds4_moe_raw_dequant(raw_up   + lr0, il, temp_up);
+            if (RAW_STAGE == 2) {
+                ds4_moe_raw_dequant(raw_up + lr0, il, temp_up);
+            } else {
+                /* Gate-only: up keeps the shipping device read, unchanged. */
+                dequantize_func(xu, il, temp_up);
+            }
         } else {
             dequantize_func(xg, il, temp_gate);
             dequantize_func(xu, il, temp_up);
@@ -9361,8 +9492,29 @@ template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_f16")]] kernel mul_mm_id
 /* SGASYNC-MOE arm B. Same numerics as the line above -- the only difference is
  * where the Q4_K bytes are read from -- so a text divergence between the two is
  * a bug in the staging, not a tuning choice. Selected by DS4_MOE_RAW_STAGE=1. */
-typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K, false, true>) mul_mm_id_pair_swiglu_f16_q4_raw;
-template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_f16_raw_stage")]] kernel mul_mm_id_pair_swiglu_f16_q4_raw kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K, false, true>;
+/* SGASYNC-MOE arms. The name carries the footprint so a binding line is
+ * unambiguous about which one actually ran -- `_raw_stage` alone could not
+ * distinguish gate-only from both, and the whole decomposition turns on that.
+ *
+ * _raw_stage IS the gate+up manual arm -- the historical name is kept because an
+ * existing harness passes DS4_MOE_RAW_STAGE=1 and that must keep meaning `both`.
+ * A second host_name on the same instantiation is illegal, so the mode is
+ * disambiguated in the binding line rather than in a duplicate symbol. */
+typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K, false, 2>) mul_mm_id_pair_swiglu_f16_q4_raw;
+template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_f16_raw_stage")]] kernel mul_mm_id_pair_swiglu_f16_q4_raw kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K, false, 2>;
+typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K, false, 1>) mul_mm_id_pair_swiglu_f16_q4_rawgate;
+template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_f16_raw_gate")]] kernel mul_mm_id_pair_swiglu_f16_q4_rawgate kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K, false, 1>;
+
+/* The async arms exist ONLY in the private clone. Instantiating them in the
+ * modern corpus would not compile -- metal_simdgroup_async is not visible --
+ * and the manual arms above are their matched controls, same source, same
+ * geometry, differing only in the fill. */
+#ifdef DS4_PRIVATE_CLONE
+typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K, false, 1, true>) mul_mm_id_pair_swiglu_f16_q4_agate;
+template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_f16_async_gate")]] kernel mul_mm_id_pair_swiglu_f16_q4_agate kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K, false, 1, true>;
+typedef decltype(kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K, false, 2, true>) mul_mm_id_pair_swiglu_f16_q4_aboth;
+template [[host_name("kernel_mul_mm_id_q4_K_pair_swiglu_f16_async_both")]] kernel mul_mm_id_pair_swiglu_f16_q4_aboth kernel_mul_mm_id_pair_swiglu_f16_impl<block_q4_K, QK_NL, dequantize_q4_K, false, 2, true>;
+#endif
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4>;
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16_half_scale")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4 kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4_half_scale>;
 template [[host_name("kernel_mul_mm_id_mxfp4_pair_swiglu_f16_tail_cull_half_scale")]] kernel mul_mm_id_pair_swiglu_f16_mxfp4_tail_cull kernel_mul_mm_id_pair_swiglu_f16_impl<block_mxfp4, 2, dequantize_mxfp4_half_scale, true>;

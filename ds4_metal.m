@@ -3632,7 +3632,12 @@ static int g_private_library_state;   /* 0 untried, 1 loaded, -1 unavailable */
  * refusal. make_private_clone_source.py stamps the matching kernel into the
  * artifact, so the check is against the artifact itself, not against a filename
  * or a timestamp. */
-#define DS4_PRIVATE_CLONE_ABI 1
+/* 2: SGASYNC-MOE. kernel_mul_mm_id_pair_swiglu_f16_impl's RAW_STAGE changed
+ * from bool to an int mode and gained RAW_ASYNC, and four new entry points
+ * appeared. An ABI-1 artifact has neither the new names nor the new staging
+ * semantics, and would bind the old raw_stage kernel under a run that believes
+ * it is measuring gate-only or async. */
+#define DS4_PRIVATE_CLONE_ABI 2
 
 static const char *ds4_gpu_private_metallib_path(void) {
     const char *env = getenv("DS4_PRIVATE_METALLIB");
@@ -3799,7 +3804,8 @@ static int ds4_gpu_sgasync_arm(void) {
  * "no regression in the other phase" reading from such a run is uninterpretable
  * -- the other phase was also modified.
  *
- * So: DS4_SGASYNC_TARGET names exactly one target ("dsa", "indexer", or "all"),
+ * So: DS4_SGASYNC_TARGET names exactly one target ("dsa", "indexer", "small",
+ * "moe", or "all"),
  * and an explicitly requested stage is never replaced by a different one. A
  * target that is not selected uses its shipping pipeline; a stage that does not
  * exist for the selected target is an error, not a silent downgrade.
@@ -3814,6 +3820,19 @@ static int ds4_gpu_sgasync_target_selected(const char *target) {
         inited = 1;
         want = getenv("DS4_SGASYNC_TARGET");
         if (!want || !want[0]) want = "all";
+        /* An unrecognised target matches nothing and silently runs shipping in
+         * EVERY arm -- which is exactly what DS4_SGASYNC_TARGET=banked did to
+         * the MOETGOCC harness for a whole campaign. Refuse it here so it
+         * cannot happen again from a typo or a stale script. */
+        if (strcmp(want, "all") && strcmp(want, "dsa") && strcmp(want, "indexer") &&
+            strcmp(want, "small") && strcmp(want, "moe")) {
+            fprintf(stderr,
+                    "ds4: FATAL -- DS4_SGASYNC_TARGET=\"%s\" is not a target "
+                    "(all|dsa|indexer|small|moe). An unknown name matches "
+                    "nothing and would run the shipping kernel in every arm.\n",
+                    want);
+            abort();
+        }
     }
     return strcmp(want, "all") == 0 || strcmp(want, target) == 0;
 }
@@ -37308,13 +37327,120 @@ static int ds4_gpu_encode_mul_mm_id_addr_mapped_tile(
  * manual stage with simdgroup_async_copy, so if staging itself loses to the
  * shipping direct read here, no copy speed can rescue it and Track B's
  * production target closes without any toolchain work. */
-static int ds4_moe_raw_stage_enabled(void) {
+/* MODES, not a flag: 0 off, 1 gate only, 2 gate+up.
+ *
+ * DS4_MOE_RAW_STAGE = off|0 | gate|1g | both|1|2. `1` keeps meaning BOTH, since
+ * an existing harness and the banked-wins ledger both pass it that way and a
+ * silent change of meaning would reinterpret every earlier result.
+ *
+ * Whitelisted, not strtol: "gate" and "goat" must not both be accepted as
+ * something, and the MOETGOCC void is a standing reminder that an arm which
+ * quietly becomes a different arm is worse than a failed run.
+ *
+ * ONE reader, enforced by tests/check_single_knob_reader.sh. */
+static int ds4_moe_raw_stage_mode(void) {
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("DS4_MOE_RAW_STAGE");
-        v = (e && e[0] == '1') ? 1 : 0;
+        if (!e || !e[0] || !strcmp(e, "off") || !strcmp(e, "0")) {
+            v = 0;
+        } else if (!strcmp(e, "gate") || !strcmp(e, "1g")) {
+            v = 1;
+        } else if (!strcmp(e, "both") || !strcmp(e, "1") || !strcmp(e, "2")) {
+            v = 2;
+        } else {
+            fprintf(stderr,
+                    "ds4: FATAL -- DS4_MOE_RAW_STAGE=\"%s\" is not one of "
+                    "off|gate|both (0|1g|1). Refusing rather than silently "
+                    "running a different arm.\n", e);
+            abort();
+        }
     }
     return v;
+}
+
+static int ds4_moe_raw_stage_enabled(void) { return ds4_moe_raw_stage_mode() != 0; }
+
+/* Threadgroup allocation per mode. The k-loop needs 10240 B of working storage
+ * plus the staged tiles; the epilogue separately needs 16384 B and aliases the
+ * same region behind a barrier, so the dispatch takes the max of the two rather
+ * than their sum. */
+static NSUInteger ds4_moe_raw_stage_tg_bytes(int mode) {
+    const NSUInteger staged = (mode == 0) ? 0u : (mode == 1) ? 9216u : 18432u;
+    const NSUInteger kloop  = 10240u + staged;
+    return kloop > 16384u ? kloop : 16384u;
+}
+
+/* Per-phase dispatch census. The raw stage is a PREFILL experiment; a decode
+ * dispatch of it would be both unintended and invisible in a prefill-only
+ * throughput number, so it is counted and reported rather than assumed absent
+ * -- the certification gate requires decode == 0. */
+static uint64_t g_moe_raw_disp_prefill, g_moe_raw_disp_decode, g_moe_raw_disp_unknown;
+
+void ds4_gpu_moe_raw_stage_report(const char *where);
+void ds4_gpu_moe_raw_stage_report(const char *where) {
+    if (!g_moe_raw_disp_prefill && !g_moe_raw_disp_decode && !g_moe_raw_disp_unknown) return;
+    fprintf(stderr,
+            "ds4: MOERAW %s -- mode=%d dispatches prefill=%llu decode=%llu "
+            "unknown=%llu%s\n",
+            where, ds4_moe_raw_stage_mode(),
+            (unsigned long long)g_moe_raw_disp_prefill,
+            (unsigned long long)g_moe_raw_disp_decode,
+            (unsigned long long)g_moe_raw_disp_unknown,
+            (g_moe_raw_disp_decode || g_moe_raw_disp_unknown)
+                ? "   *** decode/unknown dispatch: NOT a prefill-only arm ***" : "");
+}
+
+/* The one binding line the plan requires: mode, function, library, async, TG
+ * bytes. Emitted once per distinct function so it cannot flood, and emitted
+ * from the SELECTION site so it states what was actually bound rather than what
+ * was requested. */
+static void ds4_moe_raw_stage_announce(const char *fn, int mode, int is_private,
+                                       int is_async, NSUInteger tg_bytes) {
+    static const char *seen[8];
+    static int n_seen;
+    for (int i = 0; i < n_seen; i++) if (strcmp(seen[i], fn) == 0) return;
+    if (n_seen < 8) seen[n_seen++] = fn;
+    fprintf(stderr,
+            "ds4: MOERAW bind mode=%s fn=%s lib=%s copy=%s tg=%lu B\n",
+            mode == 0 ? "off" : mode == 1 ? "gate" : "both",
+            fn, is_private ? "private-14.2" : "modern",
+            is_async ? "async" : "manual", (unsigned long)tg_bytes);
+}
+
+/* Resolve the routed-MoE prefill pair kernel for the current arm.
+ *
+ * DS4_SGASYNC_ARM selects the library and the fill, exactly as it does for the
+ * other targets: 0 modern manual, 1 private non-async (the compiler control),
+ * 2 private async. A requested private arm that cannot be served falls back to
+ * the modern kernel and SAYS SO -- the harness treats that as a void arm, which
+ * is the only safe reading when the artifact is missing or stale. */
+static id<MTLComputePipelineState> ds4_gpu_moe_pair_swiglu_pipeline_for_arm(void) {
+    const int mode = ds4_moe_raw_stage_mode();
+    const NSUInteger tg = ds4_moe_raw_stage_tg_bytes(mode);
+    const char *base = mode == 0 ? "kernel_mul_mm_id_q4_K_pair_swiglu_f16"
+                     : mode == 1 ? "kernel_mul_mm_id_q4_K_pair_swiglu_f16_raw_gate"
+                                 : "kernel_mul_mm_id_q4_K_pair_swiglu_f16_raw_stage";
+    const int arm = ds4_gpu_sgasync_arm();
+    if (arm == 0 || mode == 0 || !ds4_gpu_sgasync_target_selected("moe")) {
+        ds4_moe_raw_stage_announce(base, mode, 0, 0, tg);
+        return ds4_gpu_get_pipeline(base);
+    }
+    const char *want = base;
+    if (arm == 2) {
+        want = mode == 1 ? "kernel_mul_mm_id_q4_K_pair_swiglu_f16_async_gate"
+                         : "kernel_mul_mm_id_q4_K_pair_swiglu_f16_async_both";
+    }
+    id<MTLComputePipelineState> p = ds4_gpu_get_private_pipeline(want);
+    if (p) {
+        ds4_moe_raw_stage_announce(want, mode, 1, arm == 2, tg);
+        return p;
+    }
+    fprintf(stderr,
+            "ds4: MOERAW SHIPPING (private %s unavailable) -- requested arm %d "
+            "could not be served; this arm is VOID, not a null\n", want, arm);
+    ds4_moe_raw_stage_announce(base, mode, 0, 0, tg);
+    return ds4_gpu_get_pipeline(base);
 }
 
 static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
@@ -37383,9 +37509,21 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
      * 32768 B. Stated as a ratio, not as a per-core count: dividing
      * maxThreadgroupMemoryLength gives a per-core figure that is not real,
      * because that property bounds one threadgroup and not the core's pool. */
+    /* Mode-aware: gate-only is 19456, not 28672. The previous expression gave
+     * every enabled mode the both-tensor footprint, which would have handed the
+     * gate-only arm the residency cost it exists to avoid -- and B1 vs B2 is
+     * the entire point of the decomposition. */
     const NSUInteger pair_tg_bytes =
-        compact_tile ? 8192u : (ds4_moe_raw_stage_enabled() ? 28672u : 16384u);
+        compact_tile ? 8192u : ds4_moe_raw_stage_tg_bytes(ds4_moe_raw_stage_mode());
     [enc setThreadgroupMemoryLength:DS4_TG16(pair_tg_bytes) atIndex:0];
+    /* Phase census. n_tokens is the discriminator the certification gate reads:
+     * this is a prefill experiment and decode must be 0. */
+    if (ds4_moe_raw_stage_mode() != 0) {
+        const uint32_t ntok = mm_args ? (uint32_t)mm_args->ne11 : 0u;
+        if (ntok == 0u)      g_moe_raw_disp_unknown++;
+        else if (ntok == 1u) g_moe_raw_disp_decode++;
+        else                 g_moe_raw_disp_prefill++;
+    }
     [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake((NSUInteger)work_cap,
                                           ((NSUInteger)mm_args->ne0 + tile_m - 1u) / tile_m,
                                           1)
@@ -48365,12 +48503,18 @@ int ds4_gpu_routed_moe_batch_tensor(
                     !g_quality_mode &&
                     !g_ssd_streaming_mode &&
                     g_tp_split_world == 1;
+                /* Q4_K is the SGASYNC-MOE target and goes through the arm
+                 * resolver, which picks the library and the fill and emits the
+                 * one binding line. Every other type keeps the shipping
+                 * lookup. */
+                if (gate_type == DS4_METAL_TENSOR_Q4_K) {
+                    pair_swiglu_mm_pipeline =
+                        ds4_gpu_moe_pair_swiglu_pipeline_for_arm();
+                } else
                 pair_swiglu_mm_pipeline =
                     ds4_gpu_get_pipeline(
                         gate_type == DS4_METAL_TENSOR_Q4_K ?
-                            (ds4_moe_raw_stage_enabled() ?
-                                "kernel_mul_mm_id_q4_K_pair_swiglu_f16_raw_stage" :
-                                "kernel_mul_mm_id_q4_K_pair_swiglu_f16") :
+                            "kernel_mul_mm_id_q4_K_pair_swiglu_f16" :
                         gate_type == DS4_METAL_TENSOR_MXFP4 ?
                             (use_mxfp4_mm_id_pair_swiglu_compact_tile ?
                                 (use_mxfp4_mm_id_pair_half_scale ?

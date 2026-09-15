@@ -70,6 +70,6 @@ static inline void ds4_sgasync_stage_1d(threadgroup T *dst,
  * metallib, which otherwise binds fine and then misreads its arguments. It
  * lives in the PRELUDE rather than in dsv4_misc.metal, where an unrelated edit
  * to that file removed it once and the guard then rejected every artifact. */
-kernel void ds4_private_clone_abi_1(device uint *sink [[buffer(0)]]) { sink[0] = 1u; }
+kernel void ds4_private_clone_abi_2(device uint *sink [[buffer(0)]]) { sink[0] = 2u; }
 
 #endif  /* DS4_PRIVATE_CLONE */

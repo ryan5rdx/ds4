@@ -39498,6 +39498,7 @@ static bool metal_graph_prefill_layer_major_inner(
  * layer_major bypassed it -- recreating the "no telemetry on the alternate
  * path" failure this codebase has already documented once. */
 void ds4_glm_ane_replacement_report(const char *where, int tp_rank);
+void ds4_gpu_moe_raw_stage_report(const char *where);
 
 static bool metal_graph_prefill_layer_major(
         ds4_gpu_graph *g,
@@ -39514,6 +39515,7 @@ static bool metal_graph_prefill_layer_major(
     const bool ok = metal_graph_prefill_layer_major_inner(g, model, weights, prompt, start, n_tokens, logits, show_progress, imatrix, display_progress, display_progress_ud);
     ds4_ane_aneproc_validate("prefill");
     ds4_glm_ane_replacement_report("prefill", -1);
+    ds4_gpu_moe_raw_stage_report("prefill");
     return ok;
 }
 
@@ -39724,6 +39726,7 @@ static bool metal_graph_prefill_chunked_range(
         /* Says what the GPU did, not just that the ANE ran. A served count
          * cannot distinguish replacement from shadow; these can. */
         ds4_glm_ane_replacement_report("chunk", g ? g->tp_rank : -1);
+        ds4_gpu_moe_raw_stage_report("chunk");
         ds4_ane_report();
         ds4_ane_reset();
         if (progress) {
