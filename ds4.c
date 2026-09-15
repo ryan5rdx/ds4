@@ -7920,6 +7920,10 @@ int ds4_export_ane_shexp(const ds4_model *m, const ds4_weights *w,
     const uint64_t n_ff   = (uint64_t)DS4_N_FF_EXP;
     const uint32_t n_layer = (uint32_t)DS4_N_LAYER;
 
+    const uint32_t leading_dense = (uint32_t)DS4_N_LEADING_DENSE;
+    const uint32_t ane_sparse = (n_layer > leading_dense + 1u)
+            ? (n_layer - leading_dense - 1u) : 0u;
+
     uint16_t *buf = (uint16_t *)malloc(n_embd * n_ff * sizeof(uint16_t));
     if (!buf) { snprintf(err, errlen, "out of memory"); return 0; }
 
@@ -7931,12 +7935,40 @@ int ds4_export_ane_shexp(const ds4_model *m, const ds4_weights *w,
     fprintf(mf, "  \"kind\": \"real\",\n");
     fprintf(mf, "  \"n_embd\": %llu,\n  \"n_ff_exp\": %llu,\n",
             (unsigned long long)n_embd, (unsigned long long)n_ff);
+    /* The SwiGLU clamp is part of the shipping arithmetic, not a detail of the
+     * Metal kernel: ds4_glm_swiglu() does gate = min(gate, limit) and
+     * up = clamp(up, -limit, limit) before the SiLU. A Core ML graph that omits
+     * it computes a different function on exactly the inputs that saturate, and
+     * the divergence would be blamed on FP16. It travels in the manifest so the
+     * generator cannot forget it or guess it. */
+    fprintf(mf, "  \"swiglu_clamp\": %.9g,\n", (double)DS4_SWIGLU_CLAMP_EXP);
+    fprintf(mf, "  \"leading_dense\": %u,\n  \"expected_layers\": %u,\n",
+            leading_dense, ane_sparse);
     fprintf(mf, "  \"layers\": [\n");
 
+    /* LOGICAL indexing, and this is a correctness matter rather than a naming
+     * preference. The runtime loaders iterate il = 0 .. n_layers-1 and the
+     * dispatch passes ane_li = physical - DS4_N_LEADING_DENSE, so a model set
+     * named by PHYSICAL layer is shifted by the dense prefix: with 3 leading
+     * dense layers the exporter would write L03..L44 while the loader asks for
+     * L00..L41. The first three loads would fail and every other layer would
+     * silently receive another layer's weights -- fluent, wrong text, which is
+     * exactly the failure this whole real-weight exercise exists to prevent.
+     *
+     * ane_sparse mirrors the dispatch's own bound, including its -1: the final
+     * layer is the nextn/MTP block and has no shared-expert job. */
     int emitted = 0, ok = 1;
-    for (uint32_t il = 0; il < n_layer && ok; il++) {
+    for (uint32_t il = leading_dense; il < n_layer && ok; il++) {
+        const uint32_t li = il - leading_dense;
+        if (li >= ane_sparse) break;
         const ds4_layer_weights *l = &w->layer[il];
-        if (!l->ffn_gate_shexp || !l->ffn_up_shexp || !l->ffn_down_shexp) continue;
+        if (!l->ffn_gate_shexp || !l->ffn_up_shexp || !l->ffn_down_shexp) {
+            snprintf(err, errlen,
+                     "physical layer %u (logical %u) has no shared-expert "
+                     "tensors; the model set would be incomplete", il, li);
+            ok = 0;
+            break;
+        }
 
         const struct { const ds4_tensor *t; uint64_t in, out; const char *sfx; } parts[3] = {
             { l->ffn_gate_shexp, n_embd, n_ff,   "gate" },
@@ -7944,12 +7976,12 @@ int ds4_export_ane_shexp(const ds4_model *m, const ds4_weights *w,
             { l->ffn_down_shexp, n_ff,   n_embd, "down" },
         };
         if (emitted) fprintf(mf, ",\n");
-        fprintf(mf, "    { \"layer\": %u, \"files\": [", il);
+        fprintf(mf, "    { \"logical\": %u, \"physical\": %u, \"files\": [", li, il);
         for (int k = 0; k < 3 && ok; k++) {
             if (!ds4_ane_export_tensor(m, parts[k].t, parts[k].in, parts[k].out,
                                        buf, err, errlen)) { ok = 0; break; }
             char fname[128];
-            snprintf(fname, sizeof(fname), "shexp_L%02u_%s.f16", il, parts[k].sfx);
+            snprintf(fname, sizeof(fname), "shexp_L%02u_%s.f16", li, parts[k].sfx);
             uint64_t dg = 0;
             const size_t bytes = (size_t)(parts[k].in * parts[k].out * sizeof(uint16_t));
             if (!ds4_ane_export_write(outdir, fname, buf, bytes, &dg, err, errlen)) {
@@ -7972,6 +8004,13 @@ int ds4_export_ane_shexp(const ds4_model *m, const ds4_weights *w,
     if (!ok) return 0;
     if (emitted == 0) {
         snprintf(err, errlen, "no sparse layers carry shared-expert tensors");
+        return 0;
+    }
+    if ((uint32_t)emitted != ane_sparse) {
+        snprintf(err, errlen,
+                 "exported %d layers but the runtime expects %u; a partial set "
+                 "would load some layers' weights into other layers",
+                 emitted, ane_sparse);
         return 0;
     }
     fprintf(stderr, "ds4: exported %d sparse layers of real shared-expert "

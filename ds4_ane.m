@@ -40,6 +40,7 @@ int ds4_gpu_is_live(void);
 
 static int       g_mode = -1;
 static int       g_ready;
+static int       g_models_are_real;
 static uint32_t  g_n_layers, g_n_tok, g_dim;
 static MLModel  *g_models[DS4_ANE_MAX_LAYERS];
 static MLMultiArray *g_in_array, *g_out_array;
@@ -227,6 +228,65 @@ void ds4_ane_shutdown(void) {
     ds4_ane_teardown();
 }
 
+/* REAL-WEIGHT ENFORCEMENT.
+ *
+ * PERFONLY replaces the GPU shared expert and consumes the ANE output. With
+ * synthetic weights that is a speed probe whose text is fluent and wrong; with
+ * real weights it is a production candidate. Nothing in the loader could tell
+ * them apart -- both sets are `shexp_L%02u_fused.mlpackage` in whatever
+ * directory DS4_ANE_MODEL_DIR points at -- so the only thing standing between a
+ * speed probe and a shipped wrong answer was the operator remembering which
+ * directory was which.
+ *
+ * So the generator writes a manifest and the replacement modes require it. A
+ * missing manifest is treated as SYNTHETIC, not as "probably fine": the
+ * permissive reading is the one that ships wrong text.
+ *
+ * Non-replacement modes (probe/bridge/shadow/fast) discard the ANE result and
+ * are unaffected -- they may legitimately run synthetic models, which is what
+ * they were built for. */
+static int ds4_ane_models_are_real(const char *dir, uint32_t want_layers,
+                                   uint32_t want_dim,
+                                   char *why, size_t whylen) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/manifest.json", dir);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        snprintf(why, whylen, "no manifest.json in %s (a set without one is "
+                              "treated as synthetic)", dir);
+        return 0;
+    }
+    char buf[8192];
+    const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    /* Deliberately a substring check rather than a JSON parser. The manifest is
+     * machine-written and these are the four facts that matter; pulling a JSON
+     * dependency into the sidecar to read four fields would be the larger
+     * mistake. Anything unparseable fails closed. */
+    if (!strstr(buf, "\"kind\": \"real\"")) {
+        snprintf(why, whylen, "manifest does not say kind=real");
+        return 0;
+    }
+    char want[128];
+    snprintf(want, sizeof(want), "\"expected_layers\": %u", want_layers);
+    if (!strstr(buf, want)) {
+        snprintf(why, whylen, "manifest is not for %u layers", want_layers);
+        return 0;
+    }
+    snprintf(want, sizeof(want), "\"n_embd\": %u", want_dim);
+    if (!strstr(buf, want)) {
+        snprintf(why, whylen, "manifest n_embd is not %u", want_dim);
+        return 0;
+    }
+    /* n_ff_exp is NOT checked here: the sidecar does not know the model's
+     * expert width, and inventing a constant for it would be a second source
+     * of truth. ane-gen-real.py already validates every tensor's shape against
+     * the exporter's manifest before building a conv on it, which is the check
+     * that actually has the numbers. */
+    return 1;
+}
+
 static void ds4_ane_teardown(void) {
     if (g_fast_running) {
         __atomic_store_n(&g_fast_stop, 1, __ATOMIC_RELEASE);
@@ -346,6 +406,27 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
                 ds4_ane_teardown();
                 ds4_ane_required_abort("DS4_ANE_MODEL_DIR is unset");
                 return 0;
+            }
+            /* PERFONLY consumes the ANE output as the real shared expert.
+             * Refuse to do that with a model set that does not identify itself
+             * as real -- fluent wrong text is the failure mode, and it is the
+             * one a human reviewer cannot spot. */
+            if (ds4_ane_mode() == DS4_ANE_PERFONLY) {
+                char why[256] = {0};
+                if (!ds4_ane_models_are_real(dir, n_layers, dim,
+                                             why, sizeof(why))) {
+                    char msg[512];
+                    snprintf(msg, sizeof(msg),
+                             "PERFONLY requires REAL weights and %s does not "
+                             "qualify: %s. Export them with "
+                             "`ds4 -m <model.gguf> --export-ane-shexp <dir>` "
+                             "and build the set with ane-gen-real.py. Use a "
+                             "shadow/fast mode for speed-only runs.", dir, why);
+                    ds4_ane_teardown();
+                    ds4_ane_required_abort(msg);
+                    return 0;
+                }
+                g_models_are_real = 1;
             }
             /* Which graph shape to load. ANEIO3 measured _k2 at -30% against
              * _fused on ANE-side latency with both ALL-ANE, and found _fk2

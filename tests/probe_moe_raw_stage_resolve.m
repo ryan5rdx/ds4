@@ -1,5 +1,5 @@
 /*
- * SGASYNC-MOE raw staging: whole-kernel byte identity across every arm.
+ * SGASYNC-MOE raw staging: ARM RESOLUTION ONLY. This is NOT an equivalence test.
  *
  * test-dq-q4k-equiv proves the device and threadgroup Q4_K dequantisers agree.
  * That is necessary and nowhere near sufficient: it says nothing about the
@@ -17,6 +17,13 @@
  * that writes outside its rows passes an equality check on the rows it did
  * write. The guard regions are checked separately and a violation is reported
  * as such rather than as a mismatch, because the two have different causes.
+ *
+ * WHAT THIS IS NOT. It does not dispatch, does not compare output, and does not
+ * check a poison guard. It was named `_equiv` and printed "PASS (partial)",
+ * which invited exactly the misreading that it covered correctness. It covers
+ * one thing: that every arm resolves to a real function and builds a pipeline.
+ * The byte-identity matrix below is OWED, not done, and needs a dispatch
+ * harness with real routing tables.
  *
  * ARMS. Modern manual (off/gate/both) always. The private 14.2 arms -- non-async
  * control and async -- are added when ds4_private_clone.metallib is present and
@@ -129,8 +136,8 @@ int main(int argc, const char **argv) { @autoreleasepool {
     (void)POISON; (void)xs;
 
     printf("\n%s\n", fails == 0
-           ? "PASS (partial): every arm resolves and builds. Byte identity over "
-             "the matrix above is NOT yet proven here."
+           ? "RESOLVED: every arm builds a pipeline. This is NOT a correctness "
+             "result -- nothing was dispatched or compared."
            : "FAILED");
     return fails == 0 ? 0 : 1;
 } }

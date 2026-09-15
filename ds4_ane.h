@@ -86,6 +86,57 @@ enum {
 
 /* Parsed once from the environment. 0 when unset or when this build has no
  * Core ML support. */
+/* ---- typed job queue (campaign phase 2.1) --------------------------------
+ *
+ * The worker was shaped around one model family. KDA pre-recurrence
+ * projections are a second job for the SAME worker, run at a different point
+ * in the layer, and the campaign is explicit that this stays ONE process with
+ * ONE prediction in flight until a measured single-die bottleneck says
+ * otherwise -- a second die is an escape hatch, not the starting architecture.
+ *
+ * The properties below are the ones the spec calls non-negotiable, so they are
+ * enforced here rather than left to call-site discipline:
+ *
+ *   - one worker, at most one prediction in flight. Asserted, not assumed:
+ *     ds4_ane_job_begin() refuses a second outstanding job and says which one
+ *     already holds the slot.
+ *   - DISJOINT sequence namespaces per kind, so a shared DONE can never be
+ *     mistaken for a KDA DONE. One shared counter with two kinds reading it
+ *     is the bug this design exists to make unrepresentable.
+ *   - fail-closed validation. A missing model, a wrong rank or a wrong row
+ *     count refuses the job and returns 0, and the caller must then run the
+ *     full GPU path. Never skip GPU work for a job that was not accepted.
+ */
+enum ds4_ane_job_kind {
+    DS4_ANE_JOB_SHARED = 0,
+    DS4_ANE_JOB_KDA    = 1,
+    DS4_ANE_JOB_KINDS  = 2,
+};
+
+struct ds4_ane_job {
+    int      kind;            /* ds4_ane_job_kind */
+    uint32_t physical_layer;  /* layer index in the model */
+    uint32_t logical_model;   /* index into this kind's model set */
+    uint32_t rank;            /* TP rank; a wrong-rank model is a wrong answer */
+    uint32_t rows;            /* M: rows this job covers */
+    uint32_t seq;             /* filled in by ds4_ane_job_begin() */
+    uint32_t variant;         /* kind-specific (KDA partition id) */
+};
+
+/* Accept a job, or refuse it. Returns 1 and fills job->seq on acceptance.
+ * Refusal is normal and means "run the GPU path": it is not an error state. */
+int  ds4_ane_job_begin(struct ds4_ane_job *job);
+/* Wait for the accepted job and release the in-flight slot. */
+int  ds4_ane_job_wait(const struct ds4_ane_job *job);
+/* Kind currently in flight, or -1. For assertions at the call sites that must
+ * not interleave a KDA job with an outstanding shared one. */
+int  ds4_ane_job_inflight_kind(void);
+/* One authoritative startup line: streams, model counts per kind, shapes,
+ * rank, and whether the loaded weights are real or speed-only. */
+void ds4_ane_job_announce(uint32_t rank);
+/* Per-chunk ANEONE census; see the campaign's phase 3. */
+void ds4_ane_job_report(const char *where, int rank);
+
 int ds4_ane_mode(void);
 
 /* Prepare for `n_layers` layers at exactly `n_tokens` tokens per prediction.

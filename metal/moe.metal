@@ -8871,6 +8871,7 @@ static inline void ds4_moe_raw_fill(
         device const char   *gsrc,
         device const char   *usrc,
         uint                 src_pitch_u4,
+        uint                 src_pitch_bytes,
         uint                 rows,
         uint                 blk_u4,
         bool                 vec_ok,
@@ -8928,7 +8929,12 @@ static inline void ds4_moe_raw_fill(
         device const uchar *sg = (device const uchar *)gsrc;
         device const uchar *su = (device const uchar *)usrc;
         const uint blk = blk_u4 * (uint)sizeof(uint4);
-        const uint pitch = src_pitch_u4 * (uint)sizeof(uint4);
+        /* The BYTE pitch, passed in. Reconstructing it as
+         * src_pitch_u4 * sizeof(uint4) discarded nb01 % 16 -- and this branch
+         * exists precisely for the unaligned case, so the reconstruction was
+         * wrong exactly when the path was taken. Every row after the first
+         * would have read from a drifting offset. */
+        const uint pitch = src_pitch_bytes;
         for (uint e = tiitg; e < rows * blk; e += 128u) {
             const uint rr = e / blk;
             const uint bb = e - rr * blk;
@@ -9128,8 +9134,8 @@ kernel void kernel_mul_mm_id_pair_swiglu_f16_impl(
 
                 ds4_moe_raw_fill<block_q, RAW_STAGE, RAW_ASYNC>(
                         raw_gate, raw_up, gsrc, usrc,
-                        (uint)(args.nb01 / sizeof(uint4)), rows, blk_u4,
-                        vec_ok, tiitg, sgitg);
+                        (uint)(args.nb01 / sizeof(uint4)), (uint)args.nb01,
+                        rows, blk_u4, vec_ok, tiitg, sgitg);
 
                 /* Publishes the new tile to every consuming simdgroup. Under
                  * RAW_ASYNC the issuing simdgroup's wait() orders only its own
