@@ -8641,6 +8641,98 @@ kernel void kernel_dsv4_tp_fence_wait(
     timeout[0] = 1u;
 }
 
+/* FENCEWORK: turn the FAST_SYNC spin into cache warming.
+ *
+ * NOT the dead poll-gate arm. GP1B showed a real mechanism -- attention
+ * prefetch +1.2%, all-gate +1.0% -- but was unbankable because poll-gate
+ * RELEASE was ~20% slower than FAST_SYNC on the rig. This keeps FAST_SYNC
+ * exactly as it is and changes only what the waiting kernel does with the wait.
+ *
+ * The wait is real: GATE-RESIDUE measured 22-30 us mean spins, with only 6.8%
+ * of attention gates and 23.6% of FFN gates already released when the fence
+ * began. That is otherwise-idle time on both ranks, 34+ layers per token.
+ *
+ * SHAPE. Threadgroup 0 is the original one-thread poll, byte for byte -- same
+ * coherent(system) qualifiers, same fence, same bounded iteration count, same
+ * timeout store -- so the release path cannot get slower. Every other
+ * threadgroup warms cache with ordinary sparse loads and exits as soon as the
+ * peer release lands. Kernel completion orders the following graph, so no extra
+ * barrier is needed.
+ *
+ * Ordinary loads, NOT simdgroup_async_copy: this is cache warming, not a reused
+ * threadgroup tile, and async copy would add a destination and a wait to
+ * something whose entire purpose is to be free.
+ *
+ * The release check inside the helper loop is every 16 lines, because a
+ * system-scope fence per line would dominate the loads it is meant to hide
+ * behind -- and a helper that keeps running after release is charging the
+ * following stage for work nobody needed. */
+kernel void kernel_dsv4_tp_fence_wait_prefetch(
+        volatile coherent(system) device uint * release [[buffer(0)]],
+        constant uint & value [[buffer(1)]],
+        constant uint & max_iters [[buffer(2)]],
+        volatile coherent(system) device uint * timeout [[buffer(3)]],
+        device atomic_uint * stats [[buffer(4)]],
+        constant uint & profile [[buffer(5)]],
+        device const uchar * warm [[buffer(6)]],
+        constant uint & warm_lines [[buffer(7)]],
+        device atomic_uint * sink [[buffer(8)]],
+        uint tgid [[threadgroup_position_in_grid]],
+        uint tid  [[thread_position_in_threadgroup]],
+        uint tgsz [[threads_per_threadgroup]],
+        uint ngrp [[threadgroups_per_grid]]) {
+    if (tgid == 0u) {
+        /* The original poll, unchanged. Only thread 0 spins; the rest of this
+         * threadgroup exits immediately so it cannot add contention to the one
+         * loop whose latency is on the critical path. */
+        if (tid != 0u) return;
+        for (uint i = 0; i < max_iters; i++) {
+            metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                       metal::memory_order_seq_cst,
+                                       metal::thread_scope_system);
+            if (release[0] == value) {
+                metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                           metal::memory_order_seq_cst,
+                                           metal::thread_scope_system);
+                if (profile != 0u) {
+                    atomic_fetch_add_explicit(&stats[0], i, memory_order_relaxed);
+                    atomic_fetch_add_explicit(&stats[1], 1u, memory_order_relaxed);
+                    if (i == 0u)
+                        atomic_fetch_add_explicit(&stats[2], 1u, memory_order_relaxed);
+                    atomic_fetch_max_explicit(&stats[3], i, memory_order_relaxed);
+                }
+                return;
+            }
+        }
+        if (profile != 0u) {
+            atomic_fetch_add_explicit(&stats[0], max_iters, memory_order_relaxed);
+            atomic_fetch_add_explicit(&stats[1], 1u, memory_order_relaxed);
+            atomic_fetch_max_explicit(&stats[3], max_iters, memory_order_relaxed);
+        }
+        timeout[0] = 1u;
+        return;
+    }
+
+    /* Helpers. 128 B per line -- one cache line's worth per touch. */
+    if (warm == nullptr || warm_lines == 0u) return;
+    const uint helpers = ngrp - 1u;
+    const uint stride  = helpers * tgsz;
+    uint acc = 0u;
+    for (uint line = (tgid - 1u) * tgsz + tid; line < warm_lines; line += stride) {
+        if ((line & 15u) == 0u) {
+            metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                       metal::memory_order_relaxed,
+                                       metal::thread_scope_system);
+            if (release[0] == value) break;
+        }
+        acc ^= (uint)warm[(uint64_t)line * 128u];
+    }
+    /* Keep the loads alive without writing anything the graph reads. The store
+     * is unreachable -- acc is a byte-xor and cannot be 0xffffffff -- but the
+     * compiler cannot prove it, so the loop survives. */
+    if (acc == 0xffffffffu) atomic_fetch_add_explicit(&sink[0], 1u, memory_order_relaxed);
+}
+
 // Calibration for the instrument above: spin exactly `iters` times against a
 // value that never arrives, so the host can time one command buffer and divide.
 // Without this the spin count is an uncalibrated integer and cannot be quoted
