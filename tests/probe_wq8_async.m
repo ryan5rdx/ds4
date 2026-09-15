@@ -50,7 +50,12 @@ int main(int argc, const char **argv) { @autoreleasepool {
     if (!priv) { printf("VOID: private metallib failed: %s\n", e.localizedDescription.UTF8String); return 2; }
 
     /* Production wide shape: K = 4096 (nb = 128 blocks), 2048 output rows. */
-    const int ne00 = 4096, ne01 = 16384;
+    /* ne01 chosen so the weight set exceeds the M2 Ultra's ~48 MB per-die SLC:
+     * 65536 rows x 128 blocks x 34 B = 285 MB. The earlier 16384 rows was 71 MB
+     * -- past SLC on paper, but only 1.5x it, and the staged arms read the same
+     * rows every rep. A resident working set flatters staging, because the
+     * copy's source is already warm; production streams cold weights. */
+    const int ne00 = 4096, ne01 = 65536;
     const int nb = ne00 / QK;
     const size_t w_bytes = (size_t)ne01 * nb * BLK;
 
@@ -80,25 +85,23 @@ int main(int argc, const char **argv) { @autoreleasepool {
     struct { const char *name; id<MTLLibrary> lib; size_t extra; } arms[] = {
         { "kernel_mul_mv_q8_0_f32",            mod,  0 },
         { "kernel_mul_mv_q8_0_f32",            priv, 0 },
-        { "kernel_mul_mv_q8_0_f32",            mod,  (size_t)2*NSG*NR0*2*(8*BLK) },
-        { "kernel_mul_mv_q8_0_f32",            mod,  (size_t)2*NSG*NR0*4*(8*BLK) },
-        /* The PIVOT: device -> register, no threadgroup memory, shipping
-         * corpus. Separate flags so the four-arm run attributes the gain. */
-        { "kernel_mul_mv_q8_0_f32_packed",     mod,  0 },
-        { "kernel_mul_mv_q8_0_f32_spec",       mod,  0 },
-        { "kernel_mul_mv_q8_0_f32_both",       mod,  0 },
-        /* 2 buffers x NSG simdgroups x NR0 rows x C runs x (NQ blocks x 34 B).
-         * Getting this wrong by a factor of two is what hung the GPU the first
-         * time -- the kernel wrote past the end of the threadgroup allocation.
-         * It must match ds4_gpu_wq8_async_stage_bytes() exactly. */
-        { "kernel_mul_mv_q8_0_f32_sgasync2",   priv, (size_t)2*NSG*NR0*2*(8*BLK) },
-        { "kernel_mul_mv_q8_0_f32_sgasync4",   priv, (size_t)2*NSG*NR0*4*(8*BLK) },
+        /* WQ8APPLE8, the target-native arm set. C=1 => 2176 B live scratch.
+         *
+         * Ordered so each comparison is adjacent to its control:
+         *   direct(modern) | direct(14.2) | reserve-only | manual | async x3
+         * `async vs manual` prices the primitive; `async vs DIRECT` decides
+         * deployment, and the 5% gate reads the latter. */
+        { "kernel_mul_mv_q8_0_f32_a8_reserve",   priv, (size_t)2*NSG*NR0*1*(8*BLK) },
+        { "kernel_mul_mv_q8_0_f32_a8_manual",    priv, (size_t)2*NSG*NR0*1*(8*BLK) },
+        { "kernel_mul_mv_q8_0_f32_a8_immed",     priv, (size_t)2*NSG*NR0*1*(8*BLK) },
+        { "kernel_mul_mv_q8_0_f32_a8_pingpong",  priv, (size_t)2*NSG*NR0*1*(8*BLK) },
+        { "kernel_mul_mv_q8_0_f32_a8_ppgroup",   priv, (size_t)2*NSG*NR0*1*(8*BLK) },
     };
-    const char *label[] = { "shipping (modern)", "14.2 clone, non-async",
-                            "shipping +4352 B unused", "shipping +8704 B unused",
-                            "packed loads", "shape-specialised", "packed+spec",
-                            "async C=2", "async C=4" };
-    const int n_arms = 9;
+    const char *label[] = { "direct: shipping (modern)", "direct: 14.2 clone",
+                            "reserve-only 2176 B", "manual stage 2176 B",
+                            "async immediate", "async ping-pong",
+                            "async ping-pong, grouped wait" };
+    const int n_arms = 7;
     float *ref = malloc((size_t)ne01 * sizeof(float));
     double ref_ms = 0.0;
     int fails = 0;

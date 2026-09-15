@@ -227,8 +227,31 @@ static inline float ds4_wq8_staged_dot(threadgroup const uchar *blk,
  * which of the two is responsible, instead of reporting a combined number that
  * cannot be decomposed afterwards -- the mistake the async arm's "78 pp" made.
  */
+/* WQ8_PIPE selects what the staged path DOES with its scratch, so every arm
+ * shares one code path and differs only in the thing it is named for:
+ *
+ *   0 RESERVE  reserve the bytes, keep the pointer LIVE, stage nothing. The
+ *              honest residency control -- and it must be live, because an
+ *              unreachable threadgroup argument is eliminated and the
+ *              reservation silently discarded (measured: probe_tg_residency_census).
+ *   1 MANUAL   cooperative uint4 fill into the same slots. The control the
+ *              async arms must beat; `async vs manual` prices the primitive and
+ *              `async vs DIRECT` is the deployable number.
+ *   2 IMMED    async copy, wait at once. No overlap; isolates copy cost.
+ *   3 PINGPONG async copy, issue chunk n+1 before waiting on n.
+ *   4 PPGROUP  ping-pong waiting on the whole event group rather than per
+ *              future, which is the form that can retire several copies with
+ *              one stall.
+ *
+ * At WQ8_ASYNC_C = 1 the live scratch is 2 * NSG * NR0 * 272 = 2176 B, which is
+ * the footprint the corrected design actually wants. The only instantiations
+ * that ever existed were C=2 (4352 B) and C=4 (8704 B) -- the two that measured
+ * -13.7% and -47% on M1 -- so the design was closed on footprints it was never
+ * supposed to use, and never on Apple8 at all, whose async entry points were
+ * absent from the committed metallib. */
 template<short NR0, typename args_t, int WQ8_ASYNC_C = 0,
-         bool WQ8_PACKED = false, bool WQ8_SPEC_NB = false>
+         bool WQ8_PACKED = false, bool WQ8_SPEC_NB = false,
+         int WQ8_PIPE = 3>
 void kernel_mul_mv_q8_0_f32_impl(
         args_t args,
         device const char * src0,
@@ -286,7 +309,16 @@ void kernel_mul_mv_q8_0_f32_impl(
     constexpr short WQ8_RUN_B = NQ * (short)sizeof(block_q8_0);      /* 272 */
     const short wq8_pitch_b = (short)(NSG * NQ * (short)sizeof(block_q8_0));
     const int n_runs = (nb - ib0 + NSG*NQ - 1) / (NSG*NQ);
-    if (WQ8_ASYNC_C != 0 &&
+    if (WQ8_ASYNC_C != 0 && WQ8_PIPE == 0) {
+        /* RESERVE-ONLY. Touch the scratch so the argument cannot be eliminated
+         * -- otherwise Metal discards the reservation and this "control"
+         * measures the direct kernel with extra steps, which is exactly how the
+         * routed-MoE occupancy sweep produced a flat curve from a disconnected
+         * knob. The store is behind a runtime-false guard so no bytes move. */
+        threadgroup uchar *keep = (threadgroup uchar *)shmem + 32*2*sizeof(float);
+        if (args.ne00 == 0x7fffffff) keep[tiisg] = 0;
+    }
+    if (WQ8_ASYNC_C != 0 && WQ8_PIPE != 0 &&
         nb % (NSG*NQ) == 0 &&                    /* every run is full         */
         (n_runs % WQ8_ASYNC_C) == 0) {           /* every chunk is full       */
         /* Layout, after the 256 B the reduction owns:
@@ -312,6 +344,7 @@ void kernel_mul_mv_q8_0_f32_impl(
          * supported and correct. It is the one capability assumption here that
          * is not already proven. */
         simdgroup_future<void> fut[2][NR0];
+        __metal_simdgroup_event_t evt[2][NR0];
         bool have[2] = { false, false };
 
         /* Prime chunk 0, then for each chunk: issue the NEXT one, wait on THIS
@@ -320,35 +353,98 @@ void kernel_mul_mv_q8_0_f32_impl(
          * ordering is the only thing the primitive can buy here. */
         for (int c = 0; c < n_runs; c += WQ8_ASYNC_C) {
             const short p = (short)((c / WQ8_ASYNC_C) & 1);
-            if (!have[p]) {
+            if (WQ8_PIPE != 1 && !have[p]) {
                 FOR_UNROLL (short row = 0; row < NR0; ++row) {
                     device const uchar *src =
                         (device const uchar *)(ax[row] + ib0) +
                         (uint64_t)(c) * wq8_pitch_b - (uint64_t)ix * sizeof(block_q8_0);
-                    fut[p][row] = simdgroup_async_copy(
-                        stage + p*buf_stride + sg_off + row*WQ8_SLICE,
-                        (ulong)WQ8_RUN_B, 1ul,
-                        src, (ulong)wq8_pitch_b, 1ul,
-                        ulong2(WQ8_RUN_B, WQ8_ASYNC_C));
+                    if (WQ8_PIPE == 4) {
+                        evt[p][row] = __metal_simdgroup_async_copy_2d(
+                            1ul, 1ul,
+                            (threadgroup void *)(stage + p*buf_stride + sg_off + row*WQ8_SLICE),
+                            (ulong)WQ8_RUN_B, 1ul, ulong2(WQ8_RUN_B, WQ8_ASYNC_C),
+                            (const device void *)src,
+                            (ulong)wq8_pitch_b, 1ul, ulong2(WQ8_RUN_B, WQ8_ASYNC_C),
+                            long2(0, 0), 0);
+                    } else {
+                        fut[p][row] = simdgroup_async_copy(
+                            stage + p*buf_stride + sg_off + row*WQ8_SLICE,
+                            (ulong)WQ8_RUN_B, 1ul,
+                            src, (ulong)wq8_pitch_b, 1ul,
+                            ulong2(WQ8_RUN_B, WQ8_ASYNC_C));
+                    }
                 }
                 have[p] = true;
             }
             const short pn = (short)(p ^ 1);
             const int cn = c + WQ8_ASYNC_C;
-            if (cn < n_runs) {
+            /* IMMED does not prefetch: it waits on the chunk it just issued, so
+             * the copy cost is measured with no overlap to hide it. */
+            if (WQ8_PIPE >= 3 && WQ8_PIPE != 1 && cn < n_runs) {
                 FOR_UNROLL (short row = 0; row < NR0; ++row) {
                     device const uchar *src =
                         (device const uchar *)(ax[row] + ib0) +
                         (uint64_t)(cn) * wq8_pitch_b - (uint64_t)ix * sizeof(block_q8_0);
-                    fut[pn][row] = simdgroup_async_copy(
-                        stage + pn*buf_stride + sg_off + row*WQ8_SLICE,
-                        (ulong)WQ8_RUN_B, 1ul,
-                        src, (ulong)wq8_pitch_b, 1ul,
-                        ulong2(WQ8_RUN_B, WQ8_ASYNC_C));
+                    if (WQ8_PIPE == 4) {
+                        evt[pn][row] = __metal_simdgroup_async_copy_2d(
+                            1ul, 1ul,
+                            (threadgroup void *)(stage + pn*buf_stride + sg_off + row*WQ8_SLICE),
+                            (ulong)WQ8_RUN_B, 1ul, ulong2(WQ8_RUN_B, WQ8_ASYNC_C),
+                            (const device void *)src,
+                            (ulong)wq8_pitch_b, 1ul, ulong2(WQ8_RUN_B, WQ8_ASYNC_C),
+                            long2(0, 0), 0);
+                    } else {
+                        fut[pn][row] = simdgroup_async_copy(
+                            stage + pn*buf_stride + sg_off + row*WQ8_SLICE,
+                            (ulong)WQ8_RUN_B, 1ul,
+                            src, (ulong)wq8_pitch_b, 1ul,
+                            ulong2(WQ8_RUN_B, WQ8_ASYNC_C));
+                    }
                 }
                 have[pn] = true;
             }
-            FOR_UNROLL (short row = 0; row < NR0; ++row) fut[p][row].wait();
+            /* WAIT SHAPE is an arm, not an implementation detail.
+             *
+             *   PPGROUP retires the whole event group in one stall, which is
+             *   the form that can amortise a wait across NR0 copies.
+             *   The per-future wait is what the first implementation did, and
+             *   it stalls once per row.
+             *
+             * MANUAL does no copy at all: the cooperative fill below already
+             * published the bytes, and the lanes that wrote them are the lanes
+             * that read them, so there is nothing to wait on. */
+            if (WQ8_PIPE == 1) {
+                /* MANUAL: this simdgroup fills its own slice with uint4 loads.
+                 * Its own 32 lanes both write and read it, so no barrier -- the
+                 * same ownership property that lets the async arms skip one. */
+                FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                    threadgroup uint4 *d = (threadgroup uint4 *)
+                        (stage + p*buf_stride + sg_off + row*WQ8_SLICE);
+                    device const uchar *src =
+                        (device const uchar *)(ax[row] + ib0) +
+                        (uint64_t)(c) * wq8_pitch_b - (uint64_t)ix * sizeof(block_q8_0);
+                    constexpr short NU4 = WQ8_SLICE / (short)sizeof(uint4);
+                    for (short u = (short)tiisg; u < NU4; u += 32) {
+                        const short run = u / (WQ8_RUN_B / (short)sizeof(uint4));
+                        const short off = u % (WQ8_RUN_B / (short)sizeof(uint4));
+                        d[u] = ((device const uint4 *)
+                                (src + (uint64_t)run * wq8_pitch_b))[off];
+                    }
+                }
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+            } else if (WQ8_PIPE == 4) {
+                /* GROUPED WAIT. simdgroup_future::wait() lowers to
+                 * __metal_wait_simdgroup_events(1, &event) -- one stall per
+                 * row. The intrinsic takes a count, so NR0 copies can retire in
+                 * a single stall, and `event` is a private member of the future
+                 * so this arm has to hold the raw handles the copy returns.
+                 * That is why the issue path below is duplicated for PIPE 4
+                 * rather than shared: there is no accessor to convert one into
+                 * the other. */
+                __metal_wait_simdgroup_events(NR0, &evt[p][0]);
+            } else {
+                FOR_UNROLL (short row = 0; row < NR0; ++row) fut[p][row].wait();
+            }
 
             for (short j = 0; j < WQ8_ASYNC_C; ++j) {
                 for (short i = 0; i < NQ; ++i) {
@@ -458,6 +554,42 @@ DS4_WQ8_DIRECT_VARIANT(both,   true,  true)
  * 10c is measuring: 2 -> 4352 B, 4 -> 8704 B. C = 8 is deliberately absent --
  * 17408 B leaves ONE threadgroup per core, and there is no plausible overlap
  * gain that survives that. */
+/* WQ8APPLE8: the arm set at the footprint the corrected design actually wants.
+ *
+ * C=1 => live scratch 2 * NSG * NR0 * 272 = 2176 B. The only async kernels that
+ * ever existed were C=2 (4352 B) and C=4 (8704 B), i.e. the two footprints that
+ * measured -13.7% and -47% on M1 -- so the design was closed on sizes it was
+ * never meant to run, and on the WRONG CHIP: the Apple8 run had no async entry
+ * points in its metallib at all and measured the direct variants instead.
+ *
+ * Apple7 and Apple8 have now disagreed twice in this campaign -- WQ8 residency
+ * (-47% vs -61.5%) and CMPSEL2's branchless comparator (a win on M1, a loss on
+ * Apple8) -- so an M1 verdict on a 64-bit-DMA question is not a verdict.
+ *
+ * The reserve-only arm is the honest residency control: same 2176 B, live
+ * pointer, nothing staged. `async vs manual` prices the primitive; `async vs
+ * DIRECT` is the number that decides deployment, and it is the one the gate
+ * reads. */
+#define DS4_WQ8_ARM(SUFFIX, PIPE)                                              \
+kernel void kernel_mul_mv_q8_0_f32_##SUFFIX(                                   \
+        constant ds4_metal_args_mul_mv & args,                                 \
+        device const char * src0,                                              \
+        device const char * src1,                                              \
+        device       char * dst,                                               \
+        threadgroup  char * shmem [[threadgroup(0)]],                          \
+        uint3  tgpig[[threadgroup_position_in_grid]],                          \
+        ushort tiisg[[thread_index_in_simdgroup]],                             \
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {                      \
+    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ds4_metal_args_mul_mv &,   \
+                                1, false, false, PIPE>(                        \
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);                    \
+}
+DS4_WQ8_ARM(a8_reserve,  0)   /* 2176 B reserved, live pointer, nothing staged */
+DS4_WQ8_ARM(a8_manual,   1)   /* matched manual uint4 staging                  */
+DS4_WQ8_ARM(a8_immed,    2)   /* async, wait at once -- no overlap             */
+DS4_WQ8_ARM(a8_pingpong, 3)   /* async, issue n+1 before waiting on n          */
+DS4_WQ8_ARM(a8_ppgroup,  4)   /* ping-pong, one grouped wait for NR0 copies    */
+
 kernel void kernel_mul_mv_q8_0_f32_sgasync2(
         constant ds4_metal_args_mul_mv & args,
         device const char * src0,
