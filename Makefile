@@ -752,6 +752,14 @@ tests/probe_aneproc_ring: tests/probe_aneproc_ring.m ds4_aneproc.h
 	$(CC) $(CFLAGS) -fobjc-arc -I. -o $@ tests/probe_aneproc_ring.m \
 	      -framework Foundation -framework IOSurface
 
+tests/probe_cmpsel2: tests/probe_cmpsel2.m metal/cmpsel2.metal
+	$(CC) $(CFLAGS) -fobjc-arc -I. -o $@ tests/probe_cmpsel2.m \
+	      -framework Foundation -framework Metal
+
+# Exactness is chip-independent and is the gate; the timings are data.
+test-cmpsel2: tests/probe_cmpsel2
+	./tests/probe_cmpsel2 metal/cmpsel2.metal 15
+
 tests/probe_ane_compile_cache: tests/probe_ane_compile_cache.m ds4_ane_compile.h
 	$(CC) $(CFLAGS) -fobjc-arc -I. -o $@ tests/probe_ane_compile_cache.m \
 	      -framework Foundation -framework CoreML
