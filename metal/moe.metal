@@ -1136,7 +1136,98 @@ kernel void kernel_glm_q2_K_addr_pair_swiglu2_f32_masked(
 #define DM3_DOWN_OUT_DIM    4096
 #define DM3_DOWN_ROW_BYTES  ((DM3_DOWN_IN_DIM / QK_K) * 144)
 
-template <short N_R0, int DM3>
+/* ---- SUMY1: exact Q4 activation-sum reuse ----------------------------------
+ *
+ * The pair kernel recomputes the same four activation-group sums for every
+ * output tile and every selected expert. They depend only on the activation and
+ * the lane's (ix, iq, ir) -- not on the expert, not on the output row -- so at
+ * 6 experts x (mid_dim/8) tiles the same 512 floats are rebuilt thousands of
+ * times per layer. SUMY-STUB (deliberately wrong, so free) took 5.0% off the
+ * 42-layer pair+down chain on Apple8 and passed its 3% bar; the exact producer
+ * was never built. This is it.
+ *
+ * EXACTNESS IS THE WHOLE JOB. "Same mathematical sum" is not sufficient: routed
+ * logits have already exposed reassociation failures in this codebase, and a
+ * differently-ordered sum here changes the dequantised value and therefore the
+ * token. So the producer reproduces the consumer's loop verbatim -- same eight
+ * strict left-to-right additions, same y4 lane offsets -- rather than computing
+ * the same quantity a tidier way.
+ *
+ * Layout mirrors the lane mapping exactly:
+ *
+ *   sumy[ (token * nb + ib) * 32 + it * 4 + c ],  it = tiisg % 8, c = 0..3
+ *
+ * with ib the block index. nb = in_dim / QK_K = 16 at 4096, so one token is
+ * 16 * 32 = 512 floats = 2 KiB, which is the size the campaign predicted.
+ *
+ * One thread per (token, ib, it). The grid is tiny and the work is a 32-float
+ * read per thread; this exists to be dispatched once per layer instead of once
+ * per (expert, tile). */
+/* GPU-side reference for the SUMY1 gate.
+ *
+ * A CPU replica is the WRONG oracle here: Metal flushes denormals to zero and
+ * the host does not, so a denormal-bearing activation makes the two disagree on
+ * 80% of sums by ~1e-42 -- a difference that says nothing about the producer.
+ * What must be proven is that the producer equals what the CONSUMER would have
+ * computed inline, on the same hardware under the same float environment. So
+ * the reference is this kernel: the consumer's loop verbatim, including the
+ * yl/yh stores it also performs, writing the sums where they can be compared. */
+kernel void kernel_glm53_sumy1_reference(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const float *x        [[buffer(1)]],
+        device       float *sumy_out [[buffer(2)]],
+        uint3 gid [[thread_position_in_grid]]) {
+    const uint it    = gid.x;
+    const uint ib    = gid.y;
+    const uint token = gid.z;
+    const uint nb = args.in_dim / QK_K;
+    if (it >= 8u || ib >= nb || token >= args.n_tokens) return;
+    const uint iq = it / 4u, ir = it % 4u;
+    device const float *y  = x + (uint64_t)token * args.in_dim;
+    device const float *y4 = y + ib * QK_K + 64u * iq + 8u * ir;
+
+    float yl[16], yh[16];
+    float4 sumy = {0.f, 0.f, 0.f, 0.f};
+    for (short i = 0; i < 8; ++i) {
+        yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+        yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+        yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+        yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+    }
+    device float *o = sumy_out + ((uint64_t)token * nb + ib) * 32u + it * 4u;
+    o[0] = sumy[0]; o[1] = sumy[1]; o[2] = sumy[2]; o[3] = sumy[3];
+}
+
+kernel void kernel_glm53_sumy1_produce(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const float *x        [[buffer(1)]],
+        device       float *sumy_out [[buffer(2)]],
+        uint3 gid [[thread_position_in_grid]]) {
+    const uint it    = gid.x;          /* 0..7   -- tiisg % 8            */
+    const uint ib    = gid.y;          /* block index                     */
+    const uint token = gid.z;
+    const uint nb = args.in_dim / QK_K;
+    if (it >= 8u || ib >= nb || token >= args.n_tokens) return;
+
+    const uint iq = it / 4u;
+    const uint ir = it % 4u;
+    device const float *y  = x + (uint64_t)token * args.in_dim;
+    device const float *y4 = y + ib * QK_K + 64u * iq + 8u * ir;
+
+    /* Verbatim from the consumer, including the order of the four streams and
+     * the strict left-to-right accumulation within each. */
+    float4 sumy = {0.f, 0.f, 0.f, 0.f};
+    for (short i = 0; i < 8; ++i) {
+        sumy[0] += y4[i +   0];
+        sumy[1] += y4[i +  32];
+        sumy[2] += y4[i + 128];
+        sumy[3] += y4[i + 160];
+    }
+    device float *o = sumy_out + ((uint64_t)token * nb + ib) * 32u + it * 4u;
+    o[0] = sumy[0]; o[1] = sumy[1]; o[2] = sumy[2]; o[3] = sumy[3];
+}
+
+template <short N_R0, int DM3, bool SUMY1 = false>
 static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
         ds4_metal_glm_routed_moe_args args,
         device const char *gate,
@@ -1144,6 +1235,7 @@ static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
         device const float *x,
         device const float *weights,
         device float *mid,
+        device const float *sumy_in,
         threadgroup float *scratch,
         uint3 tgpig,
         uint slot,
@@ -1204,13 +1296,28 @@ static inline void glm_q4_K_pair_swiglu_simd_f32_impl(
     for (int ib = ix; ib < nb; ib += 4) {
         float yl[16];
         float yh[16];
-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
-
-        for (short i = 0; i < 8; ++i) {
-            yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
-            yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
-            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
-            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        /* yl/yh still load: they feed the per-nibble products below and are
+         * not what SUMY1 elides. Only the four REDUCTIONS are reused. */
+        float4 sumy;
+        if (SUMY1) {
+            for (short i = 0; i < 8; ++i) {
+                yl[i + 0] = y4[i +   0];
+                yl[i + 8] = y4[i +  32];
+                yh[i + 0] = y4[i + 128];
+                yh[i + 8] = y4[i + 160];
+            }
+            device const float *sp =
+                sumy_in + ((uint64_t)token * (uint)nb + (uint)ib) * 32u +
+                (uint)(tiisg % 8) * 4u;
+            sumy = float4(sp[0], sp[1], sp[2], sp[3]);
+        } else {
+            sumy = float4(0.f, 0.f, 0.f, 0.f);
+            for (short i = 0; i < 8; ++i) {
+                yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+                yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+                yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+                yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+            }
         }
 
         device const uint16_t *scg = (device const uint16_t *)xg[ib].scales + iq;
@@ -1310,6 +1417,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_f32(
         device const int32_t *selected,
         device const float *weights,
         device float *mid,
+        device const float *sumy_in [[buffer(7)]],
         threadgroup float *scratch [[threadgroup(0)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
@@ -1322,7 +1430,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_f32(
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
     glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR2_K, 0>(
-        args, gate, up, x, weights, mid, scratch,
+        args, gate, up, x, weights, mid, sumy_in, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
 }
@@ -1335,6 +1443,7 @@ kernel void kernel_glm_q4_K_addr_pair_swiglu_f32(
         device const int32_t *selected,
         device const float *weights,
         device float *mid,
+        device const float *sumy_in [[buffer(7)]],
         threadgroup float *scratch [[threadgroup(0)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
@@ -1384,7 +1493,7 @@ kernel void kernel_glm_q4_K_addr_pair_swiglu_f32(
         local,
         reinterpret_cast<device const char *>(gate_addr),
         reinterpret_cast<device const char *>(up_addr),
-        x, weights, mid, scratch,
+        x, weights, mid, sumy_in, scratch,
         tgpig, slot, token, selected_off, 0, tiisg, sgitg);
 }
 
@@ -1397,6 +1506,7 @@ kernel void kernel_glm_q4_K_addr_pair_swiglu_f32_masked(
         device const int32_t *selected,
         device const float *weights,
         device float *mid,
+        device const float *sumy_in [[buffer(7)]],
         threadgroup float *scratch [[threadgroup(0)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
@@ -1447,7 +1557,7 @@ kernel void kernel_glm_q4_K_addr_pair_swiglu_f32_masked(
         local,
         reinterpret_cast<device const char *>(gate_addr),
         reinterpret_cast<device const char *>(up_addr),
-        x, weights, mid, scratch,
+        x, weights, mid, sumy_in, scratch,
         tgpig, slot, token, selected_off, 0, tiisg, sgitg);
 }
 
@@ -1459,6 +1569,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32(
         device const int32_t *selected,
         device const float *weights,
         device float *mid,
+        device const float *sumy_in [[buffer(7)]],
         threadgroup float *scratch [[threadgroup(0)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
@@ -1471,7 +1582,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32(
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
     glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 0>(
-        args, gate, up, x, weights, mid, scratch,
+        args, gate, up, x, weights, mid, sumy_in, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
 }
@@ -1485,6 +1596,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_spec(
         device const int32_t *selected,
         device const float *weights,
         device float *mid,
+        device const float *sumy_in [[buffer(7)]],
         threadgroup float *scratch [[threadgroup(0)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
@@ -1497,7 +1609,37 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_spec(
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
     glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, DM3_SPEC>(
-        args, gate, up, x, weights, mid, scratch,
+        args, gate, up, x, weights, mid, sumy_in, scratch,
+        tgpig, slot, token, selected_off,
+        expert - args.tp_expert_base, tiisg, sgitg);
+}
+/* SUMY1 arm: identical to _spec except that the four activation-group sums are
+ * LOADED from the producer instead of recomputed per expert per tile. Exactness
+ * is the gate -- tests/probe_sumy1_equiv.m requires the producer's output to
+ * match the in-kernel reduction bit for bit, because a reassociated sum changes
+ * the dequantised value and therefore the token. */
+kernel void kernel_glm_q4_K_pair_swiglu4_f32_spec_sumy1(
+        constant ds4_metal_glm_routed_moe_args &args,
+        device const char *gate,
+        device const char *up,
+        device const float *x,
+        device const int32_t *selected,
+        device const float *weights,
+        device float *mid,
+        device const float *sumy_in [[buffer(7)]],
+        threadgroup float *scratch [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tgpig.y;
+    const uint token = tgpig.z;
+    if (slot >= args.n_expert_used || token >= args.n_tokens) return;
+    const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
+    const int expert = selected[selected_off];
+    if (!ds4_tp_owns_expert(expert, args.n_total_expert,
+                            args.tp_rank, args.tp_world)) return;
+    glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, DM3_SPEC, true>(
+        args, gate, up, x, weights, mid, sumy_in, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
 }
@@ -1514,6 +1656,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_tgprobe(
         device const int32_t *selected,
         device const float *weights,
         device float *mid,
+        device const float *sumy_in [[buffer(7)]],
         threadgroup float *scratch [[threadgroup(0)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
@@ -1527,7 +1670,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_tgprobe(
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
     glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, 0>(
-        args, gate, up, x, weights, mid, scratch,
+        args, gate, up, x, weights, mid, sumy_in, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
 }
@@ -1540,6 +1683,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe(
         device const int32_t *selected,
         device const float *weights,
         device float *mid,
+        device const float *sumy_in [[buffer(7)]],
         threadgroup float *scratch [[threadgroup(0)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
@@ -1553,7 +1697,7 @@ kernel void kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe(
     if (!ds4_tp_owns_expert(expert, args.n_total_expert,
                             args.tp_rank, args.tp_world)) return;
     glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_GLM_Q4_PAIR_K, DM3_SPEC>(
-        args, gate, up, x, weights, mid, scratch,
+        args, gate, up, x, weights, mid, sumy_in, scratch,
         tgpig, slot, token, selected_off,
         expert - args.tp_expert_base, tiisg, sgitg);
 }
@@ -1567,6 +1711,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_mapped_f32(
         device const int32_t *hids,
         device const float *weights,
         device float *mid,
+        device const float *sumy_in [[buffer(7)]],
         threadgroup float *scratch [[threadgroup(0)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
@@ -1587,7 +1732,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_mapped_f32(
         if (slot >= args.n_expert_used || token >= args.n_tokens) continue;
         const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
         glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 0>(
-            args, gate, up, x, weights, mid, scratch,
+            args, gate, up, x, weights, mid, sumy_in, scratch,
             tgpig, slot, token, selected_off,
             (int)expert - args.tp_expert_base, tiisg, sgitg);
     }
@@ -1602,6 +1747,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_mapped_row_f32(
         device const int32_t *hids,
         device const float *weights,
         device float *mid,
+        device const float *sumy_in [[buffer(7)]],
         threadgroup float *scratch [[threadgroup(0)]],
         uint3 tgpig [[threadgroup_position_in_grid]],
         ushort tiisg [[thread_index_in_simdgroup]],
@@ -1618,7 +1764,7 @@ kernel void kernel_glm_q4_K_pair_swiglu2_mapped_row_f32(
     if (slot >= args.n_expert_used || token >= args.n_tokens) return;
     const uint64_t selected_off = (uint64_t)token * args.n_expert_used + slot;
     glm_q4_K_pair_swiglu_simd_f32_impl<N_R0_Q4_K, 0>(
-        args, gate, up, x, weights, mid, scratch,
+        args, gate, up, x, weights, mid, sumy_in, scratch,
         tgpig, slot, token, selected_off,
         (int)expert - args.tp_expert_base, tiisg, sgitg);
 }
