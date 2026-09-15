@@ -96,12 +96,17 @@ int main(int argc, const char **argv) { @autoreleasepool {
         { "kernel_mul_mv_q8_0_f32_a8_immed",     priv, (size_t)2*NSG*NR0*1*(8*BLK) },
         { "kernel_mul_mv_q8_0_f32_a8_pingpong",  priv, (size_t)2*NSG*NR0*1*(8*BLK) },
         { "kernel_mul_mv_q8_0_f32_a8_ppgroup",   priv, (size_t)2*NSG*NR0*1*(8*BLK) },
+        { "kernel_mul_mv_q8_0_f32_a8_row2",      priv, (size_t)2*NSG*NR0*1*(8*BLK) },
+        { "kernel_mul_mv_q8_0_f32_a8_row2_g2",   priv, (size_t)2*NSG*NR0*1*(8*BLK) },
     };
     const char *label[] = { "direct: shipping (modern)", "direct: 14.2 clone",
                             "reserve-only 2176 B", "manual stage 2176 B",
                             "async immediate", "async ping-pong",
-                            "async ping-pong, grouped wait" };
-    const int n_arms = 7;
+                            "async ping-pong, grouped wait",
+                            "VEC-ROW2 (1 event, both rows)",
+                            "VEC-ROW2-G2 (2 events, 1 wait)",
+                          };
+    const int n_arms = 9;
     float *ref = malloc((size_t)ne01 * sizeof(float));
     double ref_ms = 0.0;
     int fails = 0;
@@ -114,15 +119,15 @@ int main(int argc, const char **argv) { @autoreleasepool {
      * result -- the first version of this probe did exactly that and reported
      * the staged arms both 150% slower and 24% FASTER on consecutive runs.
      * Round-robin puts every arm in every thermal position. */
-    id<MTLComputePipelineState> pso[12];
-    NSUInteger smem[12];
+    id<MTLComputePipelineState> pso[16];
+    NSUInteger smem[16];
     for (int arm = 0; arm < n_arms; arm++) {
         pso[arm] = mk(dev, arms[arm].lib, arms[arm].name, NSG);
         smem[arm] = ((32u*2u*sizeof(float) + arms[arm].extra) + 15) & ~(NSUInteger)15;
         if (!pso[arm]) { printf("  %-24s MISSING\n", label[arm]); fails++; }
     }
-    static double t[12][REPS];
-    float *got[12];
+    static double t[16][REPS];
+    float *got[16];
     for (int arm = 0; arm < n_arms; arm++) got[arm] = malloc((size_t)ne01 * sizeof(float));
 
     for (int r = 0; r < REPS; r++) {

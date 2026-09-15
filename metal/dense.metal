@@ -308,6 +308,9 @@ void kernel_mul_mv_q8_0_f32_impl(
      * than producing a different answer. */
     constexpr short WQ8_RUN_B = NQ * (short)sizeof(block_q8_0);      /* 272 */
     const short wq8_pitch_b = (short)(NSG * NQ * (short)sizeof(block_q8_0));
+        /* 272 B = 17 uint4; the 544 B pitch = 34 uint4. Both exact, no remainder. */
+        constexpr short WQ8_RUN_U4 = WQ8_RUN_B / (short)sizeof(uint4);
+        const short wq8_pitch_u4 = wq8_pitch_b / (short)sizeof(uint4);
     const int n_runs = (nb - ib0 + NSG*NQ - 1) / (NSG*NQ);
     if (WQ8_ASYNC_C != 0 && WQ8_PIPE == 0) {
         /* RESERVE-ONLY. Touch the scratch so the argument cannot be eliminated
@@ -346,6 +349,12 @@ void kernel_mul_mv_q8_0_f32_impl(
         simdgroup_future<void> fut[2][NR0];
         __metal_simdgroup_event_t evt[2][NR0];
         bool have[2] = { false, false };
+        /* have[] says "this buffer holds issued data"; pending[] says "its
+         * events have not been waited on yet". G4 waits on both buffers at
+         * once, so without the second flag the next iteration re-waits an
+         * already-retired event -- which is what made it diverge on 1523 of
+         * 65536 outputs rather than fail loudly. */
+        bool pending[2] = { false, false };
 
         /* Prime chunk 0, then for each chunk: issue the NEXT one, wait on THIS
          * one, consume it. The issue happens before the wait so the transfer
@@ -353,55 +362,106 @@ void kernel_mul_mv_q8_0_f32_impl(
          * ordering is the only thing the primitive can buy here. */
         for (int c = 0; c < n_runs; c += WQ8_ASYNC_C) {
             const short p = (short)((c / WQ8_ASYNC_C) & 1);
-            if (WQ8_PIPE != 1 && !have[p]) {
+            /* ROW2: both output rows in ONE 2D event.
+             *
+             * The old comment here said the rows "cannot be merged into one
+             * copy -- they are args.nb01 apart, an arbitrary stride, and the 2D
+             * form has only a single pitch". That is wrong: the API takes
+             * SEPARATE dst_elements_per_row and src_elements_per_row, and
+             * ax[row] is exactly nb01 apart by construction. At C=1 each row
+             * contributes one contiguous 17-uint4 run, so the pair is a
+             * (17, NR0) tile with src pitch nb01/16 and dst pitch WQ8_SLICE/16.
+             * Halves the event count and the waits at the same 2176 B.
+             *
+             * Only at C=1. For C>1 the runs within a row are themselves strided
+             * and the pattern is 3D, which the 2D form cannot express. */
+            if ((WQ8_PIPE == 5 || WQ8_PIPE == 6) && !have[p]) {
+                if (WQ8_ASYNC_C == 1) {
+                    const uint64_t row_pitch_u4 = args.nb01 / sizeof(uint4);
+                    device const uchar *src0b =
+                        (device const uchar *)(ax[0] + ib0) +
+                        (uint64_t)(c) * wq8_pitch_b - (uint64_t)ix * sizeof(block_q8_0);
+                    evt[p][0] = __metal_simdgroup_async_copy_2d(
+                        16ul, 16ul,
+                        (threadgroup void *)(stage + p*buf_stride + sg_off),
+                        (ulong)WQ8_RUN_U4, 1ul, ulong2(WQ8_RUN_U4, NR0),
+                        (const device void *)src0b,
+                        row_pitch_u4, 1ul, ulong2(WQ8_RUN_U4, NR0),
+                        long2(0, 0), 0);
+                }
+                have[p] = true; pending[p] = true;
+            }
+            if (WQ8_PIPE != 1 && WQ8_PIPE < 5 && !have[p]) {
                 FOR_UNROLL (short row = 0; row < NR0; ++row) {
                     device const uchar *src =
                         (device const uchar *)(ax[row] + ib0) +
                         (uint64_t)(c) * wq8_pitch_b - (uint64_t)ix * sizeof(block_q8_0);
-                    if (WQ8_PIPE == 4) {
+                    /* uint4, NOT uchar. The first version let T infer from
+                     * `stage` (threadgroup uchar *) and passed
+                     * element_size = alignment = 1 to the raw intrinsic, so
+                     * every async arm moved BYTES while its own manual control
+                     * moved uint4 -- the exact form SGASYNC-CAP had already
+                     * shown loses. The source offset is
+                     * base + sgitg*272 + c*544, all 16-aligned, so the vector
+                     * form is legal. */
+                    if (WQ8_PIPE == 4 || WQ8_PIPE == 7) {
                         evt[p][row] = __metal_simdgroup_async_copy_2d(
-                            1ul, 1ul,
+                            16ul, 16ul,
                             (threadgroup void *)(stage + p*buf_stride + sg_off + row*WQ8_SLICE),
-                            (ulong)WQ8_RUN_B, 1ul, ulong2(WQ8_RUN_B, WQ8_ASYNC_C),
+                            (ulong)WQ8_RUN_U4, 1ul, ulong2(WQ8_RUN_U4, WQ8_ASYNC_C),
                             (const device void *)src,
-                            (ulong)wq8_pitch_b, 1ul, ulong2(WQ8_RUN_B, WQ8_ASYNC_C),
+                            (ulong)wq8_pitch_u4, 1ul, ulong2(WQ8_RUN_U4, WQ8_ASYNC_C),
                             long2(0, 0), 0);
                     } else {
                         fut[p][row] = simdgroup_async_copy(
-                            stage + p*buf_stride + sg_off + row*WQ8_SLICE,
-                            (ulong)WQ8_RUN_B, 1ul,
-                            src, (ulong)wq8_pitch_b, 1ul,
-                            ulong2(WQ8_RUN_B, WQ8_ASYNC_C));
+                            (threadgroup uint4 *)(stage + p*buf_stride + sg_off + row*WQ8_SLICE),
+                            (ulong)WQ8_RUN_U4, 1ul,
+                            (device const uint4 *)src, (ulong)wq8_pitch_u4, 1ul,
+                            ulong2(WQ8_RUN_U4, WQ8_ASYNC_C));
                     }
                 }
-                have[p] = true;
+                have[p] = true; pending[p] = true;
             }
             const short pn = (short)(p ^ 1);
             const int cn = c + WQ8_ASYNC_C;
             /* IMMED does not prefetch: it waits on the chunk it just issued, so
              * the copy cost is measured with no overlap to hide it. */
-            if (WQ8_PIPE >= 3 && WQ8_PIPE != 1 && cn < n_runs) {
+            if (WQ8_PIPE == 6 && cn < n_runs && WQ8_ASYNC_C == 1) {
+                const uint64_t row_pitch_u4 = args.nb01 / sizeof(uint4);
+                device const uchar *src0b =
+                    (device const uchar *)(ax[0] + ib0) +
+                    (uint64_t)(cn) * wq8_pitch_b - (uint64_t)ix * sizeof(block_q8_0);
+                evt[pn][0] = __metal_simdgroup_async_copy_2d(
+                    16ul, 16ul,
+                    (threadgroup void *)(stage + pn*buf_stride + sg_off),
+                    (ulong)WQ8_RUN_U4, 1ul, ulong2(WQ8_RUN_U4, NR0),
+                    (const device void *)src0b,
+                    row_pitch_u4, 1ul, ulong2(WQ8_RUN_U4, NR0),
+                    long2(0, 0), 0);
+                have[pn] = true; pending[pn] = true;
+            }
+            if ((WQ8_PIPE == 3 || WQ8_PIPE == 4 || WQ8_PIPE == 7) && cn < n_runs) {
                 FOR_UNROLL (short row = 0; row < NR0; ++row) {
                     device const uchar *src =
                         (device const uchar *)(ax[row] + ib0) +
                         (uint64_t)(cn) * wq8_pitch_b - (uint64_t)ix * sizeof(block_q8_0);
-                    if (WQ8_PIPE == 4) {
+                    if (WQ8_PIPE == 4 || WQ8_PIPE == 7) {
                         evt[pn][row] = __metal_simdgroup_async_copy_2d(
-                            1ul, 1ul,
+                            16ul, 16ul,
                             (threadgroup void *)(stage + pn*buf_stride + sg_off + row*WQ8_SLICE),
-                            (ulong)WQ8_RUN_B, 1ul, ulong2(WQ8_RUN_B, WQ8_ASYNC_C),
+                            (ulong)WQ8_RUN_U4, 1ul, ulong2(WQ8_RUN_U4, WQ8_ASYNC_C),
                             (const device void *)src,
-                            (ulong)wq8_pitch_b, 1ul, ulong2(WQ8_RUN_B, WQ8_ASYNC_C),
+                            (ulong)wq8_pitch_u4, 1ul, ulong2(WQ8_RUN_U4, WQ8_ASYNC_C),
                             long2(0, 0), 0);
                     } else {
                         fut[pn][row] = simdgroup_async_copy(
-                            stage + pn*buf_stride + sg_off + row*WQ8_SLICE,
-                            (ulong)WQ8_RUN_B, 1ul,
-                            src, (ulong)wq8_pitch_b, 1ul,
-                            ulong2(WQ8_RUN_B, WQ8_ASYNC_C));
+                            (threadgroup uint4 *)(stage + pn*buf_stride + sg_off + row*WQ8_SLICE),
+                            (ulong)WQ8_RUN_U4, 1ul,
+                            (device const uint4 *)src, (ulong)wq8_pitch_u4, 1ul,
+                            ulong2(WQ8_RUN_U4, WQ8_ASYNC_C));
                     }
                 }
-                have[pn] = true;
+                have[pn] = true; pending[pn] = true;
             }
             /* WAIT SHAPE is an arm, not an implementation detail.
              *
@@ -432,6 +492,28 @@ void kernel_mul_mv_q8_0_f32_impl(
                     }
                 }
                 simdgroup_barrier(mem_flags::mem_threadgroup);
+            } else if (WQ8_PIPE == 5) {
+                if (pending[p]) __metal_wait_simdgroup_events(1, &evt[p][0]);
+                pending[p] = false;
+            } else if (WQ8_PIPE == 6) {
+                /* Both chunk events -- this one and the prefetched next -- in a
+                 * single stall. Two events instead of four, one wait instead of
+                 * two, same 2176 B. */
+                __metal_simdgroup_event_t both[2];
+                short nev = 0;
+                if (pending[p])  both[nev++] = evt[p][0];
+                if (pending[pn]) both[nev++] = evt[pn][0];
+                if (nev) __metal_wait_simdgroup_events(nev, &both[0]);
+                pending[p] = false; pending[pn] = false;
+            } else if (WQ8_PIPE == 7) {
+                /* G4: both rows of both chunks retired in one stall, using the
+                 * two buffers that already exist. No added scratch. */
+                __metal_simdgroup_event_t four[2*NR0];
+                short nev = 0;
+                if (pending[p])  FOR_UNROLL (short row = 0; row < NR0; ++row) four[nev++] = evt[p][row];
+                if (pending[pn]) FOR_UNROLL (short row = 0; row < NR0; ++row) four[nev++] = evt[pn][row];
+                if (nev) __metal_wait_simdgroup_events(nev, &four[0]);
+                pending[p] = false; pending[pn] = false;
             } else if (WQ8_PIPE == 4) {
                 /* GROUPED WAIT. simdgroup_future::wait() lowers to
                  * __metal_wait_simdgroup_events(1, &event) -- one stall per
@@ -589,6 +671,21 @@ DS4_WQ8_ARM(a8_manual,   1)   /* matched manual uint4 staging                  *
 DS4_WQ8_ARM(a8_immed,    2)   /* async, wait at once -- no overlap             */
 DS4_WQ8_ARM(a8_pingpong, 3)   /* async, issue n+1 before waiting on n          */
 DS4_WQ8_ARM(a8_ppgroup,  4)   /* ping-pong, one grouped wait for NR0 copies    */
+/* D6, after review: the arms above moved BYTES while their manual control moved
+ * uint4, so the "async is dead" reading measured the form SGASYNC-CAP had
+ * already shown loses. All arms are uint4 now, and these three test the shapes
+ * that were never built. */
+DS4_WQ8_ARM(a8_row2,     5)   /* both rows in ONE 2D event, immediate wait     */
+DS4_WQ8_ARM(a8_row2_g2,  6)   /* two row-fused chunk events, ONE grouped wait  */
+/* a8_g4 DIVERGES and is not an arm. Grouping FOUR events into one
+ * __metal_wait_simdgroup_events consistently corrupts ~1530 of 65536 outputs on
+ * M1, while the same code grouping TWO is bit-identical. Both issue paths were
+ * verified to use the raw intrinsic, and a pending[] guard rules out re-waiting
+ * a retired event, so the remaining explanation is a depth limit on the grouped
+ * wait itself. Kept compiled so the finding stays reproducible, kept OUT of the
+ * probe so nobody measures it: it caps the grouped-wait idea at 2, which is
+ * also why group-8/16 is not worth pursuing. */
+DS4_WQ8_ARM(a8_g4,       7)
 
 kernel void kernel_mul_mv_q8_0_f32_sgasync2(
         constant ds4_metal_args_mul_mv & args,
