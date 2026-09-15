@@ -162,6 +162,27 @@ int main(int argc, const char **argv) { @autoreleasepool {
          * the GPU-contention measurement this whole arm exists to make -- the
          * sidecar would be competing with the routed MoE it is supposed to run
          * beside. */
+        /* The helper re-validates independently. It is a separate process
+         * pointed at a directory by argv/env, so the parent's check does not
+         * cover it -- and this is the process that actually loads the weights
+         * PERFONLY consumes. DS4_ANE_REQUIRE_REAL=1 is set by the parent when
+         * the replacement mode is armed. */
+        const char *req = getenv("DS4_ANE_REQUIRE_REAL");
+        if (req && req[0] && req[0] != '0') {
+            char mpath[1200];
+            snprintf(mpath, sizeof(mpath), "%s/manifest.json", model_dir);
+            FILE *mf = fopen(mpath, "rb");
+            char mbuf[8192]; size_t mn = 0;
+            if (mf) { mn = fread(mbuf, 1, sizeof(mbuf) - 1, mf); fclose(mf); }
+            mbuf[mn] = 0;
+            if (!mf || !strstr(mbuf, "\"kind\": \"real\"")) {
+                fprintf(stderr, "ds4-ane-helper: FATAL -- real weights required "
+                                "but %s does not declare kind=real\n", model_dir);
+                atomic_store_explicit(&w[DS4_ANEPROC_W_FAULT], 6u,
+                                      memory_order_release);
+                return 2;
+            }
+        }
         cfg.computeUnits = MLComputeUnitsCPUAndNeuralEngine;
         const uint64_t t0 = now_ns();
         for (uint32_t il = 0; il < n_layers; il++) {

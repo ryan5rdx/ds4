@@ -86,3 +86,20 @@ tests/probe_cpu_shexp
 tests/probe_qb_slice
 tests/probe_top1
 ds4_private_clone.metallib
+
+# Built probe binaries. 7562e8a committed seven of these, including the stale
+# probe_moe_raw_stage_equiv name that had already been renamed -- a Mach-O in
+# the tree is both noise and a trap, since a stale one runs happily and reports
+# on source that no longer exists.
+tests/probe_*
+!tests/probe_*.c
+!tests/probe_*.m
+!tests/probe_*.metal
+!tests/probe_*.py
+
+# Built helper binary (make all / make rig produce it).
+ds4-ane-helper
+# Scratch data blobs at the repo root. `git add -A` swept a 268 MB `x` into a
+# commit and GitHub's pre-receive hook rejected the push; the file was probe
+# output, not source.
+/x

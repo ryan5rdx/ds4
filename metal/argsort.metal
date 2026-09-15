@@ -773,7 +773,12 @@ kernel void kernel_glm53_idxsplit_merge_expand_impl(
     for (uint j = k; j > 0u; j >>= 1) {
         for (uint i = tid; i < n; i += 512u) {
             const uint ixj = i ^ j;
-            if (ixj > i && buf[i] < buf[ixj]) {
+            /* Through the templated comparator, not a bare `<`. This merge is
+             * the DECODE arm; leaving it native meant the kernel could announce
+             * _u32cmp and execute byte-identical comparison code -- an arm that
+             * is not the arm its label says, which is the failure this campaign
+             * keeps producing. */
+            if (ixj > i && ds4_topk_key_gt<U32CMP>(buf[ixj], buf[i])) {
                 const ulong t = buf[i]; buf[i] = buf[ixj]; buf[ixj] = t;
             }
         }

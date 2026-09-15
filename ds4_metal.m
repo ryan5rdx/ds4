@@ -30,6 +30,7 @@
 #include "ds4.h"
 #include "ds4_gpu.h"
 #include "ds4_aneproc.h"
+#include "ds4_ane.h"
 #include "ds4_top1_key.h"
 #include "ds4_image.h"
 
@@ -53397,6 +53398,11 @@ int ds4_gpu_aneproc_start(uint32_t dim, uint32_t n_tok, uint32_t n_layers) {
     snprintf(ctl_id, sizeof(ctl_id), "%u", (unsigned)IOSurfaceGetID(g_ane_ctl_surface));
     const char *models = getenv("DS4_ANE_MODEL_DIR");
     const char *path = ds4_gpu_aneproc_helper_path();
+    /* Tell the helper when the parent is in a replacement mode, so it can
+     * re-validate the manifest itself. It is a separate process and is the one
+     * that actually loads the weights PERFONLY consumes; the parent's check
+     * does not cover it. Inherited through environ. */
+    if (ds4_ane_mode() == DS4_ANE_PERFONLY) setenv("DS4_ANE_REQUIRE_REAL", "1", 1);
     const char *argv[] = { path, "--in", in_id, "--out", out_id, "--ctl", ctl_id,
                            models ? "--models" : NULL, models, NULL };
     extern char **environ;

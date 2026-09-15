@@ -51074,9 +51074,21 @@ void ds4_glm_ane_replacement_report(const char *where, int tp_rank) {
         !g_ane_gpu_shared_encoded && !g_ane_replacements && !g_ane_unpacks) {
         return;
     }
+    /* CERTIFICATION, not just diagnosis.
+     *
+     * The previous condition let an all-zero line print clean: with no
+     * replacements and no unpacks, `replacements != unpacks` is false and
+     * nothing else fired, so a run that replaced NOTHING reported no defect.
+     * That is the same shape as every other silent gate this campaign has
+     * produced. A replacement mode that produced zero replacements is the
+     * loudest possible failure, so it is now named as one. */
+    const int replacing = (ds4_ane_mode() == DS4_ANE_PERFONLY);
     const int bad = (g_ane_replacements != g_ane_unpacks) ||
                     (g_ane_replacements && g_ane_gpu_shared_encoded) ||
-                    (g_ane_ffn_batch_calls && !g_ane_ffn_split);
+                    (g_ane_ffn_batch_calls && !g_ane_ffn_split) ||
+                    (replacing && g_ane_replacements == 0) ||
+                    (replacing && g_ane_gpu_shared_encoded != 0) ||
+                    (!replacing && g_ane_ffn_split && g_ane_gpu_shared_encoded == 0);
     fprintf(stderr,
             "ds4: ANEREPL %s rank %d -- ffn_batch=%llu tp2=%llu split=%llu "
             "gpu_shared_encoded=%llu ane_replacements=%llu ane_unpacks=%llu "

@@ -135,7 +135,12 @@ test-indexer-scorer: tests/test_indexer_scorer
 tests/test_topk_stream512.o: tests/test_topk_stream512.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_topk_stream512: tests/test_topk_stream512.o ds4_metal.o
+# $(CORE_OBJS), not ds4_metal.o alone. ds4_metal.o references the ds4 core
+# (ds4_gpu_cleanup's callees, ds4_deepseek4_attention_bounds and others), so the
+# narrow link never resolved and `make test-topk-stream512` had been failing at
+# ld -- which is why the stream512 _u32cmp binding had to be confirmed by a
+# hand-rolled full-core link instead of by this target.
+tests/test_topk_stream512: tests/test_topk_stream512.o $(CORE_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
 test-topk-stream512: tests/test_topk_stream512

@@ -398,6 +398,40 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
          * made the process-isolation A/B meaningless, since the parent held
          * everything it was supposed to have handed off and never predicted
          * with any of it. */
+        /* REAL-WEIGHT ENFORCEMENT, ahead of everything that loads a model.
+         *
+         * This used to sit inside the !ds4_gpu_aneproc_active() branch below,
+         * so DS4_ANE_PROC=1 walked straight past it: the helper loads packages
+         * by filename and never looks at a manifest, which meant the one mode
+         * that consumes ANE output as the real shared expert could run
+         * synthetic weights in the configuration we are actively testing.
+         *
+         * Checked here, before the in-process loader AND before the helper is
+         * spawned, so neither path can reach a model set that has not declared
+         * itself. The helper re-checks independently -- it is a separate
+         * process and may be pointed at a different directory. */
+        if (ds4_ane_mode() == DS4_ANE_PERFONLY && !ds4_ane_test_hook()) {
+            const char *mdir = getenv("DS4_ANE_MODEL_DIR");
+            char why[256] = {0};
+            if (!mdir || !mdir[0]) {
+                ds4_ane_teardown();
+                ds4_ane_required_abort("PERFONLY needs DS4_ANE_MODEL_DIR");
+                return 0;
+            }
+            if (!ds4_ane_models_are_real(mdir, n_layers, dim, why, sizeof(why))) {
+                char msg[512];
+                snprintf(msg, sizeof(msg),
+                         "PERFONLY requires REAL weights and %s does not "
+                         "qualify: %s. Export them with `ds4 -m <model.gguf> "
+                         "--export-ane-shexp <dir>` and build the set with "
+                         "ane-gen-real.py. Use a shadow/fast mode for "
+                         "speed-only runs.", mdir, why);
+                ds4_ane_teardown();
+                ds4_ane_required_abort(msg);
+                return 0;
+            }
+            g_models_are_real = 1;
+        }
         if (ds4_ane_mode() >= DS4_ANE_SHADOW &&
             ds4_ane_mode() != DS4_ANE_FASTNULL && !ds4_ane_test_hook() &&
             !ds4_gpu_aneproc_active()) {
@@ -407,11 +441,8 @@ int ds4_ane_init(uint32_t n_layers, uint32_t dim, uint32_t n_tokens) {
                 ds4_ane_required_abort("DS4_ANE_MODEL_DIR is unset");
                 return 0;
             }
-            /* PERFONLY consumes the ANE output as the real shared expert.
-             * Refuse to do that with a model set that does not identify itself
-             * as real -- fluent wrong text is the failure mode, and it is the
-             * one a human reviewer cannot spot. */
-            if (ds4_ane_mode() == DS4_ANE_PERFONLY) {
+            /* (validation hoisted above -- it must also cover ANEPROC) */
+            if (0) {
                 char why[256] = {0};
                 if (!ds4_ane_models_are_real(dir, n_layers, dim,
                                              why, sizeof(why))) {

@@ -49,7 +49,9 @@
 
 #include "ds4_gpu.h"
 
-bool ds4_log_is_tty(FILE *fp) { (void)fp; return false; }
+/* ds4.o provides this. The stub was here because the target used to link
+ * ds4_metal.o alone -- a link that never actually resolved, so the stub was
+ * carrying a build that did not work. */
 
 #define CHECK(cond, msg) do { \
     if (!(cond)) { fprintf(stderr, "FAIL: %s\n", (msg)); return 1; } \
