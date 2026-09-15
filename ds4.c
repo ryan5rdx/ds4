@@ -59199,9 +59199,16 @@ struct ds4_session {
     ds4_gpu_tensor *glm53_rollback_kda;
     ds4_gpu_tensor *glm53_rollback_index;
     float *glm53_rollback_logits;
-    /* The captured buffer's representation, saved and restored with it. */
+    /* The captured buffer's representation, saved and restored with it.
+     * ALL of it: top-2 and the exclusion NaN flags were omitted at first, which
+     * would have restored a stale runner-up and a stale seed-quirk answer
+     * alongside a correctly restored top-1. Latent only because a sync used to
+     * clear the compact state unconditionally. */
     bool     glm53_rollback_logits_compact;
     uint64_t glm53_rollback_top1_key;
+    uint64_t glm53_rollback_top2_key;
+    bool     glm53_rollback_nan_at_0;
+    bool     glm53_rollback_nan_at_1;
     int      glm53_rollback_top1_len;
     int glm53_rollback_pos;
     uint32_t glm53_rollback_dense_len;
@@ -60623,6 +60630,9 @@ bool ds4_session_glm53_rollback_capture(ds4_session *s) {
      * guard alone would not catch it. */
     s->glm53_rollback_logits_compact = s->logits_compact;
     s->glm53_rollback_top1_key = s->compact_top1_key;
+    s->glm53_rollback_top2_key = s->compact_top2_key;
+    s->glm53_rollback_nan_at_0 = s->compact_nan_at_0;
+    s->glm53_rollback_nan_at_1 = s->compact_nan_at_1;
     s->glm53_rollback_top1_len = s->compact_top1_len;
     s->glm53_rollback_pos = s->checkpoint.len;
     s->glm53_rollback_dense_len = s->glm_dense_cache_len;
@@ -60661,6 +60671,9 @@ static bool ds4_session_glm53_rollback_restore(ds4_session *s, int pos) {
                (size_t)DS4_N_VOCAB * sizeof(float));
         s->logits_compact    = s->glm53_rollback_logits_compact;
         s->compact_top1_key  = s->glm53_rollback_top1_key;
+        s->compact_top2_key  = s->glm53_rollback_top2_key;
+        s->compact_nan_at_0  = s->glm53_rollback_nan_at_0;
+        s->compact_nan_at_1  = s->glm53_rollback_nan_at_1;
         s->compact_top1_len  = s->glm53_rollback_top1_len;
     } else {
         ds4_session_logits_mark_full(s);
@@ -72963,8 +72976,47 @@ static bool ds4_session_store_vision_identities(ds4_session *s) {
  * graph sequence and the per-layer gates pair up.  The worker acks a sync
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
+/* Would this sync evaluate anything? True only when the session already holds
+ * exactly this prompt, so no prefill and no eval can run. */
+static bool ds4_session_sync_is_exact_noop(const ds4_session *s,
+                                           const ds4_tokens *prompt,
+                                           const ds4_vision_span *images,
+                                           size_t image_count) {
+    if (!s || !prompt || !s->checkpoint_valid) return false;
+    if (!s->logits_compact) return false;   /* nothing to preserve anyway */
+    if (s->checkpoint.len != prompt->len) return false;
+    for (int i = 0; i < prompt->len; i++) {
+        if (s->checkpoint.v[i] != prompt->v[i]) return false;
+    }
+    /* A vision prefix change re-runs the prompt even when the tokens match.
+     * The multimodal entry point supplies the images as ARGUMENTS, so the
+     * comparison has to be against those, not against the ones the session
+     * happens to be holding from the previous request. */
+    if (!ds4_session_vision_prefix_matches(s, images, image_count)) {
+        return false;
+    }
+    return true;
+}
+
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
-    ds4_session_logits_mark_full(s);
+    /* An EXACT-PREFIX sync evaluates nothing, so it must not relabel the
+     * buffer. Marking full unconditionally here left a compact carrier tagged
+     * as real logits, and the next stochastic sample, logprob read or rollback
+     * would have consumed fabricated values with nothing to say so.
+     *
+     * The test is the no-op condition itself, not a proxy for it. "Frontier
+     * length unchanged" looked adequate and is not: re-prefilling a DIFFERENT
+     * prompt of the same length writes logits and lands at the same length. So
+     * compare the tokens.
+     *
+     * If this test is ever wrong in the conservative direction -- it says no-op
+     * when a prefill did run -- the buffer is real logits still labelled
+     * compact, and every reader refuses. That is loud. Wrong the other way is
+     * the silent case, which is what this replaces. */
+    if (!ds4_session_sync_is_exact_noop(s, prompt, s ? s->sync_images : NULL,
+                                        s ? s->sync_image_count : 0)) {
+        ds4_session_logits_mark_full(s);
+    }
     if (s && !ds4_session_vision_prefix_matches(
                      s, s->sync_images, s->sync_image_count)) {
         ds4_session_invalidate(s);
@@ -73142,7 +73194,11 @@ int ds4_session_sync_multimodal(
         size_t image_count,
         char *err,
         size_t errlen) {
-    ds4_session_logits_mark_full(s);
+    /* Same rule as ds4_session_sync: an exact-prefix sync evaluates nothing and
+     * must not relabel a compact carrier as real logits. See that function. */
+    if (!ds4_session_sync_is_exact_noop(s, prompt, images, image_count)) {
+        ds4_session_logits_mark_full(s);
+    }
     if (!s || !prompt || (image_count != 0 && !images)) {
         snprintf(err, errlen, "invalid multimodal prompt");
         return 1;
@@ -74317,6 +74373,22 @@ static inline bool ds4_session_compact_key_usable(const ds4_session *s) {
            s->checkpoint.len == s->compact_top1_len;
 }
 
+/* THE compact argmax. Both ds4_session_argmax() and ds4_session_sample() must
+ * answer this question identically, and they did not: sample() returned the
+ * unfloored packed winner directly while argmax() applied the floor, so the two
+ * disagreed on exactly the sub-floor vectors the floor exists for. One helper
+ * rather than two transcriptions -- the same reason ds4_top1_key_index lives in
+ * a shared header.
+ *
+ * The keys on the wire are unfloored (argmax_excluding needs them that way);
+ * sample_argmax's floor is applied here, and a winner at or below DS4_NEG_INF
+ * never beat its seed, so the answer is index 0. */
+static inline int ds4_session_compact_argmax(const ds4_session *s) {
+    const uint64_t floor_key = ds4_top1_seed_key(0);
+    if ((s->compact_top1_key >> 32) <= (floor_key >> 32)) return 0;
+    return (int)ds4_top1_key_index(s->compact_top1_key);
+}
+
 /* Declare the buffer to hold real logits again. Called by every operation that
  * materialises a full vector -- NOT on a request boundary, because the carrier
  * outlives the request that produced it and clearing the flag without
@@ -74328,6 +74400,9 @@ static void ds4_session_logits_mark_full(ds4_session *s) {
     if (!s) return;
     s->logits_compact = false;
     s->compact_top1_key = 0;
+    s->compact_top2_key = 0;
+    s->compact_nan_at_0 = false;
+    s->compact_nan_at_1 = false;
     s->compact_top1_len = -1;
 }
 
@@ -74339,12 +74414,7 @@ int ds4_session_argmax(ds4_session *s) {
          * stale and scanning it would return a token from an earlier step with
          * nothing to say so. */
         if (!ds4_session_compact_key_usable(s)) return -1;
-        /* The key is UNFLOORED; sample_argmax is not. Apply the floor here: a
-         * winner at or below DS4_NEG_INF never beats sample_argmax's seed, so
-         * the answer is index 0. Comparing score halves is that same test. */
-        const uint64_t floor_key = ds4_top1_seed_key(0);
-        if ((s->compact_top1_key >> 32) <= (floor_key >> 32)) return 0;
-        return (int)ds4_top1_key_index(s->compact_top1_key);
+        return ds4_session_compact_argmax(s);
     }
     return sample_argmax(s->logits, DS4_N_VOCAB);
 }
@@ -74574,7 +74644,10 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
             .peer_negotiated = true,   /* the exchange already happened */
         };
         if (!ds4_sampler_can_use_raw_argmax(&live)) return -1;
-        return (int)ds4_top1_key_index(s->compact_top1_key);
+        /* The SAME helper ds4_session_argmax uses. Returning the raw key index
+         * here skipped the sampler floor, so a sub-floor vector sampled a token
+         * the argmax entry point would have refused to pick. */
+        return ds4_session_compact_argmax(s);
     }
     return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
                               top_p, min_p, rng, s->sample_probs);
