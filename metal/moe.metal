@@ -8859,9 +8859,11 @@ kernel void kernel_mul_mm_id_addr(
  * that. The raw stage adds 2 x 9216 B at offset 10240, so the k-loop needs
  * 28672 B and the epilogue still needs 16384 B of the same allocation. They are
  * separated by a threadgroup barrier and may alias, so the dispatch grows to
- * 28672 B rather than 34816 B. Under Apple's 32 KiB limit, but residency drops
- * from two threadgroups per core to one -- which is exactly the cost this arm
- * exists to price.
+ * 28672 B rather than 34816 B. Under Apple's 32 KiB limit, but residency roughly
+ * HALVES -- which is exactly the cost this arm exists to price. Stated as a
+ * ratio: a per-core count obtained by dividing maxThreadgroupMemoryLength is not
+ * real, since that property bounds a single threadgroup rather than the core's
+ * pool, and tests/probe_tg_residency_census.m measures the actual numbers.
  *
  * Q4_K only: nl == 16, so `il` walks 0,2,..,14 and the block pointer advances
  * once per 8 k-steps. RAW_STAGE is rejected at instantiation for anything else.

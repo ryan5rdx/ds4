@@ -4,7 +4,8 @@
  * Every occupancy result in this campaign -- the wide-Q8 -47%, and now the
  * MOETGOCC null on both the rig and this box -- rests on the assumption that
  * reserving N bytes per threadgroup caps residency at floor(32768 / N)
- * threadgroups per core. That assumption has never been checked directly. It
+ * threadgroups per core. That assumption had never been checked directly, and
+ * the per-core half of it turns out to be false. It
  * has only ever been INFERRED from timing, and timing has confounds:
  *
  *   - a bandwidth-bound kernel is residency-insensitive by construction
@@ -18,9 +19,14 @@
  * Each threadgroup's thread 0 increments a device counter on entry, pushes the
  * running value into a peak, spins, then decrements. The peak is the largest
  * number of threadgroups the hardware ever had in flight at once. If the
- * reservation binds, that number must fall roughly in proportion to
- * floor(32768 / bytes); if it does not move, the knob is not a residency knob
- * and every sweep built on it measured nothing.
+ * reservation binds, that number must FALL as the footprint grows; if it does
+ * not move, the knob is not a residency knob and every sweep built on it
+ * measured nothing.
+ *
+ * It does not predict floor(32768 / bytes) -- that arithmetic is wrong, and
+ * disproving it is one of this probe's results: maxThreadgroupMemoryLength is
+ * the per-threadgroup maximum, not the per-core pool, and at 18432 B the count
+ * below is 72 concurrent threadgroups where the division claims one per core.
  */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>

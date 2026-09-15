@@ -3892,10 +3892,17 @@ static id<MTLComputePipelineState> ds4_gpu_get_sgasync_pipeline(
  * N_R0_Q4_K = 2 -- that is the swiglu2 kernel's constant, and the "4" in
  * swiglu4 IS the row count. Everything below was a factor of two out.
  *
- *   pair, one buffer   2 SIMD x 4 rows x 4 blocks x 144 B x (gate+up) =  9216 B -> 3 TG/core
- *   pair, ping-pong                                            x2     = 18432 B -> 1 TG/core
- *   down, one buffer   2 SIMD x 2 rows x 4 blocks x 144 B               = 2304 B -> 14 TG/core
- *   down, ping-pong                                            x2     =  4608 B -> 7 TG/core
+ *   pair, one buffer   2 SIMD x 4 rows x 4 blocks x 144 B x (gate+up) =  9216 B
+ *   pair, ping-pong                                            x2     = 18432 B
+ *   down, one buffer   2 SIMD x 2 rows x 4 blocks x 144 B               = 2304 B
+ *   down, ping-pong                                            x2     =  4608 B
+ *
+ * Footprint in BYTES only. An earlier version of this table carried a "TG/core"
+ * column obtained by dividing maxThreadgroupMemoryLength, and that number is
+ * simply wrong: that property is the per-THREADGROUP maximum, not the per-core
+ * pool. tests/probe_tg_residency_census.m counts co-residency directly and finds
+ * 72 concurrent threadgroups at 18432 B where the division claimed one per core.
+ * Measured co-residency belongs to that probe; this table states bytes.
  *
  * WHICH POINT ANSWERS WHICH QUESTION. 9216 prices an IMMEDIATE-wait
  * single-buffer pair stage; 18432 prices the ping-pong pipeline that was
@@ -37362,8 +37369,11 @@ static int ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(
      * k-loop's 10240. The raw stage adds 2 x 64 x sizeof(block_q4_K) = 18432 at
      * offset 10240, so the k-loop needs 28672 and the epilogue aliases the
      * bottom 16384 of the same allocation -- they are separated by a barrier.
-     * 28672 is under Apple's 32 KiB, but it takes residency from two
-     * threadgroups per core to one, which is the cost being priced. */
+     * 28672 is under Apple's 32 KiB, and it roughly HALVES residency -- the
+     * census probe counts 96 concurrent threadgroups at 16384 B against 48 at
+     * 32768 B. Stated as a ratio, not as a per-core count: dividing
+     * maxThreadgroupMemoryLength gives a per-core figure that is not real,
+     * because that property bounds one threadgroup and not the core's pool. */
     const NSUInteger pair_tg_bytes =
         compact_tile ? 8192u : (ds4_moe_raw_stage_enabled() ? 28672u : 16384u);
     [enc setThreadgroupMemoryLength:DS4_TG16(pair_tg_bytes) atIndex:0];
