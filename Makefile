@@ -757,6 +757,14 @@ tests/probe_aneproc_ring: tests/probe_aneproc_ring.m ds4_aneproc.h
 	$(CC) $(CFLAGS) -fobjc-arc -I. -o $@ tests/probe_aneproc_ring.m \
 	      -framework Foundation -framework IOSurface
 
+# The rig had to build this with a bare clang line because no target existed.
+tests/probe_dispatch_overhead: tests/probe_dispatch_overhead.m
+	$(CC) $(CFLAGS) -fobjc-arc -I. -o $@ tests/probe_dispatch_overhead.m \
+	      -framework Foundation -framework Metal
+
+test-dispatch-overhead: tests/probe_dispatch_overhead
+	./tests/probe_dispatch_overhead
+
 tests/probe_cmpsel2: tests/probe_cmpsel2.m metal/cmpsel2.metal
 	$(CC) $(CFLAGS) -fobjc-arc -I. -o $@ tests/probe_cmpsel2.m \
 	      -framework Foundation -framework Metal
