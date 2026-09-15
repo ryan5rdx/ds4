@@ -8654,7 +8654,12 @@ kernel void kernel_dsv4_tp_fence_wait(
  *
  * SHAPE. Threadgroup 0 is the original one-thread poll, byte for byte -- same
  * coherent(system) qualifiers, same fence, same bounded iteration count, same
- * timeout store -- so the release path cannot get slower. Every other
+ * timeout store. That makes the poll LOOP identical; it does not make the arm
+ * free. Helper traffic can still contend with the polling threadgroup for
+ * memory and issue slots, so "the release path cannot get slower" would be an
+ * overclaim. The zero-wait gate -- a release that has already landed when the
+ * fence begins must measure neutral -- is what actually tests it, and it is
+ * required rather than optional. Every other
  * threadgroup warms cache with ordinary sparse loads and exits as soon as the
  * peer release lands. Kernel completion orders the following graph, so no extra
  * barrier is needed.
@@ -8718,19 +8723,46 @@ kernel void kernel_dsv4_tp_fence_wait_prefetch(
     const uint helpers = ngrp - 1u;
     const uint stride  = helpers * tgsz;
     uint acc = 0u;
-    for (uint line = (tgid - 1u) * tgsz + tid; line < warm_lines; line += stride) {
-        if ((line & 15u) == 0u) {
-            metal::atomic_thread_fence(metal::mem_flags::mem_device,
-                                       metal::memory_order_relaxed,
-                                       metal::thread_scope_system);
-            if (release[0] == value) break;
+
+    /* STOP ON AN ITERATION COUNTER, NOT ON THE LINE INDEX.
+     *
+     * The first version tested `(line & 15u) == 0u`, but `line` advances by
+     * `helpers * tgsz` -- normally a multiple of 16 -- so the low bits never
+     * change: one thread in sixteen checked every iteration and the other
+     * fifteen never checked at all, warming their whole range long after the
+     * peer released. A helper still running past release charges the next
+     * stage for work nobody needed, which is precisely the cost this arm
+     * exists to avoid.
+     *
+     * One lane per SIMDgroup does the system-scope read and broadcasts it, so
+     * the fence is paid once per 32 lanes instead of once per thread. */
+    uint it = 0u;
+    for (uint line = (tgid - 1u) * tgsz + tid; line < warm_lines;
+         line += stride, ++it) {
+        if ((it & 15u) == 0u) {
+            uint stop = 0u;
+            if (metal::simd_is_first()) {
+                metal::atomic_thread_fence(metal::mem_flags::mem_device,
+                                           metal::memory_order_relaxed,
+                                           metal::thread_scope_system);
+                stop = (release[0] == value) ? 1u : 0u;
+            }
+            /* uint, not bool: simd_broadcast_first has no bool overload. */
+            if (metal::simd_broadcast_first(stop) != 0u) break;
         }
         acc ^= (uint)warm[(uint64_t)line * 128u];
     }
-    /* Keep the loads alive without writing anything the graph reads. The store
-     * is unreachable -- acc is a byte-xor and cannot be 0xffffffff -- but the
-     * compiler cannot prove it, so the loop survives. */
-    if (acc == 0xffffffffu) atomic_fetch_add_explicit(&sink[0], 1u, memory_order_relaxed);
+
+    /* ANTI-ELISION, and it has to be a real contract. The first version tested
+     * `acc == 0xffffffffu`, which a byte-xor can never produce -- the loads
+     * survived only because the compiler could not prove the branch dead, which
+     * is luck rather than a guarantee. Reduce across the SIMDgroup and store
+     * unconditionally to a slot nothing else reads. */
+    acc = metal::simd_xor(acc);
+    if (metal::simd_is_first()) {
+        const uint slot = ((tgid - 1u) * (tgsz / 32u)) + (tid / 32u);
+        atomic_store_explicit(&sink[slot & 1023u], acc, memory_order_relaxed);
+    }
 }
 
 // Calibration for the instrument above: spin exactly `iters` times against a

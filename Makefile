@@ -758,6 +758,15 @@ tests/probe_aneproc_ring: tests/probe_aneproc_ring.m ds4_aneproc.h
 	      -framework Foundation -framework IOSurface
 
 # The rig had to build this with a bare clang line because no target existed.
+tests/probe_sumy1_equiv: tests/probe_sumy1_equiv.m metal/moe.metal
+	$(CC) $(CFLAGS) -fobjc-arc -I. -o $@ tests/probe_sumy1_equiv.m \
+	      -framework Foundation -framework Metal
+
+# Exactness is the gate: producer==reference AND baseline pair==SUMY1 pair.
+test-sumy1-equiv: tests/probe_sumy1_equiv
+	python3 tests/make_full_metal_source.py /tmp/ds4_sumy1.metal >/dev/null
+	./tests/probe_sumy1_equiv /tmp/ds4_sumy1.metal
+
 tests/probe_dispatch_overhead: tests/probe_dispatch_overhead.m
 	$(CC) $(CFLAGS) -fobjc-arc -I. -o $@ tests/probe_dispatch_overhead.m \
 	      -framework Foundation -framework Metal

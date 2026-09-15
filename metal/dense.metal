@@ -528,22 +528,40 @@ void kernel_mul_mv_q8_0_f32_impl(
                 FOR_UNROLL (short row = 0; row < NR0; ++row) fut[p][row].wait();
             }
 
-            for (short j = 0; j < WQ8_ASYNC_C; ++j) {
-                for (short i = 0; i < NQ; ++i) {
-                    yl[i] = yb[i];
+            /* CONSUME. PIPE 6 consumes BOTH buffers here, in chunk order,
+             * because it issued both and waited once -- that is what makes it
+             * a batch of two rather than a pipeline that happens to prefetch.
+             *
+             * The first version only waited on two events on the FIRST
+             * iteration: thereafter the current buffer had already been retired
+             * and it waited on the single newly-issued one, giving seven waits
+             * for eight chunks instead of four. Stepping by two and consuming
+             * both is what actually halves them. */
+            const short nbuf = (WQ8_PIPE == 6 && have[pn]) ? 2 : 1;
+            for (short b = 0; b < nbuf; ++b) {
+                const short pb = b ? pn : p;
+                for (short j = 0; j < WQ8_ASYNC_C; ++j) {
+                    for (short i = 0; i < NQ; ++i) {
+                        yl[i] = yb[i];
+                    }
+                    /* SAME order as the device loop: row-major, NQ terms, then
+                     * scale. sumf[] must accumulate identically or the arm is
+                     * measuring numerics. */
+                    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+                        threadgroup const uchar *blk =
+                            stage + pb*buf_stride + sg_off + row*WQ8_SLICE +
+                            j*WQ8_RUN_B + (short)ix * (short)sizeof(block_q8_0);
+                        sumf[row] += ds4_wq8_staged_dot(blk, il, NQ, yl);
+                    }
+                    yb += NSG*NQ*QK8_0;
                 }
-                /* SAME order as the device loop: row-major, NQ terms, then
-                 * scale. sumf[] must accumulate identically or the arm is
-                 * measuring numerics. */
-                FOR_UNROLL (short row = 0; row < NR0; ++row) {
-                    threadgroup const uchar *blk =
-                        stage + p*buf_stride + sg_off + row*WQ8_SLICE +
-                        j*WQ8_RUN_B + (short)ix * (short)sizeof(block_q8_0);
-                    sumf[row] += ds4_wq8_staged_dot(blk, il, NQ, yl);
-                }
-                yb += NSG*NQ*QK8_0;
+                have[pb] = false;
             }
-            have[p] = false;
+            if (WQ8_PIPE == 6 && nbuf == 2) {
+                /* Both chunks retired, so skip the one the loop would visit
+                 * next -- this iteration already consumed it. */
+                c += WQ8_ASYNC_C;
+            }
         }
         wq8_staged = true;
     }
@@ -681,10 +699,13 @@ DS4_WQ8_ARM(a8_row2_g2,  6)   /* two row-fused chunk events, ONE grouped wait  *
  * __metal_wait_simdgroup_events consistently corrupts ~1530 of 65536 outputs on
  * M1, while the same code grouping TWO is bit-identical. Both issue paths were
  * verified to use the raw intrinsic, and a pending[] guard rules out re-waiting
- * a retired event, so the remaining explanation is a depth limit on the grouped
- * wait itself. Kept compiled so the finding stays reproducible, kept OUT of the
- * probe so nobody measures it: it caps the grouped-wait idea at 2, which is
- * also why group-8/16 is not worth pursuing. */
+ * a retired event, so group-of-four is UNSUPPORTED IN THIS
+ * IMPLEMENTATION. Calling it a hardware depth limit would overreach: no
+ * isolated literal-count wait-4 test has been run, and the fault could equally
+ * be in how this loop reuses buffers across a four-event group. Kept compiled
+ * so the finding stays reproducible, kept OUT of the probe so nobody measures
+ * a diverging arm. Either way it is why group-8/16 is not worth pursuing from
+ * here without that isolated test first. */
 DS4_WQ8_ARM(a8_g4,       7)
 
 kernel void kernel_mul_mv_q8_0_f32_sgasync2(

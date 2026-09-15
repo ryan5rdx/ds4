@@ -140,6 +140,95 @@ int main(int argc, const char **argv) { @autoreleasepool {
         free(xs);
     }
 
+    /* ---- the test that actually matters: baseline pair vs SUMY1 pair ----
+     *
+     * Producer-vs-reference proves the SUMS agree. It does not prove the
+     * consumer reads them correctly -- a wrong index, a wrong lane mapping or a
+     * stale buffer all survive that check and change the OUTPUT. So the two
+     * pair kernels are dispatched on identical inputs and dst_mid compared bit
+     * for bit, with the SUMY1 arm fed by the producer it will use in
+     * production. */
+    {
+        const uint32_t n_exp = 6, mid_dim = 2048, tok = 1;
+        const uint64_t grb = (uint64_t)(in_dim / QK_K) * 144;
+        const uint64_t geb = (uint64_t)mid_dim * grb;
+        id<MTLComputePipelineState> pp[2] = { nil, nil };
+        const char *pk[2] = { "kernel_glm_q4_K_pair_swiglu4_f32_spec",
+                              "kernel_glm_q4_K_pair_swiglu4_f32_spec_sumy1" };
+        for (int k = 0; k < 2; k++) {
+            id<MTLFunction> ff = [lib newFunctionWithName:@(pk[k])];
+            pp[k] = ff ? [dev newComputePipelineStateWithFunction:ff error:&e] : nil;
+            if (!pp[k]) { printf("FAIL pair pipeline %s\n", pk[k]); fails++; }
+        }
+        if (pp[0] && pp[1]) {
+            const size_t wb = (size_t)n_exp * geb;
+            id<MTLBuffer> bg = [dev newBufferWithLength:wb options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> bu = [dev newBufferWithLength:wb options:MTLResourceStorageModePrivate];
+            float *xf = malloc(in_dim * sizeof(float));
+            uint32_t st2 = 0xBEEF1234u;
+            for (uint32_t i = 0; i < in_dim; i++) {
+                st2 ^= st2 << 13; st2 ^= st2 >> 17; st2 ^= st2 << 5;
+                xf[i] = (float)((int32_t)st2) / 3.0e8f;
+            }
+            id<MTLBuffer> bxx = [dev newBufferWithBytes:xf length:in_dim*4 options:MTLResourceStorageModeShared];
+            int32_t sel[6] = {0,1,2,3,4,5};
+            float wts[6] = {0.3f,0.2f,0.15f,0.15f,0.1f,0.1f};
+            id<MTLBuffer> bsel = [dev newBufferWithBytes:sel length:24 options:MTLResourceStorageModeShared];
+            id<MTLBuffer> bw   = [dev newBufferWithBytes:wts length:24 options:MTLResourceStorageModeShared];
+            const size_t mb = (size_t)n_exp * mid_dim * sizeof(float);
+            id<MTLBuffer> bm[2];
+            for (int k = 0; k < 2; k++) {
+                bm[k] = [dev newBufferWithLength:mb options:MTLResourceStorageModeShared];
+                memset(bm[k].contents, 0xA5, mb);
+            }
+            id<MTLBuffer> bsy = [dev newBufferWithLength:(size_t)nb*32*sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+            moe_args pa = { .in_dim = in_dim, .mid_dim = mid_dim, .out_dim = 4096,
+                            .n_total_expert = n_exp, .n_expert_used = n_exp,
+                            .n_tokens = tok, .mid_token_stride = n_exp*mid_dim,
+                            .tp_world = 1,
+                            .gate_expert_bytes = geb, .gate_row_bytes = grb,
+                            .up_expert_bytes = geb, .up_row_bytes = grb };
+            id<MTLCommandBuffer> cb2 = [q commandBuffer];
+            {   /* produce the sums the SUMY1 arm will read */
+                id<MTLComputeCommandEncoder> en = [cb2 computeCommandEncoder];
+                [en setComputePipelineState:pso[0]];
+                [en setBytes:&pa length:sizeof(pa) atIndex:0];
+                [en setBuffer:bxx offset:0 atIndex:1];
+                [en setBuffer:bsy offset:0 atIndex:2];
+                [en dispatchThreads:MTLSizeMake(8, nb, 1) threadsPerThreadgroup:MTLSizeMake(8,1,1)];
+                [en endEncoding];
+            }
+            for (int k = 0; k < 2; k++) {
+                id<MTLComputeCommandEncoder> en = [cb2 computeCommandEncoder];
+                [en setComputePipelineState:pp[k]];
+                [en setBytes:&pa length:sizeof(pa) atIndex:0];
+                [en setBuffer:bg offset:0 atIndex:1];
+                [en setBuffer:bu offset:0 atIndex:2];
+                [en setBuffer:bxx offset:0 atIndex:3];
+                [en setBuffer:bsel offset:0 atIndex:4];
+                [en setBuffer:bw offset:0 atIndex:5];
+                [en setBuffer:bm[k] offset:0 atIndex:6];
+                if (k) [en setBuffer:bsy offset:0 atIndex:7];
+                [en dispatchThreadgroups:MTLSizeMake((mid_dim+7)/8, n_exp, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+                [en endEncoding];
+            }
+            [cb2 commit]; [cb2 waitUntilCompleted];
+            if (cb2.status != MTLCommandBufferStatusCompleted) {
+                printf("FAIL pair dispatch: %s\n", cb2.error.localizedDescription.UTF8String);
+                fails++;
+            } else {
+                const int diff = memcmp(bm[0].contents, bm[1].contents, mb);
+                printf("%s   baseline pair vs SUMY1 pair: dst_mid %s\n",
+                       diff ? "FAIL" : "ok  ",
+                       diff ? "DIFFERS" : "bit-identical over 6 experts x 2048");
+                if (diff) fails++;
+            }
+            free(xf);
+        }
+    }
+
     printf("\n%s\n", fails == 0
            ? "PASS: the SUMY1 producer reproduces the consumer's sums bit for bit"
            : "FAILED -- a reassociated sum changes the token; this is not a tolerance gate");
