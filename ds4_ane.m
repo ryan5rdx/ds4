@@ -32,6 +32,8 @@ int  ds4_gpu_aneproc_enabled(void);
 int  ds4_gpu_aneproc_start(uint32_t dim, uint32_t n_tok, uint32_t n_layers);
 uint32_t ds4_gpu_aneproc_fault(void);
 void ds4_gpu_aneproc_counters(uint32_t *served, uint32_t *failed);
+int ds4_gpu_aneproc_enabled(void);
+int ds4_gpu_is_live(void);
 
 #define DS4_ANE_MAX_LAYERS 64
 
@@ -177,6 +179,7 @@ int ds4_ane_mode(void) {
 
 static void *ds4_ane_sidecar_thread(void *ud);
 static void ds4_ane_atexit(void);
+static void ds4_ane_teardown(void);
 
 /* A sidecar that silently declines to run is the most dangerous outcome under
  * TP2, and ANESIDE3 is what that looks like: the models existed only on the
@@ -203,6 +206,24 @@ static void ds4_ane_required_abort(const char *why) {
             "ds4:   like a transport fault and is not one.\n"
             "ds4:   Set DS4_ANE_OPTIONAL=1 to allow the fallback.\n", why);
     exit(1);
+}
+
+/* Public, idempotent, and called by ds4_gpu_cleanup() BEFORE Metal goes away.
+ *
+ * ds4_ane_atexit() runs at process exit, which is long after
+ * ds4_engine_free() -> ds4_gpu_cleanup() has released the device, the queue and
+ * the tensor tracker. It then called ds4_gpu_synchronize() and freed the ANE
+ * scratch tensor against that torn-down state, which is the ANEPROC 8a
+ * teardown SIGSEGV -- after the CSV was written, after the helper had stopped,
+ * with "discarded 1 live tensor handles" immediately before it. That handle was
+ * g_ane_scratch: nothing in the cleanup path freed it, because the only caller
+ * of ds4_gpu_ane_stage_free() was this teardown, which ran too late. */
+/* No once-only latch: ds4_ane_teardown() is already safe to repeat (it joins a
+ * stopped thread, nils released objects and frees a NULLed tensor), and a latch
+ * would skip the teardown after any re-init -- which the test suite does, since
+ * it calls ds4_gpu_cleanup() several times in one process. */
+void ds4_ane_shutdown(void) {
+    ds4_ane_teardown();
 }
 
 static void ds4_ane_teardown(void) {
@@ -508,6 +529,11 @@ static void ds4_ane_note_completion(void) {
  * as a shortfall. */
 static void ds4_ane_atexit(void) {
     if (ds4_ane_mode() == DS4_ANE_OFF) return;
+    /* Metal may already be gone: ds4_gpu_cleanup() runs from ds4_engine_free(),
+     * this runs at process exit. Everything below dereferences the device or
+     * the tensor tracker, so report nothing rather than crash on the way out --
+     * the per-chunk ANEPROC line is the authoritative record either way. */
+    if (!ds4_gpu_is_live()) return;
     if (g_fast_running) {
         const double t0 = ds4_ane_now_ns();
         while (__atomic_load_n(&g_ring_head, __ATOMIC_ACQUIRE) !=
@@ -787,17 +813,30 @@ void ds4_ane_reset(void) {
  * helper's own counters, checked against what the parent enqueued. */
 
 void ds4_ane_aneproc_validate(const char *where) {
-    if (!ds4_gpu_aneproc_active() && !ds4_gpu_aneproc_fault()) return;
+    /* Gated on REQUESTED, not on active.
+     *
+     * This used to return early unless ds4_gpu_aneproc_active() -- so on the
+     * 8a rig run the line never printed, and "no line" was indistinguishable
+     * between "not an ANEPROC run at all" and "an ANEPROC run whose helper is
+     * not where the parent thinks it is". The second is precisely the state the
+     * gate exists to catch, and it was the state that produced no evidence.
+     *
+     * A validity gate whose failure mode is SILENCE cannot validate anything.
+     * If DS4_ANE_PROC was asked for, this line is emitted at every chunk
+     * boundary whatever the helper's condition, and says which condition. */
+    if (!ds4_gpu_aneproc_enabled()) return;
     uint32_t served = 0, failed = 0;
     ds4_gpu_aneproc_counters(&served, &failed);
     const uint32_t fault = ds4_gpu_aneproc_fault();
     const int timed_out = ds4_gpu_ane_sync_timed_out();
-    const int bad = (served != g_aneproc_enqueued) || failed != 0 ||
+    const int active = ds4_gpu_aneproc_active();
+    const int bad = !active || (served != g_aneproc_enqueued) || failed != 0 ||
                     fault != 0 || timed_out != 0;
     fprintf(stderr,
             "ds4: ANEPROC %s -- enqueued %u served %u failed %u fault %u "
-            "fence_timeout %d%s\n",
+            "fence_timeout %d helper %s%s\n",
             where, g_aneproc_enqueued, served, failed, fault, timed_out,
+            active ? "live" : "NOT-LIVE",
             bad ? "   *** RUN INVALID ***" : "");
 }
 

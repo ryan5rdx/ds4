@@ -135,6 +135,10 @@ void ds4_ane_commit_layer(void);
  * marks the run invalid rather than throwing, because the numbers are already
  * spent by the time it can be called. */
 void ds4_ane_aneproc_validate(const char *where);
+/* Release the in-process ANE state. Idempotent, and called by
+ * ds4_gpu_cleanup() while the Metal device is still alive -- the atexit
+ * handler runs too late to do it safely. */
+void ds4_ane_shutdown(void);
 
 /* TEST HOOK only (DS4_ANE_TEST_HOOK=1). Sequence numbers the sidecar actually
  * served, in order. Returns the total count, which may exceed `max`. */

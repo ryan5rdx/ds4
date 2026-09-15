@@ -2224,6 +2224,7 @@ static id<MTLComputePipelineState> ds4_gpu_new_pipeline(id<MTLFunction> fn,
                                                         NSError **error);
 static int ds4_gpu_warm_model_views(void);
 void ds4_gpu_aneproc_stop(void);
+void ds4_ane_shutdown(void);
 static double ds4_gpu_gib(uint64_t bytes);
 
 static double ds4_gpu_now_ms(void) {
@@ -14552,6 +14553,8 @@ int ds4_gpu_synchronize(void) {
     return ds4_gpu_finish_command_buffer(cb, 1, "synchronize");
 }
 
+int ds4_gpu_is_live(void) { return g_initialized; }
+
 void ds4_gpu_cleanup(void) {
     /* BEFORE anything releases GPU or surface state: the helper holds pointers
      * into the staging IOSurfaces, and nothing else in the shutdown path stops
@@ -14559,6 +14562,12 @@ void ds4_gpu_cleanup(void) {
      * so the next run measures against it. */
     ds4_gpu_aneproc_stop();
     if (!g_initialized) return;
+    /* And the in-process ANE state, while the device and the tensor tracker are
+     * still alive. This used to happen only from ds4_ane_atexit(), i.e. after
+     * this function had finished -- so the ANE scratch tensor was still live
+     * here (the "discarded N live tensor handles" line) and was then freed
+     * against a released device. */
+    ds4_ane_shutdown();
     ds4_gpu_queue_keepalive_stop_thread();
 
     @autoreleasepool {

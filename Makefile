@@ -205,8 +205,13 @@ check-mxfp4-half-lut:
 # Metal debug layer caught, and the static census is the only check that runs
 # without a device.  It costs under a second; a rig host that skips it is a rig
 # host that can measure garbage all night.
-rig: check-threadgroup-memory ds4 ds4-server ds4-bench gguf-tools/quality-testing/score_official
-	@echo "ds4: rig host ready (ds4, ds4-server, ds4-bench, score_official)"
+# ds4-ane-helper is part of `rig` because the ANEPROC arms need it and it is
+# FAIL-CLOSED: with DS4_ANE_PROC=1 and no helper binary, ds4 aborts rather than
+# silently running the in-process sidecar. That is the right behaviour, but it
+# meant a rig host built with `make rig` failed the 8a gate on a missing file
+# that `make all` would have produced.
+rig: check-threadgroup-memory ds4 ds4-server ds4-bench ds4-ane-helper gguf-tools/quality-testing/score_official
+	@echo "ds4: rig host ready (ds4, ds4-server, ds4-bench, ds4-ane-helper, score_official)"
 
 check-threadgroup-memory:
 	@python3 tools/tgmem_census.py
