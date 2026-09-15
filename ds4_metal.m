@@ -22298,9 +22298,9 @@ int ds4_gpu_indexer_topk_tensor(
                             "~%u rows)\n", tiles, n_comp / tiles);
                 }
                 id<MTLComputePipelineState> p1 =
-                    ds4_gpu_get_pipeline("kernel_dsv4_indexer_topk_tile_p1");
+                    ds4_gpu_topk_pipeline("kernel_dsv4_indexer_topk_tile_p1");
                 id<MTLComputePipelineState> p2 =
-                    ds4_gpu_get_pipeline("kernel_dsv4_indexer_topk_tile_p2");
+                    ds4_gpu_topk_pipeline("kernel_dsv4_indexer_topk_tile_p2");
                 if (!p1 || !p2) return 0;
                 const uint64_t cand_bytes = (uint64_t)tiles * top_k * sizeof(uint64_t);
                 /* Grown on demand and freed with the other scratch buffers at

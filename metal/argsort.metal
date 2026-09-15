@@ -583,8 +583,9 @@ static inline void ds4_topk_stream_core_keys(
 }
 
 /* Pass 1: one threadgroup per slice.  args.ne01 carries the slice count. */
+template <bool U32CMP>
 [[max_total_threads_per_threadgroup(512)]]
-kernel void kernel_dsv4_indexer_topk_tile_p1(
+kernel void kernel_dsv4_indexer_topk_tile_p1_impl(
         constant ds4_metal_args_argsort & args,
         device const char * src0,
         device      ulong * cand,
@@ -606,7 +607,7 @@ kernel void kernel_dsv4_indexer_topk_tile_p1(
     const uint count = base + (t < rem ? 1u : 0u);
 
     /* row is always 0 here: this path exists for the one-row decode shape. */
-    ds4_topk_stream_core<false>(src0, args.nb01, 0u, begin, count, top_k, t,
+    ds4_topk_stream_core<U32CMP>(src0, args.nb01, 0u, begin, count, top_k, t,
                          buf, tid, lane, sgid);
 
     /* Raw keys, not indices -- pass 2 needs the score to merge on.  A slice
@@ -620,8 +621,9 @@ kernel void kernel_dsv4_indexer_topk_tile_p1(
 }
 
 /* Pass 2: single threadgroup over tiles*top_k candidates. */
+template <bool U32CMP>
 [[max_total_threads_per_threadgroup(512)]]
-kernel void kernel_dsv4_indexer_topk_tile_p2(
+kernel void kernel_dsv4_indexer_topk_tile_p2_impl(
         constant ds4_metal_args_argsort & args,
         device const ulong * cand,
         device      int32_t * dst,
@@ -632,7 +634,7 @@ kernel void kernel_dsv4_indexer_topk_tile_p2(
     const uint top_k = (uint)args.top_k;
     const uint total = (uint)args.ne00;   /* tiles * top_k */
 
-    ds4_topk_stream_core_keys<false>(cand, total, top_k, buf, tid, lane, sgid);
+    ds4_topk_stream_core_keys<U32CMP>(cand, total, top_k, buf, tid, lane, sgid);
 
     for (uint j = tid; j < top_k; j += 512u) {
         dst[j] = (int32_t)(0xffffffffu - (uint32_t)buf[j]);
@@ -813,6 +815,24 @@ kernel void kernel_glm53_idxsplit_merge_expand_impl(
  * call site for an experiment. Two symbols is the smaller change, and it also
  * means an A/B cannot silently become one arm: the binding is a distinct name
  * the log can state. */
+/* tile_p1/p2 are the kernels that actually run at long context: the tiled
+ * branch fires when tiles >= 4, i.e. n_comp >= 25*top_k = 12800, which holds at
+ * every context this arm would be measured at, and that branch RETURNS before
+ * stream512 is reached. Arming only stream512 -- as the first version of this
+ * did -- would have produced a bracketed A/B of a kernel that never ran, which
+ * is the same failure MOERAW1 returned. */
+typedef decltype(kernel_dsv4_indexer_topk_tile_p1_impl<false>) ds4_topk_tile_p1_t;
+template [[host_name("kernel_dsv4_indexer_topk_tile_p1")]]
+kernel ds4_topk_tile_p1_t kernel_dsv4_indexer_topk_tile_p1_impl<false>;
+template [[host_name("kernel_dsv4_indexer_topk_tile_p1_u32cmp")]]
+kernel ds4_topk_tile_p1_t kernel_dsv4_indexer_topk_tile_p1_impl<true>;
+
+typedef decltype(kernel_dsv4_indexer_topk_tile_p2_impl<false>) ds4_topk_tile_p2_t;
+template [[host_name("kernel_dsv4_indexer_topk_tile_p2")]]
+kernel ds4_topk_tile_p2_t kernel_dsv4_indexer_topk_tile_p2_impl<false>;
+template [[host_name("kernel_dsv4_indexer_topk_tile_p2_u32cmp")]]
+kernel ds4_topk_tile_p2_t kernel_dsv4_indexer_topk_tile_p2_impl<true>;
+
 typedef decltype(kernel_dsv4_indexer_topk_stream512_impl<false>) ds4_topk_stream512_t;
 template [[host_name("kernel_dsv4_indexer_topk_stream512")]]
 kernel ds4_topk_stream512_t kernel_dsv4_indexer_topk_stream512_impl<false>;
