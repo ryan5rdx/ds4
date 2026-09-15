@@ -507,6 +507,24 @@ int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
                                     ds4_think_mode think_mode);
+/* Eligibility for the compact GPU top-1 / compact TP key path. Every condition
+ * is explicit: a zeroed struct is INELIGIBLE, because peer_negotiated must be
+ * affirmatively set. See ds4_sampler_can_use_raw_argmax(). */
+typedef struct {
+    float temperature;
+    int   top_k;
+    float top_p;
+    float min_p;
+    bool  wants_logprobs;    /* response carries logprobs or full logits    */
+    bool  has_logit_bias;
+    bool  has_penalties;     /* repetition / frequency / presence           */
+    bool  has_grammar_mask;
+    bool  speculative;       /* MTP or any draft path                       */
+    bool  peer_negotiated;   /* both ranks agreed the compact protocol      */
+} ds4_raw_argmax_ctx;
+
+bool ds4_sampler_can_use_raw_argmax(const ds4_raw_argmax_ctx *c);
+
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);

@@ -9,13 +9,27 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 fail=0
-for knob in DS4_TP_COMPACT_TOP1 DS4_MOE_RAW_STAGE DS4_SGASYNC_ARM; do
+# Two tiers, because "zero readers" means two different things.
+#
+# REQUIRED: the feature ships on this branch, so exactly one reader. Zero is a
+# knob renamed or deleted out from under its feature.
+# OPTIONAL: the feature is not on every branch in the stack -- MoE arm B is
+# unbanked, so DS4_MOE_RAW_STAGE is legitimately absent on the v4 bank. Zero is
+# reported and allowed; TWO is still a build failure, because the multi-reader
+# case is the one that actually burned us and it does not care which branch it
+# happens on.
+REQUIRED="DS4_TP_COMPACT_TOP1 DS4_SGASYNC_ARM"
+OPTIONAL="DS4_MOE_RAW_STAGE"
+for knob in $REQUIRED $OPTIONAL; do
+    case " $OPTIONAL " in *" $knob "*) opt=1 ;; *) opt=0 ;; esac
     # `|| true` on every count: grep exits 1 on no match, and under pipefail
     # that aborted the loop silently -- so a knob RENAMED out of existence
     # reported nothing at all, which is the same blind spot in miniature.
     hits=$( { grep -c "getenv(\"$knob\")" ./*.c ./*.m 2>/dev/null || true; } | grep -v ':0$' || true)
     total=$( { grep -o "getenv(\"$knob\")" ./*.c ./*.m 2>/dev/null || true; } | wc -l | tr -d ' ')
-    if [ "$total" -ne 1 ]; then
+    if [ "$total" -eq 0 ] && [ "$opt" -eq 1 ]; then
+        echo "ok   $knob: absent on this branch (optional; its feature is not banked here)"
+    elif [ "$total" -ne 1 ]; then
         echo "FAIL $knob has $total reader(s), want exactly 1:"
         if [ -n "$hits" ]; then echo "$hits" | sed 's/^/    /'; else echo "    (none -- renamed or deleted?)"; fi
         fail=1
