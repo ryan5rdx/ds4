@@ -51046,16 +51046,45 @@ static uint64_t g_ane_gpu_shared_encoded;
 static uint64_t g_ane_replacements;
 static uint64_t g_ane_unpacks;
 static uint32_t g_ane_owned_row0, g_ane_owned_row1;
+/* Why the interesting counters might be zero.
+ *
+ * P0c wired the census emitter to both prefill drivers and STILL printed
+ * nothing -- because the counters above are fed from one branch inside
+ * glm_graph_encode_ffn_batch, and on the rig that branch is never entered.
+ * Both arms were silent, including `off`, which should have incremented
+ * gpu_shared_encoded, so the failing precondition is upstream of the
+ * replacement decision entirely.
+ *
+ * Reading the source could not settle which precondition. So the report stops
+ * requiring data in order to speak: these record how far execution got, and a
+ * zero further down the chain localises the answer in one run instead of one
+ * round trip per hypothesis. */
+static uint64_t g_ane_ffn_batch_calls;    /* entered glm_graph_encode_ffn_batch */
+static uint64_t g_ane_ffn_tp2;            /* ... with tp_world == 2            */
+static uint64_t g_ane_ffn_split;          /* ... and shared_row_split, rows > 0 */
 
 void ds4_glm_ane_replacement_report(const char *where, int tp_rank);
 void ds4_glm_ane_replacement_report(const char *where, int tp_rank) {
-    if (!g_ane_gpu_shared_encoded && !g_ane_replacements && !g_ane_unpacks) return;
+    /* Speak whenever the ANE was ASKED for, not only when the counters moved.
+     * "No line" previously meant three different things -- not an ANE run, an
+     * ANE run whose branch was never entered, and an emitter that could not
+     * execute -- and the campaign has now spent two rig round trips
+     * distinguishing them. */
+    if (ds4_ane_mode() == DS4_ANE_OFF &&
+        !g_ane_gpu_shared_encoded && !g_ane_replacements && !g_ane_unpacks) {
+        return;
+    }
     const int bad = (g_ane_replacements != g_ane_unpacks) ||
-                    (g_ane_replacements && g_ane_gpu_shared_encoded);
+                    (g_ane_replacements && g_ane_gpu_shared_encoded) ||
+                    (g_ane_ffn_batch_calls && !g_ane_ffn_split);
     fprintf(stderr,
-            "ds4: ANEREPL %s rank %d -- gpu_shared_encoded=%llu "
-            "ane_replacements=%llu ane_unpacks=%llu owned_rows=[%u,%u)%s\n",
+            "ds4: ANEREPL %s rank %d -- ffn_batch=%llu tp2=%llu split=%llu "
+            "gpu_shared_encoded=%llu ane_replacements=%llu ane_unpacks=%llu "
+            "owned_rows=[%u,%u)%s\n",
             where, tp_rank,
+            (unsigned long long)g_ane_ffn_batch_calls,
+            (unsigned long long)g_ane_ffn_tp2,
+            (unsigned long long)g_ane_ffn_split,
             (unsigned long long)g_ane_gpu_shared_encoded,
             (unsigned long long)g_ane_replacements,
             (unsigned long long)g_ane_unpacks,
@@ -51693,8 +51722,10 @@ static bool glm_graph_encode_ffn_batch(
             (uint32_t)g->ffn_mid_elems,
             full_layer_prefill,
             false) != 0;
+    g_ane_ffn_batch_calls++;
     uint64_t ffn_overlap_seq = 0;
     if (ok && g->tp_world == 2) {
+        g_ane_ffn_tp2++;
         /* ane_started matters as much as ane_replaces_gpu. If the request was
          * never queued for this layer, the insert below cannot fire, and
          * skipping the GPU encode here would drop the shared expert for that
@@ -51703,6 +51734,7 @@ static bool glm_graph_encode_ffn_batch(
          * makes the counters say so: gpu_shared_encoded > 0 alongside
          * ane_replacements is reported as RUN INVALID, because for a
          * performance arm a partial fallback is a contaminated measurement. */
+        if (ok && shared_row_split && shared_rows > 0) g_ane_ffn_split++;
         if (ok && shared_row_split && shared_rows > 0 && ane_replaces_gpu &&
             ane_started) {
             /* REPLACEMENT. The ANE owns these rows, so the GPU shared expert is

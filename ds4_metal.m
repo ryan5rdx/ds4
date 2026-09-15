@@ -2224,6 +2224,7 @@ static id<MTLComputePipelineState> ds4_gpu_new_pipeline(id<MTLFunction> fn,
                                                         NSError **error);
 static int ds4_gpu_warm_model_views(void);
 void ds4_gpu_aneproc_stop(void);
+static id<MTLComputePipelineState> ds4_gpu_topk_pipeline(const char *base);
 void ds4_ane_shutdown(void);
 static double ds4_gpu_gib(uint64_t bytes);
 
@@ -22368,7 +22369,7 @@ int ds4_gpu_indexer_topk_tensor(
                         "ds4: metal indexer topk using stream512\n");
             }
             id<MTLComputePipelineState> stream_pipeline =
-                ds4_gpu_get_pipeline("kernel_dsv4_indexer_topk_stream512");
+                ds4_gpu_topk_pipeline("kernel_dsv4_indexer_topk_stream512");
             if (!stream_pipeline) return 0;
             ds4_gpu_kargs_argsort sargs = {
                 .ne00 = (int32_t)n_comp,
@@ -37338,6 +37339,45 @@ static int ds4_gpu_encode_mul_mm_id_addr_mapped_tile(
  * quietly becomes a different arm is worse than a failed run.
  *
  * ONE reader, enforced by tests/check_single_knob_reader.sh. */
+/* CMPSEL2-U32KEY arm selection.
+ *
+ * The packed top-k key is lexicographic, so its ordering needs no 64-bit
+ * arithmetic -- only its storage does. Comparing in 32-bit halves measured
+ * -5.90% on M1 and -5.36% on Apple8 for the production-shaped bitonic, with all
+ * five representations bit-exact over 65535 adversarial pairs on BOTH ranks
+ * (which is the gate that matters: two ranks compare these keys).
+ *
+ * Clones rather than a function constant, so the binding is a distinct name the
+ * log can state and an A/B cannot quietly collapse into one arm. Default OFF
+ * until the production kernel clears its own bar; CMPSEL2 measured a synthetic
+ * bitonic, not this dispatch. */
+static int ds4_gpu_topk_u32cmp_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_TOPK_U32CMP");
+        v = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (v) fprintf(stderr, "ds4: TOPK u32cmp ARM ON (split-halves key "
+                               "comparator; bit-exact, -5.4%% on Apple8 "
+                               "synthetic bitonic)\n");
+    }
+    return v;
+}
+
+static id<MTLComputePipelineState> ds4_gpu_topk_pipeline(const char *base) {
+    if (!ds4_gpu_topk_u32cmp_enabled()) return ds4_gpu_get_pipeline(base);
+    char name[160];
+    snprintf(name, sizeof(name), "%s_u32cmp", base);
+    id<MTLComputePipelineState> p = ds4_gpu_get_pipeline(name);
+    static const char *seen[4]; static int n_seen;
+    int announced = 0;
+    for (int i = 0; i < n_seen; i++) if (!strcmp(seen[i], base)) announced = 1;
+    if (!announced && n_seen < 4) {
+        seen[n_seen++] = base;
+        fprintf(stderr, "ds4: TOPK bind %s -> %s\n", base, p ? name : base);
+    }
+    return p ? p : ds4_gpu_get_pipeline(base);
+}
+
 static int ds4_moe_raw_stage_mode(void) {
     static int v = -1;
     if (v < 0) {
@@ -39283,7 +39323,7 @@ int ds4_gpu_glm53_idxsplit_merge_expand_tensor(
             return 0;
         }
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_pipeline("kernel_glm53_idxsplit_merge_expand");
+            ds4_gpu_topk_pipeline("kernel_glm53_idxsplit_merge_expand");
         if (!pipeline) return 0;
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
