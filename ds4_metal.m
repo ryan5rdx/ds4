@@ -2226,6 +2226,10 @@ static id<MTLComputePipelineState> ds4_gpu_new_pipeline(id<MTLFunction> fn,
                                                         NSError **error);
 static int ds4_gpu_warm_model_views(void);
 void ds4_gpu_aneproc_stop(void);
+static uint32_t ds4_gpu_fencework_helpers(void);
+static uint32_t ds4_gpu_fencework_lines(void);
+static id<MTLBuffer> ds4_gpu_fencework_warm_buffer(void);
+static id<MTLBuffer> g_fencework_sink;
 static id<MTLComputePipelineState> ds4_gpu_topk_pipeline(const char *base);
 void ds4_ane_shutdown(void);
 static double ds4_gpu_gib(uint64_t bytes);
@@ -13502,8 +13506,10 @@ static int ds4_gpu_tp_release_fence_encode(uint32_t slot, uint32_t want) {
     int owned = 0;
     id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
     if (!cb || owned) return 0;
-    id<MTLComputePipelineState> pipeline =
-        ds4_gpu_get_pipeline("kernel_dsv4_tp_fence_wait");
+    const uint32_t fw_helpers = ds4_gpu_fencework_helpers();
+    id<MTLComputePipelineState> pipeline = fw_helpers
+        ? ds4_gpu_get_pipeline("kernel_dsv4_tp_fence_wait_prefetch")
+        : ds4_gpu_get_pipeline("kernel_dsv4_tp_fence_wait");
     if (!pipeline) return 0;
     id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
     DS4_SET_PIPE(enc, pipeline);
@@ -13523,8 +13529,27 @@ static int ds4_gpu_tp_release_fence_encode(uint32_t slot, uint32_t want) {
            atIndex:4];
     [enc setBytes:&g_tp_fence_spin_profile
            length:sizeof(g_tp_fence_spin_profile) atIndex:5];
-    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-         threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    if (fw_helpers) {
+        if (!g_fencework_sink) {
+            g_fencework_sink = [g_device newBufferWithLength:1024 * sizeof(uint32_t)
+                                                     options:MTLResourceStorageModePrivate];
+        }
+        id<MTLBuffer> warm = ds4_gpu_fencework_warm_buffer();
+        uint32_t lines = ds4_gpu_fencework_lines();
+        if (!warm) lines = 0u;      /* kernel no-ops; TG0 still polls */
+        else if ((uint64_t)lines * 128ull > (uint64_t)warm.length)
+            lines = (uint32_t)(warm.length / 128ull);
+        if (warm) [enc setBuffer:warm offset:0 atIndex:6];
+        [enc setBytes:&lines length:sizeof(lines) atIndex:7];
+        [enc setBuffer:g_fencework_sink offset:0 atIndex:8];
+        /* TG0 polls with one live thread; the helpers use full threadgroups.
+         * One extra group for the poller, so `ngrp - 1` helpers warm. */
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(fw_helpers + 1u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    } else {
+        [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    }
     ds4_gpu_end_compute_encoder(cb, enc);
     ds4_gpu_close_batch_encoder();
     return 1;
@@ -37404,6 +37429,158 @@ static id<MTLComputePipelineState> ds4_gpu_topk_pipeline(const char *base) {
     return p ? p : ds4_gpu_get_pipeline(base);
 }
 
+/* SUMY1: exact Q4 activation-sum reuse.
+ *
+ * The pair kernel rebuilds four activation-group sums for every output tile and
+ * every selected expert, though they depend only on the activation and the
+ * lane. SUMY-STUB -- deliberately wrong and therefore free -- took 5.0% off the
+ * 42-layer pair+down chain on Apple8 and passed its 3% bar; this is the exact
+ * producer that bar was supposed to license.
+ *
+ * Default OFF. The exactness gate passes (producer == the consumer's own loop,
+ * and baseline pair == SUMY1 pair bitwise, `make test-sumy1-equiv`), but the
+ * campaign requires the model-free CHAIN to clear 3% before an end-to-end arm,
+ * and that has not been measured. */
+/* FENCEWORK: helper threadgroups that warm cache while the fence waits.
+ *
+ * GATE-RESIDUE measured 22-30 us mean spins with only 6.8% of attention gates
+ * and 23.6% of FFN gates already released when the fence began, and the rig's
+ * 2026-09-15 profile puts row gates at 243 us gpu-wait over 25596 gates. That
+ * is the idle this fills.
+ *
+ * DS4_TP_FENCEWORK=<helpers> selects 1/2/4/8 helper threadgroups;
+ * DS4_TP_FENCEWORK_KIB caps how much each gate may touch (256/512/1024/2048).
+ * Default OFF -- and the zero-wait gate is required before it is read as a win,
+ * because helper traffic can contend with the polling threadgroup even though
+ * the poll loop itself is unchanged. */
+static uint32_t ds4_gpu_fencework_helpers(void) {
+    static long v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_TP_FENCEWORK");
+        const long n = (e && e[0]) ? strtol(e, NULL, 10) : 0;
+        v = (n == 1 || n == 2 || n == 4 || n == 8) ? n : 0;
+        if (e && e[0] && v == 0) {
+            fprintf(stderr, "ds4: FATAL -- DS4_TP_FENCEWORK=\"%s\"; allowed "
+                            "helper counts are 1, 2, 4, 8.\n", e);
+            abort();
+        }
+        if (v) fprintf(stderr,
+                "ds4: FENCEWORK ON -- %ld helper threadgroup(s) warm cache "
+                "during the fence; TG0 remains the unchanged poll\n", v);
+    }
+    return (uint32_t)v;
+}
+
+static uint32_t ds4_gpu_fencework_lines(void) {
+    static long v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_TP_FENCEWORK_KIB");
+        long kib = (e && e[0]) ? strtol(e, NULL, 10) : 512;
+        if (kib != 256 && kib != 512 && kib != 1024 && kib != 2048) {
+            if (e && e[0]) {
+                fprintf(stderr, "ds4: FATAL -- DS4_TP_FENCEWORK_KIB=\"%s\"; "
+                                "allowed caps are 256, 512, 1024, 2048.\n", e);
+                abort();
+            }
+            kib = 512;
+        }
+        v = kib * 1024 / 128;   /* 128 B per touched line */
+    }
+    return (uint32_t)v;
+}
+
+/* WHAT TO WARM, and the honest limitation.
+ *
+ * The campaign specifies a priority plan per release type -- attention release
+ * warms router projection then shared gate/up; FFN release warms the next
+ * layer's first attention/KDA projection -- and that needs the actual tensor
+ * pointers threaded to the fence site, which is not built. What IS built picks
+ * the largest resident model buffer, so the first measurement answers the prior
+ * question: does warming ANYTHING during the spin help, hurt, or vanish?
+ *
+ * That ordering matters because warming the wrong bytes can EVICT what the gate
+ * is about to need, which would show up as a regression rather than a null. So
+ * a negative here does not close FENCEWORK -- it closes generic warming, and
+ * the priority plan remains the arm worth building if the mechanism shows any
+ * signal at all. Never the selected routed experts: the selection does not
+ * exist at fence time. */
+static id<MTLBuffer> ds4_gpu_fencework_warm_buffer(void) {
+    static id<MTLBuffer> cached;
+    if (cached) return cached;
+    __block id<MTLBuffer> best = nil;
+    __block NSUInteger best_len = 0;
+    [g_model_buffer_cache enumerateKeysAndObjectsUsingBlock:
+        ^(NSString *k, id<MTLBuffer> b, BOOL *stop) {
+            (void)k; (void)stop;
+            if (b.length > best_len) { best_len = b.length; best = b; }
+        }];
+    cached = best;
+    if (!cached) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "ds4: FENCEWORK has no resident model buffer to "
+                            "warm; helpers will no-op this gate\n");
+        }
+    }
+    return cached;
+}
+
+static int ds4_gpu_sumy1_enabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_GLM_SUMY1");
+        v = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (v) fprintf(stderr,
+                "ds4: SUMY1 ON -- activation-group sums produced once per layer "
+                "instead of per expert per tile (bit-identical; "
+                "make test-sumy1-equiv)\n");
+    }
+    return v;
+}
+
+/* 2 KiB per token at in_dim 4096: [token][block][lane 0..7][4]. Grown on
+ * demand and kept, because the shape is fixed per model and a per-layer
+ * allocation would cost more than the arm saves. */
+static id<MTLBuffer> g_sumy1_buf;
+static uint64_t      g_sumy1_bytes;
+
+static id<MTLBuffer> ds4_gpu_sumy1_buffer(uint32_t in_dim, uint32_t n_tokens) {
+    const uint64_t need =
+        (uint64_t)n_tokens * (in_dim / 256u) * 32u * sizeof(float);
+    if (!g_sumy1_buf || g_sumy1_bytes < need) {
+        g_sumy1_buf = [g_device newBufferWithLength:need
+                                            options:MTLResourceStorageModePrivate];
+        g_sumy1_bytes = g_sumy1_buf ? need : 0;
+    }
+    return g_sumy1_buf;
+}
+
+/* Encode the producer ahead of the pair dispatch. Returns nil when the arm is
+ * off or the shape is not the one the kernel assumes, and the caller then binds
+ * nothing and selects the baseline kernel -- a missing producer must degrade to
+ * shipping, never to a pair kernel reading an unwritten buffer. */
+static id<MTLBuffer> ds4_gpu_sumy1_encode(id<MTLCommandBuffer> cb,
+                                          const void *args, size_t args_len,
+                                          id<MTLBuffer> xbuf, uint64_t x_off,
+                                          uint32_t in_dim, uint32_t n_tokens) {
+    if (!ds4_gpu_sumy1_enabled()) return nil;
+    if (in_dim % 256u != 0u || n_tokens == 0u) return nil;
+    id<MTLComputePipelineState> p =
+        ds4_gpu_get_pipeline("kernel_glm53_sumy1_produce");
+    id<MTLBuffer> out = ds4_gpu_sumy1_buffer(in_dim, n_tokens);
+    if (!p || !out) return nil;
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    DS4_SET_PIPE(enc, p);
+    [enc setBytes:args length:args_len atIndex:0];
+    [enc setBuffer:xbuf offset:x_off atIndex:1];
+    [enc setBuffer:out offset:0 atIndex:2];
+    [DS4_DISP(enc) dispatchThreadgroups:MTLSizeMake(1, in_dim / 256u, n_tokens)
+                  threadsPerThreadgroup:MTLSizeMake(8, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+    return out;
+}
+
 static int ds4_moe_raw_stage_mode(void) {
     static int v = -1;
     if (v < 0) {
@@ -43161,6 +43338,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
               ? ds4_gpu_get_pipeline(
                     ds4_gpu_moe_tg_probe_pair_active()
                         ? "kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe"
+                        : ds4_gpu_sumy1_enabled()
+                        ? "kernel_glm_q4_K_pair_swiglu4_f32_spec_sumy1"
                         : "kernel_glm_q4_K_pair_swiglu4_f32_spec")
               : ds4_gpu_moe_tg_probe_pair_active()
               ? ds4_gpu_get_pipeline("kernel_glm_q4_K_pair_swiglu4_f32_tgprobe")
@@ -43296,6 +43475,16 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         /* 0 in production. The probe raises it; the pair kernel already takes
          * a threadgroup(0) parameter it does not use at this size, so nothing
          * in the kernel changes -- only how many threadgroups fit on a core. */
+        /* SUMY1: produce the sums once, ahead of the pair dispatch that would
+         * otherwise rebuild them per expert per tile. A nil return means the
+         * arm is off or the shape is unsupported, and the baseline kernel was
+         * selected above -- so the bind is conditional on the same fact the
+         * kernel choice was, and a missing producer degrades to shipping
+         * rather than to a pair kernel reading an unwritten buffer. */
+        id<MTLBuffer> sumy1_buf =
+            ds4_gpu_sumy1_encode(cb, &args, sizeof(args), xbuf,
+                                 ds4_gpu_tensor_offset(x),
+                                 (uint32_t)expert_in_dim, 1u);  /* decode: one row */
         const NSUInteger pair_threadgroup_bytes = ds4_gpu_moe_tg_probe_pair_bytes();
         const NSUInteger pair_threads = 64u;
         const NSUInteger down_x_groups =
@@ -43359,6 +43548,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                 [enc useResource:stream_entries[i]->up_buffer usage:MTLResourceUsageRead];
             }
         }
+        if (sumy1_buf) [enc setBuffer:sumy1_buf offset:0 atIndex:7];
         if (pair_threadgroup_bytes != 0u) {
             [enc setThreadgroupMemoryLength:DS4_TG16(pair_threadgroup_bytes)
                                  atIndex:0];

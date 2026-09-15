@@ -51949,7 +51949,25 @@ static bool glm_graph_encode_ffn_batch(
     /* PERFONLY skips the GPU shared expert; the ANE unpack below writes the
      * destination instead. Every other mode still encodes it and keeps the GPU
      * authoritative. */
-    if (ok && !shared_done && !ane_replaces_gpu) DS4_GLM_ENCODE_FFN_BATCH_SHARED();
+    /* COUNT THE GENERIC PATH TOO.
+     *
+     * The counters were fed only from the S8 row-split branch, and P0c came
+     * back with every one of them zero on BOTH arms -- including `off`, which
+     * should have recorded a GPU encode. Whatever the reason (the S8 branch not
+     * entered, or `g->tp_world` not being 2 where the harness thinks it is), a
+     * census that only observes one of two paths cannot certify either. This
+     * one is fed wherever the decision is actually made, so the next run
+     * reports regardless of which branch executes. */
+    if (ok && !shared_done) {
+        if (ane_replaces_gpu) {
+            g_ane_replacements++;
+            g_ane_owned_row0 = ane_row0;
+            g_ane_owned_row1 = ane_row0 + ane_rows;
+        } else {
+            g_ane_gpu_shared_encoded++;
+            DS4_GLM_ENCODE_FFN_BATCH_SHARED();
+        }
+    }
     if (ane_sidecar) {
         /* ane_started gates only the RENDEZVOUS. Gating the unpack on it too
          * meant BRIDGE never unpacked at all -- ds4_ane_begin_layer() returns
@@ -51977,11 +51995,17 @@ static bool glm_graph_encode_ffn_batch(
              * skipped above, which is the only configuration that measures an
              * end-to-end speedup rather than the sidecar's cost. Its text is
              * wrong by construction and it says so at startup. */
-            /* Always scratch here. PERFONLY's real destination is handled by
-             * the replacement insert above; reaching this line under PERFONLY
-             * would mean the replacement did not arm, and writing
-             * batch_ffn_out from row 0 is exactly the unoffset write that made
-             * rank 1 clobber rows it does not own. */
+            /* Scratch. The replacement's real destination is the
+             * tp_bounce_out row view written by the insert above, which runs
+             * before the combine; this line is reached only in the
+             * non-replacement modes, which are shadow arms by definition.
+             *
+             * Reaching it WITH ane_replaces_gpu set would mean the insert did
+             * not run while the GPU encode was suppressed -- the shared expert
+             * silently dropped rather than replaced. That is a wrong-output
+             * state, not a slow one, so it is asserted rather than assumed:
+             * ane_replacements without a matching ane_unpacks is reported as
+             * RUN INVALID by the census. */
             ds4_gpu_tensor *ane_dst = NULL;
             if (!ds4_gpu_ane_unpack(ane_dst, (uint32_t)DS4_N_EMBD, ane_rows,
                                     ane_dst ? 1 : 0)) {
