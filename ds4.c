@@ -39500,6 +39500,25 @@ static bool metal_graph_prefill_layer_major_inner(
 void ds4_glm_ane_replacement_report(const char *where, int tp_rank);
 void ds4_gpu_moe_raw_stage_report(const char *where);
 
+/* EVERY per-chunk validity emission, in one place.
+ *
+ * There are two prefill drivers -- layer-major and compact-indexed -- and all
+ * three of these lines were wired only to the layer-major one. The rig runs
+ * compact-indexed, so ANEPROC 8a reported chunk_lines=0 twice and PERFONLY3's
+ * +3.19% arrived with no counter line at all, from call sites that exist, are
+ * correct, and are unreachable in the configuration that matters. The MOERAW
+ * census had just been wired to the same dead sites and would have been silent
+ * for the SGASYNC-MOE campaign too.
+ *
+ * A gate whose failure mode is silence cannot gate anything, and three
+ * independent emitters each remembering to hook both drivers is how this
+ * recurred. One call, both drivers. */
+static void ds4_prefill_chunk_census(const ds4_gpu_graph *g, const char *where) {
+    ds4_ane_aneproc_validate(where);
+    ds4_glm_ane_replacement_report(where, g ? g->tp_rank : -1);
+    ds4_gpu_moe_raw_stage_report(where);
+}
+
 static bool metal_graph_prefill_layer_major(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -39513,9 +39532,7 @@ static bool metal_graph_prefill_layer_major(
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud) {
     const bool ok = metal_graph_prefill_layer_major_inner(g, model, weights, prompt, start, n_tokens, logits, show_progress, imatrix, display_progress, display_progress_ud);
-    ds4_ane_aneproc_validate("prefill");
-    ds4_glm_ane_replacement_report("prefill", -1);
-    ds4_gpu_moe_raw_stage_report("prefill");
+    ds4_prefill_chunk_census(NULL, "prefill");
     return ok;
 }
 
@@ -39722,11 +39739,9 @@ static bool metal_graph_prefill_chunked_range(
          * and the harness's grep for them could not fire. Once per completed
          * chunk is the right cadence: per layer would perturb what it
          * measures, per run would hide which chunk went wrong. */
-        ds4_ane_aneproc_validate("chunk");
         /* Says what the GPU did, not just that the ANE ran. A served count
          * cannot distinguish replacement from shadow; these can. */
-        ds4_glm_ane_replacement_report("chunk", g ? g->tp_rank : -1);
-        ds4_gpu_moe_raw_stage_report("chunk");
+        ds4_prefill_chunk_census(g, "chunk");
         ds4_ane_report();
         ds4_ane_reset();
         if (progress) {
@@ -55976,8 +55991,13 @@ static bool glm_graph_prefill_range(
             if (!ok) {
                 return false;
             }
+            /* The COMPACT-INDEXED driver. This is the path the rig runs, and
+             * until now none of the per-chunk validity lines were emitted from
+             * it at all. */
+            ds4_prefill_chunk_census(g, "chunk");
             done += chunk;
         }
+        ds4_prefill_chunk_census(g, "prefill");
         return true;
     }
     const uint32_t chunk_max = glm_graph_prefill_chunk_tokens(g->ctx_cap);

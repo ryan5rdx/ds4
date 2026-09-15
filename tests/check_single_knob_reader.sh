@@ -57,5 +57,46 @@ else
     echo "ok   rollback captures and restores every compact field"
 fi
 
+# 3. EVERY prefill driver emits the per-chunk census.
+#
+# There are two: metal_graph_prefill_chunked_range (layer-major) and
+# glm_graph_prefill_range (compact-indexed). All three validity emitters were
+# wired only to the first, and the rig runs the second -- so ANEPROC 8a reported
+# chunk_lines=0 twice and PERFONLY3's +3.19% arrived with no counter line, from
+# call sites that exist, are correct, and are unreachable. A compiler cannot see
+# this; only a check that names both drivers can.
+python3 - <<'PY' || fail=1
+import re, sys
+src = open("ds4.c").read().split("\n")
+drivers = ["metal_graph_prefill_chunked_range", "glm_graph_prefill_range"]
+bad = []
+for d in drivers:
+    # find the definition (a line starting the function, with a brace body)
+    start = next((i for i, l in enumerate(src)
+                  if re.match(r"^static .*\b" + d + r"\(", l)), None)
+    if start is None:
+        bad.append(f"{d}: definition not found (renamed?)")
+        continue
+    depth, end, seen = 0, None, False
+    for i in range(start, len(src)):
+        depth += src[i].count("{") - src[i].count("}")
+        if src[i].count("{"):
+            seen = True
+        if seen and depth <= 0:
+            end = i
+            break
+    body = "\n".join(src[start:(end or len(src)) + 1])
+    if "ds4_prefill_chunk_census" not in body:
+        bad.append(f"{d}: no ds4_prefill_chunk_census call")
+if bad:
+    print("FAIL prefill census is not emitted by every driver:")
+    for b in bad:
+        print("    " + b)
+    print("    A validity gate that is unreachable on the path the rig runs")
+    print("    reports nothing and reads as success.")
+    sys.exit(1)
+print("ok   both prefill drivers emit the per-chunk census")
+PY
+
 [ "$fail" -eq 0 ] && echo "PASS: knob readers and compact-logit invariants hold"
 exit $fail
