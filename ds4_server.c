@@ -12800,6 +12800,7 @@ static void *decode_worker_main(void *arg) {
     return NULL;
 }
 
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -13478,6 +13479,47 @@ decode_again:
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
     dsml_tracker.model_syntax = j->req.model_syntax;
+
+    /* Arm the compact top-1 TP exchange for this job, from the request's BASE
+     * sampling parameters -- deliberately not the per-iteration ones.
+     *
+     * The loop lowers temperature to 0 for tool syntax on some iterations, and
+     * arming is consumed one iteration LATER than it is set (the eval at
+     * iteration N feeds the sample at N+1). Arming off a transiently greedy
+     * iteration would leave the next one, back at its real temperature, holding
+     * a logit vector whose peer half was never transferred -- a visible error,
+     * but a false one, on an ordinary tool-calling request. The base parameters
+     * are loop-invariant, so arming on them cannot go stale.
+     *
+     * ignore_eos routes to ds4_session_argmax_ignoring_eos(), which scans the
+     * full vector to skip stop tokens and so cannot be served by a single key;
+     * it disarms outright. This server has no logprobs, logit bias, penalties
+     * or grammar, so those fields stay false -- the struct is what documents
+     * what would have to change if it grew any of them. */
+    {
+        ds4_raw_argmax_ctx rax = {
+            .temperature = j->req.temperature,
+            .top_k       = j->req.top_k,
+            .top_p       = j->req.top_p,
+            .min_p       = j->req.min_p,
+            .speculative = !s->batched_mode &&
+                           ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+                           getenv("DS4_MTP_SPEC_DISABLE") == NULL,
+        };
+        if (ds4_think_mode_enabled(j->req.think_mode)) {
+            if (!j->req.temperature_set) rax.temperature = DS4_DEFAULT_TEMPERATURE;
+            if (!j->req.top_k_set) rax.top_k = 0;
+            if (!j->req.top_p_set) rax.top_p = DS4_DEFAULT_TOP_P;
+            if (!j->req.min_p_set) rax.min_p = DS4_DEFAULT_MIN_P;
+        }
+        /* ignore_eos is not a sampler knob the ctx models, so it disarms here
+         * rather than being squeezed into a field that means something else. */
+        /* The kill switch is NOT re-checked here: ds4_session_compact_top1_enabled()
+         * reads it at the eval chokepoint, so every caller and both ranks get
+         * it. A second copy in this file is what made ds4-bench ignore it. */
+        const bool armable = !j->req.ignore_eos;
+        ds4_session_set_raw_argmax_ctx(slot->session, armable ? &rax : NULL);
+    }
 
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
@@ -17325,6 +17367,56 @@ static void test_request_defaults_use_min_p_filtering(void) {
     TEST_ASSERT(r.top_k == 0);
     TEST_ASSERT(r.min_p == DS4_DEFAULT_MIN_P);
     TEST_ASSERT(!r.ignore_eos);
+    request_free(&r);
+}
+
+/* The exact request an A/B would send: server defaults plus "temperature": 0,
+ * and nothing else. It must be eligible for the compact top-1 exchange.
+ *
+ * This is the test that would have caught e511f2c shipping a feature that could
+ * never arm. request_init() sets min_p = 0.05 and top_p = DS4_DEFAULT_TOP_P on
+ * every request, and the first version of ds4_sampler_can_use_raw_argmax()
+ * rejected any positive min_p as a "belt and braces" precaution -- so the arm
+ * would have reported a clean null and looked like a real negative result. */
+static void test_compact_top1_eligible_on_default_temperature_zero(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.temperature_set = true;
+    r.temperature = 0.0f;
+
+    ds4_raw_argmax_ctx c = {
+        .temperature = r.temperature,
+        .top_k       = r.top_k,
+        .top_p       = r.top_p,      /* DS4_DEFAULT_TOP_P, left alone */
+        .min_p       = r.min_p,      /* DS4_DEFAULT_MIN_P = 0.05, left alone */
+        .peer_negotiated = true,
+    };
+    TEST_ASSERT(r.min_p > 0.0f);     /* the default really is positive */
+    TEST_ASSERT(ds4_sampler_can_use_raw_argmax(&c));
+
+    /* Above zero it must NOT be eligible, defaults or not -- otherwise the
+     * check above would pass for the wrong reason. */
+    c.temperature = 0.7f;
+    TEST_ASSERT(!ds4_sampler_can_use_raw_argmax(&c));
+
+    /* And the transport condition is still load-bearing on its own. */
+    c.temperature = 0.0f;
+    c.peer_negotiated = false;
+    TEST_ASSERT(!ds4_sampler_can_use_raw_argmax(&c));
+
+    /* Everything the compact path genuinely cannot serve still refuses, at
+     * temperature zero, with default filtering knobs in place. */
+    const ds4_raw_argmax_ctx base = {
+        .temperature = 0.0f, .top_k = r.top_k, .top_p = r.top_p,
+        .min_p = r.min_p, .peer_negotiated = true,
+    };
+    ds4_raw_argmax_ctx v;
+    v = base; v.wants_logprobs  = true; TEST_ASSERT(!ds4_sampler_can_use_raw_argmax(&v));
+    v = base; v.has_logit_bias  = true; TEST_ASSERT(!ds4_sampler_can_use_raw_argmax(&v));
+    v = base; v.has_penalties   = true; TEST_ASSERT(!ds4_sampler_can_use_raw_argmax(&v));
+    v = base; v.has_grammar_mask= true; TEST_ASSERT(!ds4_sampler_can_use_raw_argmax(&v));
+    v = base; v.speculative     = true; TEST_ASSERT(!ds4_sampler_can_use_raw_argmax(&v));
+
     request_free(&r);
 }
 
@@ -21648,6 +21740,7 @@ static void ds4_server_unit_tests_run(void) {
     test_multimodal_prefill_resume_frontier();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();
+    test_compact_top1_eligible_on_default_temperature_zero();
     test_chat_ignore_eos_contract();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();

@@ -10,7 +10,7 @@ int main(void) {
     ds4_tp worker = { .control_fd = fd[1], .control_lock = PTHREAD_MUTEX_INITIALIZER };
     char err[256] = "";
     ds4_tp_command cmd;
-    assert(DS4_TP_PROTOCOL_VERSION == 12);
+    assert(DS4_TP_PROTOCOL_VERSION == 14);
     for (int i = 0; i < 4; i++) {
         assert(ds4_tp_send_eval(&leader, 42, 2*i, 100+i, 0u));
         assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
