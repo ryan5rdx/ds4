@@ -4009,8 +4009,8 @@ static int ds4_gpu_moe_tg_probe_pair_active(void) {
 /* The control arm cannot bind ZERO bytes.
  *
  * Keeping the threadgroup pointer live is what makes the reservation bind at
- * all -- but it also makes the binding MANDATORY. `setThreadgroupMemoryLength:0`
- * is rejected, and skipping the call entirely leaves the dispatch with a missing
+ * all -- but it also makes the binding MANDATORY. Binding a length of
+ * zero is rejected, and skipping the call entirely leaves the dispatch missing a
  * binding for a live argument, which the debug layer catches as
  *
  *     missing Threadgroup Memory binding at index 0 for scratch[0]
