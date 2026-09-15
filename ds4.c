@@ -39497,6 +39497,8 @@ static bool metal_graph_prefill_layer_major_inner(
  * It was in the chunked path only, and the four direct callers of
  * layer_major bypassed it -- recreating the "no telemetry on the alternate
  * path" failure this codebase has already documented once. */
+void ds4_glm_ane_replacement_report(const char *where, int tp_rank);
+
 static bool metal_graph_prefill_layer_major(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -39511,6 +39513,7 @@ static bool metal_graph_prefill_layer_major(
         void                  *display_progress_ud) {
     const bool ok = metal_graph_prefill_layer_major_inner(g, model, weights, prompt, start, n_tokens, logits, show_progress, imatrix, display_progress, display_progress_ud);
     ds4_ane_aneproc_validate("prefill");
+    ds4_glm_ane_replacement_report("prefill", -1);
     return ok;
 }
 
@@ -39718,6 +39721,9 @@ static bool metal_graph_prefill_chunked_range(
          * chunk is the right cadence: per layer would perturb what it
          * measures, per run would hide which chunk went wrong. */
         ds4_ane_aneproc_validate("chunk");
+        /* Says what the GPU did, not just that the ANE ran. A served count
+         * cannot distinguish replacement from shadow; these can. */
+        ds4_glm_ane_replacement_report("chunk", g ? g->tp_rank : -1);
         ds4_ane_report();
         ds4_ane_reset();
         if (progress) {
@@ -50797,6 +50803,35 @@ static bool glm_graph_encode_shared_rows_into(
     return ok;
 }
 
+/* ANEPROC replacement counters, emitted per chunk on BOTH ranks.
+ *
+ * The 8a run reported 1344/1344 predictions served and was read as evidence
+ * that the ANE had replaced the GPU shared expert. It had not: under S8 the
+ * shared rows are folded into tp_bounce_out unconditionally, so the run
+ * measured GPU routed + GPU shared + ANE shared against GPU routed + GPU
+ * shared. A served count proves the ANE RAN; only these say what the GPU did
+ * and where the result landed. */
+static uint64_t g_ane_gpu_shared_encoded;
+static uint64_t g_ane_replacements;
+static uint64_t g_ane_unpacks;
+static uint32_t g_ane_owned_row0, g_ane_owned_row1;
+
+void ds4_glm_ane_replacement_report(const char *where, int tp_rank);
+void ds4_glm_ane_replacement_report(const char *where, int tp_rank) {
+    if (!g_ane_gpu_shared_encoded && !g_ane_replacements && !g_ane_unpacks) return;
+    const int bad = (g_ane_replacements != g_ane_unpacks) ||
+                    (g_ane_replacements && g_ane_gpu_shared_encoded);
+    fprintf(stderr,
+            "ds4: ANEREPL %s rank %d -- gpu_shared_encoded=%llu "
+            "ane_replacements=%llu ane_unpacks=%llu owned_rows=[%u,%u)%s\n",
+            where, tp_rank,
+            (unsigned long long)g_ane_gpu_shared_encoded,
+            (unsigned long long)g_ane_replacements,
+            (unsigned long long)g_ane_unpacks,
+            g_ane_owned_row0, g_ane_owned_row1,
+            bad ? "   *** RUN INVALID ***" : "");
+}
+
 static bool glm_graph_encode_ffn_batch(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -51429,12 +51464,43 @@ static bool glm_graph_encode_ffn_batch(
             false) != 0;
     uint64_t ffn_overlap_seq = 0;
     if (ok && g->tp_world == 2) {
-        if (ok && shared_row_split && shared_rows > 0) {
+        /* ane_started matters as much as ane_replaces_gpu. If the request was
+         * never queued for this layer, the insert below cannot fire, and
+         * skipping the GPU encode here would drop the shared expert for that
+         * layer entirely -- wrong output, and fast, which is the worst way to
+         * be wrong. Falling through to the GPU branch keeps it correct and
+         * makes the counters say so: gpu_shared_encoded > 0 alongside
+         * ane_replacements is reported as RUN INVALID, because for a
+         * performance arm a partial fallback is a contaminated measurement. */
+        if (ok && shared_row_split && shared_rows > 0 && ane_replaces_gpu &&
+            ane_started) {
+            /* REPLACEMENT. The ANE owns these rows, so the GPU shared expert is
+             * not encoded at all.
+             *
+             * This block used to be unconditional, and the !ane_replaces_gpu
+             * guard sat further down on the NON-S8 branch, unreachable once
+             * shared_done was set here. Production runs with S8 on, so PERFONLY
+             * never replaced anything: it measured GPU routed + GPU shared +
+             * ANE shared against GPU routed + GPU shared, which is a shadow
+             * arm wearing a replacement's name.
+             *
+             * The ANE result is NOT ready here -- it is computed concurrently
+             * with routed MoE -- so the fence and the accumulate happen below,
+             * before the combine. Marking shared_done keeps both the generic
+             * encode and the P1 kick off, which is required: P1 would open the
+             * exchange window before this rank's shared rows are in the
+             * payload. */
+            shared_done = true;
+            g_ane_replacements++;
+            g_ane_owned_row0 = ane_row0;
+            g_ane_owned_row1 = ane_row0 + ane_rows;
+        } else if (ok && shared_row_split && shared_rows > 0) {
             /* Compute this rank's shared rows and fold them into its full-row
              * routed partial, so the one all-reduce below carries both.  Each
              * row is added by exactly one rank, which is what makes the sum
              * correct rather than doubled. */
             ds4_gpu_trace_tag_layer(il, "shared_expert");
+            g_ane_gpu_shared_encoded++;
             ok = glm_graph_encode_shared_rows_into(g, model, l, shared_row0,
                                                    shared_rows,
                                                    g->batch_attn_out);
@@ -51464,6 +51530,35 @@ static bool glm_graph_encode_ffn_batch(
          * window instead of behind it.  Mutually exclusive with S8 by
          * construction: if shared_done, the shared rows are already in the
          * payload and must precede the kick. */
+        /* THE REPLACEMENT INSERT, and it must land here: after routed MoE has
+         * been encoded (so the ANE has had that window to finish) and BEFORE
+         * the all-reduce, because these rows are part of this rank's payload.
+         *
+         * The generic unpack further down runs after the combine, which is why
+         * it cannot serve this path however it is offset -- the partial would
+         * miss the exchange entirely. It also wrote batch_ffn_out from row 0
+         * with no ane_row0 applied, so on rank 1 it targeted [0,2048) instead
+         * of the [2048,4096) this rank owns. The pack side had the offset right
+         * all along; only the unpack did not. */
+        if (ok && ane_replaces_gpu && ane_started) {
+            if (ds4_ane_mode() >= DS4_ANE_FAST) {
+                ok = ok && ds4_gpu_ane_fence_done(ane_seq) != 0;
+            }
+            ds4_ane_wait(ane_li);
+            const uint64_t ane_span = (uint64_t)ane_rows * DS4_N_EMBD;
+            ds4_gpu_tensor *ane_dst = glm_graph_tensor_row_view_strided(
+                    g->tp_bounce_out, ane_row0, DS4_N_EMBD, ane_span);
+            ok = ok && ane_dst != NULL &&
+                 ds4_gpu_ane_unpack(ane_dst, (uint32_t)DS4_N_EMBD, ane_rows, 1);
+            if (ane_dst) ds4_gpu_tensor_free(ane_dst);
+            if (!ok) {
+                fprintf(stderr, "ds4: ANE replacement unpack failed "
+                                "(layer %u rows [%u,%u))\n",
+                        il, ane_row0, ane_row0 + ane_rows);
+            } else {
+                g_ane_unpacks++;
+            }
+        }
         ffn_overlap_seq = 0;
         /* stage_profile/stage_sync insert a flush-or-sync boundary between the
          * kick and the finish (glm_graph_prefill_stage_boundary), which would
@@ -51476,7 +51571,13 @@ static bool glm_graph_encode_ffn_batch(
          * alternatives that have to be compared in one interleaved arm, and
          * they must activate on the same set of chunks or the comparison is
          * between different workloads. */
-        if (ok && !shared_done && !g->ssd_streaming && n_tokens >= 34u &&
+        /* !ane_replaces_gpu is belt and braces: a replacement always sets
+         * shared_done above, so this is already unreachable. It is stated
+         * because the failure it prevents -- opening the exchange window
+         * before the ANE partial is in the payload -- is silent and produces
+         * plausible numbers. */
+        if (ok && !shared_done && !ane_replaces_gpu &&
+            !g->ssd_streaming && n_tokens >= 34u &&
             !stage_profile && !stage_sync &&
             glm53_tp_ffn_overlap_requested()) {
             ffn_overlap_seq = glm_graph_tp_batch_ffn_kick(g, il, n_tokens);
@@ -51526,15 +51627,17 @@ static bool glm_graph_encode_ffn_batch(
          * 0 below SHADOW, so the arm that exists to price the layout
          * conversion measured only its pack half. Every layout number from
          * ANESIDE3/4/5B is therefore a lower bound on the real cost. */
-        if (ane_started && ds4_ane_mode() >= DS4_ANE_FAST) {
+        if (ane_started && !ane_replaces_gpu && ds4_ane_mode() >= DS4_ANE_FAST) {
             /* The GPU waits, not this thread. It reaches the fence having
              * already run routed-MoE, so a prediction that finished during
              * that window costs nothing here. Gated on ane_started: a fence
              * for a request that was never queued spins to timeout. */
             ok = ok && ds4_gpu_ane_fence_done(ane_seq) != 0;
         }
-        if (ane_started) ds4_ane_wait(ane_li);
-        if (ds4_ane_mode() >= DS4_ANE_BRIDGE) {
+        if (ane_started && !ane_replaces_gpu) ds4_ane_wait(ane_li);
+        /* Replacement already fenced, waited and accumulated above, into
+         * tp_bounce_out at ane_row0 and ahead of the combine. */
+        if (ds4_ane_mode() >= DS4_ANE_BRIDGE && !ane_replaces_gpu) {
             /* NULL destination = the bridge's own scratch. The GPU stays
              * authoritative in every mode except PERFONLY, and the sidecar's
              * weights are synthetic, so the result must not reach anything
@@ -51545,8 +51648,12 @@ static bool glm_graph_encode_ffn_batch(
              * skipped above, which is the only configuration that measures an
              * end-to-end speedup rather than the sidecar's cost. Its text is
              * wrong by construction and it says so at startup. */
-            ds4_gpu_tensor *ane_dst =
-                (ds4_ane_mode() == DS4_ANE_PERFONLY) ? g->batch_ffn_out : NULL;
+            /* Always scratch here. PERFONLY's real destination is handled by
+             * the replacement insert above; reaching this line under PERFONLY
+             * would mean the replacement did not arm, and writing
+             * batch_ffn_out from row 0 is exactly the unoffset write that made
+             * rank 1 clobber rows it does not own. */
+            ds4_gpu_tensor *ane_dst = NULL;
             if (!ds4_gpu_ane_unpack(ane_dst, (uint32_t)DS4_N_EMBD, ane_rows,
                                     ane_dst ? 1 : 0)) {
                 fprintf(stderr, "ds4: ANE bridge unpack failed (layer %u)\n", il);
