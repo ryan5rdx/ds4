@@ -39726,9 +39726,16 @@ void ds4_gpu_moe_raw_stage_report(const char *where);
  * A gate whose failure mode is silence cannot gate anything, and three
  * independent emitters each remembering to hook both drivers is how this
  * recurred. One call, both drivers. */
-static void ds4_prefill_chunk_census(const ds4_gpu_graph *g, const char *where) {
+/* Takes the RANK, not a graph pointer.
+ *
+ * It took `const ds4_gpu_graph *` and the compact-indexed driver passes
+ * `ds4_glm_gpu_graph *` -- two incompatible layouts, so `g->tp_rank` was read
+ * from the wrong offset on precisely the path the rig runs. The compiler said
+ * so twice and I shipped it anyway. Passing an int makes the mismatch
+ * unrepresentable rather than merely fixed. */
+static void ds4_prefill_chunk_census(int tp_rank, const char *where) {
     ds4_ane_aneproc_validate(where);
-    ds4_glm_ane_replacement_report(where, g ? g->tp_rank : -1);
+    ds4_glm_ane_replacement_report(where, tp_rank);
     ds4_gpu_moe_raw_stage_report(where);
 }
 
@@ -39745,7 +39752,7 @@ static bool metal_graph_prefill_layer_major(
         ds4_session_progress_fn display_progress,
         void                  *display_progress_ud) {
     const bool ok = metal_graph_prefill_layer_major_inner(g, model, weights, prompt, start, n_tokens, logits, show_progress, imatrix, display_progress, display_progress_ud);
-    ds4_prefill_chunk_census(NULL, "prefill");
+    ds4_prefill_chunk_census(-1, "prefill");
     return ok;
 }
 
@@ -39954,7 +39961,7 @@ static bool metal_graph_prefill_chunked_range(
          * measures, per run would hide which chunk went wrong. */
         /* Says what the GPU did, not just that the ANE ran. A served count
          * cannot distinguish replacement from shadow; these can. */
-        ds4_prefill_chunk_census(g, "chunk");
+        ds4_prefill_chunk_census(g ? g->tp_rank : -1, "chunk");
         ds4_ane_report();
         ds4_ane_reset();
         if (progress) {
@@ -56329,10 +56336,10 @@ static bool glm_graph_prefill_range(
             /* The COMPACT-INDEXED driver. This is the path the rig runs, and
              * until now none of the per-chunk validity lines were emitted from
              * it at all. */
-            ds4_prefill_chunk_census(g, "chunk");
+            ds4_prefill_chunk_census(g ? g->tp_rank : -1, "chunk");
             done += chunk;
         }
-        ds4_prefill_chunk_census(g, "prefill");
+        ds4_prefill_chunk_census(g ? g->tp_rank : -1, "prefill");
         return true;
     }
     const uint32_t chunk_max = glm_graph_prefill_chunk_tokens(g->ctx_cap);

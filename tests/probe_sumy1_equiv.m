@@ -149,7 +149,8 @@ int main(int argc, const char **argv) { @autoreleasepool {
      * for bit, with the SUMY1 arm fed by the producer it will use in
      * production. */
     {
-        const uint32_t n_exp = 6, mid_dim = 2048, tok = 1;
+        /* Production top-k is 8 (ds4.c: n_expert_used), not 6. */
+        const uint32_t n_exp = 8, mid_dim = 2048, tok = 1;
         const uint64_t grb = (uint64_t)(in_dim / QK_K) * 144;
         const uint64_t geb = (uint64_t)mid_dim * grb;
         id<MTLComputePipelineState> pp[2] = { nil, nil };
@@ -161,9 +162,32 @@ int main(int argc, const char **argv) { @autoreleasepool {
             if (!pp[k]) { printf("FAIL pair pipeline %s\n", pk[k]); fails++; }
         }
         if (pp[0] && pp[1]) {
+            /* REAL Q4_K BYTES, in SHARED memory.
+             *
+             * The first version allocated these Private and never wrote them.
+             * Both arms then produced all-zero output and compared equal, so
+             * the test passed while proving nothing about consumer indexing --
+             * a wrong sumy index would have been invisible. Deterministic
+             * nonzero blocks, asserted nonzero at the end, plus a negative
+             * control that perturbs one stored sum and requires the output to
+             * move. */
             const size_t wb = (size_t)n_exp * geb;
-            id<MTLBuffer> bg = [dev newBufferWithLength:wb options:MTLResourceStorageModePrivate];
-            id<MTLBuffer> bu = [dev newBufferWithLength:wb options:MTLResourceStorageModePrivate];
+            id<MTLBuffer> bg = [dev newBufferWithLength:wb options:MTLResourceStorageModeShared];
+            id<MTLBuffer> bu = [dev newBufferWithLength:wb options:MTLResourceStorageModeShared];
+            {   /* block_q4_K = 144 B: d(f16) dmin(f16) scales[12] qs[128]. */
+                uint32_t ws = 0x1234ABCDu;
+                uint8_t *gp = (uint8_t *)bg.contents, *up = (uint8_t *)bu.contents;
+                for (size_t o = 0; o < wb; o += 144) {
+                    for (int k = 0; k < 144; k++) {
+                        ws ^= ws << 13; ws ^= ws >> 17; ws ^= ws << 5;
+                        uint8_t v = (uint8_t)(ws & 0xff);
+                        if (k < 2)       v = (uint8_t)(k ? 0x2c : 0x00); /* d ~ 0.066 */
+                        else if (k < 4)  v = (uint8_t)(k == 3 ? 0x28 : 0x00);
+                        gp[o + k] = v;
+                        up[o + k] = (uint8_t)(v ^ 0x5a);
+                    }
+                }
+            }
             float *xf = malloc(in_dim * sizeof(float));
             uint32_t st2 = 0xBEEF1234u;
             for (uint32_t i = 0; i < in_dim; i++) {
@@ -171,10 +195,10 @@ int main(int argc, const char **argv) { @autoreleasepool {
                 xf[i] = (float)((int32_t)st2) / 3.0e8f;
             }
             id<MTLBuffer> bxx = [dev newBufferWithBytes:xf length:in_dim*4 options:MTLResourceStorageModeShared];
-            int32_t sel[6] = {0,1,2,3,4,5};
-            float wts[6] = {0.3f,0.2f,0.15f,0.15f,0.1f,0.1f};
-            id<MTLBuffer> bsel = [dev newBufferWithBytes:sel length:24 options:MTLResourceStorageModeShared];
-            id<MTLBuffer> bw   = [dev newBufferWithBytes:wts length:24 options:MTLResourceStorageModeShared];
+            int32_t sel[8] = {0,1,2,3,4,5,6,7};
+            float wts[8] = {0.3f,0.2f,0.12f,0.1f,0.1f,0.08f,0.05f,0.05f};
+            id<MTLBuffer> bsel = [dev newBufferWithBytes:sel length:sizeof(sel) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> bw   = [dev newBufferWithBytes:wts length:sizeof(wts) options:MTLResourceStorageModeShared];
             const size_t mb = (size_t)n_exp * mid_dim * sizeof(float);
             id<MTLBuffer> bm[2];
             for (int k = 0; k < 2; k++) {
@@ -219,11 +243,59 @@ int main(int argc, const char **argv) { @autoreleasepool {
                 printf("FAIL pair dispatch: %s\n", cb2.error.localizedDescription.UTF8String);
                 fails++;
             } else {
+                /* The output must be POPULATED, or equality is vacuous. */
+                size_t nz = 0, nonfinite = 0;
+                const float *mv = (const float *)bm[0].contents;
+                for (size_t i = 0; i < mb / sizeof(float); i++) {
+                    if (mv[i] != 0.0f) nz++;
+                    if (!isfinite(mv[i])) nonfinite++;
+                }
+                /* The bar is "not all-zero and not NaN", not a distribution.
+                 * SwiGLU drives a large fraction of outputs toward zero by
+                 * construction (silu of a negative gate), so requiring a
+                 * quarter nonzero was an arbitrary threshold of mine, not a
+                 * property of the kernel. What must never recur is the vacuous
+                 * state the first version had: 0 of 12288 nonzero. */
+                const size_t total = mb / sizeof(float);
+                const int populated = (nz >= 256) && (nz * 100 >= total) && !nonfinite;
+                printf("%s   baseline output is populated: %zu/%zu nonzero "
+                       "(%.1f%%), %zu non-finite\n", populated ? "ok  " : "FAIL",
+                       nz, total, 100.0 * (double)nz / (double)total, nonfinite);
+                if (!populated) fails++;
+
                 const int diff = memcmp(bm[0].contents, bm[1].contents, mb);
                 printf("%s   baseline pair vs SUMY1 pair: dst_mid %s\n",
                        diff ? "FAIL" : "ok  ",
-                       diff ? "DIFFERS" : "bit-identical over 6 experts x 2048");
+                       diff ? "DIFFERS" : "bit-identical over 8 experts x 2048");
                 if (diff) fails++;
+
+                /* NEGATIVE CONTROL. Perturb one stored sum; the SUMY1 arm must
+                 * now DIFFER. Without this, a consumer that ignored the buffer
+                 * entirely would pass every check above. */
+                float *syp = (float *)bsy.contents;
+                const float keep = syp[13];
+                syp[13] = keep + 1.0f;
+                id<MTLCommandBuffer> cb3 = [q commandBuffer];
+                id<MTLComputeCommandEncoder> e3 = [cb3 computeCommandEncoder];
+                [e3 setComputePipelineState:pp[1]];
+                [e3 setBytes:&pa length:sizeof(pa) atIndex:0];
+                [e3 setBuffer:bg offset:0 atIndex:1];
+                [e3 setBuffer:bu offset:0 atIndex:2];
+                [e3 setBuffer:bxx offset:0 atIndex:3];
+                [e3 setBuffer:bsel offset:0 atIndex:4];
+                [e3 setBuffer:bw offset:0 atIndex:5];
+                [e3 setBuffer:bm[1] offset:0 atIndex:6];
+                [e3 setBuffer:bsy offset:0 atIndex:7];
+                [e3 dispatchThreadgroups:MTLSizeMake((mid_dim+7)/8, n_exp, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+                [e3 endEncoding]; [cb3 commit]; [cb3 waitUntilCompleted];
+                syp[13] = keep;
+                const int moved = memcmp(bm[0].contents, bm[1].contents, mb) != 0;
+                printf("%s   negative control: perturbing one stored sum %s\n",
+                       moved ? "ok  " : "FAIL",
+                       moved ? "changes the output (the buffer IS read)"
+                             : "does NOT change the output -- the arm ignores it");
+                if (!moved) fails++;
             }
             free(xf);
         }

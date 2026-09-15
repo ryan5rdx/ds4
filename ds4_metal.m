@@ -2229,6 +2229,7 @@ void ds4_gpu_aneproc_stop(void);
 static uint32_t ds4_gpu_fencework_helpers(void);
 static uint32_t ds4_gpu_fencework_lines(void);
 static id<MTLBuffer> ds4_gpu_fencework_warm_buffer(void);
+static id<MTLBuffer> ds4_gpu_fencework_plan_range(uint32_t gate, uint64_t *off_out, uint64_t *bytes_out);
 static id<MTLBuffer> g_fencework_sink;
 static id<MTLComputePipelineState> ds4_gpu_topk_pipeline(const char *base);
 void ds4_ane_shutdown(void);
@@ -2453,6 +2454,12 @@ static int ds4_gpu_moe_selected_hotlist_record(
 static void ds4_gpu_moe_selected_trace_record_close(void) {
     if (g_moe_selected_trace_record_fp) {
         const char *path = getenv("DS4_MOE_RECORD_SELECTED_IDS");
+        /* Patch the count into the header now that it is known. */
+        if (fseek(g_moe_selected_trace_record_fp, 3 * (long)sizeof(uint32_t),
+                  SEEK_SET) == 0) {
+            const uint32_t n = (uint32_t)g_moe_selected_trace_record_count;
+            fwrite(&n, sizeof(n), 1, g_moe_selected_trace_record_fp);
+        }
         fclose(g_moe_selected_trace_record_fp);
         g_moe_selected_trace_record_fp = NULL;
         fprintf(stderr,
@@ -2497,6 +2504,17 @@ static int ds4_gpu_moe_selected_trace_record(
             fprintf(stderr, "ds4: failed to open selected-id record file %s\n", path);
             return 0;
         }
+        /* HEADER, so the stride travels with the bytes.
+         *
+         * The file was a bare positional stream and replay inferred the stride
+         * from its own caller -- so a trace recorded at top-k 8 and replayed at
+         * 6 would decode silently into plausible-looking expert ids. magic,
+         * version, stride, then count patched in at close. */
+        const uint32_t hdr[4] = { 0x4D53454Cu /* "MSEL" */, 1u, n_selected, 0u };
+        if (fwrite(hdr, sizeof(hdr[0]), 4, g_moe_selected_trace_record_fp) != 4) {
+            fprintf(stderr, "ds4: failed to write selected-id header\n");
+            return 0;
+        }
         setvbuf(g_moe_selected_trace_record_fp, NULL, _IOFBF, 1u << 20);
         atexit(ds4_gpu_moe_selected_trace_record_close);
     }
@@ -2518,6 +2536,7 @@ static int ds4_gpu_moe_selected_trace_replay(
         uint32_t n_selected) {
     const char *path = getenv("DS4_MOE_REPLAY_SELECTED_IDS");
     if (!path || !path[0]) return 0;
+    /* Replay must READ the stride, not assume it. See the header above. */
     if (n_selected == 0u || n_selected > 6u * 4u) {
         fprintf(stderr, "ds4: selected-id replay: implausible top-k %u\n", n_selected);
         return -1;
@@ -12708,7 +12727,13 @@ int ds4_gpu_tp_gate_prefetch_plan(uint32_t gate,
                                   const uint64_t *offsets, const uint64_t *bytes,
                                   uint32_t count) {
     if (gate >= DS4_TP_GATES_PER_LAYER) return 0;
-    if (!g_tp_gate_prefetch || !g_tp_poll_gates || !model_map) {
+    /* FENCEWORK consumes this plan too, so it must be built when the FAST_SYNC
+     * fence is in use -- not only for the poll-gate path, which is the dead
+     * one. The plan itself is just offsets; who touches them is the caller's
+     * business. */
+    const int want_plan = (g_tp_gate_prefetch && g_tp_poll_gates) ||
+                          ds4_gpu_fencework_helpers() != 0u;
+    if (!want_plan || !model_map) {
         g_tp_prefetch_count[gate] = 0;
         return 1;
     }
@@ -13153,11 +13178,15 @@ static void *ds4_gpu_tp_service_thread(void *arg) {
                             g_tp_stat_batch_exchange_ms * 1e3 / (double)g_tp_stat_batch_gates,
                             g_tp_stat_batch_release_ms * 1e3 / (double)g_tp_stat_batch_gates);
                 ds4_gpu_tp_fence_spin_report();
-                /* Guarded like the poll line below. g_tp_stat_gates stays zero
-                 * in configurations where only the batch counters advance, and
-                 * the three divisions then printed 0/0 -- a NaN that reads as
-                 * an uninitialised accumulator and cost a reviewer's time on
-                 * the 2026-09-15 diagnostic. */
+                /* Defensive guard, and the root cause is NOT this.
+                 *
+                 * I claimed 0/0 explained the NaN the rig saw. It cannot: this
+                 * line sits inside `if (++g_tp_stat_gates % 860 == 0)`, so the
+                 * denominator is necessarily nonzero by the time it prints. The
+                 * guard is kept because a zero denominator would still be
+                 * wrong, but the observed NaN has another source and the
+                 * diagnosis is OPEN -- most likely g_tp_stat_encode_lead or one
+                 * of the ms accumulators, which are summed elsewhere. */
                 const double gates_d = (double)g_tp_stat_gates;
                 fprintf(stderr,
                         "ds4: TP gates: encode lead %.2f gates; verify %.1f us; release %.1f us; poll hit line avg %.1f max %llu over %llu\n",
@@ -13534,12 +13563,14 @@ static int ds4_gpu_tp_release_fence_encode(uint32_t slot, uint32_t want) {
             g_fencework_sink = [g_device newBufferWithLength:1024 * sizeof(uint32_t)
                                                      options:MTLResourceStorageModePrivate];
         }
-        id<MTLBuffer> warm = ds4_gpu_fencework_warm_buffer();
+        uint64_t warm_off = 0, warm_bytes = 0;
+        id<MTLBuffer> warm =
+            ds4_gpu_fencework_plan_range(spin_bank, &warm_off, &warm_bytes);
         uint32_t lines = ds4_gpu_fencework_lines();
-        if (!warm) lines = 0u;      /* kernel no-ops; TG0 still polls */
-        else if ((uint64_t)lines * 128ull > (uint64_t)warm.length)
-            lines = (uint32_t)(warm.length / 128ull);
-        if (warm) [enc setBuffer:warm offset:0 atIndex:6];
+        if (!warm || warm_bytes == 0) lines = 0u;  /* no plan: helpers no-op */
+        else if ((uint64_t)lines * 128ull > warm_bytes)
+            lines = (uint32_t)(warm_bytes / 128ull);
+        if (warm) [enc setBuffer:warm offset:(NSUInteger)warm_off atIndex:6];
         [enc setBytes:&lines length:sizeof(lines) atIndex:7];
         [enc setBuffer:g_fencework_sink offset:0 atIndex:8];
         /* TG0 polls with one live thread; the helpers use full threadgroups.
@@ -37489,21 +37520,23 @@ static uint32_t ds4_gpu_fencework_lines(void) {
     return (uint32_t)v;
 }
 
-/* WHAT TO WARM, and the honest limitation.
+/* WHAT TO WARM: the existing per-gate priority plan.
  *
- * The campaign specifies a priority plan per release type -- attention release
- * warms router projection then shared gate/up; FFN release warms the next
- * layer's first attention/KDA projection -- and that needs the actual tensor
- * pointers threaded to the fence site, which is not built. What IS built picks
- * the largest resident model buffer, so the first measurement answers the prior
- * question: does warming ANYTHING during the spin help, hurt, or vanish?
+ * ds4.c already builds exactly the plan the campaign describes -- this layer's
+ * FFN-side weights while the attention gate waits, the next layer's
+ * attention-side weights while the FFN gate waits, rank slices where split --
+ * and ds4_gpu_tp_gate_prefetch_plan() stores it per gate. It was wired only to
+ * the POLL-gate path, which is the dead one, so FAST_SYNC never used it.
  *
- * That ordering matters because warming the wrong bytes can EVICT what the gate
- * is about to need, which would show up as a regression rather than a null. So
- * a negative here does not close FENCEWORK -- it closes generic warming, and
- * the priority plan remains the arm worth building if the mechanism shows any
- * signal at all. Never the selected routed experts: the selection does not
- * exist at fence time. */
+ * The first version of FENCEWORK warmed the first bytes of the largest cached
+ * buffer instead. That cannot demonstrate a downstream benefit: it touches
+ * memory nothing is about to read, and it can evict what the gate does need.
+ * It is retained only as the INTERFERENCE control (DS4_TP_FENCEWORK_GENERIC=1)
+ * -- the arm that answers "does helper traffic cost anything by itself".
+ *
+ * Budget, corrected: the 243 us in the rig profile is the CPU service thread
+ * waiting for the GPU to ARRIVE; the fence has not started. The window this can
+ * fill is the measured GPU spin, 22-30 us per gate. */
 static id<MTLBuffer> ds4_gpu_fencework_warm_buffer(void) {
     static id<MTLBuffer> cached;
     if (cached) return cached;
@@ -37515,15 +37548,38 @@ static id<MTLBuffer> ds4_gpu_fencework_warm_buffer(void) {
             if (b.length > best_len) { best_len = b.length; best = b; }
         }];
     cached = best;
-    if (!cached) {
-        static int warned;
-        if (!warned) {
-            warned = 1;
-            fprintf(stderr, "ds4: FENCEWORK has no resident model buffer to "
-                            "warm; helpers will no-op this gate\n");
-        }
-    }
     return cached;
+}
+
+static int ds4_gpu_fencework_generic(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_TP_FENCEWORK_GENERIC") != NULL ? 1 : 0;
+    return v;
+}
+
+/* The plan's first range for this gate, as a buffer + byte span. Returns nil
+ * when the gate has no plan, and the helpers then no-op -- a gate with nothing
+ * worth warming must not warm something arbitrary. */
+static id<MTLBuffer> ds4_gpu_fencework_plan_range(uint32_t gate,
+                                                  uint64_t *off_out,
+                                                  uint64_t *bytes_out) {
+    if (ds4_gpu_fencework_generic()) {
+        id<MTLBuffer> b = ds4_gpu_fencework_warm_buffer();
+        if (b) { *off_out = 0; *bytes_out = b.length; }
+        return b;
+    }
+    if (gate >= DS4_TP_GATES_PER_LAYER || g_tp_prefetch_count[gate] == 0) return nil;
+    if (!g_tp_prefetch_map) return nil;
+    *off_out   = g_tp_prefetch_plan[gate][0].offset;
+    *bytes_out = g_tp_prefetch_plan[gate][0].bytes;
+    /* Same resolver the poll path's touch table uses. */
+    NSUInteger inner = 0;
+    id<MTLBuffer> src = ds4_gpu_wrap_model_range(g_tp_prefetch_map,
+                                                 g_tp_prefetch_map_size,
+                                                 *off_out, *bytes_out, &inner);
+    if (!src) return nil;
+    *off_out = (uint64_t)inner;
+    return src;
 }
 
 static int ds4_gpu_sumy1_enabled(void) {
@@ -37564,7 +37620,8 @@ static id<MTLBuffer> ds4_gpu_sumy1_encode(id<MTLCommandBuffer> cb,
                                           const void *args, size_t args_len,
                                           id<MTLBuffer> xbuf, uint64_t x_off,
                                           uint32_t in_dim, uint32_t n_tokens) {
-    if (!ds4_gpu_sumy1_enabled()) return nil;
+    /* Eligibility is the caller's sumy1_active; this re-checks only the shape
+     * facts its own grid depends on. */
     if (in_dim % 256u != 0u || n_tokens == 0u) return nil;
     id<MTLComputePipelineState> p =
         ds4_gpu_get_pipeline("kernel_glm53_sumy1_produce");
@@ -43303,6 +43360,25 @@ int ds4_gpu_glm_routed_moe_one_tensor(
         }
         const int dm_spec_ok =
             ds4_gpu_decmoe_spec_ok(expert_in_dim, expert_mid_dim, out_dim);
+
+        /* SUMY1 eligibility, computed ONCE and used for all three decisions:
+         * kernel choice, producer dispatch, and the buffer-7 bind. They were
+         * three separate conditions, and on the deferred streaming path index
+         * 7 is `mid` -- arming SUMY1 there would have overwritten the output
+         * tensor with the sums buffer. Not a wrong number, a destroyed one.
+         *
+         * Each clause is a fact the _sumy1 kernel assumes: resident Q4 only
+         * (addr-table and deferred wrappers have a different buffer map),
+         * use_pair4 and dm_spec_ok (the arm exists only for _spec), not the TG
+         * probe (same kernel slot), in_dim a multiple of QK_K (the producer's
+         * grid). */
+        const int sumy1_active =
+            ds4_gpu_sumy1_enabled() &&
+            !use_stream_split_deferred &&
+            !use_stream_expert_addr_table &&
+            use_pair4 && dm_spec_ok &&
+            !ds4_gpu_moe_tg_probe_pair_active() &&
+            (expert_in_dim % 256u) == 0u;
         id<MTLComputePipelineState> pair_pipeline =
             (use_stream_split_deferred ?
              (gate_pair_q2 ?
@@ -43338,7 +43414,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
               ? ds4_gpu_get_pipeline(
                     ds4_gpu_moe_tg_probe_pair_active()
                         ? "kernel_glm_q4_K_pair_swiglu4_f32_spec_tgprobe"
-                        : ds4_gpu_sumy1_enabled()
+                        : sumy1_active
                         ? "kernel_glm_q4_K_pair_swiglu4_f32_spec_sumy1"
                         : "kernel_glm_q4_K_pair_swiglu4_f32_spec")
               : ds4_gpu_moe_tg_probe_pair_active()
@@ -43481,10 +43557,18 @@ int ds4_gpu_glm_routed_moe_one_tensor(
          * selected above -- so the bind is conditional on the same fact the
          * kernel choice was, and a missing producer degrades to shipping
          * rather than to a pair kernel reading an unwritten buffer. */
-        id<MTLBuffer> sumy1_buf =
-            ds4_gpu_sumy1_encode(cb, &args, sizeof(args), xbuf,
-                                 ds4_gpu_tensor_offset(x),
-                                 (uint32_t)expert_in_dim, 1u);  /* decode: one row */
+        id<MTLBuffer> sumy1_buf = sumy1_active
+            ? ds4_gpu_sumy1_encode(cb, &args, sizeof(args), xbuf,
+                                   ds4_gpu_tensor_offset(x),
+                                   (uint32_t)expert_in_dim, 1u)
+            : nil;
+        if (sumy1_active && !sumy1_buf) {
+            /* The kernel choice above already assumed the producer. Refusing
+             * beats running _sumy1 against an unwritten sums buffer. */
+            fprintf(stderr, "ds4: SUMY1 armed but the producer could not be "
+                            "encoded; refusing\n");
+            return 0;
+        }
         const NSUInteger pair_threadgroup_bytes = ds4_gpu_moe_tg_probe_pair_bytes();
         const NSUInteger pair_threads = 64u;
         const NSUInteger down_x_groups =
@@ -43548,7 +43632,11 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                 [enc useResource:stream_entries[i]->up_buffer usage:MTLResourceUsageRead];
             }
         }
-        if (sumy1_buf) [enc setBuffer:sumy1_buf offset:0 atIndex:7];
+        if (sumy1_active && sumy1_buf) {
+            /* Safe only because sumy1_active excludes the deferred
+             * path, where index 7 is `mid`. */
+            [enc setBuffer:sumy1_buf offset:0 atIndex:7];
+        }
         if (pair_threadgroup_bytes != 0u) {
             [enc setThreadgroupMemoryLength:DS4_TG16(pair_threadgroup_bytes)
                                  atIndex:0];
