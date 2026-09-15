@@ -47444,6 +47444,52 @@ static bool glm_graph_tp_batch_ffn_combine(ds4_glm_gpu_graph *g,
                                            ds4_gpu_tensor    *ffn_out,
                                            uint32_t           n_tokens);
 
+/* ---- A2.5: per-branch KDA projection timings -------------------------------
+ *
+ * The campaign's partition equation is
+ *
+ *     new_pre = max(ANE candidate + pack/unpack,
+ *                   measured GPU complement under ANE contention)
+ *
+ * and it is explicit that individual projection times must NOT be inferred by
+ * dividing the 0.281 ms/token KDA bucket by FLOPs -- the kernels, quantisation
+ * formats and shapes have different efficiencies, so the arithmetic answer and
+ * the measured one disagree. Nothing measured them, so no candidate in the
+ * K0-K4 ladder could be chosen on evidence.
+ *
+ * DIAGNOSTIC ONLY, and that is not a disclaimer: each boundary forces a flush,
+ * which changes command-buffer structure and therefore throughput. Use these
+ * numbers to pick the partition; never quote them as a production result. The
+ * end-to-end arm runs with DS4_GLM53_KDA_STAGE_PROFILE unset.
+ *
+ * Off by default and read once. */
+static int glm53_kda_stage_profile(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_GLM53_KDA_STAGE_PROFILE");
+        v = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (v) fprintf(stderr,
+                "ds4: GLM53 KDA stage profile ON -- per-branch boundaries force "
+                "a flush; these timings are for choosing a partition, NOT a "
+                "throughput result\n");
+    }
+    return v;
+}
+
+/* One branch boundary. Returns the new t0 so the caller threads it along. */
+static double glm53_kda_stage_mark(int on, const char *branch, uint32_t il,
+                                   uint32_t rows, double t0) {
+    if (!on) return 0.0;
+    if (ds4_gpu_synchronize() == 0) {
+        fprintf(stderr, "ds4: KDA stage profile sync failed at %s\n", branch);
+        return t0;
+    }
+    const double now = now_sec() * 1000.0;
+    fprintf(stderr, "ds4: KDA stage il=%u rows=%u %-10s %.3f ms\n",
+            il, rows, branch, now - t0);
+    return now;
+}
+
 static bool glm53_graph_kda_attention_rows(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -47497,6 +47543,8 @@ static bool glm53_graph_kda_attention_rows(
     const uint64_t off_dt = l->kda_dt_bias->abs_offset + f32_chan;
     const uint64_t off_al = l->kda_a_log->abs_offset +
         (uint64_t)(lane.lane_rows / DS4_N_KDA_HEAD_DIM) * sizeof(float);
+    const int kda_prof = glm53_kda_stage_profile();
+    double kda_t0 = kda_prof ? (now_sec() * 1000.0) : 0.0;
     const char *failed_stage = "Q projection";
     const ds4_tensor *failed_weight = l->kda_q;
     bool ok = glm53_graph_matmul_rows_at(g->batch_kda_q, model, l->kda_q, off_q,
@@ -47505,6 +47553,7 @@ static bool glm53_graph_kda_attention_rows(
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_q_ready", g->batch_kda_q,
             (uint64_t)rows * projection, il, pos0);
+    kda_t0 = glm53_kda_stage_mark(kda_prof, "Q", il, rows, kda_t0);
     if (ok) failed_stage = "K projection";
     if (ok) failed_weight = l->kda_k;
     if (ok) ok = glm53_graph_matmul_rows_at(g->batch_kda_k, model, l->kda_k, off_k,
@@ -47513,6 +47562,7 @@ static bool glm53_graph_kda_attention_rows(
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_k_ready", g->batch_kda_k,
             (uint64_t)rows * projection, il, pos0);
+    kda_t0 = glm53_kda_stage_mark(kda_prof, "K", il, rows, kda_t0);
     if (ok) failed_stage = "V projection";
     if (ok) failed_weight = l->kda_v;
     if (ok) ok = glm53_graph_matmul_rows_at(g->batch_kda_v, model, l->kda_v, off_v,
@@ -47521,6 +47571,7 @@ static bool glm53_graph_kda_attention_rows(
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_v_ready", g->batch_kda_v,
             (uint64_t)rows * projection, il, pos0);
+    kda_t0 = glm53_kda_stage_mark(kda_prof, "V", il, rows, kda_t0);
     if (ok) failed_stage = "decay low-rank projection";
     if (ok) failed_weight = l->kda_f_a;
     if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_lowrank, model,
@@ -47538,6 +47589,7 @@ static bool glm53_graph_kda_attention_rows(
     if (ok) metal_graph_debug_dump_tensor(
             "glm53_kda_raw_gate_ready", g->batch_kda_raw_gate,
             (uint64_t)rows * projection, il, pos0);
+    kda_t0 = glm53_kda_stage_mark(kda_prof, "f_a->f_b", il, rows, kda_t0);
     if (ok) failed_stage = "beta projection";
     if (ok) failed_weight = l->kda_beta;
     if (ok) ok = glm53_graph_matmul_rows_at(g->batch_kda_raw_beta, model,
@@ -47549,6 +47601,7 @@ static bool glm53_graph_kda_attention_rows(
             "glm53_kda_raw_beta_ready", g->batch_kda_raw_beta,
             (uint64_t)rows * lane.heads, il, pos0);
     if (ok) failed_stage = "output-gate low-rank projection";
+    kda_t0 = glm53_kda_stage_mark(kda_prof, "beta", il, rows, kda_t0);
     if (ok) failed_weight = l->kda_g_a;
     if (ok) ok = glm53_graph_matmul_rows(g->batch_kda_lowrank, model,
                                          l->kda_g_a,
@@ -47567,6 +47620,7 @@ static bool glm53_graph_kda_attention_rows(
             (uint64_t)rows * projection, il, pos0);
     if (ok) failed_stage = "KDA recurrence";
     if (ok) failed_weight = NULL;
+    kda_t0 = glm53_kda_stage_mark(kda_prof, "g_a->g_b", il, rows, kda_t0);
     if (ok) ok = ds4_gpu_glm53_kda_prefill(
             g->batch_kda_out,
             g->layer_kda_conv_state[il],
